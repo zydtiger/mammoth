@@ -27,12 +27,22 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `docs/ARCHITECTURE.md` | Durable package boundary, dependency direction, runtime model, logging roles, trainer scope, and compatibility policy. | Responsibilities move between layers or a stable architectural contract changes. |
 | `docs/IMPLEMENTATION_PLAN.md` | Ordered delivery phases, acceptance conditions, migration sequence, and explicitly deferred capabilities. | A phase is started/completed, delivery order changes, or deferred scope is approved. |
 | `docs/CODEMAP.md` | Map of implemented source paths, symbols, and import relationships. | Implemented files or symbols move, appear, or disappear, or their import relationships change. |
-| `pyproject.toml` | Package identity, Python requirement, build backend, dependencies, optional extras, and tool configuration. | Packaging, dependencies, commands, build behavior, or development-tool policy changes. |
+| `pyproject.toml` | Package identity, Python requirement, build backend, dependencies, CLI entry point, optional extras, and tool configuration. | Packaging, dependencies, commands, build behavior, or development-tool policy changes. |
 | `uv.lock` | Exact uv resolution generated from `pyproject.toml`. Never edit manually. | Regenerate with uv whenever dependency metadata changes. |
 | `.python-version` | uv/Python development baseline. | The supported development interpreter changes deliberately. |
 | `.gitignore` | Generated-file and local-environment exclusions. | A new reproducible build, cache, environment, or local artifact needs an exclusion. |
 | `src/mammoth/__init__.py` | Lightweight root package metadata and intentionally small stable exports. | Package version or a truly root-level stable export changes. |
 | `src/mammoth/py.typed` | PEP 561 marker declaring inline type information. | Keep present and empty while Mammoth ships typed source. |
+| `src/mammoth/core/__init__.py` | Public framework-neutral core exports. | A stable core symbol is added, removed, or renamed. |
+| `src/mammoth/core/artifacts.py` | Atomic local bytes, text, JSON, and opaque artifact publication. | Local publication durability or writer behavior changes. |
+| `src/mammoth/core/events.py` | Schema-v1 event values, append-only producer writers, replay, and active tailing. | Event validation, retention, compatibility, or stream behavior changes. |
+| `src/mammoth/core/execution.py` | Immutable execution metadata, lineage, sanitization, discovery, joins, and logical-run leases. | Attempt identity, provenance, compatibility, or lease behavior changes. |
+| `src/mammoth/core/identity.py` | Filesystem-safe run-name and execution-ID validation. | Identity syntax or length limits change. |
+| `src/mammoth/core/layout.py` | Stable caller-entry/run-name artifact path resolution. | The run-directory contract changes. |
+| `tests/test_artifacts.py` | Atomic artifact publication unit coverage. | Artifact publication behavior changes. |
+| `tests/test_events.py` | Event validation, writer, replay, tailing, and legacy-field unit coverage. | Event behavior changes. |
+| `tests/test_execution.py` | Execution metadata, lineage, sanitization, compatibility, and lease unit coverage. | Execution behavior changes. |
+| `tests/test_layout.py` | Run identity and artifact-layout unit coverage. | Layout or run-name validation changes. |
 
 Generated `.venv/`, `dist/`, caches, and build metadata are not source files.
 Do not document or commit their generated contents.
@@ -70,19 +80,20 @@ same change.
 
 ## Validation
 
-Validate in proportion to the change. The current scaffold supports:
+After every Python change, run:
 
 ```bash
 uv sync
 uv lock --check
-uv run python -m compileall -q src
+uv run ruff check .
+uv run mypy
+uv run pytest
 uv build
 ```
 
-For documentation-only changes, inspect the diff and run `git diff --check`.
-When Ruff, mypy, and pytest are added to the development dependency group,
-Python changes must also run their repository-wide configured commands. Do not
-claim a check passed unless it was actually run.
+Use `uv run pytest --cov=mammoth --cov-report=term-missing` for completion and
+release audits. For documentation-only changes, inspect the diff and run
+`git diff --check`. Do not claim a check passed unless it was actually run.
 
 ## Git Policy
 

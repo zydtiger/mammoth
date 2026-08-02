@@ -17,6 +17,8 @@ contains no dependency on the originating repository.
 
 ## Phase 1: Core identities and artifact layout
 
+Status: complete.
+
 Implement the first `mammoth.core` vertical slice:
 
 - `RunLayout` and safe run-name validation;
@@ -32,6 +34,8 @@ Exit condition: two independent fake projects can create and join attempts in
 different entry roots while producing the same operational layout.
 
 ## Phase 2: Append-only execution events
+
+Status: complete.
 
 Implement the framework-neutral event layer:
 
