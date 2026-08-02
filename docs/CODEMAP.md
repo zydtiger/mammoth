@@ -28,6 +28,11 @@ src/mammoth/
 │   ├── render.py
 │   ├── rich_ui.py
 │   └── telemetry.py
+├── workflow/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── launch.py
+│   └── runner.py
 └── py.typed
 ```
 
@@ -50,6 +55,10 @@ adapter, process text-log handler, and optional rank-aware TensorBoard sink.
 renders stable plain snapshots, and optionally provides Rich and psutil views.
 `src/mammoth/cli.py` exposes the installed `mammoth` command.
 
+`src/mammoth/workflow/` strictly parses schema-v1 YAML, resolves step DAGs,
+constructs local or `torchrun` plans, supervises process groups, and emits
+runner-owned lifecycle events.
+
 `src/mammoth/__init__.py` exports only `mammoth.__version__`. The public core
 surface is exported by `mammoth.core`.
 
@@ -62,6 +71,10 @@ mammoth
 ├── mammoth.monitor
 │   ├── mammoth.core
 │   └── rich / psutil (optional modules only)
+├── mammoth.workflow
+│   ├── mammoth.core
+│   ├── mammoth.logging
+│   └── PyYAML
 ├── mammoth.logging
 │   ├── mammoth.core
 │   └── tensorboardX (optional module only)

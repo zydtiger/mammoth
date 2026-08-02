@@ -30,4 +30,27 @@ Add `--watch --rich` for the optional interactive view. JSONL remains the
 machine-readable live state; plain monitor snapshots never contain ANSI escape
 sequences.
 
+Run project-defined commands from a strict workflow file:
+
+```yaml
+schema_version: 1
+runs:
+  example-run:
+    steps:
+      prepare:
+        command: [python, prepare.py]
+      train:
+        command: [python, train.py]
+        needs: [prepare]
+```
+
+```bash
+uv run mammoth workflow run workflow.yaml --entry runs --dry-run
+uv run mammoth workflow run workflow.yaml --entry runs
+```
+
+Use `--run <name>` and `--step <name>` for exact selection. Selecting a step
+also selects its transitive dependencies. Dry runs validate and print resolved
+commands without creating run artifacts.
+
 Repository documentation begins with [AGENTS.md](AGENTS.md).

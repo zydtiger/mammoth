@@ -89,6 +89,8 @@ compatible runs without importing project code.
 
 ## Phase 5: Declarative workflow runner
 
+Status: complete.
+
 Generalize the existing experiment-runner ideas into arbitrary steps:
 
 - YAML workflow parsing with defaults and strict validation;

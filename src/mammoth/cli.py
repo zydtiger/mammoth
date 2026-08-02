@@ -19,6 +19,7 @@ from typing import NoReturn
 from mammoth import __version__
 from mammoth.core import RunLayout
 from mammoth.monitor import ExecutionMonitor, render_snapshot, sample_viewer_telemetry
+from mammoth.workflow import load_workflow, run_workflow
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,6 +35,14 @@ def build_parser() -> argparse.ArgumentParser:
     monitor.add_argument("--rich", action="store_true")
     monitor.add_argument("--telemetry", action="store_true")
     monitor.add_argument("--interval", type=positive_float, default=1.0)
+    workflow = commands.add_parser("workflow", help="run a declarative command workflow")
+    workflow_commands = workflow.add_subparsers(dest="workflow_command", required=True)
+    workflow_run = workflow_commands.add_parser("run", help="plan or execute a workflow")
+    workflow_run.add_argument("workflow_file", type=Path)
+    workflow_run.add_argument("--entry", type=Path, required=True)
+    workflow_run.add_argument("--run", dest="selected_runs", action="append")
+    workflow_run.add_argument("--step", dest="selected_steps", action="append")
+    workflow_run.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -50,6 +59,8 @@ def run(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     if arguments.command == "monitor":
         return run_monitor(arguments)
+    if arguments.command == "workflow" and arguments.workflow_command == "run":
+        return run_workflow_command(arguments)
     raise AssertionError(f"Unhandled Mammoth command: {arguments.command}")
 
 
@@ -72,6 +83,31 @@ def run_monitor(arguments: argparse.Namespace) -> int:
         if not arguments.watch or snapshot.status in {"completed", "failed", "interrupted"}:
             return 0
         time.sleep(arguments.interval)
+
+
+def run_workflow_command(arguments: argparse.Namespace) -> int:
+    """Plan or execute a strict YAML workflow from the public CLI."""
+    result = run_workflow(
+        load_workflow(arguments.workflow_file),
+        entry=arguments.entry,
+        selected_runs=arguments.selected_runs,
+        selected_steps=arguments.selected_steps,
+        dry_run=arguments.dry_run,
+        invocation_command=tuple(sys.argv),
+    )
+    if arguments.dry_run:
+        for plan in result.plans:
+            sys.stdout.write(
+                f"{plan.run_name}/{plan.step_name}: "
+                f"{' '.join(plan.command)}\n"
+            )
+    else:
+        for run_result in result.runs:
+            sys.stdout.write(
+                f"{run_result.run_name}: {run_result.outcome} "
+                f"execution={run_result.execution_id}\n"
+            )
+    return 0 if result.successful else 1
 
 
 def main() -> NoReturn:

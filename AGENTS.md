@@ -53,12 +53,17 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/monitor/render.py` | Canonical stable ANSI-free monitor snapshot rendering. | Plain monitor output changes. |
 | `src/mammoth/monitor/rich_ui.py` | Optional interactive Rich live display. | Rich refresh or presentation behavior changes. |
 | `src/mammoth/monitor/telemetry.py` | Standard-library viewer-host telemetry with explicit provenance labels. | Base local telemetry changes. |
+| `src/mammoth/workflow/__init__.py` | Public workflow configuration, planning, launch, and result exports. | A stable workflow symbol is added, removed, or renamed. |
+| `src/mammoth/workflow/config.py` | Strict schema-v1 YAML values, defaults, selection, and DAG validation. | Workflow configuration syntax or selection changes. |
+| `src/mammoth/workflow/launch.py` | Local and torchrun command construction plus process-group supervision. | Launch, timeout, signal, or descendant handling changes. |
+| `src/mammoth/workflow/runner.py` | Dry-run planning, per-run attempts, policies, environment hooks, and lifecycle events. | Workflow orchestration behavior changes. |
 | `tests/test_artifacts.py` | Atomic artifact publication unit coverage. | Artifact publication behavior changes. |
 | `tests/test_events.py` | Event validation, writer, replay, tailing, and legacy-field unit coverage. | Event behavior changes. |
 | `tests/test_execution.py` | Execution metadata, lineage, sanitization, compatibility, and lease unit coverage. | Execution behavior changes. |
 | `tests/test_layout.py` | Run identity and artifact-layout unit coverage. | Layout or run-name validation changes. |
 | `tests/test_logging.py` | Observer, sink isolation, JSONL routing, text, and TensorBoard unit coverage. | Logging behavior changes. |
 | `tests/test_monitor.py` | Discovery, lineage, folding, rendering, telemetry, malformed streams, and CLI unit coverage. | Monitor or monitor CLI behavior changes. |
+| `tests/test_workflow.py` | YAML validation, DAGs, selection, dry runs, launches, policies, environment, timeout, and CLI unit coverage. | Workflow behavior changes. |
 
 Generated `.venv/`, `dist/`, caches, and build metadata are not source files.
 Do not document or commit their generated contents.
