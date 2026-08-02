@@ -53,6 +53,8 @@ only filesystem artifacts, and logging failure does not stop the command.
 
 ## Phase 3: Logging facade and TensorBoard
 
+Status: complete.
+
 Add a sink-oriented logging package:
 
 - `RunObserver` as the producer-facing API;
