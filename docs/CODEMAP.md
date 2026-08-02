@@ -44,35 +44,29 @@ src/mammoth/
 └── py.typed
 ```
 
-## Implemented Symbols
+## Public Symbol Index
 
-`src/mammoth/core/` provides the implemented framework-neutral foundation:
+| Import path | Symbols |
+| --- | --- |
+| `mammoth` | `__version__` |
+| `mammoth.core` | `RunLayout`, `ExecutionContext`, `ExecutionMetadata`, `LogicalRunLease`, `ExecutionEvent`, `ExecutionEventWriter`, `ExecutionEventTailReader`, `ExecutionEventReadError`, artifact writers, execution lifecycle functions, event readers, sanitizers, and identity validators |
+| `mammoth.logging` | `Observation`, `Media`, `ObservationSink`, `RunObserver`, `JsonlEventSink`, `ProcessTextLogHandler`, `create_process_text_handler` |
+| `mammoth.logging.tensorboard` | `TensorBoardSink` |
+| `mammoth.monitor` | `ExecutionMonitor`, `MonitorSnapshot`, `ProducerKey`, `ProducerState`, `TaskState`, `MetricPoint`, `ViewerTelemetry`, discovery/folding/rendering functions, and viewer telemetry sampling |
+| `mammoth.workflow` | `WorkflowConfig`, `RunConfig`, `StepConfig`, `CommandPlan`, `SupervisedProcess`, `ProcessResult`, `WorkflowResult`, `RunResult`, `StepResult`, workflow loading/planning/running functions, and command construction |
+| `mammoth.torch` | `Trainer`, `TrainerConfig`, `TrainerState`, `TrainerResult`, `StepContext`, `StepOutput`, `Callback`, `EarlyStopping`, `MetricSpec`, `MetricAccumulator`, `StateRegistry`, `AsyncCheckpointPublisher`, batch movement, checkpoint creation, and checkpoint restoration |
+
+## Command Routes
 
 ```text
-RunLayout and identity validation
-atomic local artifact publication
-immutable execution metadata and producer leases
-credential-safe provenance fields
-schema-v1 execution event writers, replay, and active tailing
+mammoth monitor
+└── mammoth.cli.run_monitor
+    └── mammoth.monitor.ExecutionMonitor
+
+mammoth workflow run
+└── mammoth.cli.run_workflow_command
+    └── mammoth.workflow.run_workflow
 ```
-
-`src/mammoth/logging/` provides the producer-facing `RunObserver`, the JSONL
-adapter, process text-log handler, and optional rank-aware TensorBoard sink.
-
-`src/mammoth/monitor/` discovers attempts, incrementally folds event streams,
-renders stable plain snapshots, and optionally provides Rich and psutil views.
-`src/mammoth/cli.py` exposes the installed `mammoth` command.
-
-`src/mammoth/workflow/` strictly parses schema-v1 YAML, resolves step DAGs,
-constructs local or `torchrun` plans, supervises process groups, and emits
-runner-owned lifecycle events.
-
-`src/mammoth/torch/` provides the optional constructed-object trainer,
-recursive batch movement, scalar aggregation, callbacks, early stopping, DDP,
-and registered-state checkpoint publication.
-
-`src/mammoth/__init__.py` exports only `mammoth.__version__`. The public core
-surface is exported by `mammoth.core`.
 
 ## Current Import Graph
 

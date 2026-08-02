@@ -55,7 +55,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/monitor/telemetry.py` | Standard-library viewer-host telemetry with explicit provenance labels. | Base local telemetry changes. |
 | `src/mammoth/workflow/__init__.py` | Public workflow configuration, planning, launch, and result exports. | A stable workflow symbol is added, removed, or renamed. |
 | `src/mammoth/workflow/config.py` | Strict schema-v1 YAML values, defaults, selection, and DAG validation. | Workflow configuration syntax or selection changes. |
-| `src/mammoth/workflow/launch.py` | Local and torchrun command construction plus process-group supervision. | Launch, timeout, signal, or descendant handling changes. |
+| `src/mammoth/workflow/launch.py` | Local and torchrun command construction plus reusable launcher/descendant supervision. | Launch, timeout, signal, or descendant handling changes. |
 | `src/mammoth/workflow/runner.py` | Dry-run planning, per-run attempts, policies, environment hooks, and lifecycle events. | Workflow orchestration behavior changes. |
 | `src/mammoth/torch/__init__.py` | Public optional trainer, callback, metric, batch, and checkpoint exports. | A stable PyTorch integration symbol is added, removed, or renamed. |
 | `src/mammoth/torch/batch.py` | Recursive common-container tensor transfer to one torch device. | Default batch transfer behavior changes. |

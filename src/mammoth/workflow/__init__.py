@@ -8,7 +8,12 @@ from mammoth.workflow.config import (
     WorkflowConfig,
     load_workflow,
 )
-from mammoth.workflow.launch import CommandPlan, ProcessResult, command_for_step
+from mammoth.workflow.launch import (
+    CommandPlan,
+    ProcessResult,
+    SupervisedProcess,
+    command_for_step,
+)
 from mammoth.workflow.runner import (
     RunResult,
     StepResult,
@@ -24,6 +29,7 @@ __all__ = [
     "RunResult",
     "StepConfig",
     "StepResult",
+    "SupervisedProcess",
     "WorkflowConfig",
     "WorkflowResult",
     "command_for_step",

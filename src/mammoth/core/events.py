@@ -21,7 +21,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, BinaryIO, Literal, cast
+from typing import Any, BinaryIO, Literal, Self, cast
 
 from mammoth.core.execution import (
     ExecutionContext,
@@ -466,7 +466,7 @@ class ExecutionEventWriter:
         *,
         rank: int,
         **options: Any,
-    ) -> ExecutionEventWriter:
+    ) -> Self:
         """Open the reserved ``rank-N.jsonl`` stream for one execution rank."""
         return cls(
             process_event_stream_path(context, rank),
@@ -483,7 +483,7 @@ class ExecutionEventWriter:
         cls,
         context: ExecutionContext,
         **options: Any,
-    ) -> ExecutionEventWriter:
+    ) -> Self:
         """Open the reserved optional ``runner.jsonl`` orchestration stream."""
         return cls(
             runner_event_stream_path(context),

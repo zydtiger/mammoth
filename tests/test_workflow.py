@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -10,7 +11,7 @@ import yaml
 
 from mammoth.cli import run
 from mammoth.core import RunLayout, read_execution_events
-from mammoth.workflow import load_workflow, plan_workflow, run_workflow
+from mammoth.workflow import SupervisedProcess, load_workflow, plan_workflow, run_workflow
 
 
 def write_workflow(tmp_path: Path, payload: dict) -> Path:
@@ -309,6 +310,43 @@ def test_timeout_terminates_child_process_group(tmp_path: Path) -> None:
     process = result.runs[0].steps[0].process
     assert process is not None and process.timed_out
     assert result.runs[0].outcome == "failed"
+
+
+def test_supervisor_stops_descendant_in_an_independent_session(tmp_path: Path) -> None:
+    worker_pid_path = tmp_path / "worker.pid"
+    launcher = "\n".join(
+        (
+            "import subprocess",
+            "import sys",
+            "import time",
+            "from pathlib import Path",
+            "worker = subprocess.Popen(",
+            "    (sys.executable, '-c', 'import time; time.sleep(60)'),",
+            "    start_new_session=True,",
+            ")",
+            f"Path({str(worker_pid_path)!r}).write_text(str(worker.pid), encoding='utf-8')",
+            "while True:",
+            "    time.sleep(1)",
+        )
+    )
+    supervisor = SupervisedProcess(
+        (sys.executable, "-c", launcher),
+        cwd=None,
+        environment={},
+        terminate_grace_seconds=0.1,
+        descendant_grace_seconds=0.1,
+    ).start()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and not worker_pid_path.is_file():
+        time.sleep(0.01)
+    worker_pid = int(worker_pid_path.read_text(encoding="utf-8"))
+
+    supervisor.stop()
+
+    with pytest.raises(ProcessLookupError):
+        os.kill(supervisor.pid, 0)
+    with pytest.raises(ProcessLookupError):
+        os.kill(worker_pid, 0)
 
 
 def test_workflow_cli_dry_run_is_side_effect_free(tmp_path: Path, capsys) -> None:
