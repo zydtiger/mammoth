@@ -16,7 +16,7 @@ uv run python -c "import mammoth; print(mammoth.__version__)"
 Install optional integrations only where they are needed:
 
 ```bash
-uv sync --extra monitor --extra tensorboard
+uv sync --extra monitor --extra tensorboard --extra torch
 ```
 
 Inspect the latest attempt for a run, or select one immutable attempt exactly:
@@ -52,5 +52,30 @@ uv run mammoth workflow run workflow.yaml --entry runs
 Use `--run <name>` and `--step <name>` for exact selection. Selecting a step
 also selects its transitive dependencies. Dry runs validate and print resolved
 commands without creating run artifacts.
+
+The optional trainer accepts constructed PyTorch objects and a project step
+function:
+
+```python
+from mammoth.torch import StepOutput, Trainer, TrainerConfig
+
+def train_step(model, batch, context):
+    inputs, targets = batch
+    prediction = model(inputs)
+    loss = project_loss(prediction, targets)
+    return StepOutput(loss=loss, metrics={"project/score": project_score(prediction, targets)})
+
+with Trainer(
+    model=model,
+    optimizer=optimizer,
+    train_loader=train_loader,
+    train_step=train_step,
+    config=TrainerConfig(epochs=10),
+) as trainer:
+    result = trainer.fit()
+```
+
+Mammoth does not construct those objects or define the batch, loss, metric, or
+checkpoint-compatibility semantics.
 
 Repository documentation begins with [AGENTS.md](AGENTS.md).

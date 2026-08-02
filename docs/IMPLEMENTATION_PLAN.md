@@ -112,6 +112,8 @@ execution join environment.
 
 ## Phase 6: Generic PyTorch trainer
 
+Status: complete.
+
 Add the optional `mammoth.torch` layer with a deliberately bounded first API:
 
 - one constructed `nn.Module`;

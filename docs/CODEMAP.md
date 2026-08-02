@@ -33,6 +33,14 @@ src/mammoth/
 │   ├── config.py
 │   ├── launch.py
 │   └── runner.py
+├── torch/
+│   ├── __init__.py
+│   ├── batch.py
+│   ├── callbacks.py
+│   ├── checkpoint.py
+│   ├── metrics.py
+│   ├── state.py
+│   └── trainer.py
 └── py.typed
 ```
 
@@ -59,6 +67,10 @@ renders stable plain snapshots, and optionally provides Rich and psutil views.
 constructs local or `torchrun` plans, supervises process groups, and emits
 runner-owned lifecycle events.
 
+`src/mammoth/torch/` provides the optional constructed-object trainer,
+recursive batch movement, scalar aggregation, callbacks, early stopping, DDP,
+and registered-state checkpoint publication.
+
 `src/mammoth/__init__.py` exports only `mammoth.__version__`. The public core
 surface is exported by `mammoth.core`.
 
@@ -75,6 +87,10 @@ mammoth
 │   ├── mammoth.core
 │   ├── mammoth.logging
 │   └── PyYAML
+├── mammoth.torch
+│   ├── mammoth.core
+│   ├── mammoth.logging
+│   └── PyTorch (optional extra)
 ├── mammoth.logging
 │   ├── mammoth.core
 │   └── tensorboardX (optional module only)
