@@ -135,6 +135,8 @@ the same trainer by changing only their model, loaders, and step functions.
 
 ## Phase 7: First-project migration
 
+Status: complete.
+
 Adopt Mammoth incrementally in the originating project:
 
 1. Read existing artifacts through compatibility readers.
@@ -146,6 +148,13 @@ Adopt Mammoth incrementally in the originating project:
 6. Retain project-owned loops for specialized behavior.
 
 No artifact migration or destructive rewrite should be required.
+
+The originating project now uses compatibility facades for execution metadata
+and JSONL streams, defaults to the generic monitor while retaining an explicit
+project view, and delegates subprocess supervision without moving command
+construction or scheduling. Its training managers remain project-owned because
+their multi-model loss, metric, manifest, and checkpoint contracts do not match
+the bounded generic trainer exactly.
 
 ## Deferred capabilities
 
