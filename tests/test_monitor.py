@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from mammoth.cli import run
+from typer.testing import CliRunner
+
+from mammoth.cli import app
 from mammoth.core import RunLayout, create_execution_context
 from mammoth.core.events import ExecutionEventWriter
 from mammoth.monitor import (
@@ -130,14 +132,15 @@ def test_monitor_preserves_valid_prefix_and_isolates_malformed_stream(tmp_path: 
     assert "line 2" in snapshot.warnings[0]
 
 
-def test_monitor_cli_preserves_public_command_shape(tmp_path: Path, capsys) -> None:
+def test_monitor_cli_preserves_public_command_shape(tmp_path: Path) -> None:
     layout = RunLayout(tmp_path, "run").prepare()
     context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
     with ExecutionEventWriter.for_runner(context) as writer:
         writer.emit("execution_started")
         writer.emit("execution_completed")
 
-    exit_code = run(
+    result = CliRunner().invoke(
+        app,
         [
             "monitor",
             "run",
@@ -149,11 +152,10 @@ def test_monitor_cli_preserves_public_command_shape(tmp_path: Path, capsys) -> N
         ]
     )
 
-    output = capsys.readouterr().out
-    assert exit_code == 0
-    assert "Run: run" in output
-    assert "Execution: attempt" in output
-    assert '"host_role": "viewer"' in output
+    assert result.exit_code == 0
+    assert "Run: run" in result.output
+    assert "Execution: attempt" in result.output
+    assert '"host_role": "viewer"' in result.output
 
 
 def test_local_telemetry_never_claims_execution_host_provenance() -> None:

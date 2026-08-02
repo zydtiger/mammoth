@@ -19,6 +19,13 @@ Install optional integrations only where they are needed:
 uv sync --extra monitor --extra tensorboard --extra torch
 ```
 
+Inspect the Typer command tree or print the installed version:
+
+```bash
+uv run mammoth --help
+uv run mammoth --version
+```
+
 Inspect the latest attempt for a run, or select one immutable attempt exactly:
 
 ```bash

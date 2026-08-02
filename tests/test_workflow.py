@@ -8,8 +8,9 @@ from pathlib import Path
 
 import pytest
 import yaml
+from typer.testing import CliRunner
 
-from mammoth.cli import run
+from mammoth.cli import app
 from mammoth.core import RunLayout, read_execution_events
 from mammoth.workflow import SupervisedProcess, load_workflow, plan_workflow, run_workflow
 
@@ -349,7 +350,7 @@ def test_supervisor_stops_descendant_in_an_independent_session(tmp_path: Path) -
         os.kill(worker_pid, 0)
 
 
-def test_workflow_cli_dry_run_is_side_effect_free(tmp_path: Path, capsys) -> None:
+def test_workflow_cli_dry_run_is_side_effect_free(tmp_path: Path) -> None:
     path = write_workflow(
         tmp_path,
         {
@@ -359,8 +360,36 @@ def test_workflow_cli_dry_run_is_side_effect_free(tmp_path: Path, capsys) -> Non
     )
     entry = tmp_path / "runs"
 
-    exit_code = run(["workflow", "run", str(path), "--entry", str(entry), "--dry-run"])
+    result = CliRunner().invoke(
+        app,
+        ["workflow", "run", str(path), "--entry", str(entry), "--dry-run"],
+    )
 
-    assert exit_code == 0
-    assert "run/step: echo hello" in capsys.readouterr().out
+    assert result.exit_code == 0
+    assert "run/step: echo hello" in result.output
     assert not entry.exists()
+
+
+def test_workflow_cli_failure_returns_nonzero_without_traceback(tmp_path: Path) -> None:
+    path = write_workflow(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "runs": {
+                "run": {
+                    "steps": {
+                        "step": {"command": [sys.executable, "-c", "raise SystemExit(7)"]}
+                    }
+                }
+            },
+        },
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["workflow", "run", str(path), "--entry", str(tmp_path / "runs")],
+    )
+
+    assert result.exit_code == 1
+    assert "run: failed execution=" in result.output
+    assert "Traceback" not in result.output

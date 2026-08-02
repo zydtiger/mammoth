@@ -33,7 +33,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `.gitignore` | Generated-file and local-environment exclusions. | A new reproducible build, cache, environment, or local artifact needs an exclusion. |
 | `src/mammoth/__init__.py` | Lightweight root package metadata and intentionally small stable exports. | Package version or a truly root-level stable export changes. |
 | `src/mammoth/__main__.py` | `python -m mammoth` forwarding entry point. | Module execution behavior changes. |
-| `src/mammoth/cli.py` | Public standard-library CLI parser and command routing. | A public command, option, or exit behavior changes. |
+| `src/mammoth/cli.py` | Public Typer application, typed commands, and console exit routing. | A public command, option, or exit behavior changes. |
 | `src/mammoth/py.typed` | PEP 561 marker declaring inline type information. | Keep present and empty while Mammoth ships typed source. |
 | `src/mammoth/core/__init__.py` | Public framework-neutral core exports. | A stable core symbol is added, removed, or renamed. |
 | `src/mammoth/core/artifacts.py` | Atomic local bytes, text, JSON, and opaque artifact publication. | Local publication durability or writer behavior changes. |
@@ -69,6 +69,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `tests/test_execution.py` | Execution metadata, lineage, sanitization, compatibility, and lease unit coverage. | Execution behavior changes. |
 | `tests/test_layout.py` | Run identity and artifact-layout unit coverage. | Layout or run-name validation changes. |
 | `tests/test_logging.py` | Observer, sink isolation, JSONL routing, text, and TensorBoard unit coverage. | Logging behavior changes. |
+| `tests/test_cli.py` | Typer version, help, usage-error, validation, and repeatable-selector CLI coverage. | Root CLI behavior, command composition, validation, or selectors change. |
 | `tests/test_monitor.py` | Discovery, lineage, folding, rendering, telemetry, malformed streams, and CLI unit coverage. | Monitor or monitor CLI behavior changes. |
 | `tests/test_workflow.py` | YAML validation, DAGs, selection, dry runs, launches, policies, environment, timeout, and CLI unit coverage. | Workflow behavior changes. |
 | `tests/test_torch.py` | Multi-task trainer, device movement, precision, accumulation, metrics, callbacks, checkpoints, and DDP unit coverage. | Optional trainer behavior changes. |
