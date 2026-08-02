@@ -1,0 +1,22 @@
+version: 2
+skills:
+  issue-delivery:
+    mode: vendored
+    source:
+      repository: git@gitea:tigerding/agent-workflows.git
+      path: skills/issue-delivery
+      ref: main
+    resolved:
+      commit: 04405ca4a4abef727ea2ff3eb1b4d0a90c815264
+      digest: sha256:e50e5d5816c43d8b85e0d0bd6ec688b1226c9670999f5aa050517e969d35b5ba
+    destination: issue-delivery
+  issue-discovery:
+    mode: vendored
+    source:
+      repository: git@gitea:tigerding/agent-workflows.git
+      path: skills/issue-discovery
+      ref: main
+    resolved:
+      commit: 04405ca4a4abef727ea2ff3eb1b4d0a90c815264
+      digest: sha256:6cd979bcbe0d4aee5edbde4f8a14250eb31f2cf7453d1460de8186cd5246a9b1
+    destination: issue-discovery

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Issue Delivery"
+  short_description: "Ship approved issues with verified closeout"
+  default_prompt: "Use $issue-delivery to implement this issue in reviewed steps, verify forge-body round trips, and require acceptance-criteria reconciliation around the approval-gated merge."

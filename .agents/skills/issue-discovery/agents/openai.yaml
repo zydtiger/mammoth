@@ -1,0 +1,4 @@
+interface:
+  display_name: "Issue Discovery"
+  short_description: "Draft approved issues across GitHub and Gitea"
+  default_prompt: "Use $issue-discovery to inspect this request, draft a forge issue, and create it only after my approval."
