@@ -71,6 +71,8 @@ TensorBoard series while preserving their distinct retention semantics.
 
 ## Phase 4: Passive monitor
 
+Status: complete.
+
 Build monitoring above immutable metadata and event readers:
 
 - discovery and exact execution selection;
@@ -81,13 +83,6 @@ Build monitoring above immutable metadata and event readers:
 - stable ANSI-free snapshots;
 - optional Rich/Textual interactive interface; and
 - optional psutil/vendor telemetry with explicit viewer-host labeling.
-
-Preserve the command shape:
-
-```bash
-mammoth monitor <run-name> --entry <entry>
-mammoth monitor <run-name> --entry <entry> --execution <execution-id>
-```
 
 Exit condition: the monitor can read both Mammoth-generated runs and existing
 compatible runs without importing project code.

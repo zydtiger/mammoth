@@ -32,6 +32,8 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `.python-version` | uv/Python development baseline. | The supported development interpreter changes deliberately. |
 | `.gitignore` | Generated-file and local-environment exclusions. | A new reproducible build, cache, environment, or local artifact needs an exclusion. |
 | `src/mammoth/__init__.py` | Lightweight root package metadata and intentionally small stable exports. | Package version or a truly root-level stable export changes. |
+| `src/mammoth/__main__.py` | `python -m mammoth` forwarding entry point. | Module execution behavior changes. |
+| `src/mammoth/cli.py` | Public standard-library CLI parser and command routing. | A public command, option, or exit behavior changes. |
 | `src/mammoth/py.typed` | PEP 561 marker declaring inline type information. | Keep present and empty while Mammoth ships typed source. |
 | `src/mammoth/core/__init__.py` | Public framework-neutral core exports. | A stable core symbol is added, removed, or renamed. |
 | `src/mammoth/core/artifacts.py` | Atomic local bytes, text, JSON, and opaque artifact publication. | Local publication durability or writer behavior changes. |
@@ -45,11 +47,18 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/logging/observer.py` | Producer facade, lifecycle contexts, sink fan-out, and failure isolation. | Producer-facing logging behavior changes. |
 | `src/mammoth/logging/tensorboard.py` | Optional rank-aware TensorBoard scalar and media history sink. | TensorBoard routing, step selection, or ownership changes. |
 | `src/mammoth/logging/text.py` | Process-exclusive plain-text Python logging handler. | Text-log ownership or formatting changes. |
+| `src/mammoth/monitor/__init__.py` | Public passive-monitor exports. | A stable monitor symbol is added, removed, or renamed. |
+| `src/mammoth/monitor/model.py` | Execution discovery, lineage, incremental stream reads, and project-neutral state folding. | Monitor selection or reconstructed state changes. |
+| `src/mammoth/monitor/psutil_telemetry.py` | Optional psutil-backed viewer-host samples. | Optional CPU or memory sampling changes. |
+| `src/mammoth/monitor/render.py` | Canonical stable ANSI-free monitor snapshot rendering. | Plain monitor output changes. |
+| `src/mammoth/monitor/rich_ui.py` | Optional interactive Rich live display. | Rich refresh or presentation behavior changes. |
+| `src/mammoth/monitor/telemetry.py` | Standard-library viewer-host telemetry with explicit provenance labels. | Base local telemetry changes. |
 | `tests/test_artifacts.py` | Atomic artifact publication unit coverage. | Artifact publication behavior changes. |
 | `tests/test_events.py` | Event validation, writer, replay, tailing, and legacy-field unit coverage. | Event behavior changes. |
 | `tests/test_execution.py` | Execution metadata, lineage, sanitization, compatibility, and lease unit coverage. | Execution behavior changes. |
 | `tests/test_layout.py` | Run identity and artifact-layout unit coverage. | Layout or run-name validation changes. |
 | `tests/test_logging.py` | Observer, sink isolation, JSONL routing, text, and TensorBoard unit coverage. | Logging behavior changes. |
+| `tests/test_monitor.py` | Discovery, lineage, folding, rendering, telemetry, malformed streams, and CLI unit coverage. | Monitor or monitor CLI behavior changes. |
 
 Generated `.venv/`, `dist/`, caches, and build metadata are not source files.
 Do not document or commit their generated contents.

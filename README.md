@@ -13,4 +13,21 @@ uv sync
 uv run python -c "import mammoth; print(mammoth.__version__)"
 ```
 
+Install optional integrations only where they are needed:
+
+```bash
+uv sync --extra monitor --extra tensorboard
+```
+
+Inspect the latest attempt for a run, or select one immutable attempt exactly:
+
+```bash
+uv run mammoth monitor <run-name> --entry <entry>
+uv run mammoth monitor <run-name> --entry <entry> --execution <execution-id>
+```
+
+Add `--watch --rich` for the optional interactive view. JSONL remains the
+machine-readable live state; plain monitor snapshots never contain ANSI escape
+sequences.
+
 Repository documentation begins with [AGENTS.md](AGENTS.md).

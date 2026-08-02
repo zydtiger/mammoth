@@ -5,6 +5,8 @@
 ```text
 src/mammoth/
 ├── __init__.py
+├── __main__.py
+├── cli.py
 ├── core/
 │   ├── __init__.py
 │   ├── artifacts.py
@@ -19,6 +21,13 @@ src/mammoth/
 │   ├── observer.py
 │   ├── tensorboard.py
 │   └── text.py
+├── monitor/
+│   ├── __init__.py
+│   ├── model.py
+│   ├── psutil_telemetry.py
+│   ├── render.py
+│   ├── rich_ui.py
+│   └── telemetry.py
 └── py.typed
 ```
 
@@ -37,6 +46,10 @@ schema-v1 execution event writers, replay, and active tailing
 `src/mammoth/logging/` provides the producer-facing `RunObserver`, the JSONL
 adapter, process text-log handler, and optional rank-aware TensorBoard sink.
 
+`src/mammoth/monitor/` discovers attempts, incrementally folds event streams,
+renders stable plain snapshots, and optionally provides Rich and psutil views.
+`src/mammoth/cli.py` exposes the installed `mammoth` command.
+
 `src/mammoth/__init__.py` exports only `mammoth.__version__`. The public core
 surface is exported by `mammoth.core`.
 
@@ -44,6 +57,11 @@ surface is exported by `mammoth.core`.
 
 ```text
 mammoth
+├── mammoth.cli
+│   └── mammoth.monitor
+├── mammoth.monitor
+│   ├── mammoth.core
+│   └── rich / psutil (optional modules only)
 ├── mammoth.logging
 │   ├── mammoth.core
 │   └── tensorboardX (optional module only)
