@@ -13,11 +13,10 @@ from mammoth.monitor.textual_ui import run_textual
 def watch_rich(
     monitor: ExecutionMonitor,
     *,
-    interval_seconds: float = 1.0,
+    interval_seconds: float = 2.0,
     stale_after_seconds: float = 90.0,
 ) -> None:
     """Launch the Textual dashboard through the legacy helper name."""
-    del stale_after_seconds
     run_monitor = RunMonitor(monitor.layout, monitor.context.metadata.execution_id)
     run_textual(
         run_monitor,
@@ -25,4 +24,5 @@ def watch_rich(
         watch=True,
         telemetry=True,
         interval_seconds=interval_seconds,
+        stale_after_seconds=stale_after_seconds,
     )

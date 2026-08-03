@@ -90,10 +90,11 @@ uv run mammoth monitor demo --entry runs
 ```
 
 On an interactive terminal, this opens the Textual dashboard with continuous
-polling and explicitly viewer-host telemetry enabled. The dashboard includes
-run progress, progress bars, throughput, ETA, execution history and lineage,
-producer and task state, responsive metric trends, and labelled loss and
-learning-rate charts when those conventional metrics are reported.
+two-second polling and explicitly viewer-host telemetry enabled. The dashboard
+includes compact attempt IDs, resume-aware run progress, integrated progress
+bars, throughput, ETA, rank state, lineage-rich attempt history, and responsive
+multi-row Braille charts for conventional loss and learning-rate metrics. Exact
+detail retains complete immutable IDs and provenance.
 
 Use the arrow keys or `j`/`k` to select an execution, Enter to toggle overview
 and detail, `r` to refresh, and `q` to quit. Pass `--execution <execution-id>`
@@ -111,6 +112,7 @@ Interactive invocations can opt out of individual defaults:
 uv run mammoth monitor demo --entry runs --plain
 uv run mammoth monitor demo --entry runs --no-watch
 uv run mammoth monitor demo --entry runs --no-telemetry
+uv run mammoth monitor demo --entry runs --interval 5 --stale-after 120
 ```
 
 The existing `--rich`, `--watch`, and `--telemetry` flags remain accepted for

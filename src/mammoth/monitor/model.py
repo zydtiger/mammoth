@@ -26,7 +26,15 @@ from mammoth.core.execution import (
 from mammoth.core.layout import RunLayout
 
 RunStatus = Literal["pending", "running", "completed", "failed", "interrupted"]
-ScopeStatus = Literal["pending", "running", "completed", "failed", "skipped", "stale"]
+ScopeStatus = Literal[
+    "pending",
+    "running",
+    "completed",
+    "failed",
+    "interrupted",
+    "skipped",
+    "stale",
+]
 
 _RANK_STREAM_PATTERN = re.compile(r"^rank-(?P<rank>[0-9]+)\.jsonl$")
 _TERMINAL_RUN_STATUS: dict[str, RunStatus] = {
@@ -123,6 +131,7 @@ class ProducerState:
     phase: str | None = None
     sequence: int = 0
     updated_at: datetime | None = None
+    last_event: str | None = None
     exit_code: int | None = None
     signal: int | str | None = None
 
@@ -146,6 +155,7 @@ class MonitorSnapshot:
     metric_history: dict[str, list[MetricPoint]] = field(default_factory=dict)
     lineage: tuple[str, ...] = ()
     warnings: list[str] = field(default_factory=list)
+    events: tuple[ExecutionEvent, ...] = ()
 
     @property
     def execution_id(self) -> str:
@@ -210,14 +220,64 @@ class RunSnapshot:
         raise RuntimeError(f"Selected execution {self.selected_execution_id!r} disappeared")
 
     @property
-    def metric_history(self) -> dict[str, tuple[MetricPoint, ...]]:
-        """Return selected-lineage metric histories in chronological order."""
+    def resume_lineage(self) -> tuple[MonitorSnapshot, ...]:
+        """Return the selected attempt and resolved resume parents chronologically."""
         selected = self.selected
-        lineage_ids = {selected.execution_id, *selected.lineage}
+        by_id = {snapshot.execution_id: snapshot for snapshot in self.executions}
+        reversed_lineage: list[MonitorSnapshot] = []
+        current: MonitorSnapshot | None = selected
+        seen: set[str] = set()
+        while current is not None and current.execution_id not in seen:
+            reversed_lineage.append(current)
+            seen.add(current.execution_id)
+            parent_id = current.context.metadata.parent_execution_id
+            current = by_id.get(parent_id) if parent_id is not None else None
+        return tuple(reversed(reversed_lineage))
+
+    @property
+    def logical_coordinates(self) -> dict[str, int | float | str]:
+        """Return latest coordinates across the selected explicit resume lineage."""
+        coordinates: dict[str, int | float | str] = {}
+        for snapshot in self.resume_lineage:
+            tasks = sorted(
+                snapshot.tasks.values(),
+                key=lambda task: task.updated_at or snapshot.created_at,
+            )
+            for task in tasks:
+                coordinates.update(task.coordinates)
+        return coordinates
+
+    @property
+    def logical_source_execution_id(self) -> str | None:
+        """Return the execution that supplied the newest logical coordinates."""
+        source: str | None = None
+        latest: datetime | None = None
+        for snapshot in self.resume_lineage:
+            for task in snapshot.tasks.values():
+                if not task.coordinates or task.updated_at is None:
+                    continue
+                if latest is None or task.updated_at >= latest:
+                    latest = task.updated_at
+                    source = snapshot.execution_id
+        return source
+
+    @property
+    def metric_history(self) -> dict[str, tuple[MetricPoint, ...]]:
+        """Return resume-aware metric histories in chronological order."""
         combined: dict[str, list[MetricPoint]] = {}
-        for snapshot in self.executions:
-            if snapshot.execution_id not in lineage_ids:
-                continue
+        for snapshot in self.resume_lineage:
+            metadata = snapshot.context.metadata
+            if metadata.parent_execution_id is not None:
+                for name, points in combined.items():
+                    combined[name] = [
+                        point
+                        for point in points
+                        if _metric_precedes_resume(
+                            point,
+                            starting_global_step=metadata.starting_global_step,
+                            starting_epoch=metadata.starting_epoch,
+                        )
+                    ]
             for name, points in snapshot.metric_history.items():
                 combined.setdefault(name, []).extend(points)
         return {
@@ -292,7 +352,6 @@ def fold_events(
     warnings: Iterable[str] = (),
 ) -> MonitorSnapshot:
     """Fold an arbitrary producer-event collection into deterministic state."""
-    snapshot = MonitorSnapshot(context=context, lineage=lineage, warnings=list(warnings))
     ordered = sorted(
         events,
         key=lambda event: (
@@ -302,8 +361,15 @@ def fold_events(
             event.sequence,
         ),
     )
+    snapshot = MonitorSnapshot(
+        context=context,
+        lineage=lineage,
+        warnings=list(warnings),
+        events=tuple(ordered),
+    )
     for event in ordered:
         apply_event(snapshot, event)
+    _finalize_run_status(snapshot, ordered)
     return snapshot
 
 
@@ -314,6 +380,7 @@ def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
     producer = snapshot.producers.setdefault(producer_key, ProducerState(producer_key))
     producer.sequence = event.sequence
     producer.updated_at = observed_at
+    producer.last_event = event.event
     if event.phase is not None:
         producer.phase = event.phase
 
@@ -323,11 +390,25 @@ def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
     elif event.event in _TERMINAL_RUN_STATUS:
         snapshot.status = _TERMINAL_RUN_STATUS[event.event]
     elif event.event == "process_started":
+        for task_key in [key for key in snapshot.tasks if key[0] == producer_key]:
+            del snapshot.tasks[task_key]
         producer.status = "running"
     elif event.event == "process_completed":
-        producer.status = "completed" if event.exit_code in {None, 0} else "failed"
+        if event.signal is not None:
+            producer.status = "interrupted"
+        else:
+            producer.status = "completed" if event.exit_code in {None, 0} else "failed"
         producer.exit_code = event.exit_code
         producer.signal = event.signal
+
+    if snapshot.status == "pending" and event.event in {
+        "process_started",
+        "phase_started",
+        "task_started",
+        "progress",
+        "heartbeat",
+    }:
+        snapshot.status = "running"
 
     if event.phase is not None:
         if event.event == "phase_started":
@@ -378,11 +459,65 @@ def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
 def combined_coordinates(event: ExecutionEvent) -> dict[str, int | float | str]:
     """Return new coordinates plus compatible scalar legacy extension fields."""
     coordinates = dict(event.coordinates)
-    for name in ("epoch", "batch", "global_step", "optimizer_step", "slide_id"):
+    for name in (
+        "epoch",
+        "epoch_total",
+        "batch",
+        "global_step",
+        "optimizer_step",
+        "optimizer_step_total",
+        "optimizer_total",
+        "slide_id",
+    ):
         value = event.extensions.get(name)
         if isinstance(value, int | float | str) and not isinstance(value, bool):
             coordinates.setdefault(name, value)
     return coordinates
+
+
+def _metric_precedes_resume(
+    point: MetricPoint,
+    *,
+    starting_global_step: int | None,
+    starting_epoch: int | None,
+) -> bool:
+    """Return whether a parent metric remains before a resumed child horizon."""
+    global_step = point.coordinates.get("global_step")
+    if starting_global_step is not None and isinstance(global_step, int):
+        return global_step < starting_global_step
+    epoch = point.coordinates.get("epoch")
+    if starting_epoch is not None and isinstance(epoch, int):
+        return epoch < starting_epoch
+    return True
+
+
+def _finalize_run_status(
+    snapshot: MonitorSnapshot,
+    events: list[ExecutionEvent],
+) -> None:
+    """Infer direct-process terminal state when no runner terminal was emitted."""
+    if any(event.event in _TERMINAL_RUN_STATUS for event in events):
+        return
+    processes = [
+        producer
+        for key, producer in snapshot.producers.items()
+        if key.source == "process"
+    ]
+    if not processes:
+        return
+    if any(producer.status == "interrupted" for producer in processes):
+        snapshot.status = "interrupted"
+        return
+    if any(producer.status == "failed" for producer in processes):
+        snapshot.status = "failed"
+        return
+    expected = snapshot.context.metadata.world_size
+    if len(processes) >= expected and all(
+        producer.status == "completed" for producer in processes
+    ):
+        snapshot.status = "completed"
+    elif any(producer.status == "running" for producer in processes):
+        snapshot.status = "running"
 
 
 class ExecutionMonitor:

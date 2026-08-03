@@ -57,7 +57,9 @@ class MonitorApp(App[None]):
         *,
         watch: bool = True,
         telemetry: bool = True,
-        interval_seconds: float = 1.0,
+        interval_seconds: float = 2.0,
+        stale_after_seconds: float = 90.0,
+        initial_host: PsutilViewerTelemetry | None = None,
     ) -> None:
         """Bind the passive monitor and interactive default policies."""
         super().__init__()
@@ -66,8 +68,9 @@ class MonitorApp(App[None]):
         self.watch_enabled = watch
         self.telemetry_enabled = telemetry
         self.interval_seconds = interval_seconds
-        self.host: PsutilViewerTelemetry | None = None
-        self.detail = False
+        self.stale_after_seconds = stale_after_seconds
+        self.host = initial_host
+        self.detail = monitor.execution_id is not None
         self.error: str | None = None
         self._refresh_generation = 0
         self._refresh_lock = Lock()
@@ -136,7 +139,8 @@ class MonitorApp(App[None]):
 
     def action_toggle_detail(self) -> None:
         """Toggle logical overview and exact selected-execution details."""
-        self.detail = not self.detail
+        if self.monitor.execution_id is None:
+            self.detail = not self.detail
         self._render()
 
     def _move_selection(self, offset: int) -> None:
@@ -153,12 +157,16 @@ class MonitorApp(App[None]):
     def _render(self) -> None:
         """Update the Rich dashboard using the current terminal width."""
         body = self.query_one("#body", Static)
-        compact = (body.size.width or self.size.width) < 80
+        available_width = body.size.width or max(0, self.size.width - 2)
+        compact = available_width < 80
         renderable = dashboard_layout(
             self.snapshot,
             host=self.host,
             detail=self.detail,
             compact=compact,
+            pinned=self.monitor.execution_id is not None,
+            stale_after_seconds=self.stale_after_seconds,
+            refresh_seconds=self.interval_seconds,
         )
         if self.error is not None:
             renderable = Group(
@@ -175,12 +183,16 @@ def run_textual(
     watch: bool,
     telemetry: bool,
     interval_seconds: float,
+    stale_after_seconds: float,
 ) -> None:
     """Run the Textual monitor application until the viewer quits."""
+    initial_host = sample_psutil_viewer_telemetry() if telemetry else None
     MonitorApp(
         monitor,
         initial_snapshot,
         watch=watch,
         telemetry=telemetry,
         interval_seconds=interval_seconds,
+        stale_after_seconds=stale_after_seconds,
+        initial_host=initial_host,
     ).run()

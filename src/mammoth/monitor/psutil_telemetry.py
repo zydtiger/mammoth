@@ -23,6 +23,9 @@ class PsutilViewerTelemetry:
     cpu_percent: float | None
     memory_percent: float | None
     load_average_1m: float | None
+    cpu_frequency_mhz: float | None = None
+    memory_used_bytes: int | None = None
+    memory_total_bytes: int | None = None
 
 
 def sample_psutil_viewer_telemetry() -> PsutilViewerTelemetry:
@@ -40,9 +43,19 @@ def sample_psutil_viewer_telemetry() -> PsutilViewerTelemetry:
     except (OSError, psutil.Error):
         cpu_percent = None
     try:
-        memory_percent = float(psutil.virtual_memory().percent)
+        memory = psutil.virtual_memory()
+        memory_percent = float(memory.percent)
+        memory_used_bytes = int(memory.used)
+        memory_total_bytes = int(memory.total)
     except (OSError, psutil.Error):
         memory_percent = None
+        memory_used_bytes = None
+        memory_total_bytes = None
+    try:
+        frequency = psutil.cpu_freq()
+        cpu_frequency_mhz = float(frequency.current) if frequency is not None else None
+    except (OSError, psutil.Error):
+        cpu_frequency_mhz = None
     return PsutilViewerTelemetry(
         host_role="viewer",
         hostname=hostname,
@@ -50,4 +63,7 @@ def sample_psutil_viewer_telemetry() -> PsutilViewerTelemetry:
         cpu_percent=cpu_percent,
         memory_percent=memory_percent,
         load_average_1m=load_average,
+        cpu_frequency_mhz=cpu_frequency_mhz,
+        memory_used_bytes=memory_used_bytes,
+        memory_total_bytes=memory_total_bytes,
     )
