@@ -86,8 +86,11 @@ Install the monitor dependencies, then open the latest execution of `demo`:
 
 ```bash
 uv sync --extra monitor
-uv run mammoth monitor demo --entry runs
+uv run mammoth monitor demo
 ```
+
+The monitor reads from `./runs` by default. Use `--entry <path>` to inspect a
+different artifact root.
 
 On an interactive terminal, this opens the Textual dashboard with continuous
 two-second polling and explicitly viewer-host telemetry enabled. The dashboard
@@ -103,16 +106,16 @@ to pin one immutable attempt exactly.
 Redirected output remains a single stable ANSI-free snapshot:
 
 ```bash
-uv run mammoth monitor demo --entry runs > monitor.txt
+uv run mammoth monitor demo > monitor.txt
 ```
 
 Interactive invocations can opt out of individual defaults:
 
 ```bash
-uv run mammoth monitor demo --entry runs --plain
-uv run mammoth monitor demo --entry runs --no-watch
-uv run mammoth monitor demo --entry runs --no-telemetry
-uv run mammoth monitor demo --entry runs --interval 5 --stale-after 120
+uv run mammoth monitor demo --plain
+uv run mammoth monitor demo --no-watch
+uv run mammoth monitor demo --no-telemetry
+uv run mammoth monitor demo --interval 5 --stale-after 120
 ```
 
 The existing `--rich`, `--watch`, and `--telemetry` flags remain accepted for

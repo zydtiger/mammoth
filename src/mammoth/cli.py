@@ -90,7 +90,10 @@ def load_textual_ui() -> ModuleType:
 @app.command("monitor")
 def run_monitor(
     run_name: Annotated[str, typer.Argument(help="Logical run name to inspect.")],
-    entry: Annotated[Path, typer.Option("--entry", help="Run-directory entry path.")],
+    entry: Annotated[
+        Path,
+        typer.Option("--entry", help="Run-directory entry path."),
+    ] = Path("./runs"),
     execution: Annotated[
         str | None,
         typer.Option("--execution", help="Exact immutable execution to inspect."),

@@ -50,14 +50,6 @@ def test_cli_help_for_root_and_commands(arguments: list[str]) -> None:
     assert "Traceback" not in result.output
 
 
-def test_monitor_rejects_missing_entry_without_traceback() -> None:
-    result = runner.invoke(app, ["monitor", "run"])
-
-    assert result.exit_code == 2
-    assert "Missing option '--entry'" in result.output
-    assert "Traceback" not in result.output
-
-
 @pytest.mark.parametrize("interval", ["0", "-0.5", "nan", "inf", "+inf", "-inf"])
 @pytest.mark.parametrize("option", ["--interval", "--stale-after"])
 def test_monitor_rejects_non_positive_duration(
@@ -115,6 +107,19 @@ def create_completed_monitor_run(tmp_path: Path) -> None:
     with ExecutionEventWriter.for_runner(context) as writer:
         writer.emit("execution_started")
         writer.emit("execution_completed")
+
+
+def test_monitor_defaults_entry_to_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_completed_monitor_run(tmp_path / "runs")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["monitor", "run", "--plain"])
+
+    assert result.exit_code == 0
+    assert "Execution: attempt" in result.output
 
 
 def test_monitor_defaults_to_textual_watch_and_telemetry_on_tty(
