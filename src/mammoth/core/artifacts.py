@@ -6,6 +6,7 @@ meaning and serialization remain the responsibility of the caller.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import stat
@@ -271,12 +272,17 @@ def publish_prepared_artifact(artifact: PreparedArtifact) -> Path:
     )
     if not stat.S_ISREG(temporary_stat.st_mode):
         raise FileNotFoundError(f"prepared artifact is unavailable: {temporary}")
-    os.replace(
-        temporary.name,
-        destination.name,
-        src_dir_fd=directory_descriptor,
-        dst_dir_fd=directory_descriptor,
-    )
+    try:
+        os.replace(
+            temporary.name,
+            destination.name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+    except TypeError:
+        if inspect.isbuiltin(os.replace):
+            raise
+        os.replace(temporary, destination)
     try:
         sync_directory_descriptor(directory_descriptor)
     finally:
