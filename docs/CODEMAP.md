@@ -69,6 +69,7 @@ mammoth.cli.app (Typer)
 │       ├── redirected/plain → mammoth.monitor.ExecutionMonitor
 │       └── interactive TTY → mammoth.monitor.RunMonitor
 │           └── mammoth.monitor.textual_ui.MonitorApp
+│               └── presentation contract → docs/MONITOR.md
 └── mammoth workflow
     └── mammoth workflow run
         └── mammoth.cli.run_workflow_command

@@ -498,7 +498,7 @@ def _telemetry_panel(host: PsutilViewerTelemetry, *, compact: bool) -> Renderabl
         _resource_block(
             _cpu_label(host),
             _load_metric(f"Util {_percentage(host.cpu_percent)}", host.cpu_percent),
-            f"Core {_frequency(host.cpu_frequency_mhz)}",
+            _power_and_frequency(host.cpu_power_w, host.cpu_frequency_mhz),
             compact=compact,
         ),
         _resource_block(
@@ -515,7 +515,7 @@ def _telemetry_panel(host: PsutilViewerTelemetry, *, compact: bool) -> Renderabl
                 f"Util {_percentage(gpu.utilization_percent)}",
                 gpu.utilization_percent,
             ),
-            f"Core {_frequency(gpu.core_clock_mhz)}",
+            _power_and_frequency(gpu.power_draw_w, gpu.core_clock_mhz),
             compact=compact,
         )
         for gpu in host.gpus
@@ -551,6 +551,11 @@ def _cpu_label(host: PsutilViewerTelemetry) -> str:
 
 def _frequency(value: float | None) -> str:
     return "--" if value is None else f"{value:,.0f} MHz"
+
+
+def _power_and_frequency(power_w: float | None, frequency_mhz: float | None) -> str:
+    power = "--" if power_w is None else f"{power_w:,.1f} W"
+    return f"Power {power} · Core {_frequency(frequency_mhz)}"
 
 
 def _ram_hardware(host: PsutilViewerTelemetry) -> str:
@@ -1053,7 +1058,7 @@ def _progress_text(progress: _ProgressView) -> str:
 
 
 def _rate_unit(unit: str | None) -> str:
-    return "b" if unit == "microbatch" else unit or "unit"
+    return "b" if unit in {"batch", "microbatch"} else unit or "unit"
 
 
 def _logical_eta_text(
