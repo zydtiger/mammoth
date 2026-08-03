@@ -510,7 +510,10 @@ def test_dashboard_keeps_parent_overview_and_active_leaf_rank_progress(
         "2026-01-01T00:00:00Z",
         world_size=2,
     )
-    for rank, child_completed, child_total in ((0, 9, 10), (1, 3, 4)):
+    for rank, child_completed, child_total in (
+        (0, 9_876_543, 10_000_000),
+        (1, 3_000_000, 4_000_000),
+    ):
         with ExecutionEventWriter.for_process(context, rank=rank) as writer:
             writer.emit("process_started", phase="work")
             writer.emit("task_started", phase="work", task_id="pipeline")
@@ -557,8 +560,8 @@ def test_dashboard_keeps_parent_overview_and_active_leaf_rank_progress(
     assert "work / pipeline" in selected_attempt
     assert "5/41" in selected_attempt
     assert ranks.count("current-item") == 2
-    assert "9/10" in ranks
-    assert "3/4" in ranks
+    assert "9,876,543/10,000,000" in ranks
+    assert "3,000,000/4,000,000" in ranks
 
 
 def test_resume_history_prunes_superseded_parent_metric_tail(tmp_path: Path) -> None:

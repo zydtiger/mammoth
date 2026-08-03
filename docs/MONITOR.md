@@ -48,6 +48,9 @@ small presentation conventions stated below.
 
 - The selected-attempt overview prefers the highest active task ancestor that
   has progress. Rank rows show the deepest active leaf for each producer.
+- In the wide rank table, rank is a fixed four-character field and progress has
+  protected width for comma-formatted production counters. Progress receives
+  expansion space before rank or status fields.
 - Distributed progress is reconciled only among matching process-rank tasks.
   Identical counters are treated as replicated global progress and shown once.
   Distinct compatible counters are summed. Missing expected ranks produce an
