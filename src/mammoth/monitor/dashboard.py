@@ -131,6 +131,11 @@ def _header(snapshot: RunSnapshot, now: datetime) -> Table:
     table.add_column(justify="center", ratio=1, overflow="ellipsis")
     table.add_column(justify="right", no_wrap=True)
     status = Text(selected.status.upper(), style=_STATE_STYLE[selected.status])
+    if any(
+        producer.effective_status(now, 90.0) == "stale"
+        for producer in selected.producers.values()
+    ):
+        status.append(" · STALE PRODUCER", style=_STATE_STYLE["stale"])
     table.add_row(
         Text("Mammoth Monitor", style="bold"),
         Text(snapshot.layout.run_name),
@@ -223,17 +228,19 @@ def _metric_sort_key(item: tuple[str, tuple[object, ...]]) -> tuple[int, str]:
 def _telemetry_panel(host: PsutilViewerTelemetry, *, compact: bool) -> Table:
     """Render explicitly viewer-host resource telemetry."""
     table = Table.grid(expand=True, padding=(0, 1))
-    for _ in range(3 if compact else 4):
+    for _ in range(3 if compact else 5):
         table.add_column(ratio=1)
+    load = f"{host.load_average_1m:.2f}" if host.load_average_1m is not None else "--"
     values = [
         "Provenance viewer-host",
         f"CPU {_percentage(host.cpu_percent)}",
         f"Memory {_percentage(host.memory_percent)}",
     ]
-    if not compact:
-        load = f"{host.load_average_1m:.2f}" if host.load_average_1m is not None else "--"
-        values.append(f"Load 1m {load}")
-    table.add_row(*values)
+    if compact:
+        table.add_row(*values)
+        table.add_row(f"Sampled {host.sampled_at}", f"Load 1m {load}", "")
+    else:
+        table.add_row(*values, f"Load 1m {load}", f"Sampled {host.sampled_at}")
     return table
 
 

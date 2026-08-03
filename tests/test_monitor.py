@@ -269,6 +269,8 @@ def test_dashboard_renders_identity_progress_metrics_and_viewer_telemetry(
     assert "learning_rate" in rendered
     assert "VIEWER HOST · viewer-host" in rendered
     assert "CPU 25.0%" in rendered
+    assert "Sampled" in rendered
+    assert "2026-01-01T00:00:00Z" in rendered
 
 
 def test_metric_sparkline_handles_sparse_constant_and_narrow_histories() -> None:
