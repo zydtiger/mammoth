@@ -116,7 +116,7 @@ def prepare_artifact(
     path: Path,
     writer: Callable[[Path], None],
     *,
-    mode: int = 0o600,
+    mode: int | None = 0o600,
     preserve_permissions: bool = True,
 ) -> PreparedArtifact:
     """Serialize and sync one opaque artifact without publishing its destination."""
@@ -138,7 +138,7 @@ def prepare_artifact_in_directory(
     writer: Callable[[Path], None],
     *,
     directory_descriptor: int,
-    mode: int = 0o600,
+    mode: int | None = 0o600,
     preserve_permissions: bool = True,
 ) -> PreparedArtifact:
     """Prepare an artifact while taking ownership of an opened parent directory."""
@@ -206,7 +206,8 @@ def prepare_artifact_in_directory(
                 raise FileNotFoundError(
                     f"artifact writer did not create a file for {destination}"
                 )
-            os.fchmod(serialized_descriptor, mode)
+            if mode is not None:
+                os.fchmod(serialized_descriptor, mode)
             os.fsync(serialized_descriptor)
         finally:
             os.close(serialized_descriptor)
@@ -248,10 +249,12 @@ def descriptor_relative_writer_path(directory_descriptor: int, name: str) -> Pat
     )
 
 
-def validate_artifact_writer(writer: Callable[[Path], None], mode: int) -> None:
+def validate_artifact_writer(writer: Callable[[Path], None], mode: int | None) -> None:
     """Validate shared prepared-artifact writer arguments."""
-    if isinstance(mode, bool) or not isinstance(mode, int) or not 0 <= mode <= 0o777:
-        raise ValueError("mode must be an integer from 0o000 through 0o777")
+    if mode is not None and (
+        isinstance(mode, bool) or not isinstance(mode, int) or not 0 <= mode <= 0o777
+    ):
+        raise ValueError("mode must be None or an integer from 0o000 through 0o777")
     if not callable(writer):
         raise TypeError("artifact writer must be callable")
 

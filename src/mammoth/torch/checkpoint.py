@@ -38,7 +38,7 @@ class CheckpointArtifact:
 
     destination: Path
     writer: Callable[[Path], None]
-    mode: int = 0o600
+    mode: int | None = 0o600
     preserve_permissions: bool = True
 
 
@@ -239,12 +239,14 @@ def validate_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPlan:
             raise ValueError(f"duplicate checkpoint publication target: {destination}")
         if not callable(artifact.writer):
             raise TypeError("checkpoint artifact writer must be callable")
-        if (
+        if artifact.mode is not None and (
             isinstance(artifact.mode, bool)
             or not isinstance(artifact.mode, int)
             or not 0 <= artifact.mode <= 0o777
         ):
-            raise ValueError("checkpoint artifact mode must be from 0o000 through 0o777")
+            raise ValueError(
+                "checkpoint artifact mode must be None or from 0o000 through 0o777"
+            )
         destinations.add(resolved)
         normalized_artifacts.append(
             CheckpointArtifact(

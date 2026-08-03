@@ -160,6 +160,31 @@ def test_prepared_artifact_applies_read_only_mode_after_serialization(tmp_path: 
     assert stat.S_IMODE(created.stat().st_mode) == 0o400
 
 
+def test_prepared_artifact_can_retain_serializer_mode_for_new_files(tmp_path: Path) -> None:
+    created = tmp_path / "created.bin"
+
+    def write_created(temporary: Path) -> None:
+        temporary.write_bytes(b"created")
+        temporary.chmod(0o640)
+
+    prepared_created = prepare_artifact(created, write_created, mode=None)
+    publish_prepared_artifact(prepared_created)
+
+    existing = tmp_path / "existing.bin"
+    existing.write_bytes(b"old")
+    existing.chmod(0o400)
+
+    def write_existing(temporary: Path) -> None:
+        temporary.write_bytes(b"new")
+        temporary.chmod(0o640)
+
+    prepared_existing = prepare_artifact(existing, write_existing, mode=None)
+    publish_prepared_artifact(prepared_existing)
+
+    assert stat.S_IMODE(created.stat().st_mode) == 0o640
+    assert stat.S_IMODE(existing.stat().st_mode) == 0o400
+
+
 def test_prepared_artifact_cleans_temporary_when_permission_setup_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

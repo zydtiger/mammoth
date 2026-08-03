@@ -304,8 +304,10 @@ Serialization callbacks and retention choices remain project-owned. Ordered
 replacement is crash-safe per file but is not a multi-file transaction, so a
 project should place its commit-marker artifact last. Mammoth gives each
 serializer a descriptor-anchored path inside a private staging directory and
-atomically moves the completed file to its destination. This confined durability
-path requires POSIX descriptor-relative filesystem operations and raises
+atomically moves the completed file to its destination. Artifact modes default
+to `0o600`; `mode=None` retains serializer-created permissions for a new file
+while still preserving an existing regular destination's mode. This confined
+durability path requires POSIX descriptor-relative filesystem operations and raises
 `NotImplementedError` before publication when they are unavailable.
 
 ## Learn more
