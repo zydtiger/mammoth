@@ -9,8 +9,12 @@ from mammoth.torch.batch import move_batch_to_device
 from mammoth.torch.callbacks import Callback, EarlyStopping
 from mammoth.torch.checkpoint import (
     AsyncCheckpointPublisher,
+    CheckpointArtifact,
+    CheckpointPlan,
+    CheckpointPublication,
     StateRegistry,
     checkpoint_payload,
+    publish_checkpoint_plan,
     restore_checkpoint,
 )
 from mammoth.torch.metrics import MetricAccumulator, MetricSpec
@@ -32,6 +36,9 @@ from mammoth.torch.trainer import (
 __all__ = [
     "AsyncCheckpointPublisher",
     "Callback",
+    "CheckpointArtifact",
+    "CheckpointPlan",
+    "CheckpointPublication",
     "EarlyStopping",
     "MetricAccumulator",
     "MetricSpec",
@@ -48,5 +55,6 @@ __all__ = [
     "checkpoint_payload",
     "initialize_torch_runtime",
     "move_batch_to_device",
+    "publish_checkpoint_plan",
     "restore_checkpoint",
 ]
