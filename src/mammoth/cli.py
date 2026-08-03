@@ -120,7 +120,15 @@ def run_monitor(
             callback=positive_float,
             help="Polling interval in seconds.",
         ),
-    ] = 1.0,
+    ] = 2.0,
+    stale_after: Annotated[
+        float,
+        typer.Option(
+            "--stale-after",
+            callback=positive_float,
+            help="Seconds without an observation before a running producer is stale.",
+        ),
+    ] = 90.0,
 ) -> None:
     """Open the live dashboard on a TTY or render a stable plain snapshot."""
     interactive = stdout_is_interactive() if rich is None else rich
@@ -149,11 +157,12 @@ def run_monitor(
             watch=should_watch,
             telemetry=include_telemetry,
             interval_seconds=interval,
+            stale_after_seconds=stale_after,
         )
         return
     while True:
         snapshot = monitor.poll()
-        sys.stdout.write(render_snapshot(snapshot))
+        sys.stdout.write(render_snapshot(snapshot, stale_after_seconds=stale_after))
         if include_telemetry:
             sys.stdout.write(json.dumps(asdict(sample_viewer_telemetry()), sort_keys=True) + "\n")
         sys.stdout.flush()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from itertools import count
 from pathlib import Path
 
 from rich.console import Console
@@ -19,7 +20,7 @@ from mammoth.monitor import (
     sample_viewer_telemetry,
     select_execution,
 )
-from mammoth.monitor.dashboard import dashboard_layout, sparkline
+from mammoth.monitor.dashboard import braille_line_chart, dashboard_layout, sparkline
 from mammoth.monitor.psutil_telemetry import (
     PsutilViewerTelemetry,
     sample_psutil_viewer_telemetry,
@@ -34,19 +35,24 @@ def create_context(
     *,
     previous_execution_id: str | None = None,
     parent_execution_id: str | None = None,
+    world_size: int = 1,
+    starting_epoch: int | None = None,
+    starting_global_step: int | None = None,
 ):
     return create_execution_context(
         layout.run_dir,
         run_name=layout.run_name,
         invocation_kind="test",
         intended_phases=("opaque",),
-        world_size=1,
-        execution_mode="single",
+        world_size=world_size,
+        execution_mode="single" if world_size == 1 else "distributed",
         command=("python", "job.py"),
         execution_id=execution_id,
         created_at=created_at,
         previous_execution_id=previous_execution_id,
         parent_execution_id=parent_execution_id,
+        starting_epoch=starting_epoch,
+        starting_global_step=starting_global_step,
     )
 
 
@@ -95,7 +101,7 @@ def test_run_monitor_exposes_execution_history_and_lineage_metrics(tmp_path: Pat
         layout,
         "second",
         "2026-01-02T00:00:00Z",
-        previous_execution_id="first",
+        parent_execution_id="first",
     )
     with ExecutionEventWriter.for_process(first, rank=0) as writer:
         writer.emit_progress(
@@ -263,12 +269,12 @@ def test_dashboard_renders_identity_progress_metrics_and_viewer_telemetry(
     assert "complete-execution-id" in rendered
     assert "4/10" in rendered
     assert "ETA 3s" in rendered
-    assert "epoch 2" in rendered
-    assert "optimizer_step 12" in rendered
+    assert "Epoch 2/--" in rendered
+    assert "Optimizer 12/--" in rendered
     assert "loss" in rendered
-    assert "learning_rate" in rendered
-    assert "VIEWER HOST · viewer-host" in rendered
-    assert "CPU 25.0%" in rendered
+    assert "Learning rate" in rendered
+    assert "VIEWER HOST RESOURCES · viewer-host" in rendered
+    assert "Util 25.0%" in rendered
     assert "Sampled" in rendered
     assert "2026-01-01T00:00:00Z" in rendered
 
@@ -278,6 +284,266 @@ def test_metric_sparkline_handles_sparse_constant_and_narrow_histories() -> None
     assert sparkline((2.0,), 8) == "▄"
     assert sparkline((2.0, 2.0, 2.0), 2) == "▄▄"
     assert len(sparkline(tuple(float(value) for value in range(100)), 12)) == 12
+
+
+def test_braille_chart_restores_multi_row_terminal_geometry() -> None:
+    values = tuple(float(value) for value in (5, 4, 3, 2, 3, 1, 2, 0))
+
+    wide = braille_line_chart(values, 24, height=4)
+    compact = braille_line_chart(values, 16, height=3, aggregation="last")
+
+    assert len(wide.splitlines()) == 4
+    assert len(compact.splitlines()) == 3
+    assert any(0x2800 <= ord(character) <= 0x28FF for character in wide)
+
+
+def test_dashboard_restores_legacy_wide_and_compact_information_hierarchy(
+    tmp_path: Path,
+) -> None:
+    layout = RunLayout(tmp_path, "a-production-run-name").prepare()
+    first_id = "20260101T000000000000Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    second_id = "20260102T000000000000Z-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    first = create_context(layout, first_id, "2026-01-01T00:00:00Z")
+    second = create_context(
+        layout,
+        second_id,
+        "2026-01-02T00:00:00Z",
+        parent_execution_id=first_id,
+        starting_epoch=2,
+        starting_global_step=16,
+    )
+    for context, start in ((first, 0), (second, 16)):
+        ticks = count()
+        with ExecutionEventWriter.for_process(
+            context,
+            rank=0,
+            monotonic_clock=lambda ticks=ticks: float(next(ticks) * 2),
+        ) as writer:
+            writer.emit("process_started", phase="train")
+            writer.emit("phase_started", phase="train")
+            writer.emit("task_started", phase="train", task_id="train-epoch-3")
+            for index in range(16):
+                step = start + index + 1
+                writer.emit(
+                    "progress",
+                    phase="train",
+                    task_id="train-epoch-3",
+                    completed=index + 1,
+                    total=2000,
+                    unit="microbatch",
+                    throughput=6.5,
+                    epoch=3,
+                    epoch_total=10,
+                    optimizer_step=step,
+                    optimizer_step_total=100,
+                    display_metrics={
+                        "loss": 2.0 / (index + 1),
+                        "learning_rate": index / 1000,
+                        "mean_iou": index / 16,
+                    },
+                )
+    snapshot = RunMonitor(layout).poll()
+    host = PsutilViewerTelemetry(
+        host_role="viewer",
+        hostname="viewer-host",
+        sampled_at="2026-01-02T00:05:00Z",
+        cpu_percent=25.0,
+        memory_percent=50.0,
+        load_average_1m=1.5,
+        cpu_frequency_mhz=4200.0,
+        memory_used_bytes=16 * 1024**3,
+        memory_total_bytes=32 * 1024**3,
+    )
+    now = datetime(2026, 1, 2, 0, 10, tzinfo=UTC)
+
+    wide_console = Console(width=140, record=True, color_system=None)
+    wide_console.print(
+        dashboard_layout(
+            snapshot,
+            host=host,
+            detail=False,
+            compact=False,
+            now=now,
+        )
+    )
+    wide = wide_console.export_text()
+
+    assert "SELECTED ATTEMPT · bbbbbbbb" in wide
+    assert second_id not in wide
+    assert "Epoch 3/10" in wide
+    assert "Optimizer 32/100" in wide
+    assert "TRAINING TRENDS" in wide
+    assert "Training losses · batch" in wide
+    assert "Learning rate" in wide
+    assert any(0x2800 <= ord(character) <= 0x28FF for character in wide)
+    assert "Overall" in wide
+    assert "16/2,000" in wide
+    assert "6.5 microbatch/s" in wide
+    assert "VIEWER HOST RESOURCES · viewer-host" in wide
+    assert "16.0/32.0 GiB (50.0%)" in wide
+    assert "RANKS" in wide
+    assert "ATTEMPT HISTORY" in wide
+    assert "aaaaaaaa -> ep2" in wide
+
+    compact_console = Console(width=80, record=True, color_system=None)
+    compact_console.print(
+        dashboard_layout(
+            snapshot,
+            host=host,
+            detail=False,
+            compact=True,
+            now=now,
+        )
+    )
+    compact = compact_console.export_text()
+
+    assert "SELECTED ATTEMPT · bbbbbbbb" in compact
+    assert second_id not in compact
+    assert "overall: 16/2,000 microbatch · 6.5 microbatch/s" in compact
+    assert "Overall ━" not in compact
+    assert max(len(line) for line in compact.splitlines()) <= 80
+
+
+def test_dashboard_keeps_parent_overview_and_active_leaf_rank_progress(
+    tmp_path: Path,
+) -> None:
+    layout = RunLayout(tmp_path, "distributed-run").prepare()
+    context = create_context(
+        layout,
+        "20260101T000000000000Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "2026-01-01T00:00:00Z",
+        world_size=2,
+    )
+    for rank, child_completed, child_total in ((0, 9, 10), (1, 3, 4)):
+        with ExecutionEventWriter.for_process(context, rank=rank) as writer:
+            writer.emit("process_started", phase="work")
+            writer.emit("task_started", phase="work", task_id="pipeline")
+            writer.emit(
+                "progress",
+                phase="work",
+                task_id="pipeline",
+                completed=5,
+                total=41,
+                unit="items",
+            )
+            writer.emit(
+                "task_started",
+                phase="work",
+                task_id="current-item",
+                parent_task_id="pipeline",
+            )
+            writer.emit(
+                "progress",
+                phase="work",
+                task_id="current-item",
+                parent_task_id="pipeline",
+                completed=child_completed,
+                total=child_total,
+                unit="parts",
+            )
+            writer.emit("heartbeat", phase="work", task_id="pipeline")
+
+    snapshot = RunMonitor(layout).poll()
+    console = Console(width=140, record=True, color_system=None)
+    console.print(
+        dashboard_layout(
+            snapshot,
+            host=None,
+            detail=False,
+            compact=False,
+            now=datetime(2026, 1, 1, 0, 1, tzinfo=UTC),
+        )
+    )
+    rendered = console.export_text()
+    selected_attempt, ranks = rendered.split("RANKS", maxsplit=1)
+    ranks, _history = ranks.split("ATTEMPT HISTORY", maxsplit=1)
+
+    assert "work / pipeline" in selected_attempt
+    assert "5/41" in selected_attempt
+    assert ranks.count("current-item") == 2
+    assert "9/10" in ranks
+    assert "3/4" in ranks
+
+
+def test_resume_history_prunes_superseded_parent_metric_tail(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    parent = create_context(layout, "parent", "2026-01-01T00:00:00Z")
+    child = create_context(
+        layout,
+        "child",
+        "2026-01-02T00:00:00Z",
+        parent_execution_id="parent",
+        starting_global_step=3,
+    )
+    parent_ticks = count()
+    with ExecutionEventWriter.for_process(
+        parent,
+        rank=0,
+        monotonic_clock=lambda: float(next(parent_ticks) * 2),
+    ) as writer:
+        for step in (1, 2, 3, 4):
+            writer.emit(
+                "progress",
+                phase="train",
+                task_id="train",
+                completed=step,
+                total=10,
+                global_step=step,
+                display_metrics={"loss": float(step)},
+            )
+    child_ticks = count()
+    with ExecutionEventWriter.for_process(
+        child,
+        rank=0,
+        monotonic_clock=lambda: float(next(child_ticks) * 2),
+    ) as writer:
+        for step in (3, 4):
+            writer.emit(
+                "progress",
+                phase="train",
+                task_id="train",
+                completed=step,
+                total=10,
+                global_step=step,
+                display_metrics={"loss": float(step * 10)},
+            )
+
+    snapshot = RunMonitor(layout).poll()
+
+    assert [point.value for point in snapshot.metric_history["loss"]] == [
+        1.0,
+        2.0,
+        30.0,
+        40.0,
+    ]
+
+
+def test_new_process_generation_clears_stale_task_progress_and_infers_terminal(
+    tmp_path: Path,
+) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    with ExecutionEventWriter.for_process(context, rank=0) as writer:
+        writer.emit("process_started", phase="train")
+        writer.emit("task_started", phase="train", task_id="train")
+        writer.emit(
+            "progress",
+            phase="train",
+            task_id="train",
+            completed=8,
+            total=10,
+        )
+        writer.emit("process_completed", phase="train", exit_code=0)
+        writer.emit("process_started", phase="train")
+        writer.emit("task_started", phase="train", task_id="train")
+        writer.emit("process_completed", phase="train", exit_code=0)
+
+    snapshot = ExecutionMonitor(layout).poll()
+
+    assert snapshot.status == "completed"
+    assert snapshot.current_task is not None
+    assert snapshot.current_task.completed == 0
+    assert snapshot.current_task.total is None
 
 
 def test_psutil_telemetry_isolates_optional_sampler_failures(
@@ -318,5 +584,31 @@ def test_textual_monitor_navigates_execution_history_and_resizes(tmp_path: Path)
             assert app.detail is True
             await pilot.resize_terminal(70, 30)
             assert app.query_one("#body").size.width < 80
+
+    asyncio.run(exercise())
+
+
+def test_exact_textual_monitor_opens_and_remains_in_locked_detail_mode(
+    tmp_path: Path,
+) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    create_context(layout, "first", "2026-01-01T00:00:00Z")
+    create_context(layout, "second", "2026-01-02T00:00:00Z")
+    monitor = RunMonitor(layout, "first")
+    app = MonitorApp(
+        monitor,
+        monitor.poll(),
+        watch=False,
+        telemetry=False,
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert app.detail is True
+            assert app.snapshot.selected_execution_id == "first"
+            await pilot.press("enter", "j")
+            assert app.detail is True
+            assert app.snapshot.selected_execution_id == "first"
 
     asyncio.run(exercise())

@@ -59,14 +59,20 @@ def test_monitor_rejects_missing_entry_without_traceback() -> None:
 
 
 @pytest.mark.parametrize("interval", ["0", "-0.5", "nan", "inf", "+inf", "-inf"])
-def test_monitor_rejects_non_positive_interval(interval: str, tmp_path: Path) -> None:
+@pytest.mark.parametrize("option", ["--interval", "--stale-after"])
+def test_monitor_rejects_non_positive_duration(
+    interval: str,
+    option: str,
+    tmp_path: Path,
+) -> None:
     result = runner.invoke(
         app,
-        ["monitor", "run", "--entry", str(tmp_path), "--interval", interval],
+        ["monitor", "run", "--entry", str(tmp_path), option, interval],
     )
 
     assert result.exit_code == 2
-    assert "value must be finite and greater than zero" in result.output
+    assert "value must be finite and greater than" in result.output
+    assert "zero" in result.output
     assert "Traceback" not in result.output
     assert isinstance(result.exception, SystemExit)
 
@@ -130,7 +136,8 @@ def test_monitor_defaults_to_textual_watch_and_telemetry_on_tty(
     assert run_textual.call_args.kwargs == {
         "watch": True,
         "telemetry": True,
-        "interval_seconds": 1.0,
+        "interval_seconds": 2.0,
+        "stale_after_seconds": 90.0,
     }
 
 
@@ -182,7 +189,8 @@ def test_monitor_explicit_tui_opt_outs_reach_textual_app(
     assert run_textual.call_args.kwargs == {
         "watch": False,
         "telemetry": False,
-        "interval_seconds": 1.0,
+        "interval_seconds": 2.0,
+        "stale_after_seconds": 90.0,
     }
 
 
