@@ -73,7 +73,8 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/workflow/config.py` | Strict schema-v1 YAML values, defaults, selection, and DAG validation. | Workflow configuration syntax or selection changes. |
 | `src/mammoth/workflow/launch.py` | Local and torchrun command construction plus reusable launcher/descendant supervision. | Launch, timeout, signal, or descendant handling changes. |
 | `src/mammoth/workflow/runner.py` | Dry-run planning, per-run attempts, policies, environment hooks, and lifecycle events. | Workflow orchestration behavior changes. |
-| `src/mammoth/torch/__init__.py` | Public optional trainer, callback, metric, batch, and checkpoint exports. | A stable PyTorch integration symbol is added, removed, or renamed. |
+| `src/mammoth/torch/__init__.py` | Public optional runtime, trainer, callback, metric, batch, and checkpoint exports. | A stable PyTorch integration symbol is added, removed, or renamed. |
+| `src/mammoth/torch/runtime.py` | Generic single/DDP process-group, collective, execution-startup, and rank-logging lifecycle. | PyTorch runtime identity, collectives, startup consensus, or cleanup changes. |
 | `src/mammoth/torch/batch.py` | Recursive common-container tensor transfer to one torch device. | Default batch transfer behavior changes. |
 | `src/mammoth/torch/callbacks.py` | Generic trainer lifecycle callbacks and metric-based early stopping. | Callback hooks or early-stopping behavior changes. |
 | `src/mammoth/torch/checkpoint.py` | Registered state, CPU snapshots, restore, and bounded asynchronous atomic publication. | Trainer checkpoint mechanics or schema change. |

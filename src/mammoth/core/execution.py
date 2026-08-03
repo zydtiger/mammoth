@@ -20,6 +20,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
@@ -226,7 +227,12 @@ class ExecutionMetadata:
     parent_execution_id: str | None = None
     starting_epoch: int | None = None
     starting_global_step: int | None = None
-    runtime: dict[str, Any] | None = None
+    runtime: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.runtime is not None:
+            sanitized = sanitize_metadata_fields(self.runtime)
+            object.__setattr__(self, "runtime", _freeze_metadata_mapping(sanitized))
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON payload written by :func:`create_execution_context`."""
@@ -248,7 +254,7 @@ class ExecutionMetadata:
             "starting_global_step": self.starting_global_step,
         }
         if self.runtime is not None:
-            payload["runtime"] = self.runtime
+            payload["runtime"] = _thaw_metadata_value(self.runtime)
         return payload
 
     @classmethod
@@ -319,14 +325,23 @@ class ExecutionContext:
     metadata_path: Path
     metadata: ExecutionMetadata
 
-    def rank_log_path(self, rank: int) -> Path:
-        """Return the process-exclusive plain-text log path for ``rank``."""
+    def rank_log_path(self, rank: int, *, world_size: int | None = None) -> Path:
+        """Return the process-exclusive log path for one runtime rank.
+
+        ``world_size`` is used only by workflow children whose launcher topology
+        differs from the single-process runner that owns the execution.
+        """
         if not isinstance(rank, int) or isinstance(rank, bool):
             raise ValueError(f"rank must be an integer, got {rank!r}.")
-        if rank < 0 or rank >= self.metadata.world_size:
-            raise ValueError(
-                f"rank={rank} is outside execution world_size={self.metadata.world_size}."
-            )
+        effective_world_size = self.metadata.world_size if world_size is None else world_size
+        if (
+            not isinstance(effective_world_size, int)
+            or isinstance(effective_world_size, bool)
+            or effective_world_size < 1
+        ):
+            raise ValueError(f"world_size must be a positive integer, got {world_size!r}.")
+        if rank < 0 or rank >= effective_world_size:
+            raise ValueError(f"rank={rank} is outside execution world_size={effective_world_size}.")
         return self.execution_dir / f"rank-{rank}.log"
 
 
@@ -800,7 +815,32 @@ def _structured_name_is_sensitive(name: str) -> bool:
             parts[-1] == "key"
             and bool(set(parts[:-1]).intersection({"api", "access", "private", "auth", "secret"}))
         )
+        or (
+            len(parts) >= 3
+            and parts[-2:] == ("key", "id")
+            and bool(set(parts[:-2]).intersection({"api", "access", "private", "auth", "secret"}))
+        )
     )
+
+
+def _freeze_metadata_mapping(fields: Mapping[str, Any]) -> Mapping[str, Any]:
+    return MappingProxyType({key: _freeze_metadata_value(value) for key, value in fields.items()})
+
+
+def _freeze_metadata_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return _freeze_metadata_mapping(value)
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_metadata_value(item) for item in value)
+    return value
+
+
+def _thaw_metadata_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_metadata_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_metadata_value(item) for item in value]
+    return value
 
 
 def _structured_name_parts(name: str) -> tuple[str, ...]:

@@ -40,6 +40,7 @@ src/mammoth/
 │   ├── callbacks.py
 │   ├── checkpoint.py
 │   ├── metrics.py
+│   ├── runtime.py
 │   ├── state.py
 │   └── trainer.py
 └── py.typed
@@ -55,7 +56,7 @@ src/mammoth/
 | `mammoth.logging.tensorboard` | `TensorBoardSink` |
 | `mammoth.monitor` | `ExecutionMonitor`, `MonitorSnapshot`, `ProducerKey`, `ProducerState`, `TaskState`, `MetricPoint`, `ViewerTelemetry`, discovery/folding/rendering functions, and viewer telemetry sampling |
 | `mammoth.workflow` | `WorkflowConfig`, `RunConfig`, `StepConfig`, `CommandPlan`, `SupervisedProcess`, `ProcessResult`, `WorkflowResult`, `RunResult`, `StepResult`, workflow loading/planning/running functions, and command construction |
-| `mammoth.torch` | `Trainer`, `TrainerConfig`, `TrainerState`, `TrainerResult`, `StepContext`, `StepOutput`, `Callback`, `EarlyStopping`, `MetricSpec`, `MetricAccumulator`, `StateRegistry`, `AsyncCheckpointPublisher`, batch movement, checkpoint creation, and checkpoint restoration |
+| `mammoth.torch` | `TorchExecutionRuntime`, `TorchRuntimeConfig`, `TorchExecutionRequest`, `initialize_torch_runtime`, `Trainer`, `TrainerConfig`, `TrainerState`, `TrainerResult`, `StepContext`, `StepOutput`, `Callback`, `EarlyStopping`, `MetricSpec`, `MetricAccumulator`, `StateRegistry`, `AsyncCheckpointPublisher`, batch movement, checkpoint creation, and checkpoint restoration |
 
 ## Command Routes
 

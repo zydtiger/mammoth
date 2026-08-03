@@ -465,16 +465,18 @@ class ExecutionEventWriter:
         context: ExecutionContext,
         *,
         rank: int,
+        world_size: int | None = None,
         **options: Any,
     ) -> Self:
         """Open the reserved ``rank-N.jsonl`` stream for one execution rank."""
+        effective_world_size = context.metadata.world_size if world_size is None else world_size
         return cls(
-            process_event_stream_path(context, rank),
+            process_event_stream_path(context, rank, world_size=effective_world_size),
             execution_id=context.metadata.execution_id,
             run_name=context.metadata.run_name,
             source="process",
             rank=rank,
-            world_size=context.metadata.world_size,
+            world_size=effective_world_size,
             **options,
         )
 
@@ -997,9 +999,14 @@ def _decode_event_line(line: bytes) -> ExecutionEvent:
     return ExecutionEvent.from_dict(payload)
 
 
-def process_event_stream_path(context: ExecutionContext, rank: int) -> Path:
+def process_event_stream_path(
+    context: ExecutionContext,
+    rank: int,
+    *,
+    world_size: int | None = None,
+) -> Path:
     """Return the reserved process-owned JSONL path for one validated rank."""
-    context.rank_log_path(rank)
+    context.rank_log_path(rank, world_size=world_size)
     return context.execution_dir / PROCESS_EVENT_STREAM_TEMPLATE.format(rank=rank)
 
 

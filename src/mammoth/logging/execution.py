@@ -49,14 +49,20 @@ def create_execution_logging(
     context: ExecutionContext,
     *,
     rank: int,
+    world_size: int | None = None,
     additional_sinks: Sequence[ObservationSink] = (),
     text_level: int = logging.INFO,
 ) -> ExecutionLogging:
     """Create JSONL-first observation fan-out plus one exclusive text handler."""
-    writer = ExecutionEventWriter.for_process(context, rank=rank)
+    writer = ExecutionEventWriter.for_process(context, rank=rank, world_size=world_size)
     observer = RunObserver((JsonlEventSink(writer), *additional_sinks))
     try:
-        text_handler = create_process_text_handler(context, rank=rank, level=text_level)
+        text_handler = create_process_text_handler(
+            context,
+            rank=rank,
+            world_size=world_size,
+            level=text_level,
+        )
     except BaseException:
         observer.close()
         raise

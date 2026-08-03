@@ -72,12 +72,14 @@ def test_runtime_metadata_is_optional_sanitized_schema_v1_data(tmp_path: Path) -
             "framework": "pytorch",
             "strategy": "single",
             "credentials": {"api_token": "secret"},
+            "AWS_ACCESS_KEY_ID": "AKIAEXAMPLE",
         },
     )
 
     payload = json.loads(context.metadata_path.read_text())
     assert payload["schema_version"] == 1
     assert payload["runtime"] == {
+        "AWS_ACCESS_KEY_ID": "<redacted>",
         "credentials": "<redacted>",
         "framework": "pytorch",
         "strategy": "single",
@@ -86,6 +88,30 @@ def test_runtime_metadata_is_optional_sanitized_schema_v1_data(tmp_path: Path) -
         join_execution_context(layout.run_dir, "runtime-attempt").metadata.runtime
         == payload["runtime"]
     )
+
+
+def test_runtime_metadata_is_deeply_immutable_and_to_dict_is_detached(tmp_path: Path) -> None:
+    runtime = {"framework": "pytorch", "nested": {"devices": ["cpu"]}}
+    layout = RunLayout(tmp_path, "immutable-runtime").prepare()
+    context = create_execution_context(
+        layout.run_dir,
+        run_name=layout.run_name,
+        invocation_kind="test",
+        intended_phases=("train",),
+        world_size=1,
+        execution_mode="single",
+        command=("python", "job.py"),
+        runtime=runtime,
+    )
+    runtime["framework"] = "changed"
+    payload = context.metadata.to_dict()
+    payload["runtime"]["nested"]["devices"].append("cuda")
+
+    assert context.metadata.runtime is not None
+    assert context.metadata.runtime["framework"] == "pytorch"
+    assert context.metadata.runtime["nested"]["devices"] == ("cpu",)
+    with pytest.raises(TypeError):
+        context.metadata.runtime["framework"] = "changed"  # type: ignore[index]
 
 
 def test_runtime_metadata_rejects_non_object_payload() -> None:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import multiprocessing
 from collections.abc import Mapping
 from pathlib import Path
+from queue import Empty
 from typing import Any
 
 import pytest
@@ -9,6 +11,12 @@ import torch
 import torch.distributed
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
+import mammoth.torch.runtime as torch_runtime_module
+from mammoth.core import (
+    claim_logical_run_lease,
+    create_execution_context,
+    read_execution_events,
+)
 from mammoth.logging import Observation, RunObserver
 from mammoth.torch import (
     AsyncCheckpointPublisher,
@@ -18,8 +26,11 @@ from mammoth.torch import (
     StateRegistry,
     StepContext,
     StepOutput,
+    TorchExecutionRequest,
+    TorchRuntimeConfig,
     Trainer,
     TrainerConfig,
+    initialize_torch_runtime,
     move_batch_to_device,
     restore_checkpoint,
 )
@@ -102,6 +113,123 @@ def regression_step(
     prediction = model(batch["features"])
     loss = torch.nn.functional.mse_loss(prediction, batch["targets"])
     return StepOutput(loss=loss, metrics={"mae": (prediction - batch["targets"]).abs().mean()})
+
+
+def distributed_regression_step(
+    model: torch.nn.Module,
+    batch: Any,
+    context: StepContext,
+) -> StepOutput:
+    """Return one scalar loss for the CPU DDP runtime integration fixture."""
+    features, targets = batch
+    prediction = model(features)
+    return StepOutput(loss=torch.nn.functional.mse_loss(prediction, targets))
+
+
+def _torch_runtime_worker(
+    rank: int,
+    rendezvous: str,
+    run_dir: str,
+    result_queue: Any,
+    fail_logging_rank: int | None,
+) -> None:
+    """Exercise a real two-process Gloo runtime and report bounded results."""
+    try:
+        config = TorchRuntimeConfig(
+            strategy="ddp",
+            device="cpu",
+            backend="gloo",
+            init_method=rendezvous,
+            timeout_seconds=30,
+            rank=rank,
+            local_rank=rank,
+            world_size=2,
+        )
+        with initialize_torch_runtime(config) as runtime:
+            if fail_logging_rank == rank:
+
+                def fail_logging(*args: Any, **kwargs: Any) -> Any:
+                    raise PermissionError("rank log unavailable")
+
+                torch_runtime_module.create_execution_logging = fail_logging
+            bundle = runtime.start_execution(
+                TorchExecutionRequest(
+                    run_dir=Path(run_dir),
+                    run_name="ddp-run",
+                    invocation_kind="test",
+                    intended_phases=("train",),
+                    command=("python", "train.py"),
+                    execution_id="ddp-attempt",
+                )
+            )
+            broadcast = runtime.broadcast_object("ready" if rank == 0 else None)
+            gathered = runtime.all_gather_object(rank)
+            reduced = runtime.all_reduce_sum(torch.tensor(rank + 1)).item()
+            features = torch.arange(4, dtype=torch.float32).reshape(-1, 1)
+            targets = 2 * features
+            loader = DataLoader(TensorDataset(features, targets), batch_size=2)
+            model = torch.nn.Linear(1, 1)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+            with Trainer(
+                model=model,
+                optimizer=optimizer,
+                train_loader=loader,
+                train_step=distributed_regression_step,
+                config=TrainerConfig(epochs=1, device="cpu", strategy="ddp"),
+                checkpoint_dir=Path(run_dir) / "checkpoints",
+                runtime=runtime,
+            ) as trainer:
+                result = trainer.fit()
+            bundle.observer.emit("process_completed", phase="train", exit_code=0)
+            runtime.close_process_group()
+            result_queue.put(
+                (
+                    rank,
+                    runtime.execution_context.metadata.execution_id,
+                    broadcast,
+                    gathered,
+                    reduced,
+                    result.state.global_step,
+                    None,
+                )
+            )
+    except BaseException as error:
+        result_queue.put((rank, None, None, None, None, None, str(error)))
+
+
+def run_two_process_runtime(
+    tmp_path: Path,
+    *,
+    fail_logging_rank: int | None = None,
+) -> list[tuple[Any, ...]]:
+    """Launch the reusable CPU DDP fixture and return one result per rank."""
+    process_context = multiprocessing.get_context("spawn")
+    result_queue = process_context.Queue()
+    rendezvous = f"file://{tmp_path / 'rendezvous'}"
+    run_dir = str(tmp_path / "ddp-run")
+    processes = [
+        process_context.Process(
+            target=_torch_runtime_worker,
+            args=(rank, rendezvous, run_dir, result_queue, fail_logging_rank),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=40)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            pytest.fail("CPU DDP runtime worker did not shut down coherently")
+        assert process.exitcode == 0
+    results: list[tuple[Any, ...]] = []
+    for _ in processes:
+        try:
+            results.append(result_queue.get(timeout=5))
+        except Empty:
+            pytest.fail("CPU DDP runtime worker returned no result")
+    return sorted(results)
 
 
 def test_same_trainer_handles_classification_and_mapping_regression(tmp_path: Path) -> None:
@@ -188,15 +316,11 @@ def test_validation_callback_stops_early_on_project_metric() -> None:
     model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
 
-    def train_step(
-        module: torch.nn.Module, batch: Any, context: StepContext
-    ) -> StepOutput:
+    def train_step(module: torch.nn.Module, batch: Any, context: StepContext) -> StepOutput:
         prediction = module(batch[0])
         return StepOutput(loss=prediction.sum() * 0)
 
-    def validation_step(
-        module: torch.nn.Module, batch: Any, context: StepContext
-    ) -> StepOutput:
+    def validation_step(module: torch.nn.Module, batch: Any, context: StepContext) -> StepOutput:
         return StepOutput(metrics={"score": 1.0})
 
     with Trainer(
@@ -389,3 +513,147 @@ def test_world_size_one_cpu_ddp_uses_same_project_step_contract(tmp_path: Path) 
         assert result.state.global_step == len(loader)
     finally:
         torch.distributed.destroy_process_group()
+
+
+def test_single_runtime_establishes_execution_and_supplies_trainer_observer(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "single-run"
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    with initialize_torch_runtime(TorchRuntimeConfig(device="cpu")) as runtime:
+        bundle = runtime.start_execution(
+            TorchExecutionRequest(
+                run_dir=run_dir,
+                run_name="single-run",
+                invocation_kind="test",
+                intended_phases=("train",),
+                command=("python", "train.py"),
+                execution_id="single-attempt",
+                runtime={"credentials": {"api_token": "secret"}},
+            )
+        )
+        bundle.observer.emit("process_started", phase="train")
+        with Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=loader,
+            train_step=regression_step,
+            config=TrainerConfig(epochs=1, device="cpu"),
+            checkpoint_dir=run_dir / "checkpoints",
+            runtime=runtime,
+        ) as trainer:
+            result = trainer.fit()
+        bundle.observer.emit("process_completed", phase="train", exit_code=0)
+
+        assert result.state.global_step == len(loader)
+        assert runtime.execution_context is not None
+        assert runtime.execution_context.metadata.runtime == {
+            "backend": None,
+            "credentials": "<redacted>",
+            "device_type": "cpu",
+            "framework": "pytorch",
+            "framework_version": str(torch.__version__),
+            "strategy": "single",
+        }
+
+    events = read_execution_events(
+        run_dir / "logs" / "executions" / "single-attempt" / "rank-0.jsonl"
+    )
+    assert {event.event for event in events} >= {
+        "process_started",
+        "phase_started",
+        "progress",
+        "phase_completed",
+        "process_completed",
+    }
+    assert (run_dir / "checkpoints" / "checkpoint-0000.pt").is_file()
+
+
+def test_single_runtime_joins_runner_execution_from_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "joined-run"
+    create_execution_context(
+        run_dir,
+        run_name="joined-run",
+        invocation_kind="workflow",
+        intended_phases=("train", "validate"),
+        world_size=1,
+        execution_mode="single",
+        command=("mammoth", "workflow", "run"),
+        execution_id="runner-attempt",
+    )
+    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
+
+    with initialize_torch_runtime(TorchRuntimeConfig(device="cpu")) as runtime:
+        bundle = runtime.start_execution(
+            TorchExecutionRequest(
+                run_dir=run_dir,
+                run_name="joined-run",
+                invocation_kind="train",
+                intended_phases=("train",),
+                command=("python", "train.py"),
+            )
+        )
+        bundle.observer.emit("process_completed", phase="train", exit_code=0)
+        assert runtime.execution_context is not None
+        assert runtime.execution_context.metadata.execution_id == "runner-attempt"
+
+
+def test_execution_establishment_can_be_used_without_mammoth_logging(tmp_path: Path) -> None:
+    run_dir = tmp_path / "adapter-run"
+    runtime = initialize_torch_runtime(TorchRuntimeConfig(device="cpu"))
+    context = runtime.establish_execution(
+        TorchExecutionRequest(
+            run_dir=run_dir,
+            run_name="adapter-run",
+            invocation_kind="test",
+            intended_phases=("custom",),
+            command=("python", "custom.py"),
+            execution_id="adapter-attempt",
+        )
+    )
+
+    assert context.metadata.execution_id == "adapter-attempt"
+    with pytest.raises(RuntimeError, match="already active"):
+        claim_logical_run_lease(run_dir)
+    runtime.close()
+    with claim_logical_run_lease(run_dir):
+        pass
+
+
+def test_two_process_runtime_owns_ddp_execution_collectives_and_rank_streams(
+    tmp_path: Path,
+) -> None:
+    results = run_two_process_runtime(tmp_path)
+
+    assert [result[0] for result in results] == [0, 1]
+    assert {result[1] for result in results} == {"ddp-attempt"}
+    assert {result[2] for result in results} == {"ready"}
+    assert {result[3] for result in results} == {(0, 1)}
+    assert {result[4] for result in results} == {3}
+    assert {result[5] for result in results} == {2}
+    assert {result[6] for result in results} == {None}
+    execution_dir = tmp_path / "ddp-run" / "logs" / "executions" / "ddp-attempt"
+    for rank in range(2):
+        assert (execution_dir / f"rank-{rank}.log").is_file()
+        events = read_execution_events(execution_dir / f"rank-{rank}.jsonl")
+        assert any(event.event == "progress" for event in events)
+    assert len(list((tmp_path / "ddp-run" / "checkpoints").glob("*.pt"))) == 1
+
+
+def test_two_process_runtime_propagates_rank_logging_startup_failure(
+    tmp_path: Path,
+) -> None:
+    results = run_two_process_runtime(tmp_path, fail_logging_rank=1)
+
+    errors = {result[6] for result in results}
+    assert len(errors) == 1
+    error = errors.pop()
+    assert error is not None
+    assert "execution logging" in error
+    assert "rank 1" in error
+    assert "rank log unavailable" in error

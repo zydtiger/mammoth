@@ -127,7 +127,11 @@ def create_process_text_handler(
     context: ExecutionContext,
     *,
     rank: int,
+    world_size: int | None = None,
     level: int = logging.INFO,
 ) -> ProcessTextLogHandler:
     """Create the exclusive plain-text handler for one execution process."""
-    return ProcessTextLogHandler(context.rank_log_path(rank), level=level)
+    return ProcessTextLogHandler(
+        context.rank_log_path(rank, world_size=world_size),
+        level=level,
+    )

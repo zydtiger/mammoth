@@ -142,7 +142,7 @@ Install only the features your project uses:
 ```bash
 uv sync --extra monitor       # Rich display and psutil telemetry
 uv sync --extra tensorboard   # TensorBoard logging sink
-uv sync --extra torch         # Generic PyTorch trainer
+uv sync --extra torch         # Generic PyTorch runtime and trainer
 ```
 
 Multiple extras may be installed together:
@@ -185,6 +185,48 @@ Mammoth owns ordinary loop mechanics such as device movement, precision,
 gradient accumulation, validation, callbacks, scheduling, and checkpoints. It
 does not choose your architecture, dataset, batch format, loss, or metric
 meaning.
+
+For a direct single-process or `torchrun` invocation, initialize Mammoth's
+runtime before the trainer. Rank zero creates the immutable execution, every
+rank joins it and receives its own JSONL and text stream, and the trainer uses
+the runtime's device and rank identity:
+
+```python
+from pathlib import Path
+
+from mammoth.torch import (
+    TorchExecutionRequest,
+    TorchRuntimeConfig,
+    Trainer,
+    TrainerConfig,
+    initialize_torch_runtime,
+)
+
+runtime_config = TorchRuntimeConfig(strategy="ddp", device="auto")
+with initialize_torch_runtime(runtime_config) as runtime:
+    runtime.start_execution(
+        TorchExecutionRequest(
+            run_dir=Path("runs/example"),
+            run_name="example",
+            invocation_kind="train",
+            intended_phases=("train",),
+            command=("python", "train.py"),
+        )
+    )
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        train_step=train_step,
+        config=TrainerConfig(epochs=10, strategy="ddp"),
+        runtime=runtime,
+    ) as trainer:
+        result = trainer.fit()
+```
+
+Use `strategy="single"` without `torchrun` for the corresponding local
+lifecycle. Project-specific GPU validation, sampler policy, and custom
+collectives stay in the consuming project.
 
 ## Learn more
 
