@@ -261,7 +261,8 @@ def test_dashboard_renders_identity_progress_metrics_and_viewer_telemetry(
         cpu_model_name="Example CPU",
         ram_ddr_generation="DDR5",
         ram_speed="5,600 MT/s",
-        gpus=(GpuTelemetry(0, "Example GPU", 75.0, 2800.0),),
+        cpu_power_w=105.5,
+        gpus=(GpuTelemetry(0, "Example GPU", 75.0, 2800.0, 275.25),),
     )
     console = Console(width=120, record=True, color_system=None)
 
@@ -287,11 +288,11 @@ def test_dashboard_renders_identity_progress_metrics_and_viewer_telemetry(
     assert "VIEWER HOST RESOURCES" not in rendered
     assert "CPU · Example CPU" in rendered
     assert "Util 25.0%" in rendered
-    assert "Core 4,200 MHz" in rendered
+    assert "Power 105.5 W · Core 4,200 MHz" in rendered
     assert "DDR5 · 5,600 MT/s" in rendered
     assert "GPU 0 · Example GPU" in rendered
     assert "Util 75.0%" in rendered
-    assert "Core 2,800 MHz" in rendered
+    assert "Power 275.2 W · Core 2,800 MHz" in rendered
     assert "Load" not in rendered
     assert "Sampled" not in rendered
 
@@ -305,6 +306,35 @@ def test_braille_chart_restores_multi_row_terminal_geometry() -> None:
     assert len(wide.splitlines()) == 4
     assert len(compact.splitlines()) == 3
     assert any(0x2800 <= ord(character) <= 0x28FF for character in wide)
+
+
+def test_dashboard_shortens_batch_and_microbatch_throughput_units(tmp_path: Path) -> None:
+    for unit in ("batch", "microbatch"):
+        layout = RunLayout(tmp_path / unit, "run").prepare()
+        context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+        with ExecutionEventWriter.for_process(context, rank=0) as writer:
+            writer.emit_progress(
+                phase="train",
+                task_id="train",
+                completed=1,
+                total=2,
+                unit=unit,
+                throughput=2.0,
+            )
+        console = Console(width=120, record=True, color_system=None)
+
+        console.print(
+            dashboard_layout(
+                RunMonitor(layout).poll(),
+                host=None,
+                detail=False,
+                compact=False,
+            )
+        )
+        rendered = console.export_text()
+
+        assert "2.0 b/s" in rendered
+        assert f"{unit}/s" not in rendered
 
 
 def test_dashboard_omits_secondary_metrics_without_loss_or_learning_rate(
@@ -395,9 +425,10 @@ def test_dashboard_restores_legacy_wide_and_compact_information_hierarchy(
         cpu_model_name="Example CPU",
         ram_ddr_generation="DDR5",
         ram_speed="5,600 MT/s",
+        cpu_power_w=105.5,
         gpus=(
-            GpuTelemetry(0, "GPU Zero", 25.0, 2400.0),
-            GpuTelemetry(1, "GPU One", 75.0, 2800.0),
+            GpuTelemetry(0, "GPU Zero", 25.0, 2400.0, 200.0),
+            GpuTelemetry(1, "GPU One", 75.0, 2800.0, 275.25),
         ),
     )
     now = datetime(2026, 1, 2, 0, 10, tzinfo=UTC)
@@ -436,6 +467,9 @@ def test_dashboard_restores_legacy_wide_and_compact_information_hierarchy(
     assert "DDR5 · 5,600 MT/s" in wide
     assert "GPU 0 · GPU Zero" in wide
     assert "GPU 1 · GPU One" in wide
+    assert "Power 105.5 W · Core 4,200 MHz" in wide
+    assert "Power 200.0 W · Core 2,400 MHz" in wide
+    assert "Power 275.2 W · Core 2,800 MHz" in wide
     wide_lines = wide.splitlines()
     for identity in ("CPU · Example CPU", "RAM", "GPU 0 · GPU Zero", "GPU 1 · GPU One"):
         identity_index = next(
@@ -652,11 +686,28 @@ def test_psutil_telemetry_restores_sudo_dimm_probe_and_all_gpu_rows() -> None:
                 """,
                 "",
             )
+        if normalized[0] == "sensors":
+            return subprocess.CompletedProcess(
+                normalized,
+                0,
+                """
+                {
+                  "zenpower-pci-00c3": {
+                    "RAPL_P_Package": {"power1_input": 65.25}
+                  },
+                  "zenpower-pci-00c4": {
+                    "RAPL_P_Package": {"power1_input": 40.25}
+                  }
+                }
+                """,
+                "",
+            )
         if normalized[0] == "nvidia-smi":
             return subprocess.CompletedProcess(
                 normalized,
                 0,
-                "0, NVIDIA RTX A, 25, 2400\n1, NVIDIA RTX B, 75, 2800\n",
+                "0, NVIDIA RTX A, 25, 200, 2400\n"
+                "1, NVIDIA RTX B, 75, 275.25, 2800\n",
                 "",
             )
         raise AssertionError(normalized)
@@ -671,15 +722,18 @@ def test_psutil_telemetry_restores_sudo_dimm_probe_and_all_gpu_rows() -> None:
 
     assert first.ram_ddr_generation == "DDR5"
     assert first.ram_speed == "5,200 MT/s"
+    assert first.cpu_power_w == 105.5
     assert [(gpu.index, gpu.name) for gpu in first.gpus] == [
         (0, "NVIDIA RTX A"),
         (1, "NVIDIA RTX B"),
     ]
     assert first.gpus[1].utilization_percent == 75.0
+    assert first.gpus[1].power_draw_w == 275.25
     assert first.gpus[1].core_clock_mhz == 2800.0
     assert second.gpus == first.gpus
     assert commands.count(("sudo", "-n", "dmidecode", "--type", "memory")) == 1
     assert commands.count(("sudo", "dmidecode", "--type", "memory")) == 1
+    assert commands.count(("sensors", "-j", "zenpower-*")) == 2
     assert sum(command[0] == "nvidia-smi" for command in commands) == 2
 
 

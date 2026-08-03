@@ -2,7 +2,9 @@
 
 This file is the first document every agent should read before changing
 Mammoth. Read `docs/CODEMAP.md` next for repository navigation, then open only
-the files needed for the task.
+the files needed for the task. Before changing monitor reconstruction,
+presentation, telemetry, refresh, or interaction behavior, read
+`docs/MONITOR.md`.
 
 ## Core Principles
 
@@ -26,6 +28,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `README.md` | Concise user-facing project introduction and setup entry point. | Public package purpose, installation, stable CLI/API, or user-visible behavior changes. |
 | `LICENSE` | MIT license terms and copyright notice. | The project license or copyright notice changes. |
 | `docs/ARCHITECTURE.md` | Durable package boundary, dependency direction, runtime model, logging roles, trainer scope, and compatibility policy. | Responsibilities move between layers or a stable architectural contract changes. |
+| `docs/MONITOR.md` | Canonical passive-monitor reconstruction, dashboard hierarchy, telemetry, responsive presentation, and interaction behavior. | Monitor folding, layout, display naming or units, resource probes, refresh policy, or keyboard behavior changes. |
 | `docs/IMPLEMENTATION_PLAN.md` | Ordered delivery phases, acceptance conditions, migration sequence, and explicitly deferred capabilities. | A phase is started/completed, delivery order changes, or deferred scope is approved. |
 | `docs/CODEMAP.md` | Map of implemented source paths, symbols, and import relationships. | Implemented files or symbols move, appear, or disappear, or their import relationships change. |
 | `pyproject.toml` | Package identity, Python requirement, build backend, dependencies, CLI entry point, optional extras, and tool configuration. | Packaging, dependencies, commands, build behavior, or development-tool policy changes. |

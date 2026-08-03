@@ -8,6 +8,7 @@ dashboard refresh.
 from __future__ import annotations
 
 import csv
+import json
 import math
 import os
 import platform
@@ -26,9 +27,10 @@ import psutil  # type: ignore[import-untyped]
 _COMMAND_TIMEOUT_SECONDS = 1.0
 _SUDO_PROMPT_TIMEOUT_SECONDS = 120.0
 _MEMORY_QUERY = ("dmidecode", "--type", "memory")
+_CPU_POWER_QUERY = ("sensors", "-j", "zenpower-*")
 _GPU_QUERY = (
     "nvidia-smi",
-    "--query-gpu=index,name,utilization.gpu,clocks.current.graphics",
+    "--query-gpu=index,name,utilization.gpu,power.draw,clocks.current.graphics",
     "--format=csv,noheader,nounits",
 )
 _UNAVAILABLE_VALUES = frozenset(
@@ -61,6 +63,7 @@ class GpuTelemetry:
     name: str
     utilization_percent: float | None
     core_clock_mhz: float | None
+    power_draw_w: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +82,7 @@ class PsutilViewerTelemetry:
     cpu_model_name: str | None = None
     ram_ddr_generation: str | None = None
     ram_speed: str | None = None
+    cpu_power_w: float | None = None
     gpus: tuple[GpuTelemetry, ...] = ()
 
 
@@ -123,6 +127,7 @@ class PsutilViewerTelemetrySampler:
             cpu_model_name=self._static.cpu_model_name,
             ram_ddr_generation=self._static.ram_ddr_generation,
             ram_speed=self._static.ram_speed,
+            cpu_power_w=self._sample_cpu_package_power(),
             gpus=self._sample_gpus(),
         )
 
@@ -170,6 +175,11 @@ class PsutilViewerTelemetrySampler:
     def _sample_gpus(self) -> tuple[GpuTelemetry, ...]:
         result = self._run_command(_GPU_QUERY)
         return _parse_gpus(result.stdout) if result is not None else ()
+
+    def _sample_cpu_package_power(self) -> float | None:
+        """Read package power from the zenpower lm-sensors JSON payload."""
+        result = self._run_command(_CPU_POWER_QUERY)
+        return _parse_cpu_package_power(result.stdout) if result is not None else None
 
     def _run_command(
         self,
@@ -262,7 +272,7 @@ def _parse_gpus(output: str) -> tuple[GpuTelemetry, ...]:
     parsed: list[GpuTelemetry] = []
     seen: set[int] = set()
     for row in csv.reader(output.splitlines()):
-        if len(row) != 4:
+        if len(row) != 5:
             continue
         try:
             index = int(row[0].strip())
@@ -273,9 +283,44 @@ def _parse_gpus(output: str) -> tuple[GpuTelemetry, ...]:
         seen.add(index)
         name = _sanitized_text(row[1]) or "--"
         utilization = _optional_float(row[2], minimum=0.0, maximum=100.0)
-        core_clock = _optional_float(row[3], minimum=0.0)
-        parsed.append(GpuTelemetry(index, name, utilization, core_clock))
+        power_draw = _optional_float(row[3], minimum=0.0)
+        core_clock = _optional_float(row[4], minimum=0.0)
+        parsed.append(
+            GpuTelemetry(
+                index=index,
+                name=name,
+                utilization_percent=utilization,
+                core_clock_mhz=core_clock,
+                power_draw_w=power_draw,
+            )
+        )
     return tuple(sorted(parsed, key=lambda gpu: gpu.index))
+
+
+def _parse_cpu_package_power(output: str) -> float | None:
+    """Sum zenpower RAPL package readings reported by lm-sensors."""
+    try:
+        payload = json.loads(output)
+    except (json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    values: list[float] = []
+    for chip_name, chip in payload.items():
+        if not isinstance(chip_name, str) or not chip_name.startswith("zenpower-"):
+            continue
+        if not isinstance(chip, dict):
+            continue
+        package = chip.get("RAPL_P_Package")
+        if not isinstance(package, dict):
+            continue
+        raw_power = package.get("power1_input")
+        if isinstance(raw_power, bool) or not isinstance(raw_power, int | float):
+            continue
+        power = float(raw_power)
+        if math.isfinite(power) and power >= 0:
+            values.append(power)
+    return sum(values) if values else None
 
 
 def _parse_memory_hardware(output: str) -> tuple[str | None, str | None]:
