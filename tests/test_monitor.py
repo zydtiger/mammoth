@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from datetime import UTC, datetime
 from itertools import count
 from pathlib import Path
@@ -20,9 +21,11 @@ from mammoth.monitor import (
     sample_viewer_telemetry,
     select_execution,
 )
-from mammoth.monitor.dashboard import braille_line_chart, dashboard_layout, sparkline
+from mammoth.monitor.dashboard import braille_line_chart, dashboard_layout
 from mammoth.monitor.psutil_telemetry import (
+    GpuTelemetry,
     PsutilViewerTelemetry,
+    PsutilViewerTelemetrySampler,
     sample_psutil_viewer_telemetry,
 )
 from mammoth.monitor.textual_ui import MonitorApp
@@ -252,6 +255,13 @@ def test_dashboard_renders_identity_progress_metrics_and_viewer_telemetry(
         cpu_percent=25.0,
         memory_percent=50.0,
         load_average_1m=1.5,
+        cpu_frequency_mhz=4200.0,
+        memory_used_bytes=16 * 1024**3,
+        memory_total_bytes=32 * 1024**3,
+        cpu_model_name="Example CPU",
+        ram_ddr_generation="DDR5",
+        ram_speed="5,600 MT/s",
+        gpus=(GpuTelemetry(0, "Example GPU", 75.0, 2800.0),),
     )
     console = Console(width=120, record=True, color_system=None)
 
@@ -273,17 +283,17 @@ def test_dashboard_renders_identity_progress_metrics_and_viewer_telemetry(
     assert "Optimizer 12/--" in rendered
     assert "loss" in rendered
     assert "Learning rate" in rendered
-    assert "VIEWER HOST RESOURCES · viewer-host" in rendered
+    assert "HOST RESOURCES · viewer-host" in rendered
+    assert "VIEWER HOST RESOURCES" not in rendered
+    assert "CPU · Example CPU" in rendered
     assert "Util 25.0%" in rendered
-    assert "Sampled" in rendered
-    assert "2026-01-01T00:00:00Z" in rendered
-
-
-def test_metric_sparkline_handles_sparse_constant_and_narrow_histories() -> None:
-    assert sparkline((), 8) == "--"
-    assert sparkline((2.0,), 8) == "▄"
-    assert sparkline((2.0, 2.0, 2.0), 2) == "▄▄"
-    assert len(sparkline(tuple(float(value) for value in range(100)), 12)) == 12
+    assert "Core 4,200 MHz" in rendered
+    assert "DDR5 · 5,600 MT/s" in rendered
+    assert "GPU 0 · Example GPU" in rendered
+    assert "Util 75.0%" in rendered
+    assert "Core 2,800 MHz" in rendered
+    assert "Load" not in rendered
+    assert "Sampled" not in rendered
 
 
 def test_braille_chart_restores_multi_row_terminal_geometry() -> None:
@@ -295,6 +305,35 @@ def test_braille_chart_restores_multi_row_terminal_geometry() -> None:
     assert len(wide.splitlines()) == 4
     assert len(compact.splitlines()) == 3
     assert any(0x2800 <= ord(character) <= 0x28FF for character in wide)
+
+
+def test_dashboard_omits_secondary_metrics_without_loss_or_learning_rate(
+    tmp_path: Path,
+) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    with ExecutionEventWriter.for_process(context, rank=0) as writer:
+        writer.emit_progress(
+            phase="train",
+            task_id="train",
+            completed=1,
+            total=2,
+            display_metrics={"mean_iou": 0.75},
+        )
+    console = Console(width=120, record=True, color_system=None)
+
+    console.print(
+        dashboard_layout(
+            RunMonitor(layout).poll(),
+            host=None,
+            detail=False,
+            compact=False,
+        )
+    )
+    rendered = console.export_text()
+
+    assert "TRAINING TRENDS" not in rendered
+    assert "mean_iou" not in rendered
 
 
 def test_dashboard_restores_legacy_wide_and_compact_information_hierarchy(
@@ -353,6 +392,13 @@ def test_dashboard_restores_legacy_wide_and_compact_information_hierarchy(
         cpu_frequency_mhz=4200.0,
         memory_used_bytes=16 * 1024**3,
         memory_total_bytes=32 * 1024**3,
+        cpu_model_name="Example CPU",
+        ram_ddr_generation="DDR5",
+        ram_speed="5,600 MT/s",
+        gpus=(
+            GpuTelemetry(0, "GPU Zero", 25.0, 2400.0),
+            GpuTelemetry(1, "GPU One", 75.0, 2800.0),
+        ),
     )
     now = datetime(2026, 1, 2, 0, 10, tzinfo=UTC)
 
@@ -372,15 +418,31 @@ def test_dashboard_restores_legacy_wide_and_compact_information_hierarchy(
     assert second_id not in wide
     assert "Epoch 3/10" in wide
     assert "Optimizer 32/100" in wide
+    assert "Global step" not in wide
     assert "TRAINING TRENDS" in wide
     assert "Training losses · batch" in wide
     assert "Learning rate" in wide
+    assert "mean_iou" not in wide
+    assert "Metric" not in wide
+    assert "Trend" not in wide
     assert any(0x2800 <= ord(character) <= 0x28FF for character in wide)
     assert "Overall" in wide
     assert "16/2,000" in wide
-    assert "6.5 microbatch/s" in wide
-    assert "VIEWER HOST RESOURCES · viewer-host" in wide
+    assert "6.5 b/s" in wide
+    assert "microbatch/s" not in wide
+    assert "HOST RESOURCES · viewer-host" in wide
     assert "16.0/32.0 GiB (50.0%)" in wide
+    assert "CPU · Example CPU" in wide
+    assert "DDR5 · 5,600 MT/s" in wide
+    assert "GPU 0 · GPU Zero" in wide
+    assert "GPU 1 · GPU One" in wide
+    wide_lines = wide.splitlines()
+    for identity in ("CPU · Example CPU", "RAM", "GPU 0 · GPU Zero", "GPU 1 · GPU One"):
+        identity_index = next(
+            index for index, line in enumerate(wide_lines) if line.strip() == identity
+        )
+        assert "Util" in wide_lines[identity_index + 1] or identity == "RAM"
+        assert "Core" in wide_lines[identity_index + 1] or identity == "RAM"
     assert "RANKS" in wide
     assert "ATTEMPT HISTORY" in wide
     assert "aaaaaaaa -> ep2" in wide
@@ -399,7 +461,7 @@ def test_dashboard_restores_legacy_wide_and_compact_information_hierarchy(
 
     assert "SELECTED ATTEMPT · bbbbbbbb" in compact
     assert second_id not in compact
-    assert "overall: 16/2,000 microbatch · 6.5 microbatch/s" in compact
+    assert "overall: 16/2,000 microbatch · 6.5 b/s" in compact
     assert "Overall ━" not in compact
     assert max(len(line) for line in compact.splitlines()) <= 80
 
@@ -560,6 +622,65 @@ def test_psutil_telemetry_isolates_optional_sampler_failures(
     assert sample.host_role == "viewer"
     assert sample.cpu_percent is None
     assert sample.memory_percent is None
+
+
+def test_psutil_telemetry_restores_sudo_dimm_probe_and_all_gpu_rows() -> None:
+    commands: list[tuple[str, ...]] = []
+
+    def run_command(
+        command,
+        *,
+        capture_output: bool,
+        text: bool,
+        timeout: float,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        del capture_output, text, timeout, check
+        normalized = tuple(command)
+        commands.append(normalized)
+        if normalized[:2] == ("sudo", "-n"):
+            return subprocess.CompletedProcess(normalized, 1, "", "password required")
+        if normalized[:2] == ("sudo", "dmidecode"):
+            return subprocess.CompletedProcess(
+                normalized,
+                0,
+                """
+                Memory Device
+                    Type: DDR5
+                    Speed: 5600 MT/s
+                    Configured Memory Speed: 5200 MT/s
+                """,
+                "",
+            )
+        if normalized[0] == "nvidia-smi":
+            return subprocess.CompletedProcess(
+                normalized,
+                0,
+                "0, NVIDIA RTX A, 25, 2400\n1, NVIDIA RTX B, 75, 2800\n",
+                "",
+            )
+        raise AssertionError(normalized)
+
+    sampler = PsutilViewerTelemetrySampler(
+        command_runner=run_command,
+        allow_sudo_password_prompt=True,
+    )
+
+    first = sampler.sample()
+    second = sampler.sample()
+
+    assert first.ram_ddr_generation == "DDR5"
+    assert first.ram_speed == "5,200 MT/s"
+    assert [(gpu.index, gpu.name) for gpu in first.gpus] == [
+        (0, "NVIDIA RTX A"),
+        (1, "NVIDIA RTX B"),
+    ]
+    assert first.gpus[1].utilization_percent == 75.0
+    assert first.gpus[1].core_clock_mhz == 2800.0
+    assert second.gpus == first.gpus
+    assert commands.count(("sudo", "-n", "dmidecode", "--type", "memory")) == 1
+    assert commands.count(("sudo", "dmidecode", "--type", "memory")) == 1
+    assert sum(command[0] == "nvidia-smi" for command in commands) == 2
 
 
 def test_textual_monitor_navigates_execution_history_and_resizes(tmp_path: Path) -> None:
