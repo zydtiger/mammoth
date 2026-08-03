@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
+from rich.console import Console
 from typer.testing import CliRunner
 
 from mammoth.cli import app
@@ -17,6 +19,12 @@ from mammoth.monitor import (
     sample_viewer_telemetry,
     select_execution,
 )
+from mammoth.monitor.dashboard import dashboard_layout, sparkline
+from mammoth.monitor.psutil_telemetry import (
+    PsutilViewerTelemetry,
+    sample_psutil_viewer_telemetry,
+)
+from mammoth.monitor.textual_ui import MonitorApp
 
 
 def create_context(
@@ -104,7 +112,8 @@ def test_run_monitor_exposes_execution_history_and_lineage_metrics(tmp_path: Pat
             task_id="epoch",
             completed=1,
             total=2,
-            coordinates={"epoch": 1, "optimizer_step": 4},
+            epoch=1,
+            optimizer_step=4,
             display_metrics={"loss": 1.0, "learning_rate": 0.01},
         )
 
@@ -210,3 +219,102 @@ def test_local_telemetry_never_claims_execution_host_provenance() -> None:
     sample = sample_viewer_telemetry()
     assert sample.host_role == "viewer"
     assert sample.hostname
+
+
+def test_dashboard_renders_identity_progress_metrics_and_viewer_telemetry(
+    tmp_path: Path,
+) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "complete-execution-id", "2026-01-01T00:00:00Z")
+    with ExecutionEventWriter.for_process(context, rank=0) as writer:
+        writer.emit("execution_started")
+        writer.emit("process_started", phase="train")
+        writer.emit_progress(
+            phase="train",
+            task_id="epoch-2",
+            completed=4,
+            total=10,
+            throughput=2.0,
+            coordinates={"epoch": 2, "optimizer_step": 12},
+            display_metrics={"loss": 0.5, "learning_rate": 0.001},
+        )
+    snapshot = RunMonitor(layout).poll()
+    host = PsutilViewerTelemetry(
+        host_role="viewer",
+        hostname="viewer-host",
+        sampled_at="2026-01-01T00:00:00Z",
+        cpu_percent=25.0,
+        memory_percent=50.0,
+        load_average_1m=1.5,
+    )
+    console = Console(width=120, record=True, color_system=None)
+
+    console.print(
+        dashboard_layout(
+            snapshot,
+            host=host,
+            detail=True,
+            compact=False,
+            now=datetime.now(UTC),
+        )
+    )
+    rendered = console.export_text()
+
+    assert "complete-execution-id" in rendered
+    assert "4/10" in rendered
+    assert "ETA 3s" in rendered
+    assert "epoch 2" in rendered
+    assert "optimizer_step 12" in rendered
+    assert "loss" in rendered
+    assert "learning_rate" in rendered
+    assert "VIEWER HOST · viewer-host" in rendered
+    assert "CPU 25.0%" in rendered
+
+
+def test_metric_sparkline_handles_sparse_constant_and_narrow_histories() -> None:
+    assert sparkline((), 8) == "--"
+    assert sparkline((2.0,), 8) == "▄"
+    assert sparkline((2.0, 2.0, 2.0), 2) == "▄▄"
+    assert len(sparkline(tuple(float(value) for value in range(100)), 12)) == 12
+
+
+def test_psutil_telemetry_isolates_optional_sampler_failures(
+    monkeypatch,
+) -> None:
+    def fail(*_args, **_kwargs):
+        raise OSError("unavailable")
+
+    monkeypatch.setattr("mammoth.monitor.psutil_telemetry.psutil.cpu_percent", fail)
+    monkeypatch.setattr("mammoth.monitor.psutil_telemetry.psutil.virtual_memory", fail)
+
+    sample = sample_psutil_viewer_telemetry()
+
+    assert sample.host_role == "viewer"
+    assert sample.cpu_percent is None
+    assert sample.memory_percent is None
+
+
+def test_textual_monitor_navigates_execution_history_and_resizes(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    create_context(layout, "first", "2026-01-01T00:00:00Z")
+    create_context(layout, "second", "2026-01-02T00:00:00Z")
+    monitor = RunMonitor(layout)
+    app = MonitorApp(
+        monitor,
+        monitor.poll(),
+        watch=False,
+        telemetry=False,
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert app.snapshot.selected_execution_id == "second"
+            await pilot.press("k")
+            assert app.snapshot.selected_execution_id == "first"
+            await pilot.press("enter")
+            assert app.detail is True
+            await pilot.resize_terminal(70, 30)
+            assert app.query_one("#body").size.width < 80
+
+    asyncio.run(exercise())

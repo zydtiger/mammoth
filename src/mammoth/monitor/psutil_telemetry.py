@@ -20,8 +20,8 @@ class PsutilViewerTelemetry:
     host_role: str
     hostname: str
     sampled_at: str
-    cpu_percent: float
-    memory_percent: float
+    cpu_percent: float | None
+    memory_percent: float | None
     load_average_1m: float | None
 
 
@@ -31,11 +31,23 @@ def sample_psutil_viewer_telemetry() -> PsutilViewerTelemetry:
         load_average = os.getloadavg()[0]
     except (AttributeError, OSError):
         load_average = None
+    try:
+        hostname = socket.gethostname()
+    except OSError:
+        hostname = "unknown"
+    try:
+        cpu_percent = float(psutil.cpu_percent(interval=None))
+    except (OSError, psutil.Error):
+        cpu_percent = None
+    try:
+        memory_percent = float(psutil.virtual_memory().percent)
+    except (OSError, psutil.Error):
+        memory_percent = None
     return PsutilViewerTelemetry(
         host_role="viewer",
-        hostname=socket.gethostname(),
+        hostname=hostname,
         sampled_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        cpu_percent=float(psutil.cpu_percent(interval=None)),
-        memory_percent=float(psutil.virtual_memory().percent),
+        cpu_percent=cpu_percent,
+        memory_percent=memory_percent,
         load_average_1m=load_average,
     )

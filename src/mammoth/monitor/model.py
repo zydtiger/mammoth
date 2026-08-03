@@ -364,7 +364,7 @@ def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
             task.throughput = event.throughput
         if event.message is not None:
             task.message = event.message
-        task.coordinates.update(event.coordinates)
+        task.coordinates.update(combined_coordinates(event))
         task.display_metrics.update(event.display_metrics)
 
     if event.display_metrics:

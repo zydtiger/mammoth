@@ -1,18 +1,13 @@
-"""Optional Rich live display for the passive Mammoth monitor.
+"""Compatibility entry point for the former optional Rich live display.
 
-The CLI loads this module only when the ``monitor`` extra is installed and the
-user requests an interactive view.
+New callers use :mod:`mammoth.monitor.textual_ui`; this module preserves the
+existing internal ``watch_rich`` function while routing it to Textual.
 """
 
 from __future__ import annotations
 
-import time
-
-from rich.live import Live
-from rich.panel import Panel
-
-from mammoth.monitor.model import ExecutionMonitor
-from mammoth.monitor.render import render_snapshot
+from mammoth.monitor.model import ExecutionMonitor, RunMonitor
+from mammoth.monitor.textual_ui import run_textual
 
 
 def watch_rich(
@@ -21,20 +16,13 @@ def watch_rich(
     interval_seconds: float = 1.0,
     stale_after_seconds: float = 90.0,
 ) -> None:
-    """Refresh an interactive Rich panel until interrupted."""
-    with Live(refresh_per_second=max(1, round(1 / interval_seconds))) as live:
-        while True:
-            snapshot = monitor.poll()
-            live.update(
-                Panel(
-                    render_snapshot(
-                        snapshot,
-                        stale_after_seconds=stale_after_seconds,
-                    ),
-                    title="Mammoth",
-                ),
-                refresh=True,
-            )
-            if snapshot.status in {"completed", "failed", "interrupted"}:
-                return
-            time.sleep(interval_seconds)
+    """Launch the Textual dashboard through the legacy helper name."""
+    del stale_after_seconds
+    run_monitor = RunMonitor(monitor.layout, monitor.context.metadata.execution_id)
+    run_textual(
+        run_monitor,
+        run_monitor.poll(),
+        watch=True,
+        telemetry=True,
+        interval_seconds=interval_seconds,
+    )
