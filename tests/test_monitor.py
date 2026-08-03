@@ -10,6 +10,7 @@ from mammoth.core import RunLayout, create_execution_context
 from mammoth.core.events import ExecutionEventWriter
 from mammoth.monitor import (
     ExecutionMonitor,
+    RunMonitor,
     discover_executions,
     execution_lineage,
     render_snapshot,
@@ -77,6 +78,53 @@ def test_lineage_follows_only_explicit_links_without_cycles(tmp_path: Path) -> N
 
     assert execution_lineage(layout, current.metadata) == ("parent", "root")
     assert execution_lineage(layout, parent.metadata) == ("root",)
+
+
+def test_run_monitor_exposes_execution_history_and_lineage_metrics(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    first = create_context(layout, "first", "2026-01-01T00:00:00Z")
+    second = create_context(
+        layout,
+        "second",
+        "2026-01-02T00:00:00Z",
+        previous_execution_id="first",
+    )
+    with ExecutionEventWriter.for_process(first, rank=0) as writer:
+        writer.emit_progress(
+            phase="train",
+            task_id="epoch",
+            completed=1,
+            total=2,
+            coordinates={"epoch": 0},
+            display_metrics={"loss": 2.0},
+        )
+    with ExecutionEventWriter.for_process(second, rank=0) as writer:
+        writer.emit_progress(
+            phase="train",
+            task_id="epoch",
+            completed=1,
+            total=2,
+            coordinates={"epoch": 1, "optimizer_step": 4},
+            display_metrics={"loss": 1.0, "learning_rate": 0.01},
+        )
+
+    snapshot = RunMonitor(layout).poll()
+
+    assert [attempt.execution_id for attempt in snapshot.executions] == ["first", "second"]
+    assert snapshot.selected_execution_id == "second"
+    assert snapshot.selected.current_coordinates == {"epoch": 1, "optimizer_step": 4}
+    assert [point.value for point in snapshot.metric_history["loss"]] == [2.0, 1.0]
+    assert [point.value for point in snapshot.metric_history["learning_rate"]] == [0.01]
+
+
+def test_run_monitor_can_select_an_earlier_execution(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    create_context(layout, "first", "2026-01-01T00:00:00Z")
+    create_context(layout, "second", "2026-01-02T00:00:00Z")
+
+    snapshot = RunMonitor(layout).poll(selected_execution_id="first")
+
+    assert snapshot.selected_execution_id == "first"
 
 
 def test_monitor_folds_generic_tasks_metrics_throughput_and_eta(tmp_path: Path) -> None:

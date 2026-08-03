@@ -152,6 +152,79 @@ class MonitorSnapshot:
         """Return the selected immutable attempt ID."""
         return self.context.metadata.execution_id
 
+    @property
+    def created_at(self) -> datetime:
+        """Return the execution creation time as normalized UTC."""
+        return parse_time(self.context.metadata.created_at)
+
+    @property
+    def updated_at(self) -> datetime:
+        """Return the latest observed event time, falling back to creation."""
+        observed = [
+            producer.updated_at
+            for producer in self.producers.values()
+            if producer.updated_at is not None
+        ]
+        observed.extend(
+            task.updated_at for task in self.tasks.values() if task.updated_at is not None
+        )
+        return max(observed, default=self.created_at)
+
+    @property
+    def duration_seconds(self) -> float:
+        """Return the nonnegative observed execution duration."""
+        return max(0.0, (self.updated_at - self.created_at).total_seconds())
+
+    @property
+    def current_task(self) -> TaskState | None:
+        """Return the newest running task, or the newest observed task."""
+        tasks = sorted(
+            self.tasks.values(),
+            key=lambda task: task.updated_at or self.created_at,
+        )
+        running = [task for task in tasks if task.status == "running"]
+        return (running or tasks)[-1] if tasks else None
+
+    @property
+    def current_coordinates(self) -> dict[str, int | float | str]:
+        """Return coordinates from the current task without assigning semantics."""
+        task = self.current_task
+        return dict(task.coordinates) if task is not None else {}
+
+
+@dataclass(frozen=True, slots=True)
+class RunSnapshot:
+    """All valid execution snapshots for one logical run."""
+
+    layout: RunLayout
+    executions: tuple[MonitorSnapshot, ...]
+    selected_execution_id: str
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def selected(self) -> MonitorSnapshot:
+        """Return the selected execution snapshot."""
+        for snapshot in self.executions:
+            if snapshot.execution_id == self.selected_execution_id:
+                return snapshot
+        raise RuntimeError(f"Selected execution {self.selected_execution_id!r} disappeared")
+
+    @property
+    def metric_history(self) -> dict[str, tuple[MetricPoint, ...]]:
+        """Return selected-lineage metric histories in chronological order."""
+        selected = self.selected
+        lineage_ids = {selected.execution_id, *selected.lineage}
+        combined: dict[str, list[MetricPoint]] = {}
+        for snapshot in self.executions:
+            if snapshot.execution_id not in lineage_ids:
+                continue
+            for name, points in snapshot.metric_history.items():
+                combined.setdefault(name, []).extend(points)
+        return {
+            name: tuple(sorted(points, key=lambda point: point.time))
+            for name, points in combined.items()
+        }
+
 
 def discover_executions(layout: RunLayout) -> tuple[list[ExecutionContext], list[str]]:
     """Return valid attempts sorted by creation time plus isolated warnings."""
@@ -343,6 +416,45 @@ class ExecutionMonitor:
             self._events,
             lineage=execution_lineage(self.layout, self.context.metadata),
             warnings=self._warnings,
+        )
+
+
+class RunMonitor:
+    """Incrementally monitor every valid execution for one logical run."""
+
+    def __init__(self, layout: RunLayout, execution_id: str | None = None) -> None:
+        self.layout = layout
+        self.execution_id = execution_id
+        if execution_id is not None:
+            select_execution(layout, execution_id)
+        self._monitors: dict[str, ExecutionMonitor] = {}
+
+    def poll(self, selected_execution_id: str | None = None) -> RunSnapshot:
+        """Discover attempts, tail each stream, and select one execution."""
+        contexts, warnings = discover_executions(self.layout)
+        if not contexts:
+            raise FileNotFoundError(f"No valid executions found for {self.layout.run_dir}")
+        execution_ids = {context.metadata.execution_id for context in contexts}
+        for execution_id in execution_ids:
+            self._monitors.setdefault(
+                execution_id,
+                ExecutionMonitor(self.layout, execution_id),
+            )
+        snapshots = tuple(
+            self._monitors[context.metadata.execution_id].poll() for context in contexts
+        )
+        if self.execution_id is not None and self.execution_id not in execution_ids:
+            raise FileNotFoundError(
+                f"Execution {self.execution_id!r} is no longer available for "
+                f"{self.layout.run_dir}"
+            )
+        requested = self.execution_id or selected_execution_id
+        selected = requested if requested in execution_ids else snapshots[-1].execution_id
+        return RunSnapshot(
+            layout=self.layout,
+            executions=snapshots,
+            selected_execution_id=selected,
+            warnings=tuple(warnings),
         )
 
 
