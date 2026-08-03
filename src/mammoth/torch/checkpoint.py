@@ -7,12 +7,14 @@ responsibility for deciding whether their model and checkpoint states match.
 from __future__ import annotations
 
 import os
+import stat
 from collections import deque
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Any, Protocol
 
 import torch
@@ -55,6 +57,16 @@ class CheckpointPublication:
 
     published: tuple[Path, ...]
     retired: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class _AnchoredCheckpointPlan:
+    """Normalized plan bound to the submitted checkpoint-root identity."""
+
+    checkpoint_root: Path
+    root_identity: tuple[int, int]
+    artifacts: tuple[CheckpointArtifact, ...]
+    retire_after_commit: tuple[Path, ...]
 
 
 class Stateful(Protocol):
@@ -116,56 +128,63 @@ class AsyncCheckpointPublisher:
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mammoth-checkpoint")
         self._pending: deque[Future[Any]] = deque()
         self._closed = False
+        self._lock = RLock()
 
     @property
     def pending_count(self) -> int:
         """Return queued or running publications."""
-        self._discard_completed()
-        return len(self._pending)
+        with self._lock:
+            self._discard_completed()
+            return len(self._pending)
 
     def publish(self, path: Path, payload: Mapping[str, Any]) -> Future[Path]:
         """Clone state to CPU and submit one bounded atomic publication."""
-        if self._closed:
-            raise RuntimeError("checkpoint publisher is closed")
-        self._await_submission_slot()
-        snapshot = snapshot_to_cpu(payload)
-        future = self._executor.submit(publish_torch_payload, Path(path), snapshot)
-        self._pending.append(future)
-        return future
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("checkpoint publisher is closed")
+            self._await_submission_slot()
+            snapshot = snapshot_to_cpu(payload)
+            future = self._executor.submit(publish_torch_payload, Path(path), snapshot)
+            self._pending.append(future)
+            return future
 
     def submit(self, plan: CheckpointPlan) -> Future[CheckpointPublication]:
         """Submit one caller-owned immutable ordered checkpoint plan."""
-        if self._closed:
-            raise RuntimeError("checkpoint publisher is closed")
-        validated = validate_checkpoint_plan(plan)
-        self._await_submission_slot()
-        future = self._executor.submit(publish_checkpoint_plan, validated)
-        self._pending.append(future)
-        return future
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("checkpoint publisher is closed")
+            validated = validate_checkpoint_plan(plan)
+            anchored = anchor_checkpoint_plan(validated)
+            self._await_submission_slot()
+            future = self._executor.submit(publish_anchored_checkpoint_plan, anchored)
+            self._pending.append(future)
+            return future
 
     def flush(self) -> None:
         """Wait for and surface every pending publication result."""
-        first_error: BaseException | None = None
-        while self._pending:
-            try:
-                self._resolve_oldest()
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except BaseException as error:
-                if first_error is None:
-                    first_error = error
-        if first_error is not None:
-            raise first_error
+        with self._lock:
+            first_error: BaseException | None = None
+            while self._pending:
+                try:
+                    self._resolve_oldest()
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as error:
+                    if first_error is None:
+                        first_error = error
+            if first_error is not None:
+                raise first_error
 
     def close(self) -> None:
         """Flush and shut down the worker exactly once."""
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            self.flush()
-        finally:
-            self._executor.shutdown(wait=True, cancel_futures=False)
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self.flush()
+            finally:
+                self._executor.shutdown(wait=True, cancel_futures=False)
 
     def __enter__(self) -> AsyncCheckpointPublisher:
         return self
@@ -186,7 +205,9 @@ class AsyncCheckpointPublisher:
         pending = self._pending[0]
         try:
             pending.result()
-        except (KeyboardInterrupt, SystemExit):
+        except (KeyboardInterrupt, SystemExit) as error:
+            if pending.done() and pending.exception() is error:
+                self._pending.popleft()
             raise
         except BaseException:
             self._pending.popleft()
@@ -200,13 +221,14 @@ def validate_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPlan:
     if not isinstance(plan, CheckpointPlan):
         raise TypeError("checkpoint plan must be a CheckpointPlan")
     checkpoint_root = Path(plan.checkpoint_root)
-    if not plan.artifacts:
+    artifacts = tuple(plan.artifacts)
+    if not artifacts:
         raise ValueError("checkpoint plan must contain at least one artifact")
     root_resolved = checkpoint_root.resolve()
 
     destinations: set[Path] = set()
     normalized_artifacts: list[CheckpointArtifact] = []
-    for artifact in plan.artifacts:
+    for artifact in artifacts:
         if not isinstance(artifact, CheckpointArtifact):
             raise TypeError("checkpoint artifacts must be CheckpointArtifact values")
         destination = Path(artifact.destination)
@@ -235,13 +257,25 @@ def validate_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPlan:
 
     retirements: set[Path] = set()
     normalized_retirements: list[Path] = []
-    for retirement_path in plan.retire_after_commit:
+    for retirement_path in tuple(plan.retire_after_commit):
         retirement = Path(retirement_path)
         resolved = resolve_confined_path(root_resolved, retirement, role="retirement")
         if resolved in destinations:
             raise ValueError(f"checkpoint retirement target is also published: {retirement}")
         if resolved in retirements:
             raise ValueError(f"duplicate checkpoint retirement target: {retirement}")
+        try:
+            retirement_mode = os.stat(
+                retirement,
+                follow_symlinks=False,
+            ).st_mode
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(retirement_mode):
+                raise ValueError(
+                    f"checkpoint retirement target must be a regular file: {retirement}"
+                )
         retirements.add(resolved)
         normalized_retirements.append(resolved)
 
@@ -263,15 +297,32 @@ def resolve_confined_path(root: Path, path: Path, *, role: str) -> Path:
 def publish_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPublication:
     """Prepare all artifacts, commit them in order, then retire exact old paths."""
     validated = validate_checkpoint_plan(plan)
-    validated.checkpoint_root.mkdir(parents=True, exist_ok=True)
+    return publish_anchored_checkpoint_plan(anchor_checkpoint_plan(validated))
+
+
+def anchor_checkpoint_plan(plan: CheckpointPlan) -> _AnchoredCheckpointPlan:
+    """Bind one normalized plan to a durably created checkpoint root."""
+    require_descriptor_relative_filesystem()
+    root_identity = ensure_checkpoint_root(plan.checkpoint_root)
+    return _AnchoredCheckpointPlan(
+        checkpoint_root=plan.checkpoint_root,
+        root_identity=root_identity,
+        artifacts=plan.artifacts,
+        retire_after_commit=plan.retire_after_commit,
+    )
+
+
+def publish_anchored_checkpoint_plan(plan: _AnchoredCheckpointPlan) -> CheckpointPublication:
+    """Publish one plan without rebasing its submitted root identity."""
     prepared: list[PreparedArtifact] = []
     committed_count = 0
     try:
-        for artifact in validated.artifacts:
+        for artifact in plan.artifacts:
             directory_descriptor = open_confined_parent(
-                validated.checkpoint_root,
+                plan.checkpoint_root,
                 artifact.destination,
                 create=True,
+                root_identity=plan.root_identity,
             )
             prepared.append(
                 prepare_artifact_in_directory(
@@ -285,7 +336,7 @@ def publish_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPublication:
         published: list[Path] = []
         for prepared_artifact in prepared:
             ensure_confined_path_unchanged(
-                validated.checkpoint_root,
+                plan.checkpoint_root,
                 prepared_artifact.destination,
                 role="publication",
             )
@@ -293,8 +344,12 @@ def publish_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPublication:
             committed_count += 1
 
         retired: list[Path] = []
-        for path in validated.retire_after_commit:
-            if retire_confined_path(validated.checkpoint_root, path):
+        for path in plan.retire_after_commit:
+            if retire_confined_path(
+                plan.checkpoint_root,
+                path,
+                root_identity=plan.root_identity,
+            ):
                 retired.append(path)
         return CheckpointPublication(published=tuple(published), retired=tuple(retired))
     finally:
@@ -302,11 +357,21 @@ def publish_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPublication:
             discard_prepared_artifact(prepared_artifact)
 
 
-def retire_confined_path(root: Path, path: Path) -> bool:
+def retire_confined_path(
+    root: Path,
+    path: Path,
+    *,
+    root_identity: tuple[int, int],
+) -> bool:
     """Unlink one exact retirement path through a no-follow root-relative traversal."""
     ensure_confined_path_unchanged(root, path, role="retirement")
     try:
-        directory_descriptor = open_confined_parent(root, path, create=False)
+        directory_descriptor = open_confined_parent(
+            root,
+            path,
+            create=False,
+            root_identity=root_identity,
+        )
     except FileNotFoundError:
         return False
     try:
@@ -330,21 +395,43 @@ def ensure_confined_path_unchanged(root: Path, path: Path, *, role: str) -> None
         )
 
 
-def open_confined_parent(root: Path, path: Path, *, create: bool) -> int:
+def open_confined_parent(
+    root: Path,
+    path: Path,
+    *,
+    create: bool,
+    root_identity: tuple[int, int],
+) -> int:
     """Open a target parent by walking from its checkpoint root without symlinks."""
     ensure_confined_path_unchanged(root, path, role="target")
     relative_parent = path.parent.relative_to(root)
     directory_descriptor = os.open(root, directory_open_flags())
     try:
+        opened_root_stat = os.fstat(directory_descriptor)
+        opened_root_identity = (opened_root_stat.st_dev, opened_root_stat.st_ino)
+        if opened_root_identity != root_identity:
+            raise RuntimeError(f"checkpoint root changed before filesystem effect: {root}")
         for component in relative_parent.parts:
+            created = False
             if create:
-                with suppress(FileExistsError):
+                try:
                     os.mkdir(component, dir_fd=directory_descriptor)
+                except FileExistsError:
+                    pass
+                else:
+                    created = True
             child_descriptor = os.open(
                 component,
                 directory_open_flags(),
                 dir_fd=directory_descriptor,
             )
+            if created:
+                try:
+                    sync_directory_descriptor(directory_descriptor)
+                except BaseException:
+                    with suppress(OSError):
+                        os.close(child_descriptor)
+                    raise
             parent_descriptor = directory_descriptor
             directory_descriptor = child_descriptor
             try:
@@ -358,6 +445,71 @@ def open_confined_parent(root: Path, path: Path, *, create: bool) -> int:
         with suppress(OSError):
             os.close(directory_descriptor)
         raise
+
+
+def ensure_checkpoint_root(root: Path) -> tuple[int, int]:
+    """Create a resolved checkpoint root and durably link each new directory."""
+    missing_components: list[str] = []
+    existing_parent = root
+    while True:
+        try:
+            directory_descriptor = os.open(existing_parent, directory_open_flags())
+        except FileNotFoundError:
+            missing_components.append(existing_parent.name)
+            existing_parent = existing_parent.parent
+        else:
+            break
+
+    try:
+        for component in reversed(missing_components):
+            created = False
+            try:
+                os.mkdir(component, dir_fd=directory_descriptor)
+            except FileExistsError:
+                pass
+            else:
+                created = True
+            child_descriptor = os.open(
+                component,
+                directory_open_flags(),
+                dir_fd=directory_descriptor,
+            )
+            if created:
+                try:
+                    sync_directory_descriptor(directory_descriptor)
+                except BaseException:
+                    with suppress(OSError):
+                        os.close(child_descriptor)
+                    raise
+            parent_descriptor = directory_descriptor
+            directory_descriptor = child_descriptor
+            try:
+                os.close(parent_descriptor)
+            except BaseException:
+                with suppress(OSError):
+                    os.close(parent_descriptor)
+                raise
+        root_stat = os.fstat(directory_descriptor)
+        return root_stat.st_dev, root_stat.st_ino
+    finally:
+        with suppress(OSError):
+            os.close(directory_descriptor)
+
+
+def require_descriptor_relative_filesystem() -> None:
+    """Reject platforms without the operations required for confined durability."""
+    required = (os.mkdir, os.open, os.rename, os.stat, os.unlink)
+    unsupported = [
+        operation.__name__
+        for operation in required
+        if operation not in os.supports_dir_fd
+    ]
+    if unsupported:
+        names = ", ".join(sorted(unsupported))
+        raise NotImplementedError(
+            "ordered checkpoint publication requires POSIX descriptor-relative "
+            f"filesystem operations; unavailable: {names}"
+        )
 
 
 def checkpoint_payload(registry: StateRegistry) -> dict[str, Any]:

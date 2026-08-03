@@ -183,25 +183,40 @@ def test_prepared_artifact_cleans_temporary_when_permission_setup_fails(
     assert not list(tmp_path.glob(".*.tmp"))
 
 
-def test_prepared_artifact_cleans_temporary_when_initial_close_fails(
+def test_prepared_artifact_cleans_private_staging_when_output_open_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    real_close = os.close
-    close_calls = 0
+    real_open = os.open
 
-    def fail_first_close(file_descriptor: int) -> None:
-        nonlocal close_calls
-        close_calls += 1
-        if close_calls == 1:
-            raise OSError("initial close failed")
-        real_close(file_descriptor)
+    def fail_output_open(path: str | Path, flags: int, *args: object, **kwargs: object) -> int:
+        if path == "checkpoint.bin" and flags & os.O_RDONLY == os.O_RDONLY:
+            raise OSError("output open failed")
+        return real_open(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(os, "close", fail_first_close)
+    monkeypatch.setattr(os, "open", fail_output_open)
 
-    with pytest.raises(OSError, match="initial close failed"):
-        prepare_artifact(tmp_path / "checkpoint.bin", lambda _temporary: None)
+    with pytest.raises(OSError, match="output open failed"):
+        prepare_artifact(
+            tmp_path / "checkpoint.bin",
+            lambda temporary: temporary.write_bytes(b"checkpoint"),
+        )
 
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_prepared_artifact_uses_private_staging_directory(tmp_path: Path) -> None:
+    destination = tmp_path / "checkpoint.bin"
+
+    def write(temporary: Path) -> None:
+        assert temporary.parent != destination.parent
+        assert stat.S_IMODE(temporary.parent.stat().st_mode) == 0o700
+        temporary.write_bytes(b"checkpoint")
+
+    prepared = prepare_artifact(destination, write)
+    publish_prepared_artifact(prepared)
+
+    assert destination.read_bytes() == b"checkpoint"
     assert not list(tmp_path.glob(".*.tmp"))
 
 
@@ -226,6 +241,32 @@ def test_prepared_artifact_rejects_parent_replacement_during_serialization(
     assert not (outside / destination.name).exists()
     assert not list(outside.glob(".*.tmp"))
     assert not list(moved_parent.glob(".*.tmp"))
+
+
+def test_prepared_artifact_anchors_writer_during_transient_parent_replacement(
+    tmp_path: Path,
+) -> None:
+    parent = tmp_path / "checkpoints" / "nested"
+    parent.mkdir(parents=True)
+    moved_parent = tmp_path / "moved-nested"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    destination = parent / "checkpoint.bin"
+    destination.write_bytes(b"old")
+
+    def replace_restore_and_write(temporary: Path) -> None:
+        parent.rename(moved_parent)
+        parent.symlink_to(outside, target_is_directory=True)
+        temporary.write_bytes(b"secret-checkpoint")
+        parent.unlink()
+        moved_parent.rename(parent)
+
+    prepared = prepare_artifact(destination, replace_restore_and_write)
+    publish_prepared_artifact(prepared)
+
+    assert destination.read_bytes() == b"secret-checkpoint"
+    assert not list(outside.iterdir())
+    assert not list(parent.glob(".*.tmp"))
 
 
 def test_prepared_artifact_rejects_parent_replacement_before_publication(
@@ -271,6 +312,30 @@ def test_prepared_artifact_supports_two_argument_replace_failure_adapter(
     monkeypatch.setattr(os, "replace", fail_replace)
 
     with pytest.raises(OSError, match="replace adapter failed"):
+        publish_prepared_artifact(prepared)
+    discard_prepared_artifact(prepared)
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+def test_prepared_artifact_propagates_type_error_from_keyword_replace_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "checkpoint.bin"
+    prepared = prepare_artifact(
+        destination,
+        lambda temporary: temporary.write_bytes(b"checkpoint"),
+    )
+
+    def fail_replace(source: str, target: str, **kwargs: object) -> None:
+        del source, target, kwargs
+        raise TypeError("replace adapter failed internally")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(TypeError, match="failed internally"):
         publish_prepared_artifact(prepared)
     discard_prepared_artifact(prepared)
 

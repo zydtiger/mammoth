@@ -20,9 +20,11 @@ from typing import Any
 
 @dataclass
 class _DirectoryHandle:
-    """Mutable ownership cell for one prepared artifact's parent descriptor."""
+    """Mutable ownership cell for one prepared artifact's staging resources."""
 
-    descriptor: int | None
+    parent_descriptor: int | None
+    staging_descriptor: int | None
+    staging_name: str
 
 
 @dataclass(frozen=True)
@@ -147,69 +149,45 @@ def prepare_artifact_in_directory(
             os.close(directory_descriptor)
         raise RuntimeError(f"artifact parent changed before preparation: {destination.parent}")
 
-    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    staging_name = f".{destination.name}.{uuid.uuid4().hex}.tmp"
+    artifact_name = destination.name
+    staging_descriptor: int | None = None
     try:
-        descriptor = os.open(
-            temporary.name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            mode,
+        os.mkdir(staging_name, mode=0o700, dir_fd=directory_descriptor)
+        staging_descriptor = os.open(
+            staging_name,
+            directory_open_flags(),
             dir_fd=directory_descriptor,
         )
-    except BaseException:
-        with suppress(OSError):
-            os.close(directory_descriptor)
-        raise
-    try:
-        if preserve_permissions:
-            try:
-                destination_mode = (
-                    stat.S_IMODE(
-                        os.stat(
-                            destination.name,
-                            dir_fd=directory_descriptor,
-                            follow_symlinks=False,
-                        ).st_mode
-                    )
-                    & 0o777
+        try:
+            destination_stat = os.stat(
+                destination.name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(destination_stat.st_mode):
+                raise ValueError(
+                    f"artifact destination must be a regular file: {destination}"
                 )
-            except FileNotFoundError:
-                pass
-            else:
-                os.fchmod(descriptor, destination_mode)
-        prepared_mode = stat.S_IMODE(os.fstat(descriptor).st_mode) & 0o777
+            if preserve_permissions:
+                destination_mode = stat.S_IMODE(destination_stat.st_mode) & 0o777
+                mode = destination_mode
     except BaseException:
-        with suppress(OSError):
-            os.close(descriptor)
-        with suppress(OSError):
-            os.unlink(temporary.name, dir_fd=directory_descriptor)
-        with suppress(OSError):
-            os.close(directory_descriptor)
-        raise
-    try:
-        os.close(descriptor)
-    except BaseException:
-        if not directory_path_matches_descriptor(destination.parent, directory_descriptor):
+        if staging_descriptor is not None:
             with suppress(OSError):
-                temporary.unlink()
+                os.close(staging_descriptor)
         with suppress(OSError):
-            os.unlink(temporary.name, dir_fd=directory_descriptor)
-        with suppress(OSError):
-            os.close(directory_descriptor)
-        raise
-    try:
-        os.unlink(temporary.name, dir_fd=directory_descriptor)
-    except BaseException:
-        with suppress(OSError):
-            os.unlink(temporary.name, dir_fd=directory_descriptor)
+            os.rmdir(staging_name, dir_fd=directory_descriptor)
         with suppress(OSError):
             os.close(directory_descriptor)
         raise
 
     try:
-        writer(temporary)
+        writer(descriptor_relative_writer_path(staging_descriptor, artifact_name))
         if not directory_path_matches_descriptor(destination.parent, directory_descriptor):
-            with suppress(OSError):
-                temporary.unlink()
             raise RuntimeError(
                 f"artifact parent changed during serialization: {destination.parent}"
             )
@@ -219,30 +197,54 @@ def prepare_artifact_in_directory(
             | getattr(os, "O_NONBLOCK", 0)
         )
         serialized_descriptor = os.open(
-            temporary.name,
+            artifact_name,
             open_flags,
-            dir_fd=directory_descriptor,
+            dir_fd=staging_descriptor,
         )
         try:
             if not stat.S_ISREG(os.fstat(serialized_descriptor).st_mode):
-                raise FileNotFoundError(f"artifact writer did not create a file at {temporary}")
-            os.fchmod(serialized_descriptor, prepared_mode)
+                raise FileNotFoundError(
+                    f"artifact writer did not create a file for {destination}"
+                )
+            os.fchmod(serialized_descriptor, mode)
             os.fsync(serialized_descriptor)
         finally:
             os.close(serialized_descriptor)
     except BaseException:
-        if not directory_path_matches_descriptor(destination.parent, directory_descriptor):
-            with suppress(OSError):
-                temporary.unlink()
         with suppress(OSError):
-            os.unlink(temporary.name, dir_fd=directory_descriptor)
+            os.unlink(artifact_name, dir_fd=staging_descriptor)
+        with suppress(OSError):
+            os.close(staging_descriptor)
+        with suppress(OSError):
+            os.rmdir(staging_name, dir_fd=directory_descriptor)
         with suppress(OSError):
             os.close(directory_descriptor)
         raise
+    temporary = destination.parent / staging_name / artifact_name
     return PreparedArtifact(
         destination=destination,
         temporary=temporary,
-        _directory_handle=_DirectoryHandle(directory_descriptor),
+        _directory_handle=_DirectoryHandle(
+            parent_descriptor=directory_descriptor,
+            staging_descriptor=staging_descriptor,
+            staging_name=staging_name,
+        ),
+    )
+
+
+def descriptor_relative_writer_path(directory_descriptor: int, name: str) -> Path:
+    """Return a serializer path anchored to an already opened directory."""
+    for descriptor_root in (Path("/proc/self/fd"), Path("/dev/fd")):
+        anchored_parent = descriptor_root / str(directory_descriptor)
+        try:
+            anchored_stat = anchored_parent.stat()
+        except OSError:
+            continue
+        if stat.S_ISDIR(anchored_stat.st_mode):
+            return anchored_parent / name
+    raise NotImplementedError(
+        "prepared artifact serializers require a descriptor filesystem at "
+        "/proc/self/fd or /dev/fd"
     )
 
 
@@ -258,50 +260,94 @@ def publish_prepared_artifact(artifact: PreparedArtifact) -> Path:
     """Atomically publish one prepared artifact and sync its parent directory."""
     destination = Path(artifact.destination)
     temporary = Path(artifact.temporary)
-    if temporary.parent != destination.parent:
-        raise ValueError("prepared artifact must use a same-directory temporary file")
-    directory_descriptor = artifact._directory_handle.descriptor
-    if directory_descriptor is None:
+    parent_descriptor = artifact._directory_handle.parent_descriptor
+    staging_descriptor = artifact._directory_handle.staging_descriptor
+    if parent_descriptor is None or staging_descriptor is None:
         raise RuntimeError("prepared artifact has already been published or discarded")
-    if not directory_path_matches_descriptor(destination.parent, directory_descriptor):
+    if not directory_path_matches_descriptor(destination.parent, parent_descriptor):
         raise RuntimeError(f"artifact parent changed before publication: {destination.parent}")
     temporary_stat = os.stat(
         temporary.name,
-        dir_fd=directory_descriptor,
+        dir_fd=staging_descriptor,
         follow_symlinks=False,
     )
     if not stat.S_ISREG(temporary_stat.st_mode):
         raise FileNotFoundError(f"prepared artifact is unavailable: {temporary}")
+    replace_prepared_artifact(
+        temporary.name,
+        destination.name,
+        staging_descriptor=staging_descriptor,
+        parent_descriptor=parent_descriptor,
+    )
     try:
-        os.replace(
-            temporary.name,
-            destination.name,
-            src_dir_fd=directory_descriptor,
-            dst_dir_fd=directory_descriptor,
-        )
-    except TypeError:
-        if inspect.isbuiltin(os.replace):
-            raise
-        os.replace(temporary, destination)
-    try:
-        sync_directory_descriptor(directory_descriptor)
+        os.rmdir(artifact._directory_handle.staging_name, dir_fd=parent_descriptor)
+        sync_directory_descriptor(parent_descriptor)
     finally:
-        artifact._directory_handle.descriptor = None
-        with suppress(OSError):
-            os.close(directory_descriptor)
+        try:
+            os.close(staging_descriptor)
+        finally:
+            artifact._directory_handle.staging_descriptor = None
+        try:
+            os.close(parent_descriptor)
+        finally:
+            artifact._directory_handle.parent_descriptor = None
     return destination
+
+
+def replace_prepared_artifact(
+    source_name: str,
+    destination_name: str,
+    *,
+    staging_descriptor: int,
+    parent_descriptor: int,
+) -> None:
+    """Replace through descriptor anchors without masking adapter failures."""
+    try:
+        parameters = inspect.signature(os.replace).parameters.values()
+    except (TypeError, ValueError):
+        supports_descriptors = inspect.isbuiltin(os.replace)
+    else:
+        supports_descriptors = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
+        ) or {"src_dir_fd", "dst_dir_fd"}.issubset(
+            parameter.name for parameter in parameters
+        )
+    if supports_descriptors:
+        os.replace(
+            source_name,
+            destination_name,
+            src_dir_fd=staging_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+    else:
+        os.replace(
+            descriptor_relative_writer_path(staging_descriptor, source_name),
+            descriptor_relative_writer_path(parent_descriptor, destination_name),
+        )
+
+
+def release_prepared_artifact(artifact: PreparedArtifact, *, unlink: bool) -> None:
+    """Release one prepared artifact's private staging resources."""
+    parent_descriptor = artifact._directory_handle.parent_descriptor
+    staging_descriptor = artifact._directory_handle.staging_descriptor
+    if parent_descriptor is None or staging_descriptor is None:
+        return
+    if unlink:
+        with suppress(OSError):
+            os.unlink(Path(artifact.temporary).name, dir_fd=staging_descriptor)
+    with suppress(OSError):
+        os.close(staging_descriptor)
+    artifact._directory_handle.staging_descriptor = None
+    with suppress(OSError):
+        os.rmdir(artifact._directory_handle.staging_name, dir_fd=parent_descriptor)
+    with suppress(OSError):
+        os.close(parent_descriptor)
+    artifact._directory_handle.parent_descriptor = None
 
 
 def discard_prepared_artifact(artifact: PreparedArtifact) -> None:
     """Remove one unpublished temporary artifact if it still exists."""
-    directory_descriptor = artifact._directory_handle.descriptor
-    if directory_descriptor is None:
-        return
-    with suppress(OSError):
-        os.unlink(Path(artifact.temporary).name, dir_fd=directory_descriptor)
-    artifact._directory_handle.descriptor = None
-    with suppress(OSError):
-        os.close(directory_descriptor)
+    release_prepared_artifact(artifact, unlink=True)
 
 
 def directory_open_flags() -> int:
