@@ -42,6 +42,7 @@ build-backend = "hatchling.build"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = [".agents/skills"]
 
 [tool.ruff.lint]
 select = ["B", "D", "E", "F", "I", "SIM", "UP"]
