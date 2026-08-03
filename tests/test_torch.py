@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import errno
 import multiprocessing
-from collections.abc import Mapping
+import os
+import stat
+import threading
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from queue import Empty
 from typing import Any
@@ -11,15 +15,21 @@ import torch
 import torch.distributed
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
+import mammoth.torch.checkpoint as checkpoint_module
 import mammoth.torch.runtime as torch_runtime_module
 from mammoth.core import (
+    PreparedArtifact,
     claim_logical_run_lease,
     create_execution_context,
+    publish_prepared_artifact,
     read_execution_events,
 )
 from mammoth.logging import Observation, RunObserver
 from mammoth.torch import (
     AsyncCheckpointPublisher,
+    CheckpointArtifact,
+    CheckpointPlan,
+    CheckpointPublication,
     EarlyStopping,
     MetricAccumulator,
     MetricSpec,
@@ -32,6 +42,7 @@ from mammoth.torch import (
     TrainerConfig,
     initialize_torch_runtime,
     move_batch_to_device,
+    publish_checkpoint_plan,
     restore_checkpoint,
 )
 
@@ -404,6 +415,601 @@ def test_async_checkpoint_publication_is_atomic_and_bounded(tmp_path: Path) -> N
     restore_checkpoint(second, restored_registry)
     assert restored.value == 7
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_async_checkpoint_publication_clones_tensors_before_worker_serialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    real_publish = checkpoint_module.publish_torch_payload
+
+    def blocking_publish(path: Path, payload: Mapping[str, Any]) -> Path:
+        started.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("test did not release checkpoint writer")
+        return real_publish(path, payload)
+
+    monkeypatch.setattr(checkpoint_module, "publish_torch_payload", blocking_publish)
+    live_tensor = torch.tensor([1.0])
+    destination = tmp_path / "checkpoint.pt"
+    with AsyncCheckpointPublisher() as publisher:
+        publisher.publish(destination, {"tensor": live_tensor})
+        assert started.wait(timeout=5)
+        live_tensor.add_(10)
+        release.set()
+
+    saved = torch.load(destination, map_location="cpu", weights_only=False)
+    torch.testing.assert_close(saved["tensor"], torch.tensor([1.0]))
+
+
+def test_checkpoint_plan_prepares_all_artifacts_before_ordered_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    previous = checkpoint_root / "checkpoint-0000.pt"
+    previous.write_bytes(b"previous")
+    retained = checkpoint_root / "retained.pt"
+    retained.write_bytes(b"retained")
+    first = checkpoint_root / "best.weights"
+    second = checkpoint_root / "checkpoint-0001.pt"
+    events: list[str] = []
+
+    def writer(name: str, payload: bytes) -> Callable[[Path], None]:
+        def write(temporary: Path) -> None:
+            events.append(f"prepare:{name}")
+            temporary.write_bytes(payload)
+
+        return write
+
+    def record_publish(artifact: PreparedArtifact) -> Path:
+        events.append(f"commit:{artifact.destination.name}")
+        return publish_prepared_artifact(artifact)
+
+    monkeypatch.setattr(checkpoint_module, "publish_prepared_artifact", record_publish)
+    result = publish_checkpoint_plan(
+        CheckpointPlan(
+            checkpoint_root=checkpoint_root,
+            artifacts=(
+                CheckpointArtifact(first, writer("best", b"best")),
+                CheckpointArtifact(second, writer("resume", b"resume")),
+            ),
+            retire_after_commit=(previous,),
+        )
+    )
+
+    assert events == [
+        "prepare:best",
+        "prepare:resume",
+        "commit:best.weights",
+        "commit:checkpoint-0001.pt",
+    ]
+    assert result == CheckpointPublication(
+        published=(first, second),
+        retired=(previous,),
+    )
+    assert first.read_bytes() == b"best"
+    assert second.read_bytes() == b"resume"
+    assert not previous.exists()
+    assert retained.read_bytes() == b"retained"
+    assert not list(checkpoint_root.glob(".*.tmp"))
+
+
+def test_checkpoint_plan_preparation_failure_preserves_all_destinations(
+    tmp_path: Path,
+) -> None:
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    first = checkpoint_root / "best.weights"
+    second = checkpoint_root / "latest.pt"
+    retired = checkpoint_root / "previous.pt"
+    first.write_bytes(b"old-best")
+    second.write_bytes(b"old-latest")
+    retired.write_bytes(b"old-resume")
+
+    def write_first(temporary: Path) -> None:
+        temporary.write_bytes(b"new-best")
+
+    def fail_second(temporary: Path) -> None:
+        temporary.write_bytes(b"partial")
+        raise OSError("serialization failed")
+
+    with pytest.raises(OSError, match="serialization failed"):
+        publish_checkpoint_plan(
+            CheckpointPlan(
+                checkpoint_root=checkpoint_root,
+                artifacts=(
+                    CheckpointArtifact(first, write_first),
+                    CheckpointArtifact(second, fail_second),
+                ),
+                retire_after_commit=(retired,),
+            )
+        )
+
+    assert first.read_bytes() == b"old-best"
+    assert second.read_bytes() == b"old-latest"
+    assert retired.read_bytes() == b"old-resume"
+    assert not list(checkpoint_root.glob(".*.tmp"))
+
+
+def test_checkpoint_plan_noop_serializer_preserves_destinations_and_retirement(
+    tmp_path: Path,
+) -> None:
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    destination = checkpoint_root / "latest.pt"
+    retirement = checkpoint_root / "previous.pt"
+    destination.write_bytes(b"old-latest")
+    retirement.write_bytes(b"old-previous")
+
+    with pytest.raises(FileNotFoundError):
+        publish_checkpoint_plan(
+            CheckpointPlan(
+                checkpoint_root,
+                (CheckpointArtifact(destination, lambda _temporary: None),),
+                retire_after_commit=(retirement,),
+            )
+        )
+
+    assert destination.read_bytes() == b"old-latest"
+    assert retirement.read_bytes() == b"old-previous"
+    assert not list(checkpoint_root.glob(".*.tmp"))
+
+
+def test_checkpoint_plan_commit_failure_cleans_unpublished_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    first = checkpoint_root / "best.weights"
+    second = checkpoint_root / "latest.pt"
+    retired = checkpoint_root / "previous.pt"
+    second.write_bytes(b"old-latest")
+    retired.write_bytes(b"old-resume")
+    publications = 0
+    real_replace = os.replace
+
+    def write(payload: bytes) -> Callable[[Path], None]:
+        def write_payload(temporary: Path) -> None:
+            temporary.write_bytes(payload)
+
+        return write_payload
+
+    def fail_second_replace(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal publications
+        publications += 1
+        if publications == 2:
+            raise OSError("replace failed")
+        real_replace(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(os, "replace", fail_second_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        publish_checkpoint_plan(
+            CheckpointPlan(
+                checkpoint_root=checkpoint_root,
+                artifacts=(
+                    CheckpointArtifact(first, write(b"new-best")),
+                    CheckpointArtifact(second, write(b"new-latest")),
+                ),
+                retire_after_commit=(retired,),
+            )
+        )
+
+    assert first.read_bytes() == b"new-best"
+    assert second.read_bytes() == b"old-latest"
+    assert retired.read_bytes() == b"old-resume"
+    assert not list(checkpoint_root.glob(".*.tmp"))
+
+
+def test_checkpoint_plan_rejects_parent_replacement_before_retirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_root = tmp_path / "checkpoints"
+    nested = checkpoint_root / "nested"
+    nested.mkdir(parents=True)
+    moved_nested = checkpoint_root / "moved-nested"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    retirement = nested / "old.pt"
+    retirement.write_bytes(b"inside")
+    outside_retirement = outside / "old.pt"
+    outside_retirement.write_bytes(b"outside")
+    destination = checkpoint_root / "latest.pt"
+    real_publish = publish_prepared_artifact
+
+    def write(temporary: Path) -> None:
+        temporary.write_bytes(b"latest")
+
+    def publish_then_replace_parent(artifact: PreparedArtifact) -> Path:
+        published = real_publish(artifact)
+        nested.rename(moved_nested)
+        nested.symlink_to(outside, target_is_directory=True)
+        return published
+
+    monkeypatch.setattr(
+        checkpoint_module,
+        "publish_prepared_artifact",
+        publish_then_replace_parent,
+    )
+
+    with pytest.raises(ValueError, match="outside checkpoint_root"):
+        publish_checkpoint_plan(
+            CheckpointPlan(
+                checkpoint_root,
+                (CheckpointArtifact(destination, write),),
+                retire_after_commit=(retirement,),
+            )
+        )
+
+    assert destination.read_bytes() == b"latest"
+    assert (moved_nested / "old.pt").read_bytes() == b"inside"
+    assert outside_retirement.read_bytes() == b"outside"
+
+
+def test_checkpoint_plan_rejects_same_parent_moved_outside_root(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path / "checkpoints"
+    nested = checkpoint_root / "nested"
+    nested.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    moved_nested = outside / "moved-nested"
+    destination = nested / "latest.pt"
+
+    def move_parent_and_write(temporary: Path) -> None:
+        nested.rename(moved_nested)
+        nested.symlink_to(moved_nested, target_is_directory=True)
+        temporary.write_bytes(b"outside")
+
+    with pytest.raises(ValueError, match="outside checkpoint_root"):
+        publish_checkpoint_plan(
+            CheckpointPlan(
+                checkpoint_root,
+                (CheckpointArtifact(destination, move_parent_and_write),),
+            )
+        )
+
+    assert not (moved_nested / "latest.pt").exists()
+    assert not list(moved_nested.glob(".*.tmp"))
+
+
+def test_checkpoint_plan_surfaces_directory_sync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    destination = checkpoint_root / "latest.pt"
+    retirement = checkpoint_root / "previous.pt"
+    retirement.write_bytes(b"previous")
+    real_fsync = os.fsync
+
+    def fail_directory_sync(file_descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(file_descriptor).st_mode):
+            raise OSError(errno.EIO, "directory sync failed")
+        real_fsync(file_descriptor)
+
+    def write(temporary: Path) -> None:
+        temporary.write_bytes(b"latest")
+
+    monkeypatch.setattr(os, "fsync", fail_directory_sync)
+
+    with pytest.raises(OSError, match="directory sync failed"):
+        publish_checkpoint_plan(
+            CheckpointPlan(
+                checkpoint_root,
+                (CheckpointArtifact(destination, write),),
+                retire_after_commit=(retirement,),
+            )
+        )
+
+    assert destination.read_bytes() == b"latest"
+    assert retirement.read_bytes() == b"previous"
+    assert not list(checkpoint_root.glob(".*.tmp"))
+
+
+def test_checkpoint_plan_rejects_unconfined_and_ambiguous_targets(tmp_path: Path) -> None:
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    target = checkpoint_root / "latest.pt"
+    outside = tmp_path / "outside.pt"
+
+    def writer(temporary: Path) -> None:
+        temporary.write_bytes(b"checkpoint")
+
+    invalid_plans = (
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(outside, writer),),
+        ),
+        CheckpointPlan(
+            checkpoint_root,
+            (
+                CheckpointArtifact(target, writer),
+                CheckpointArtifact(target, writer),
+            ),
+        ),
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(target, writer),),
+            retire_after_commit=(target,),
+        ),
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(target, writer),),
+            retire_after_commit=(outside,),
+        ),
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(target, writer),),
+            retire_after_commit=(checkpoint_root / "old.pt", checkpoint_root / "old.pt"),
+        ),
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(checkpoint_root, writer),),
+        ),
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(target, writer),),
+            retire_after_commit=(checkpoint_root,),
+        ),
+    )
+    for plan in invalid_plans:
+        with pytest.raises(ValueError):
+            publish_checkpoint_plan(plan)
+
+
+def test_async_checkpoint_plan_submission_applies_bounded_backpressure(
+    tmp_path: Path,
+) -> None:
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_writer(temporary: Path) -> None:
+        started.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("test did not release checkpoint writer")
+        temporary.write_bytes(b"first")
+
+    def write_second(temporary: Path) -> None:
+        temporary.write_bytes(b"second")
+
+    first_plan = CheckpointPlan(
+        checkpoint_root,
+        (CheckpointArtifact(checkpoint_root / "first.pt", blocking_writer),),
+    )
+    second_plan = CheckpointPlan(
+        checkpoint_root,
+        (
+            CheckpointArtifact(
+                checkpoint_root / "second.pt",
+                write_second,
+            ),
+        ),
+    )
+    errors: list[BaseException] = []
+    with AsyncCheckpointPublisher(max_pending=1) as publisher:
+        publisher.submit(first_plan)
+        assert started.wait(timeout=5)
+
+        def submit_second() -> None:
+            try:
+                publisher.submit(second_plan)
+            except BaseException as error:
+                errors.append(error)
+
+        submitter = threading.Thread(target=submit_second)
+        submitter.start()
+        submitter.join(timeout=0.1)
+        assert submitter.is_alive()
+        release.set()
+        submitter.join(timeout=5)
+        assert not submitter.is_alive()
+        publisher.flush()
+
+    assert errors == []
+    assert (checkpoint_root / "first.pt").read_bytes() == b"first"
+    assert (checkpoint_root / "second.pt").read_bytes() == b"second"
+
+
+def test_async_checkpoint_plan_freezes_relative_paths_before_worker_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    checkpoint_root = Path("checkpoints")
+    checkpoint_root.mkdir()
+    previous = checkpoint_root / "previous.pt"
+    previous.write_bytes(b"previous")
+    blocker_root = tmp_path / "blocker"
+    blocker_root.mkdir()
+    started = threading.Event()
+    release = threading.Event()
+
+    def block(temporary: Path) -> None:
+        started.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("test did not release checkpoint writer")
+        temporary.write_bytes(b"blocker")
+
+    def write_relative(temporary: Path) -> None:
+        temporary.write_bytes(b"relative")
+
+    with AsyncCheckpointPublisher(max_pending=2) as publisher:
+        publisher.submit(
+            CheckpointPlan(
+                blocker_root,
+                (CheckpointArtifact(blocker_root / "first.pt", block),),
+            )
+        )
+        assert started.wait(timeout=5)
+        future = publisher.submit(
+            CheckpointPlan(
+                checkpoint_root,
+                (CheckpointArtifact(checkpoint_root / "latest.pt", write_relative),),
+                retire_after_commit=(previous,),
+            )
+        )
+        other_directory = tmp_path / "other"
+        other_directory.mkdir()
+        monkeypatch.chdir(other_directory)
+        release.set()
+        publisher.flush()
+
+    publication = future.result()
+    resolved_root = (tmp_path / "checkpoints").resolve()
+    assert publication.published == (resolved_root / "latest.pt",)
+    assert publication.retired == (resolved_root / "previous.pt",)
+    assert (resolved_root / "latest.pt").read_bytes() == b"relative"
+    assert not (other_directory / "checkpoints").exists()
+
+
+def test_async_checkpoint_plan_failure_surfaces_at_next_bounded_submission(
+    tmp_path: Path,
+) -> None:
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+
+    def fail(temporary: Path) -> None:
+        temporary.write_bytes(b"partial")
+        raise OSError("plan failed")
+
+    def succeed(temporary: Path) -> None:
+        temporary.write_bytes(b"complete")
+
+    publisher = AsyncCheckpointPublisher(max_pending=1)
+    failed = publisher.submit(
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(checkpoint_root / "failed.pt", fail),),
+        )
+    )
+    with pytest.raises(OSError, match="plan failed"):
+        failed.result()
+    with pytest.raises(OSError, match="plan failed"):
+        publisher.submit(
+            CheckpointPlan(
+                checkpoint_root,
+                (CheckpointArtifact(checkpoint_root / "blocked.pt", succeed),),
+            )
+        )
+    publisher.submit(
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(checkpoint_root / "complete.pt", succeed),),
+        )
+    )
+    publisher.flush()
+    publisher.close()
+    publisher.close()
+
+    assert (checkpoint_root / "complete.pt").read_bytes() == b"complete"
+    assert not list(checkpoint_root.glob(".*.tmp"))
+
+
+def test_async_checkpoint_plan_failure_surfaces_from_flush_close_and_context(
+    tmp_path: Path,
+) -> None:
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+
+    def fail(temporary: Path) -> None:
+        temporary.write_bytes(b"partial")
+        raise OSError("plan failed")
+
+    plan = CheckpointPlan(
+        checkpoint_root,
+        (CheckpointArtifact(checkpoint_root / "failed.pt", fail),),
+    )
+
+    flushed = AsyncCheckpointPublisher()
+    flushed.submit(plan)
+    with pytest.raises(OSError, match="plan failed"):
+        flushed.flush()
+    flushed.close()
+
+    closed = AsyncCheckpointPublisher()
+    closed.submit(plan)
+    with pytest.raises(OSError, match="plan failed"):
+        closed.close()
+    closed.close()
+
+    with pytest.raises(OSError, match="plan failed"), AsyncCheckpointPublisher() as contextual:
+        contextual.submit(plan)
+
+    assert not list(checkpoint_root.glob(".*.tmp"))
+
+
+def test_async_checkpoint_flush_waits_for_later_work_before_raising(
+    tmp_path: Path,
+) -> None:
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    second_started = threading.Event()
+    release_second = threading.Event()
+
+    def fail_first(temporary: Path) -> None:
+        temporary.write_bytes(b"partial")
+        raise OSError("first plan failed")
+
+    def block_second(temporary: Path) -> None:
+        second_started.set()
+        if not release_second.wait(timeout=5):
+            raise TimeoutError("test did not release second checkpoint writer")
+        temporary.write_bytes(b"second")
+
+    publisher = AsyncCheckpointPublisher(max_pending=2)
+    publisher.submit(
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(checkpoint_root / "first.pt", fail_first),),
+        )
+    )
+    publisher.submit(
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(checkpoint_root / "second.pt", block_second),),
+        )
+    )
+    errors: list[BaseException] = []
+
+    def flush() -> None:
+        try:
+            publisher.flush()
+        except BaseException as error:
+            errors.append(error)
+
+    waiter = threading.Thread(target=flush)
+    waiter.start()
+    assert second_started.wait(timeout=5)
+    waiter.join(timeout=0.1)
+    assert waiter.is_alive()
+    release_second.set()
+    waiter.join(timeout=5)
+    publisher.close()
+
+    assert not waiter.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], OSError)
+    assert str(errors[0]) == "first plan failed"
+    assert (checkpoint_root / "second.pt").read_bytes() == b"second"
 
 
 def test_precision_and_ddp_configuration_guards(tmp_path: Path) -> None:
