@@ -2,5 +2,5 @@ version: 1
 entry: issue-discovery
 scope: project
 lock: .agents/skills.lock.yaml
-repository: git@gitea:tigerding/agent-workflows.git
+repository: https://github.com/zydtiger/agent-workflows.git
 commit: 04405ca4a4abef727ea2ff3eb1b4d0a90c815264

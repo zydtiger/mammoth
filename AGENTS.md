@@ -104,7 +104,7 @@ review, publication, merge-approval, verification, and cleanup gates.
 
 The directories marked `mode: vendored` in `.agents/skills.lock.yaml` are
 read-only snapshots. Run `skillctl check` before changing managed skill state,
-make reusable changes in `tigerding/agent-workflows`, and apply approved
+make reusable changes in `zydtiger/agent-workflows` on GitHub, and apply approved
 upstream revisions with `skillctl update`. Commit the generated lock and
 vendored trees together; do not edit their commits, digests, markers, or files
 manually.

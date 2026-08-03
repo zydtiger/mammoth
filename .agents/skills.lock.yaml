@@ -3,7 +3,7 @@ skills:
   issue-delivery:
     mode: vendored
     source:
-      repository: git@gitea:tigerding/agent-workflows.git
+      repository: https://github.com/zydtiger/agent-workflows.git
       path: skills/issue-delivery
       ref: main
     resolved:
@@ -13,7 +13,7 @@ skills:
   issue-discovery:
     mode: vendored
     source:
-      repository: git@gitea:tigerding/agent-workflows.git
+      repository: https://github.com/zydtiger/agent-workflows.git
       path: skills/issue-discovery
       ref: main
     resolved:
