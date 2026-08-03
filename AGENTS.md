@@ -64,10 +64,12 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/logging/text.py` | Process-exclusive plain-text Python logging handler. | Text-log ownership or formatting changes. |
 | `src/mammoth/monitor/__init__.py` | Public passive-monitor exports. | A stable monitor symbol is added, removed, or renamed. |
 | `src/mammoth/monitor/model.py` | Execution discovery, lineage, incremental stream reads, and project-neutral state folding. | Monitor selection or reconstructed state changes. |
+| `src/mammoth/monitor/dashboard.py` | Responsive Rich renderables for the optional Textual dashboard. | Interactive panels, progress bars, metric charts, or wide/compact presentation changes. |
 | `src/mammoth/monitor/psutil_telemetry.py` | Optional psutil-backed viewer-host samples. | Optional CPU or memory sampling changes. |
 | `src/mammoth/monitor/render.py` | Canonical stable ANSI-free monitor snapshot rendering. | Plain monitor output changes. |
-| `src/mammoth/monitor/rich_ui.py` | Optional interactive Rich live display. | Rich refresh or presentation behavior changes. |
+| `src/mammoth/monitor/rich_ui.py` | Compatibility route from the former Rich helper to the Textual application. | Legacy interactive-helper compatibility changes. |
 | `src/mammoth/monitor/telemetry.py` | Standard-library viewer-host telemetry with explicit provenance labels. | Base local telemetry changes. |
+| `src/mammoth/monitor/textual_ui.py` | Optional Textual application lifecycle, refresh worker, navigation, and resize handling. | Interactive monitor lifecycle, bindings, or polling behavior changes. |
 | `src/mammoth/workflow/__init__.py` | Public workflow configuration, planning, launch, and result exports. | A stable workflow symbol is added, removed, or renamed. |
 | `src/mammoth/workflow/config.py` | Strict schema-v1 YAML values, defaults, selection, and DAG validation. | Workflow configuration syntax or selection changes. |
 | `src/mammoth/workflow/launch.py` | Local and torchrun command construction plus reusable launcher/descendant supervision. | Launch, timeout, signal, or descendant handling changes. |

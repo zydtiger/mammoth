@@ -104,7 +104,17 @@ parses them for state; it consumes immutable metadata and JSONL events.
 
 The generic monitor reconstructs executions, producer liveness, task trees,
 progress, throughput, arbitrary metric trends, failures, and lineage. Generic
-ETA uses only completed work, total work, and observed time.
+ETA uses only completed work, total work, and observed time. A run-level monitor
+keeps every valid immutable execution available for navigation while selected
+lineage histories provide continuous project-neutral metric trends.
+
+An interactive terminal launches the optional Textual dashboard by default.
+Textual owns refresh workers, keyboard navigation, scrolling, and responsive
+layout; Rich renderables provide progress bars, execution panels, task tables,
+and terminal-width-aware metric charts. Redirected output remains one stable
+ANSI-free snapshot. Conventional metric names such as `loss` and
+`learning_rate` receive presentation priority only and do not alter folding or
+assign scientific meaning.
 
 The optional PyTorch integration may provide a training view for Mammoth's own
 trainer. Project-specific pipeline projections are supplied as data or plugins,
@@ -112,6 +122,10 @@ not embedded in the monitor.
 
 Viewer-host telemetry and execution-host telemetry are distinct. Local resource
 sampling must never be presented as historical or remote execution provenance.
+The Textual dashboard samples optional viewer CPU, memory, and load data in a
+worker, labels it as viewer-host state, and isolates sampling failures. The
+monitor remains passive: neither rendering nor telemetry writes artifacts,
+contacts producers, or controls an execution.
 
 ## Generic PyTorch trainer
 
