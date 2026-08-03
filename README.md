@@ -82,29 +82,41 @@ one.
 
 ## Inspect or watch a run
 
-Show the latest execution of `demo`:
-
-```bash
-uv run mammoth monitor demo --entry runs
-```
-
-To keep refreshing until an active execution finishes, use:
-
-```bash
-uv run mammoth monitor demo --entry runs --watch
-```
-
-For the optional interactive display, install the monitor dependencies and add
-`--rich`:
+Install the monitor dependencies, then open the latest execution of `demo`:
 
 ```bash
 uv sync --extra monitor
-uv run mammoth monitor demo --entry runs --watch --rich
+uv run mammoth monitor demo --entry runs
 ```
 
-Pass `--execution <execution-id>` to inspect an older attempt exactly. Add
-`--telemetry` when you also want CPU and memory information from the computer
-running the monitor.
+On an interactive terminal, this opens the Textual dashboard with continuous
+polling and explicitly viewer-host telemetry enabled. The dashboard includes
+run progress, progress bars, throughput, ETA, execution history and lineage,
+producer and task state, responsive metric trends, and labelled loss and
+learning-rate charts when those conventional metrics are reported.
+
+Use the arrow keys or `j`/`k` to select an execution, Enter to toggle overview
+and detail, `r` to refresh, and `q` to quit. Pass `--execution <execution-id>`
+to pin one immutable attempt exactly.
+
+Redirected output remains a single stable ANSI-free snapshot:
+
+```bash
+uv run mammoth monitor demo --entry runs > monitor.txt
+```
+
+Interactive invocations can opt out of individual defaults:
+
+```bash
+uv run mammoth monitor demo --entry runs --plain
+uv run mammoth monitor demo --entry runs --no-watch
+uv run mammoth monitor demo --entry runs --no-telemetry
+```
+
+The existing `--rich`, `--watch`, and `--telemetry` flags remain accepted for
+explicit compatibility. Plain mode works without the monitor extra; requesting
+the dashboard without its optional dependencies reports the exact installation
+command.
 
 ## Select only part of a workflow
 
@@ -140,7 +152,7 @@ the full CLI reference.
 Install only the features your project uses:
 
 ```bash
-uv sync --extra monitor       # Rich display and psutil telemetry
+uv sync --extra monitor       # Textual dashboard, Rich renderables, and psutil telemetry
 uv sync --extra tensorboard   # TensorBoard logging sink
 uv sync --extra torch         # Generic PyTorch trainer
 ```
