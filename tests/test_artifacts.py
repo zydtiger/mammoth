@@ -252,3 +252,27 @@ def test_prepared_artifact_rejects_parent_replacement_before_publication(
     assert not (outside / destination.name).exists()
     assert not list(outside.glob(".*.tmp"))
     assert not list(moved_parent.glob(".*.tmp"))
+
+
+def test_prepared_artifact_supports_two_argument_replace_failure_adapter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "checkpoint.bin"
+
+    def write(temporary: Path) -> None:
+        temporary.write_bytes(b"checkpoint")
+
+    def fail_replace(source: Path, target: Path) -> None:
+        del source, target
+        raise OSError("replace adapter failed")
+
+    prepared = prepare_artifact(destination, write)
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace adapter failed"):
+        publish_prepared_artifact(prepared)
+    discard_prepared_artifact(prepared)
+
+    assert not destination.exists()
+    assert not list(tmp_path.glob(".*.tmp"))
