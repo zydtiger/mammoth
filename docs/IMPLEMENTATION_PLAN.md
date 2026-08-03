@@ -157,6 +157,26 @@ construction or scheduling. Its training managers remain project-owned because
 their multi-model loss, metric, manifest, and checkpoint contracts do not match
 the bounded generic trainer exactly.
 
+## Phase 8: Unified PyTorch execution runtime
+
+Status: complete.
+
+Compose the framework-level pieces used by both generic and project-owned
+training loops:
+
+- optional sanitized runtime provenance in schema-version-1 metadata;
+- single-process and standard DDP initialization and cleanup;
+- generic rank, local-rank, world-size, backend, and device identity;
+- common object and tensor collectives;
+- rank-wide execution creation, joining, and startup consensus;
+- exclusive rank text logs and JSONL observation streams;
+- primary-rank TensorBoard and checkpoint defaults; and
+- optional runtime consumption by the generic trainer.
+
+Exit condition: one direct invocation can use the same API in single-process or
+two-rank DDP mode, and a rank-local startup failure reaches every participant
+without moving project hardware or workload policy into Mammoth.
+
 ## Deferred capabilities
 
 Defer these until another real project supplies requirements:

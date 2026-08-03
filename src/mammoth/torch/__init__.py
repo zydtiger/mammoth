@@ -14,6 +14,12 @@ from mammoth.torch.checkpoint import (
     restore_checkpoint,
 )
 from mammoth.torch.metrics import MetricAccumulator, MetricSpec
+from mammoth.torch.runtime import (
+    TorchExecutionRequest,
+    TorchExecutionRuntime,
+    TorchRuntimeConfig,
+    initialize_torch_runtime,
+)
 from mammoth.torch.state import TrainerState
 from mammoth.torch.trainer import (
     StepContext,
@@ -36,7 +42,11 @@ __all__ = [
     "TrainerConfig",
     "TrainerResult",
     "TrainerState",
+    "TorchExecutionRequest",
+    "TorchExecutionRuntime",
+    "TorchRuntimeConfig",
     "checkpoint_payload",
+    "initialize_torch_runtime",
     "move_batch_to_device",
     "restore_checkpoint",
 ]

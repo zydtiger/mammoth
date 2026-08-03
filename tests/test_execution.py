@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from mammoth.core import (
+    ExecutionMetadata,
     RunLayout,
     claim_logical_run_lease,
     create_execution_context,
@@ -46,11 +47,90 @@ def test_create_and_join_publish_immutable_sanitized_metadata(tmp_path: Path) ->
     assert payload["command"][2] == "--token=<redacted>"
     assert payload["command"][3] == "https://<redacted>@example.test/x"
     assert payload["config_reference"] == "https://<redacted>@example.test/config.yaml"
-    assert join_execution_context(
-        context.run_dir,
-        "attempt-1",
-        expected_run_name="run-one",
-    ) == context
+    assert (
+        join_execution_context(
+            context.run_dir,
+            "attempt-1",
+            expected_run_name="run-one",
+        )
+        == context
+    )
+
+
+def test_runtime_metadata_is_optional_sanitized_schema_v1_data(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "runtime-run").prepare()
+    context = create_execution_context(
+        layout.run_dir,
+        run_name=layout.run_name,
+        invocation_kind="test",
+        intended_phases=("train",),
+        world_size=1,
+        execution_mode="single",
+        command=("python", "job.py"),
+        execution_id="runtime-attempt",
+        runtime={
+            "framework": "pytorch",
+            "strategy": "single",
+            "credentials": {"api_token": "secret"},
+            "AWS_ACCESS_KEY_ID": "AKIAEXAMPLE",
+        },
+    )
+
+    payload = json.loads(context.metadata_path.read_text())
+    assert payload["schema_version"] == 1
+    assert payload["runtime"] == {
+        "AWS_ACCESS_KEY_ID": "<redacted>",
+        "credentials": "<redacted>",
+        "framework": "pytorch",
+        "strategy": "single",
+    }
+    assert (
+        join_execution_context(layout.run_dir, "runtime-attempt").metadata.runtime
+        == payload["runtime"]
+    )
+
+
+def test_runtime_metadata_is_deeply_immutable_and_to_dict_is_detached(tmp_path: Path) -> None:
+    runtime = {"framework": "pytorch", "nested": {"devices": ["cpu"]}}
+    layout = RunLayout(tmp_path, "immutable-runtime").prepare()
+    context = create_execution_context(
+        layout.run_dir,
+        run_name=layout.run_name,
+        invocation_kind="test",
+        intended_phases=("train",),
+        world_size=1,
+        execution_mode="single",
+        command=("python", "job.py"),
+        runtime=runtime,
+    )
+    runtime["framework"] = "changed"
+    payload = context.metadata.to_dict()
+    payload["runtime"]["nested"]["devices"].append("cuda")
+
+    assert context.metadata.runtime is not None
+    assert context.metadata.runtime["framework"] == "pytorch"
+    assert context.metadata.runtime["nested"]["devices"] == ("cpu",)
+    with pytest.raises(TypeError):
+        context.metadata.runtime["framework"] = "changed"  # type: ignore[index]
+
+
+def test_runtime_metadata_rejects_non_object_payload() -> None:
+    payload = {
+        "schema_version": 1,
+        "run_name": "run",
+        "execution_id": "attempt",
+        "created_at": "2026-01-02T03:04:05Z",
+        "invocation_kind": "test",
+        "intended_phases": ["train"],
+        "world_size": 1,
+        "execution_mode": "single",
+        "command": ["python", "job.py"],
+        "config_reference": "",
+        "runtime": "ddp",
+    }
+
+    with pytest.raises(ValueError, match="runtime must be an object"):
+        ExecutionMetadata.from_dict(payload)
 
 
 def test_lineage_is_explicit_and_not_inferred(tmp_path: Path) -> None:
@@ -116,9 +196,7 @@ def test_environment_hook_accepts_mammoth_and_legacy_names() -> None:
     assert execution_id_from_environment({"TISAM_EXECUTION_ID": "two"}) == "two"
     assert execution_id_from_environment({}) is None
     with pytest.raises(ValueError, match="disagree"):
-        execution_id_from_environment(
-            {"MAMMOTH_EXECUTION_ID": "one", "TISAM_EXECUTION_ID": "two"}
-        )
+        execution_id_from_environment({"MAMMOTH_EXECUTION_ID": "one", "TISAM_EXECUTION_ID": "two"})
 
 
 def test_logical_run_lease_rejects_a_second_producer(tmp_path: Path) -> None:
