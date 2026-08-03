@@ -57,6 +57,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/core/identity.py` | Filesystem-safe run-name and execution-ID validation. | Identity syntax or length limits change. |
 | `src/mammoth/core/layout.py` | Stable caller-entry/run-name artifact path resolution. | The run-directory contract changes. |
 | `src/mammoth/logging/__init__.py` | Public lightweight logging exports that do not require TensorBoard. | A stable logging symbol is added, removed, or renamed. |
+| `src/mammoth/logging/execution.py` | Per-process execution logging bundle for JSONL observations and exclusive text diagnostics. | Execution logging composition or ownership changes. |
 | `src/mammoth/logging/jsonl.py` | Adapter from sink-neutral observations to append-only execution events. | JSONL routing or flush behavior changes. |
 | `src/mammoth/logging/model.py` | Immutable sink-neutral metric, media, and lifecycle observations. | The logging sink contract changes. |
 | `src/mammoth/logging/observer.py` | Producer facade, lifecycle contexts, sink fan-out, and failure isolation. | Producer-facing logging behavior changes. |

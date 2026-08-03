@@ -226,10 +226,11 @@ class ExecutionMetadata:
     parent_execution_id: str | None = None
     starting_epoch: int | None = None
     starting_global_step: int | None = None
+    runtime: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON payload written by :func:`create_execution_context`."""
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "run_name": self.run_name,
             "execution_id": self.execution_id,
@@ -246,6 +247,9 @@ class ExecutionMetadata:
             "starting_epoch": self.starting_epoch,
             "starting_global_step": self.starting_global_step,
         }
+        if self.runtime is not None:
+            payload["runtime"] = self.runtime
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> ExecutionMetadata:
@@ -278,6 +282,14 @@ class ExecutionMetadata:
                 f"execution_mode={mode_value!r}, world_size={world_size}."
             )
 
+        runtime_payload = payload.get("runtime")
+        if runtime_payload is None:
+            runtime = None
+        elif isinstance(runtime_payload, Mapping):
+            runtime = sanitize_metadata_fields(runtime_payload)
+        else:
+            raise ValueError("Execution metadata runtime must be an object when present.")
+
         return cls(
             schema_version=schema_version,
             run_name=run_name,
@@ -294,6 +306,7 @@ class ExecutionMetadata:
             parent_execution_id=_optional_execution_id(payload, "parent_execution_id"),
             starting_epoch=_optional_nonnegative_int(payload, "starting_epoch"),
             starting_global_step=_optional_nonnegative_int(payload, "starting_global_step"),
+            runtime=runtime,
         )
 
 
@@ -434,6 +447,7 @@ def create_execution_context(
     parent_execution_id: str | None = None,
     starting_epoch: int | None = None,
     starting_global_step: int | None = None,
+    runtime: Mapping[str, Any] | None = None,
     created_at: str | None = None,
 ) -> ExecutionContext:
     """Create and atomically publish one immutable execution attempt.
@@ -461,6 +475,7 @@ def create_execution_context(
     sanitized_resume_checkpoint = (
         sanitize_reference(resume_checkpoint) if resume_checkpoint is not None else None
     )
+    sanitized_runtime = sanitize_metadata_fields(runtime) if runtime is not None else None
     if not isinstance(world_size, int) or isinstance(world_size, bool) or world_size < 1:
         raise ValueError(f"world_size must be a positive integer, got {world_size!r}.")
     if execution_mode not in {"single", "distributed"}:
@@ -520,6 +535,7 @@ def create_execution_context(
             parent_execution_id=parent_execution_id,
             starting_epoch=starting_epoch,
             starting_global_step=starting_global_step,
+            runtime=sanitized_runtime,
         )
         metadata_path = execution_dir / EXECUTION_METADATA_FILENAME
         try:

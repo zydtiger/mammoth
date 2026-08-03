@@ -16,6 +16,7 @@ src/mammoth/
 │   └── layout.py
 ├── logging/
 │   ├── __init__.py
+│   ├── execution.py
 │   ├── jsonl.py
 │   ├── model.py
 │   ├── observer.py
@@ -50,7 +51,7 @@ src/mammoth/
 | --- | --- |
 | `mammoth` | `__version__` |
 | `mammoth.core` | `RunLayout`, `ExecutionContext`, `ExecutionMetadata`, `LogicalRunLease`, `ExecutionEvent`, `ExecutionEventWriter`, `ExecutionEventTailReader`, `ExecutionEventReadError`, artifact writers, execution lifecycle functions, event readers, sanitizers, and identity validators |
-| `mammoth.logging` | `Observation`, `Media`, `ObservationSink`, `RunObserver`, `JsonlEventSink`, `ProcessTextLogHandler`, `create_process_text_handler` |
+| `mammoth.logging` | `Observation`, `Media`, `ObservationSink`, `RunObserver`, `JsonlEventSink`, `ExecutionLogging`, `ProcessTextLogHandler`, `ProcessTextLogLease`, `claim_process_text_log`, `create_execution_logging`, `create_process_text_handler` |
 | `mammoth.logging.tensorboard` | `TensorBoardSink` |
 | `mammoth.monitor` | `ExecutionMonitor`, `MonitorSnapshot`, `ProducerKey`, `ProducerState`, `TaskState`, `MetricPoint`, `ViewerTelemetry`, discovery/folding/rendering functions, and viewer telemetry sampling |
 | `mammoth.workflow` | `WorkflowConfig`, `RunConfig`, `StepConfig`, `CommandPlan`, `SupervisedProcess`, `ProcessResult`, `WorkflowResult`, `RunResult`, `StepResult`, workflow loading/planning/running functions, and command construction |
