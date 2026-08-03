@@ -759,10 +759,10 @@ def _rank_table(
         collapse_padding=True,
     )
     table.add_column("Task", width=22, no_wrap=True, overflow="ellipsis")
-    table.add_column("Rank", width=4, no_wrap=True)
+    table.add_column("Rank", width=6, no_wrap=True)
     table.add_column("State", ratio=1)
     table.add_column("Last", ratio=1)
-    table.add_column("Progress", min_width=21, ratio=2, no_wrap=True)
+    table.add_column("Progress", min_width=18, ratio=2, no_wrap=True)
     table.add_column("Rate", ratio=1)
     table.add_column("Task ETA", justify="right", ratio=1)
     for rank in range(selected.context.metadata.world_size):
