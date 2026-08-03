@@ -23,11 +23,13 @@ src/mammoth/
 │   └── text.py
 ├── monitor/
 │   ├── __init__.py
+│   ├── dashboard.py
 │   ├── model.py
 │   ├── psutil_telemetry.py
 │   ├── render.py
 │   ├── rich_ui.py
-│   └── telemetry.py
+│   ├── telemetry.py
+│   └── textual_ui.py
 ├── workflow/
 │   ├── __init__.py
 │   ├── config.py
@@ -52,7 +54,7 @@ src/mammoth/
 | `mammoth.core` | `RunLayout`, `ExecutionContext`, `ExecutionMetadata`, `LogicalRunLease`, `ExecutionEvent`, `ExecutionEventWriter`, `ExecutionEventTailReader`, `ExecutionEventReadError`, artifact writers, execution lifecycle functions, event readers, sanitizers, and identity validators |
 | `mammoth.logging` | `Observation`, `Media`, `ObservationSink`, `RunObserver`, `JsonlEventSink`, `ProcessTextLogHandler`, `create_process_text_handler` |
 | `mammoth.logging.tensorboard` | `TensorBoardSink` |
-| `mammoth.monitor` | `ExecutionMonitor`, `MonitorSnapshot`, `ProducerKey`, `ProducerState`, `TaskState`, `MetricPoint`, `ViewerTelemetry`, discovery/folding/rendering functions, and viewer telemetry sampling |
+| `mammoth.monitor` | `ExecutionMonitor`, `RunMonitor`, `MonitorSnapshot`, `RunSnapshot`, `ProducerKey`, `ProducerState`, `TaskState`, `MetricPoint`, `ViewerTelemetry`, discovery/folding/rendering functions, and viewer telemetry sampling |
 | `mammoth.workflow` | `WorkflowConfig`, `RunConfig`, `StepConfig`, `CommandPlan`, `SupervisedProcess`, `ProcessResult`, `WorkflowResult`, `RunResult`, `StepResult`, workflow loading/planning/running functions, and command construction |
 | `mammoth.torch` | `Trainer`, `TrainerConfig`, `TrainerState`, `TrainerResult`, `StepContext`, `StepOutput`, `Callback`, `EarlyStopping`, `MetricSpec`, `MetricAccumulator`, `StateRegistry`, `AsyncCheckpointPublisher`, batch movement, checkpoint creation, and checkpoint restoration |
 
@@ -62,7 +64,9 @@ src/mammoth/
 mammoth.cli.app (Typer)
 ├── mammoth monitor
 │   └── mammoth.cli.run_monitor
-│       └── mammoth.monitor.ExecutionMonitor
+│       ├── redirected/plain → mammoth.monitor.ExecutionMonitor
+│       └── interactive TTY → mammoth.monitor.RunMonitor
+│           └── mammoth.monitor.textual_ui.MonitorApp
 └── mammoth workflow
     └── mammoth workflow run
         └── mammoth.cli.run_workflow_command
@@ -79,7 +83,7 @@ mammoth
 │   └── mammoth.workflow
 ├── mammoth.monitor
 │   ├── mammoth.core
-│   └── rich / psutil (optional modules only)
+│   └── Textual / Rich / psutil (optional modules only)
 ├── mammoth.workflow
 │   ├── mammoth.core
 │   ├── mammoth.logging

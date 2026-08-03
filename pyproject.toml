@@ -18,7 +18,8 @@ mammoth = "mammoth.cli:main"
 [project.optional-dependencies]
 monitor = [
     "psutil>=6.1",
-    "rich>=13.9",
+    "rich>=14.3.2",
+    "textual>=8.2.8",
 ]
 tensorboard = [
     "tensorboardX>=2.6.2.2",
@@ -30,9 +31,12 @@ torch = [
 [dependency-groups]
 dev = [
     "mypy>=1.14",
+    "psutil>=6.1",
     "pytest>=8.3",
     "pytest-cov>=6.0",
+    "rich>=14.3.2",
     "ruff>=0.9",
+    "textual>=8.2.8",
     "types-PyYAML>=6.0.12.20241230",
 ]
 

@@ -81,7 +81,8 @@ Build monitoring above immutable metadata and event readers:
 - generic progress, throughput, metric trends, and ETA;
 - warning isolation for malformed or missing streams;
 - stable ANSI-free snapshots;
-- optional Rich/Textual interactive interface; and
+- default-on-TTY Textual interface with responsive Rich panels, execution
+  navigation, progress bars, ETA, and arbitrary metric trends;
 - optional psutil/vendor telemetry with explicit viewer-host labeling.
 
 Exit condition: the monitor can read both Mammoth-generated runs and existing
