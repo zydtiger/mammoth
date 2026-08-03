@@ -148,6 +148,77 @@ def test_dry_run_builds_torchrun_command_without_artifacts(tmp_path: Path) -> No
     )
 
 
+def test_torchrun_workflow_children_join_runner_execution_with_rank_streams(
+    tmp_path: Path,
+) -> None:
+    child = tmp_path / "distributed_child.py"
+    child.write_text(
+        """from __future__ import annotations
+
+import os
+from pathlib import Path
+
+from mammoth.torch import (
+    TorchExecutionRequest,
+    TorchRuntimeConfig,
+    initialize_torch_runtime,
+)
+
+phase = os.environ["MAMMOTH_PHASE"]
+with initialize_torch_runtime(
+    TorchRuntimeConfig(strategy="ddp", device="cpu", backend="gloo")
+) as runtime:
+    bundle = runtime.start_execution(
+        TorchExecutionRequest(
+            run_dir=Path(os.environ["RUN_DIR"]),
+            run_name=os.environ["MAMMOTH_RUN_NAME"],
+            invocation_kind="workflow-child",
+            intended_phases=(phase,),
+            command=("python", "distributed_child.py"),
+        )
+    )
+    bundle.observer.emit("process_started", phase=phase)
+    bundle.observer.emit("process_completed", phase=phase, exit_code=0)
+""",
+        encoding="utf-8",
+    )
+    entry = tmp_path / "runs"
+    run_dir = entry / "distributed"
+    path = write_workflow(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "runs": {
+                "distributed": {
+                    "environment": {"RUN_DIR": str(run_dir)},
+                    "steps": {
+                        "train": {
+                            "command": [str(child)],
+                            "launcher": "torchrun",
+                            "processes": 2,
+                        }
+                    },
+                }
+            },
+        },
+    )
+
+    result = run_workflow(load_workflow(path), entry=entry)
+
+    assert result.successful
+    execution_id = result.runs[0].execution_id
+    assert execution_id is not None
+    execution_dir = run_dir / "logs" / "executions" / execution_id
+    for rank in range(2):
+        assert (execution_dir / f"rank-{rank}.log").is_file()
+        events = read_execution_events(execution_dir / f"rank-{rank}.jsonl")
+        assert [event.event for event in events] == [
+            "process_started",
+            "process_completed",
+        ]
+        assert all(event.world_size == 2 for event in events)
+
+
 def test_local_workflow_inherits_explicit_environment_and_writes_runner_events(
     tmp_path: Path,
 ) -> None:

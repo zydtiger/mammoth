@@ -30,10 +30,10 @@ from mammoth.torch.checkpoint import (
     restore_checkpoint,
 )
 from mammoth.torch.metrics import MetricAccumulator, MetricSpec
+from mammoth.torch.runtime import Strategy, TorchExecutionRuntime, resolve_device
 from mammoth.torch.state import TrainerState
 
 Precision = Literal["fp32", "bf16", "fp16"]
-Strategy = Literal["single", "ddp"]
 SchedulerInterval = Literal["optimizer", "epoch", "validation"]
 
 
@@ -151,14 +151,31 @@ class Trainer:
         checkpoint_dir: Path | None = None,
         extra_state: Mapping[str, Stateful] | None = None,
         batch_mover: BatchMover | None = None,
+        runtime: TorchExecutionRuntime | None = None,
     ) -> None:
         if (validation_loader is None) != (validation_step is None):
             raise ValueError("validation_loader and validation_step must be provided together")
         self.config = config
-        self.device = resolve_device(config.device)
+        self.runtime = runtime
+        if runtime is not None and runtime.strategy != config.strategy:
+            raise ValueError(
+                f"Trainer strategy {config.strategy!r} does not match runtime "
+                f"strategy {runtime.strategy!r}"
+            )
+        self.device = runtime.device if runtime is not None else resolve_device(config.device)
+        if runtime is not None and config.device != "auto":
+            configured_device = resolve_device(config.device)
+            if configured_device != self.device:
+                raise ValueError(
+                    f"Trainer device {configured_device} does not match runtime device "
+                    f"{self.device}"
+                )
         if config.precision == "fp16" and self.device.type != "cuda":
             raise ValueError("fp16 precision requires a CUDA device")
-        self.rank, self.world_size = distributed_identity(config.strategy)
+        if runtime is None:
+            self.rank, self.world_size = distributed_identity(config.strategy)
+        else:
+            self.rank, self.world_size = runtime.rank, runtime.world_size
         self.base_model = model.to(self.device)
         self.model = wrap_model(self.base_model, self.device, config.strategy)
         self.optimizer = optimizer
@@ -167,7 +184,12 @@ class Trainer:
         self.validation_loader = validation_loader
         self.validation_step = validation_step
         self.scheduler = scheduler
-        self.observer = observer or RunObserver()
+        runtime_observer = (
+            runtime.execution_logging.observer
+            if runtime is not None and runtime.execution_logging is not None
+            else None
+        )
+        self.observer = observer or runtime_observer or RunObserver()
         self.callbacks = tuple(callbacks)
         self.metric_specs = dict(metric_specs or {})
         self.checkpoint_dir = None if checkpoint_dir is None else Path(checkpoint_dir)
@@ -399,7 +421,7 @@ class Trainer:
             self.checkpoint_dir is not None
             and every is not None
             and (epoch + 1) % every == 0
-            and self.rank == 0
+            and (self.runtime.is_primary if self.runtime is not None else self.rank == 0)
         )
 
     def publish_checkpoint(self, epoch: int) -> None:
@@ -468,16 +490,6 @@ def display_metrics(
     if len(selected) > 16:
         raise ValueError("display_metric_names may select at most 16 reported metrics")
     return selected
-
-
-def resolve_device(value: str) -> torch.device:
-    """Resolve ``auto`` or one explicit torch device string."""
-    if value == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(value)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA device requested but CUDA is unavailable")
-    return device
 
 
 def distributed_identity(strategy: Strategy) -> tuple[int, int]:

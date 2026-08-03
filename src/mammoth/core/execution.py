@@ -20,6 +20,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
@@ -226,10 +227,16 @@ class ExecutionMetadata:
     parent_execution_id: str | None = None
     starting_epoch: int | None = None
     starting_global_step: int | None = None
+    runtime: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.runtime is not None:
+            sanitized = sanitize_metadata_fields(self.runtime)
+            object.__setattr__(self, "runtime", _freeze_metadata_mapping(sanitized))
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON payload written by :func:`create_execution_context`."""
-        return {
+        payload = {
             "schema_version": self.schema_version,
             "run_name": self.run_name,
             "execution_id": self.execution_id,
@@ -246,6 +253,9 @@ class ExecutionMetadata:
             "starting_epoch": self.starting_epoch,
             "starting_global_step": self.starting_global_step,
         }
+        if self.runtime is not None:
+            payload["runtime"] = _thaw_metadata_value(self.runtime)
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> ExecutionMetadata:
@@ -278,6 +288,14 @@ class ExecutionMetadata:
                 f"execution_mode={mode_value!r}, world_size={world_size}."
             )
 
+        runtime_payload = payload.get("runtime")
+        if runtime_payload is None:
+            runtime = None
+        elif isinstance(runtime_payload, Mapping):
+            runtime = sanitize_metadata_fields(runtime_payload)
+        else:
+            raise ValueError("Execution metadata runtime must be an object when present.")
+
         return cls(
             schema_version=schema_version,
             run_name=run_name,
@@ -294,6 +312,7 @@ class ExecutionMetadata:
             parent_execution_id=_optional_execution_id(payload, "parent_execution_id"),
             starting_epoch=_optional_nonnegative_int(payload, "starting_epoch"),
             starting_global_step=_optional_nonnegative_int(payload, "starting_global_step"),
+            runtime=runtime,
         )
 
 
@@ -306,14 +325,23 @@ class ExecutionContext:
     metadata_path: Path
     metadata: ExecutionMetadata
 
-    def rank_log_path(self, rank: int) -> Path:
-        """Return the process-exclusive plain-text log path for ``rank``."""
+    def rank_log_path(self, rank: int, *, world_size: int | None = None) -> Path:
+        """Return the process-exclusive log path for one runtime rank.
+
+        ``world_size`` is used only by workflow children whose launcher topology
+        differs from the single-process runner that owns the execution.
+        """
         if not isinstance(rank, int) or isinstance(rank, bool):
             raise ValueError(f"rank must be an integer, got {rank!r}.")
-        if rank < 0 or rank >= self.metadata.world_size:
-            raise ValueError(
-                f"rank={rank} is outside execution world_size={self.metadata.world_size}."
-            )
+        effective_world_size = self.metadata.world_size if world_size is None else world_size
+        if (
+            not isinstance(effective_world_size, int)
+            or isinstance(effective_world_size, bool)
+            or effective_world_size < 1
+        ):
+            raise ValueError(f"world_size must be a positive integer, got {world_size!r}.")
+        if rank < 0 or rank >= effective_world_size:
+            raise ValueError(f"rank={rank} is outside execution world_size={effective_world_size}.")
         return self.execution_dir / f"rank-{rank}.log"
 
 
@@ -434,6 +462,7 @@ def create_execution_context(
     parent_execution_id: str | None = None,
     starting_epoch: int | None = None,
     starting_global_step: int | None = None,
+    runtime: Mapping[str, Any] | None = None,
     created_at: str | None = None,
 ) -> ExecutionContext:
     """Create and atomically publish one immutable execution attempt.
@@ -461,6 +490,7 @@ def create_execution_context(
     sanitized_resume_checkpoint = (
         sanitize_reference(resume_checkpoint) if resume_checkpoint is not None else None
     )
+    sanitized_runtime = sanitize_metadata_fields(runtime) if runtime is not None else None
     if not isinstance(world_size, int) or isinstance(world_size, bool) or world_size < 1:
         raise ValueError(f"world_size must be a positive integer, got {world_size!r}.")
     if execution_mode not in {"single", "distributed"}:
@@ -520,6 +550,7 @@ def create_execution_context(
             parent_execution_id=parent_execution_id,
             starting_epoch=starting_epoch,
             starting_global_step=starting_global_step,
+            runtime=sanitized_runtime,
         )
         metadata_path = execution_dir / EXECUTION_METADATA_FILENAME
         try:
@@ -784,7 +815,32 @@ def _structured_name_is_sensitive(name: str) -> bool:
             parts[-1] == "key"
             and bool(set(parts[:-1]).intersection({"api", "access", "private", "auth", "secret"}))
         )
+        or (
+            len(parts) >= 3
+            and parts[-2:] == ("key", "id")
+            and bool(set(parts[:-2]).intersection({"api", "access", "private", "auth", "secret"}))
+        )
     )
+
+
+def _freeze_metadata_mapping(fields: Mapping[str, Any]) -> Mapping[str, Any]:
+    return MappingProxyType({key: _freeze_metadata_value(value) for key, value in fields.items()})
+
+
+def _freeze_metadata_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return _freeze_metadata_mapping(value)
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_metadata_value(item) for item in value)
+    return value
+
+
+def _thaw_metadata_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_metadata_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_metadata_value(item) for item in value]
+    return value
 
 
 def _structured_name_parts(name: str) -> tuple[str, ...]:

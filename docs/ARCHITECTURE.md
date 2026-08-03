@@ -53,6 +53,11 @@ Mammoth uses six nested concepts:
 Core event consumers treat phase names, task names, coordinates, metric names,
 and artifact extensions as opaque validated data.
 
+Execution metadata may contain an optional sanitized `runtime` object. It
+records allowlisted framework facts such as strategy, backend, and device type;
+it never captures a complete process environment. Omitting this extension keeps
+historical schema-version-1 records unchanged.
+
 ## Artifact layout
 
 `RunLayout(entry, run_name)` resolves the stable run directory and its
@@ -98,7 +103,10 @@ a no-op sink unless explicitly configured otherwise.
 ### Text logs
 
 Per-producer text logs contain diagnostics and tracebacks. Monitoring never
-parses them for state; it consumes immutable metadata and JSONL events.
+parses them for state; it consumes immutable metadata and JSONL events. Each
+process holds an exclusive append lease for its rank log until logging closes.
+`ExecutionLogging` composes that handler with the rank's JSONL sink and any
+caller-selected sinks, including rank-aware TensorBoard.
 
 ## Monitoring
 
@@ -127,6 +135,29 @@ worker, labels it as viewer-host state, and isolates sampling failures. The
 monitor remains passive: neither rendering nor telemetry writes artifacts,
 contacts producers, or controls an execution.
 
+## PyTorch execution runtime
+
+`TorchExecutionRuntime` owns framework-level single-process or standard DDP
+state. It resolves rank, local rank, world size, and device; initializes an
+uninitialized default process group; exposes common object and tensor
+collectives; and destroys only a process group that it created. Execution
+establishment is available separately from the combined rank-logging startup
+so compatibility adapters can retain a project-specific logging facade. It
+does not encode GPU models, workload weights, samplers, or project topology
+rules.
+
+Rank zero creates a direct execution and holds its logical-run lease, or joins
+an execution already identified by `MAMMOTH_EXECUTION_ID` or the compatible
+`TISAM_EXECUTION_ID` hook. Every rank validates the same immutable context,
+opens its own JSONL and text streams, and reaches startup consensus. A failure
+on any rank is reported coherently before project work begins. TensorBoard's
+rank-aware sink and trainer checkpoints default to rank zero.
+
+A workflow execution is owned by its single runner and may launch steps with
+different process counts. Joined workflow children therefore validate run and
+phase identity while their process streams record the child runtime's actual
+world size; direct executions retain strict metadata/runtime topology matching.
+
 ## Generic PyTorch trainer
 
 The trainer accepts constructed objects:
@@ -139,7 +170,10 @@ The trainer accepts constructed objects:
 Mammoth may own the ordinary loop mechanics: mode switching, device transfer,
 precision, backward, accumulation, clipping, optimizer/scheduler steps,
 standard DDP, callbacks, logging, interruption handling, and registered-state
-checkpoint publication.
+checkpoint publication. A trainer may consume a `TorchExecutionRuntime` for
+device/rank identity and its active execution observer; constructing the
+trainer without a runtime remains supported for callers that already own their
+process group.
 
 Complex algorithms with several optimizers, alternating updates, reinforcement
 learning control flow, or custom collectives keep their loop in the consuming

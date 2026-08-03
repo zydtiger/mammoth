@@ -8,7 +8,14 @@ import pytest
 
 from mammoth.core import RunLayout, create_execution_context, read_execution_events
 from mammoth.core.events import ExecutionEventWriter
-from mammoth.logging import JsonlEventSink, Media, Observation, RunObserver
+from mammoth.logging import (
+    JsonlEventSink,
+    Media,
+    Observation,
+    RunObserver,
+    claim_process_text_log,
+    create_execution_logging,
+)
 from mammoth.logging.tensorboard import NullSummaryWriter, TensorBoardSink
 from mammoth.logging.text import create_process_text_handler
 
@@ -181,3 +188,44 @@ def test_process_text_handler_writes_plain_diagnostics(tmp_path: Path) -> None:
     contents = context.rank_log_path(0).read_text()
     assert "plain diagnostic" in contents
     assert "\x1b[" not in contents
+
+
+def test_process_text_log_lease_rejects_concurrent_owner(tmp_path: Path) -> None:
+    path = tmp_path / "rank-0.log"
+    with claim_process_text_log(path), pytest.raises(RuntimeError, match="already owned"):
+        claim_process_text_log(path)
+    with claim_process_text_log(path):
+        pass
+    assert path.is_file()
+
+
+def test_process_text_handler_close_is_idempotent(tmp_path: Path) -> None:
+    context = execution_context(tmp_path)
+    handler = create_process_text_handler(context, rank=0)
+
+    handler.close()
+    handler.close()
+
+    with claim_process_text_log(context.rank_log_path(0)):
+        pass
+
+
+def test_execution_logging_composes_jsonl_text_and_additional_sinks(tmp_path: Path) -> None:
+    context = execution_context(tmp_path)
+    recording = RecordingSink()
+    bundle = create_execution_logging(context, rank=0, additional_sinks=(recording,))
+    named_logger = logging.getLogger("mammoth-test-execution-bundle")
+    named_logger.setLevel(logging.INFO)
+    named_logger.propagate = False
+    named_logger.addHandler(bundle.text_handler)
+    try:
+        bundle.observer.emit("process_started", phase="phase")
+        named_logger.info("bundle diagnostic")
+    finally:
+        named_logger.removeHandler(bundle.text_handler)
+        bundle.close()
+
+    events = read_execution_events(context.execution_dir / "rank-0.jsonl")
+    assert [event.event for event in events] == ["process_started"]
+    assert [observation.event for observation in recording.observations] == ["process_started"]
+    assert "bundle diagnostic" in context.rank_log_path(0).read_text()
