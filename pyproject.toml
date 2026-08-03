@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "PyYAML>=6.0.2",
+    "typer-slim>=0.21.2,<0.22",
 ]
 
 [project.scripts]

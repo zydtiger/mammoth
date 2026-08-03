@@ -59,13 +59,14 @@ src/mammoth/
 ## Command Routes
 
 ```text
-mammoth monitor
-└── mammoth.cli.run_monitor
-    └── mammoth.monitor.ExecutionMonitor
-
-mammoth workflow run
-└── mammoth.cli.run_workflow_command
-    └── mammoth.workflow.run_workflow
+mammoth.cli.app (Typer)
+├── mammoth monitor
+│   └── mammoth.cli.run_monitor
+│       └── mammoth.monitor.ExecutionMonitor
+└── mammoth workflow
+    └── mammoth workflow run
+        └── mammoth.cli.run_workflow_command
+            └── mammoth.workflow.run_workflow
 ```
 
 ## Current Import Graph
@@ -73,7 +74,9 @@ mammoth workflow run
 ```text
 mammoth
 ├── mammoth.cli
-│   └── mammoth.monitor
+│   ├── Typer
+│   ├── mammoth.monitor
+│   └── mammoth.workflow
 ├── mammoth.monitor
 │   ├── mammoth.core
 │   └── rich / psutil (optional modules only)
