@@ -8,6 +8,7 @@ telemetry in an exclusive worker so the Textual event loop stays responsive.
 from __future__ import annotations
 
 from dataclasses import replace
+from threading import Lock
 
 from rich.console import Group
 from rich.text import Text
@@ -68,6 +69,8 @@ class MonitorApp(App[None]):
         self.host: PsutilViewerTelemetry | None = None
         self.detail = False
         self.error: str | None = None
+        self._refresh_generation = 0
+        self._refresh_lock = Lock()
 
     def compose(self) -> ComposeResult:
         """Create one scrollable dashboard surface and standard footer."""
@@ -87,32 +90,39 @@ class MonitorApp(App[None]):
 
     def action_refresh(self) -> None:
         """Start one exclusive background poll and telemetry sample."""
-        self._refresh_state()
+        self._refresh_generation += 1
+        self._refresh_state(self._refresh_generation)
 
     @work(name="monitor-refresh", group="monitor-refresh", exclusive=True, thread=True)
-    def _refresh_state(self) -> None:
+    def _refresh_state(self, generation: int) -> None:
         """Poll files and local telemetry outside the Textual event loop."""
         try:
-            snapshot = self.monitor.poll(self.snapshot.selected_execution_id)
-            host = sample_psutil_viewer_telemetry() if self.telemetry_enabled else None
+            with self._refresh_lock:
+                snapshot = self.monitor.poll(self.snapshot.selected_execution_id)
+                host = sample_psutil_viewer_telemetry() if self.telemetry_enabled else None
         except (OSError, RuntimeError, ValueError) as error:
-            self.call_from_thread(self._accept_error, str(error))
+            self.call_from_thread(self._accept_error, generation, str(error))
             return
-        self.call_from_thread(self._accept_refresh, snapshot, host)
+        self.call_from_thread(self._accept_refresh, generation, snapshot, host)
 
     def _accept_refresh(
         self,
+        generation: int,
         snapshot: RunSnapshot,
         host: PsutilViewerTelemetry | None,
     ) -> None:
         """Publish one completed worker refresh on the Textual event loop."""
+        if generation != self._refresh_generation:
+            return
         self.snapshot = snapshot
         self.host = host
         self.error = None
         self._render()
 
-    def _accept_error(self, message: str) -> None:
+    def _accept_error(self, generation: int, message: str) -> None:
         """Retain the last valid state and expose one refresh error."""
+        if generation != self._refresh_generation:
+            return
         self.error = message
         self._render()
 
@@ -136,6 +146,7 @@ class MonitorApp(App[None]):
         ids = [execution.execution_id for execution in self.snapshot.executions]
         index = ids.index(self.snapshot.selected_execution_id)
         next_index = min(len(ids) - 1, max(0, index + offset))
+        self._refresh_generation += 1
         self.snapshot = replace(self.snapshot, selected_execution_id=ids[next_index])
         self._render()
 
