@@ -21,7 +21,7 @@ from mammoth.monitor.dashboard import dashboard_layout
 from mammoth.monitor.model import RunMonitor, RunSnapshot
 from mammoth.monitor.psutil_telemetry import (
     PsutilViewerTelemetry,
-    sample_psutil_viewer_telemetry,
+    PsutilViewerTelemetrySampler,
 )
 
 
@@ -60,6 +60,7 @@ class MonitorApp(App[None]):
         interval_seconds: float = 2.0,
         stale_after_seconds: float = 90.0,
         initial_host: PsutilViewerTelemetry | None = None,
+        telemetry_sampler: PsutilViewerTelemetrySampler | None = None,
     ) -> None:
         """Bind the passive monitor and interactive default policies."""
         super().__init__()
@@ -70,6 +71,9 @@ class MonitorApp(App[None]):
         self.interval_seconds = interval_seconds
         self.stale_after_seconds = stale_after_seconds
         self.host = initial_host
+        self.telemetry_sampler = telemetry_sampler or (
+            PsutilViewerTelemetrySampler() if telemetry else None
+        )
         self.detail = monitor.execution_id is not None
         self.error: str | None = None
         self._refresh_generation = 0
@@ -102,7 +106,11 @@ class MonitorApp(App[None]):
         try:
             with self._refresh_lock:
                 snapshot = self.monitor.poll(self.snapshot.selected_execution_id)
-                host = sample_psutil_viewer_telemetry() if self.telemetry_enabled else None
+                host = (
+                    self.telemetry_sampler.sample()
+                    if self.telemetry_sampler is not None
+                    else None
+                )
         except (OSError, RuntimeError, ValueError) as error:
             self.call_from_thread(self._accept_error, generation, str(error))
             return
@@ -186,7 +194,12 @@ def run_textual(
     stale_after_seconds: float,
 ) -> None:
     """Run the Textual monitor application until the viewer quits."""
-    initial_host = sample_psutil_viewer_telemetry() if telemetry else None
+    telemetry_sampler = (
+        PsutilViewerTelemetrySampler(allow_sudo_password_prompt=True)
+        if telemetry
+        else None
+    )
+    initial_host = telemetry_sampler.sample() if telemetry_sampler is not None else None
     MonitorApp(
         monitor,
         initial_snapshot,
@@ -195,4 +208,5 @@ def run_textual(
         interval_seconds=interval_seconds,
         stale_after_seconds=stale_after_seconds,
         initial_host=initial_host,
+        telemetry_sampler=telemetry_sampler,
     ).run()

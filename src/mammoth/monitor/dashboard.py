@@ -40,7 +40,6 @@ _STATE_STYLE = {
     "interrupted": "bold magenta",
     "skipped": "dim cyan",
 }
-_SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 _SHORT_EXECUTION_ID_LENGTH = 8
 _COORDINATE_ORDER = (
     "epoch",
@@ -78,7 +77,7 @@ class _MonitorSpeedColumn(ProgressColumn):
         if not isinstance(throughput, int | float):
             return Text("--")
         unit = task.fields.get("monitor_unit")
-        unit_text = str(unit) if unit else "unit"
+        unit_text = _rate_unit(str(unit) if unit else None)
         return Text(f"{float(throughput):.1f} {unit_text}/s", style="progress.data.speed")
 
 
@@ -166,22 +165,6 @@ def dashboard_layout(
     )
 
 
-def sparkline(values: tuple[float, ...], width: int) -> str:
-    """Return a terminal-width-aware one-row summary for secondary metrics."""
-    finite = tuple(value for value in values if math.isfinite(value))
-    if not finite or width <= 0:
-        return "--"
-    sampled = _downsample(finite, width, aggregation="mean")
-    low = min(sampled)
-    high = max(sampled)
-    if math.isclose(low, high):
-        return _SPARK_BLOCKS[(len(_SPARK_BLOCKS) - 1) // 2] * len(sampled)
-    scale = len(_SPARK_BLOCKS) - 1
-    return "".join(
-        _SPARK_BLOCKS[round((value - low) * scale / (high - low))] for value in sampled
-    )
-
-
 def braille_line_chart(
     values: tuple[float, ...],
     width: int,
@@ -264,12 +247,12 @@ def _wide_layout(
         _section("RUN PROGRESS"),
         _logical_panel(snapshot, compact=False),
     ]
-    if snapshot.metric_history:
+    if _featured_metric_names(list(snapshot.metric_history.items())):
         pieces.extend((_section("TRAINING TRENDS"), _metric_panel(snapshot, compact=False)))
     if host is not None:
         pieces.extend(
             (
-                _section(f"VIEWER HOST RESOURCES · {host.hostname}"),
+                _section(f"HOST RESOURCES · {host.hostname}"),
                 _telemetry_panel(host, compact=False),
             )
         )
@@ -314,7 +297,7 @@ def _compact_layout(
         Text("RUN PROGRESS", style="bold"),
         _logical_panel(snapshot, compact=True),
     ]
-    if snapshot.metric_history:
+    if _featured_metric_names(list(snapshot.metric_history.items())):
         pieces.extend(
             (
                 Text("\nTRAINING TRENDS", style="bold"),
@@ -324,7 +307,7 @@ def _compact_layout(
     if host is not None:
         pieces.extend(
             (
-                Text(f"\nVIEWER HOST RESOURCES · {host.hostname}", style="bold"),
+                Text(f"\nHOST RESOURCES · {host.hostname}", style="bold"),
                 _telemetry_panel(host, compact=True),
             )
         )
@@ -399,8 +382,6 @@ def _logical_panel(snapshot: RunSnapshot, *, compact: bool) -> RenderableType:
     )
     if optimizer is not None or optimizer_total is not None:
         fields.append(f"Optimizer {_coordinate(optimizer, optimizer_total)}")
-    if "global_step" in coordinates:
-        fields.append(f"Global step {coordinates['global_step']}")
     progress = _progress_view(selected)
     eta_text = _logical_eta_text(snapshot, progress)
     if eta_text is not None:
@@ -414,7 +395,7 @@ def _logical_panel(snapshot: RunSnapshot, *, compact: bool) -> RenderableType:
         primary = [
             field
             for field in fields
-            if not field.startswith("Global step") and not field.startswith("ETA ")
+            if not field.startswith("ETA ")
         ]
         lines = [" | ".join(field.lower() for field in primary)]
         if eta_text is not None:
@@ -433,7 +414,7 @@ def _logical_panel(snapshot: RunSnapshot, *, compact: bool) -> RenderableType:
 
 
 def _metric_panel(snapshot: RunSnapshot, *, compact: bool) -> RenderableType:
-    """Render featured Braille charts and concise arbitrary metric histories."""
+    """Render only conventional training-loss and learning-rate Braille charts."""
     ordered = sorted(snapshot.metric_history.items(), key=_metric_sort_key)
     featured_names = _featured_metric_names(ordered)
     pieces: list[RenderableType] = []
@@ -459,28 +440,6 @@ def _metric_panel(snapshot: RunSnapshot, *, compact: bool) -> RenderableType:
                 grid.add_column(ratio=1)
             grid.add_row(*trends)
             pieces.append(grid)
-
-    secondary = [(name, points) for name, points in ordered if name not in featured_names]
-    if secondary:
-        if pieces:
-            pieces.append(Text())
-        table = Table(expand=True, box=None, padding=(0, 1), show_header=True)
-        table.add_column("Metric", ratio=2, overflow="fold")
-        table.add_column("Latest", justify="right", ratio=1)
-        if not compact:
-            table.add_column("Range", justify="right", ratio=2)
-        table.add_column("Trend", ratio=4)
-        width = 20 if compact else 40
-        for name, points in secondary:
-            values = tuple(point.value for point in points if math.isfinite(point.value))
-            if not values:
-                continue
-            row = [name, f"{values[-1]:.6g}"]
-            if not compact:
-                row.append(f"{min(values):.6g} … {max(values):.6g}")
-            row.append(sparkline(values, width))
-            table.add_row(*row)
-        pieces.append(table)
     return Group(*pieces)
 
 
@@ -534,34 +493,69 @@ def _metric_value_format(name: str) -> str:
 
 
 def _telemetry_panel(host: PsutilViewerTelemetry, *, compact: bool) -> RenderableType:
-    """Render explicitly viewer-host resource state with legacy density."""
-    cpu = _load_metric(f"Util {_percentage(host.cpu_percent)}", host.cpu_percent)
-    memory = _load_metric(_memory_usage(host), host.memory_percent)
-    frequency = (
-        "--"
-        if host.cpu_frequency_mhz is None
-        else f"{host.cpu_frequency_mhz:,.0f} MHz"
+    """Render every host resource as an identity row plus one metric row."""
+    blocks: list[RenderableType] = [
+        _resource_block(
+            _cpu_label(host),
+            _load_metric(f"Util {_percentage(host.cpu_percent)}", host.cpu_percent),
+            f"Core {_frequency(host.cpu_frequency_mhz)}",
+            compact=compact,
+        ),
+        _resource_block(
+            "RAM",
+            _load_metric(_memory_usage(host), host.memory_percent),
+            _ram_hardware(host),
+            compact=compact,
+        ),
+    ]
+    blocks.extend(
+        _resource_block(
+            f"GPU {gpu.index} · {gpu.name}",
+            _load_metric(
+                f"Util {_percentage(gpu.utilization_percent)}",
+                gpu.utilization_percent,
+            ),
+            f"Core {_frequency(gpu.core_clock_mhz)}",
+            compact=compact,
+        )
+        for gpu in host.gpus
     )
-    load = f"{host.load_average_1m:.2f}" if host.load_average_1m is not None else "--"
-    if compact:
-        lines = Text()
-        lines.append("  CPU", style="italic")
-        lines.append("  ")
-        lines.append_text(cpu)
-        lines.append(f" · Core {frequency} · Load 1m {load}\n")
-        lines.append("  RAM", style="italic")
-        lines.append("  ")
-        lines.append_text(memory)
-        lines.append(f"\n  viewer-host · sampled {host.sampled_at}", style="dim")
-        return lines
-    table = Table(expand=True, box=None, padding=(0, 1), show_header=False)
-    table.add_column("Resource", ratio=1, style="italic")
-    table.add_column("Utilization", ratio=2)
-    table.add_column("Detail", justify="right", ratio=3)
-    table.add_row("CPU", cpu, f"Core {frequency} · Load 1m {load}")
-    table.add_row("RAM", memory, "Provenance viewer-host")
-    table.add_row("Sampled", host.sampled_at, "")
-    return table
+    if not host.gpus:
+        blocks.append(_resource_block("GPU", "none reported", "--", compact=compact))
+    return Group(*blocks)
+
+
+def _resource_block(
+    identity: str,
+    left: str | Text,
+    right: str | Text,
+    *,
+    compact: bool,
+) -> RenderableType:
+    """Keep one full-width identity above edge-aligned resource metrics."""
+    prefix = "  " if compact else ""
+    metrics = Table.grid(expand=True, padding=0, pad_edge=False)
+    metrics.add_column(justify="left", no_wrap=True, overflow="ellipsis")
+    metrics.add_column(ratio=1, min_width=2)
+    metrics.add_column(justify="right", no_wrap=True, overflow="ellipsis")
+    metrics.add_row(Text.assemble(prefix, left), "  ", right)
+    return Group(
+        Text(prefix + identity, style="italic", no_wrap=True, overflow="ellipsis"),
+        metrics,
+    )
+
+
+def _cpu_label(host: PsutilViewerTelemetry) -> str:
+    return "CPU" if host.cpu_model_name is None else f"CPU · {host.cpu_model_name}"
+
+
+def _frequency(value: float | None) -> str:
+    return "--" if value is None else f"{value:,.0f} MHz"
+
+
+def _ram_hardware(host: PsutilViewerTelemetry) -> str:
+    values = [value for value in (host.ram_ddr_generation, host.ram_speed) if value]
+    return " · ".join(values) if values else "--"
 
 
 def _selected_attempt_panel(
@@ -1032,13 +1026,13 @@ def _task_counts(task: TaskState | None) -> str:
 def _task_rate(task: TaskState | None) -> str:
     if task is None or task.throughput is None:
         return "--"
-    return f"{task.throughput:.1f} {task.unit or 'unit'}/s"
+    return f"{task.throughput:.1f} {_rate_unit(task.unit)}/s"
 
 
 def _compact_task_rate(task: TaskState | None) -> str:
     if task is None or task.throughput is None:
         return "--"
-    return f"{task.throughput:.1f}/s"
+    return f"{task.throughput:.1f} {_rate_unit(task.unit)}/s"
 
 
 def _progress_text(progress: _ProgressView) -> str:
@@ -1049,13 +1043,17 @@ def _progress_text(progress: _ProgressView) -> str:
     )
     unit = f" {progress.unit}" if progress.unit else ""
     rate = (
-        f" · {progress.throughput:.1f} {progress.unit or 'unit'}/s"
+        f" · {progress.throughput:.1f} {_rate_unit(progress.unit)}/s"
         if progress.throughput is not None
         else ""
     )
     eta = format_duration(progress.eta_seconds)
     eta_text = f" · ETA {eta}" if eta is not None else ""
     return f"{counts}{unit}{rate}{eta_text}"
+
+
+def _rate_unit(unit: str | None) -> str:
+    return "b" if unit == "microbatch" else unit or "unit"
 
 
 def _logical_eta_text(
