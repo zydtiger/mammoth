@@ -81,6 +81,7 @@ class TorchRuntimeOptions:
     cuda_matmul_allow_tf32: bool | None = None
     cudnn_allow_tf32: bool | None = None
     cudnn_benchmark: bool | None = None
+    cudnn_deterministic: bool | None = None
     deterministic_algorithms: bool | None = None
     deterministic_warn_only: bool = False
 
@@ -97,6 +98,7 @@ class TorchRuntimeState:
     cuda_matmul_allow_tf32: bool
     cudnn_allow_tf32: bool
     cudnn_benchmark: bool
+    cudnn_deterministic: bool
     deterministic_algorithms: bool
     deterministic_warn_only: bool
 
@@ -339,6 +341,8 @@ def torch_runtime_options(options: TorchRuntimeOptions) -> Iterator[None]:
             torch.backends.cudnn.allow_tf32 = options.cudnn_allow_tf32
         if options.cudnn_benchmark is not None:
             torch.backends.cudnn.benchmark = options.cudnn_benchmark
+        if options.cudnn_deterministic is not None:
+            torch.backends.cudnn.deterministic = options.cudnn_deterministic
         if options.deterministic_algorithms is not None:
             torch.use_deterministic_algorithms(
                 options.deterministic_algorithms,
@@ -350,6 +354,7 @@ def torch_runtime_options(options: TorchRuntimeOptions) -> Iterator[None]:
         torch.backends.cuda.matmul.allow_tf32 = previous.cuda_matmul_allow_tf32
         torch.backends.cudnn.allow_tf32 = previous.cudnn_allow_tf32
         torch.backends.cudnn.benchmark = previous.cudnn_benchmark
+        torch.backends.cudnn.deterministic = previous.cudnn_deterministic
         torch.use_deterministic_algorithms(
             previous.deterministic_algorithms,
             warn_only=previous.deterministic_warn_only,
@@ -363,6 +368,7 @@ def current_torch_runtime_state() -> TorchRuntimeState:
         cuda_matmul_allow_tf32=bool(torch.backends.cuda.matmul.allow_tf32),
         cudnn_allow_tf32=bool(torch.backends.cudnn.allow_tf32),
         cudnn_benchmark=bool(torch.backends.cudnn.benchmark),
+        cudnn_deterministic=bool(torch.backends.cudnn.deterministic),
         deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
         deterministic_warn_only=torch.is_deterministic_algorithms_warn_only_enabled(),
     )
@@ -507,6 +513,10 @@ def _row_sort_value(row: Any, name: str) -> float:
         "self_device_time_total": "self_cuda_time_total",
         "device_memory_usage": "cuda_memory_usage",
         "self_device_memory_usage": "self_cuda_memory_usage",
+        "cuda_time_total": "device_time_total",
+        "self_cuda_time_total": "self_device_time_total",
+        "cuda_memory_usage": "device_memory_usage",
+        "self_cuda_memory_usage": "self_device_memory_usage",
     }
     return _row_number(row, name, fallbacks.get(name))
 
