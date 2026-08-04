@@ -78,12 +78,13 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/workflow/config.py` | Strict schema-v1 YAML values, defaults, selection, and DAG validation. | Workflow configuration syntax or selection changes. |
 | `src/mammoth/workflow/launch.py` | Local and torchrun command construction plus reusable launcher/descendant supervision. | Launch, timeout, signal, or descendant handling changes. |
 | `src/mammoth/workflow/runner.py` | Dry-run planning, per-run attempts, policies, environment hooks, and lifecycle events. | Workflow orchestration behavior changes. |
-| `src/mammoth/torch/__init__.py` | Public optional runtime, trainer, callback, metric, batch, and checkpoint exports. | A stable PyTorch integration symbol is added, removed, or renamed. |
+| `src/mammoth/torch/__init__.py` | Public optional runtime, trainer, profiler, callback, metric, batch, and checkpoint exports. | A stable PyTorch integration symbol is added, removed, or renamed. |
 | `src/mammoth/torch/runtime.py` | Generic single/DDP process-group, collective, execution-startup, and rank-logging lifecycle. | PyTorch runtime identity, collectives, startup consensus, or cleanup changes. |
 | `src/mammoth/torch/batch.py` | Recursive common-container tensor transfer to one torch device. | Default batch transfer behavior changes. |
 | `src/mammoth/torch/callbacks.py` | Generic trainer lifecycle callbacks and metric-based early stopping. | Callback hooks or early-stopping behavior changes. |
 | `src/mammoth/torch/checkpoint.py` | Registered state, CPU snapshots, restore, and bounded asynchronous atomic publication. | Trainer checkpoint mechanics or schema change. |
 | `src/mammoth/torch/metrics.py` | Mean, sum, last, and optional DDP scalar reductions. | Metric aggregation policy changes. |
+| `src/mammoth/torch/profiling.py` | Model-independent callable timing, Torch operation profiling, runtime controls, and versioned reports. | Generic PyTorch profiling behavior or report schema changes. |
 | `src/mammoth/torch/state.py` | Serializable ordinary trainer loop coordinates. | Trainer resume coordinates change. |
 | `src/mammoth/torch/trainer.py` | Constructed-object single/DDP loops, precision, accumulation, validation, scheduling, logging, and checkpoints. | Generic trainer behavior changes. |
 | `tests/test_artifacts.py` | Atomic artifact publication unit coverage. | Artifact publication behavior changes. |
@@ -95,6 +96,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `tests/test_monitor.py` | Discovery, lineage, folding, rendering, telemetry, malformed streams, and CLI unit coverage. | Monitor or monitor CLI behavior changes. |
 | `tests/test_workflow.py` | YAML validation, DAGs, selection, dry runs, launches, policies, environment, timeout, and CLI unit coverage. | Workflow behavior changes. |
 | `tests/test_torch.py` | Multi-task trainer, device movement, precision, accumulation, metrics, callbacks, checkpoints, and DDP unit coverage. | Optional trainer behavior changes. |
+| `tests/test_profiling.py` | Callable profiling, output summaries, component ranges, runtime restoration, report, and CUDA-conditional coverage. | Generic PyTorch profiling behavior changes. |
 
 Generated `.venv/`, `dist/`, caches, and build metadata are not source files.
 Do not document or commit their generated contents.
