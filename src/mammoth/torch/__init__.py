@@ -13,11 +13,18 @@ from mammoth.torch.checkpoint import (
     CheckpointPlan,
     CheckpointPublication,
     StateRegistry,
+    TrainerCheckpointContext,
+    TrainerCheckpointPolicy,
     checkpoint_payload,
     publish_checkpoint_plan,
     restore_checkpoint,
 )
-from mammoth.torch.metrics import MetricAccumulator, MetricSpec
+from mammoth.torch.metrics import (
+    MetricAccumulator,
+    MetricRoute,
+    MetricSpec,
+    StatefulMetric,
+)
 from mammoth.torch.profiling import (
     CudaMemoryStats,
     LatencySummary,
@@ -41,6 +48,11 @@ from mammoth.torch.runtime import (
     TorchRuntimeConfig,
     initialize_torch_runtime,
 )
+from mammoth.torch.scheduling import (
+    AccumulationPlan,
+    AccumulationPolicy,
+    UniformAccumulationPolicy,
+)
 from mammoth.torch.state import TrainerState
 from mammoth.torch.trainer import (
     StepContext,
@@ -52,6 +64,8 @@ from mammoth.torch.trainer import (
 
 __all__ = [
     "AsyncCheckpointPublisher",
+    "AccumulationPlan",
+    "AccumulationPolicy",
     "Callback",
     "CheckpointArtifact",
     "CheckpointPlan",
@@ -60,16 +74,20 @@ __all__ = [
     "EarlyStopping",
     "LatencySummary",
     "MetricAccumulator",
+    "MetricRoute",
     "MetricSpec",
     "OperationProfile",
     "ProfileConfig",
     "ProfileReport",
     "ProfileTiming",
     "StateRegistry",
+    "StatefulMetric",
     "StepContext",
     "StepOutput",
     "Trainer",
     "TrainerConfig",
+    "TrainerCheckpointContext",
+    "TrainerCheckpointPolicy",
     "TrainerResult",
     "TrainerState",
     "TorchExecutionRequest",
@@ -78,6 +96,7 @@ __all__ = [
     "TorchRuntimeOptions",
     "TorchRuntimeState",
     "ThroughputSummary",
+    "UniformAccumulationPolicy",
     "checkpoint_payload",
     "current_torch_runtime_state",
     "initialize_torch_runtime",

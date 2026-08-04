@@ -5,6 +5,7 @@ import multiprocessing
 import os
 import stat
 import threading
+import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from contextlib import suppress
@@ -15,7 +16,7 @@ from typing import Any, cast
 import pytest
 import torch
 import torch.distributed
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data import DataLoader, Dataset, Sampler, TensorDataset
 
 import mammoth.torch.checkpoint as checkpoint_module
 import mammoth.torch.runtime as torch_runtime_module
@@ -28,12 +29,15 @@ from mammoth.core import (
 )
 from mammoth.logging import Observation, RunObserver
 from mammoth.torch import (
+    AccumulationPlan,
     AsyncCheckpointPublisher,
+    Callback,
     CheckpointArtifact,
     CheckpointPlan,
     CheckpointPublication,
     EarlyStopping,
     MetricAccumulator,
+    MetricRoute,
     MetricSpec,
     StateRegistry,
     StepContext,
@@ -41,12 +45,16 @@ from mammoth.torch import (
     TorchExecutionRequest,
     TorchRuntimeConfig,
     Trainer,
+    TrainerCheckpointContext,
     TrainerConfig,
+    TrainerState,
+    UniformAccumulationPolicy,
     initialize_torch_runtime,
     move_batch_to_device,
     publish_checkpoint_plan,
     restore_checkpoint,
 )
+from mammoth.torch.metrics import compute_stateful_metrics
 
 
 class RecordingSink:
@@ -104,6 +112,262 @@ class CountingScheduler:
         if not isinstance(steps, int):
             raise ValueError("scheduler steps must be an integer")
         self.steps = steps
+
+
+class UnevenAccumulationPolicy:
+    """Give two test ranks a 3:1 local microbatch split."""
+
+    def plan(
+        self,
+        *,
+        rank: int,
+        world_size: int,
+        local_batch_count: int,
+    ) -> AccumulationPlan:
+        assert world_size == 2
+        assert local_batch_count in {2, 6}
+        return AccumulationPlan(
+            local_microbatches_per_step=3 if rank == 0 else 1,
+            loss_scale=world_size / 4,
+            incomplete_window="error",
+        )
+
+
+class UnevenPartialAccumulationPolicy:
+    """Give two ranks correct scales for a partial two-microbatch window."""
+
+    def plan(
+        self,
+        *,
+        rank: int,
+        world_size: int,
+        local_batch_count: int,
+    ) -> AccumulationPlan:
+        assert world_size == 2
+        assert local_batch_count in {2, 4}
+        return AccumulationPlan(
+            local_microbatches_per_step=3 if rank == 0 else 1,
+            loss_scale=world_size / 4,
+            incomplete_window="step",
+            window_loss_scales=(world_size / 4, world_size / 2),
+        )
+
+
+class RankConditionalInvalidPolicy:
+    """Reject only rank one's local final window for consensus coverage."""
+
+    def plan(
+        self,
+        *,
+        rank: int,
+        world_size: int,
+        local_batch_count: int,
+    ) -> AccumulationPlan:
+        del world_size, local_batch_count
+        return AccumulationPlan(
+            local_microbatches_per_step=1 if rank == 0 else 2,
+            loss_scale=1.0,
+            incomplete_window="error",
+        )
+
+
+class AdditiveCountMetric:
+    """Count opaque update values through additive tensor state."""
+
+    def __init__(self) -> None:
+        self.count = torch.tensor(0.0)
+
+    def reset(self) -> None:
+        self.count.zero_()
+
+    def update(self, value: Any) -> None:
+        self.count += float(value)
+
+    def state_tensors(self) -> Mapping[str, torch.Tensor]:
+        return {"count": self.count}
+
+    def compute(
+        self,
+        state: Mapping[str, torch.Tensor],
+    ) -> Mapping[str, float | torch.Tensor]:
+        return {"count": state["count"]}
+
+
+class RaisingResetMetric(AdditiveCountMetric):
+    """Fail during metric lifecycle setup for terminal-event coverage."""
+
+    def reset(self) -> None:
+        raise RuntimeError("reset failed")
+
+
+class RankShapedMetric(AdditiveCountMetric):
+    """Return rank-dependent state shapes for pre-collective validation."""
+
+    def __init__(self, rank: int) -> None:
+        self.count = torch.zeros(rank + 1)
+
+
+class NamedCountMetric(AdditiveCountMetric):
+    """Return additive count state under one configured scalar name."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__()
+        self.name = name
+
+    def compute(
+        self,
+        state: Mapping[str, torch.Tensor],
+    ) -> Mapping[str, float | torch.Tensor]:
+        return {self.name: state["count"]}
+
+
+class RankFailingComputeMetric(NamedCountMetric):
+    """Fail project metric computation only on one rank."""
+
+    def __init__(self, rank: int) -> None:
+        super().__init__("first")
+        self.rank = rank
+
+    def compute(
+        self,
+        state: Mapping[str, torch.Tensor],
+    ) -> Mapping[str, float | torch.Tensor]:
+        if self.rank == 1:
+            raise ValueError("rank-one metric compute failed")
+        return super().compute(state)
+
+
+class RankFailingSampler(Sampler[int]):
+    """Fail epoch setup on one selected rank for DDP consensus coverage."""
+
+    def __init__(self, rank: int) -> None:
+        self.rank = rank
+
+    def __iter__(self) -> Any:
+        return iter((0,))
+
+    def __len__(self) -> int:
+        return 1
+
+    def set_epoch(self, epoch: int) -> None:
+        del epoch
+        if self.rank == 1:
+            raise ValueError("rank-one sampler failed")
+
+
+class EpochRecordingBatchSampler(Sampler[list[int]]):
+    """Record epoch advancement for a project-owned batch sampler."""
+
+    def __init__(self) -> None:
+        self.epochs: list[int] = []
+
+    def __iter__(self) -> Any:
+        return iter(([0],))
+
+    def __len__(self) -> int:
+        return 1
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epochs.append(epoch)
+
+
+class RaisingCallback(Callback):
+    """Fail at one selected outer trainer lifecycle hook."""
+
+    def __init__(self, hook: str) -> None:
+        self.hook = hook
+
+    def on_train_start(self, state: TrainerState) -> None:
+        del state
+        if self.hook == "start":
+            raise RuntimeError("start callback failed")
+
+    def on_train_end(self, state: TrainerState) -> None:
+        del state
+        if self.hook == "end":
+            raise RuntimeError("end callback failed")
+
+
+class RecordingCheckpointPolicy:
+    """Record trainer checkpoint contexts in one project-owned text artifact."""
+
+    def __init__(self, checkpoint_dir: Path) -> None:
+        self.checkpoint_dir = checkpoint_dir
+        self.contexts: list[TrainerCheckpointContext] = []
+
+    def restore(
+        self,
+        path: Path,
+        state: TrainerState,
+        *,
+        device: torch.device,
+    ) -> None:
+        del path, device
+        state.epoch = 2
+        state.global_step = 7
+        state.optimizer_step = 3
+
+    def plan(self, context: TrainerCheckpointContext) -> CheckpointPlan:
+        self.contexts.append(context)
+        destination = self.checkpoint_dir / "project.checkpoint"
+        return CheckpointPlan(
+            checkpoint_root=self.checkpoint_dir,
+            artifacts=(
+                CheckpointArtifact(
+                    destination=destination,
+                    writer=lambda path: path.write_text(
+                        f"epoch={context.epoch}\n",
+                        encoding="utf-8",
+                    ),
+                ),
+            ),
+        )
+
+
+class SlowRecordingCheckpointPolicy(RecordingCheckpointPolicy):
+    """Delay checkpoint planning long enough to exercise periodic heartbeats."""
+
+    def plan(self, context: TrainerCheckpointContext) -> CheckpointPlan:
+        time.sleep(0.05)
+        return super().plan(context)
+
+
+class RankFailingRestorePolicy(RecordingCheckpointPolicy):
+    """Fail project checkpoint restore only on one DDP rank."""
+
+    def __init__(self, checkpoint_dir: Path, rank: int) -> None:
+        super().__init__(checkpoint_dir)
+        self.rank = rank
+
+    def restore(
+        self,
+        path: Path,
+        state: TrainerState,
+        *,
+        device: torch.device,
+    ) -> None:
+        if self.rank == 1:
+            raise ValueError("rank-one restore failed")
+        super().restore(path, state, device=device)
+
+
+class RankDivergentRestorePolicy(RecordingCheckpointPolicy):
+    """Restore different successful trainer coordinates on each rank."""
+
+    def __init__(self, checkpoint_dir: Path, rank: int) -> None:
+        super().__init__(checkpoint_dir)
+        self.rank = rank
+
+    def restore(
+        self,
+        path: Path,
+        state: TrainerState,
+        *,
+        device: torch.device,
+    ) -> None:
+        del path, device
+        state.epoch = self.rank
+        state.global_step = self.rank * 10
 
 
 def classification_step(
@@ -245,6 +509,388 @@ def run_two_process_runtime(
     return sorted(results)
 
 
+def _uneven_accumulation_worker(
+    rank: int,
+    rendezvous: str,
+    checkpoint_dir: str,
+    result_queue: Any,
+) -> None:
+    """Exercise unequal rank-local windows with global logical-batch metrics."""
+    try:
+        with initialize_torch_runtime(
+            TorchRuntimeConfig(
+                strategy="ddp",
+                device="cpu",
+                backend="gloo",
+                init_method=rendezvous,
+                timeout_seconds=30,
+                rank=rank,
+                local_rank=rank,
+                world_size=2,
+            )
+        ) as runtime:
+            local_count = 6 if rank == 0 else 2
+            local_value = 1.0 if rank == 0 else 3.0
+            features = torch.full((local_count, 1), local_value)
+            loader = DataLoader(TensorDataset(features), batch_size=1)
+            model = torch.nn.Linear(1, 1, bias=False)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+            sink = RecordingSink()
+
+            def step(
+                module: torch.nn.Module,
+                batch: Any,
+                context: StepContext,
+            ) -> StepOutput:
+                del context
+                values = batch[0]
+                loss = module(values).sum() * 0 + values.mean()
+                return StepOutput(
+                    loss=loss,
+                    metrics={"sample": values.mean()},
+                    metric_updates={"count": len(values)},
+                )
+
+            with Trainer(
+                model=model,
+                optimizer=optimizer,
+                train_loader=loader,
+                train_step=step,
+                config=TrainerConfig(
+                    epochs=1,
+                    device="cpu",
+                    strategy="ddp",
+                ),
+                accumulation_policy=UnevenAccumulationPolicy(),
+                train_stateful_metrics={"count": AdditiveCountMetric()},
+                train_metric_routes={
+                    "count": MetricRoute(
+                        batch_name="batch/count",
+                        epoch_name="epoch/count",
+                    )
+                },
+                observer=RunObserver((sink,)),
+                checkpoint_dir=Path(checkpoint_dir) if rank == 0 else None,
+                runtime=runtime,
+            ) as trainer:
+                result = trainer.fit()
+            progress = [
+                observation
+                for observation in sink.observations
+                if observation.event == "progress"
+            ]
+            partial_count = 4 if rank == 0 else 2
+            partial_value = 1.0 if rank == 0 else 3.0
+            partial_loader = DataLoader(
+                TensorDataset(torch.full((partial_count, 1), partial_value)),
+                batch_size=1,
+            )
+            partial_model = torch.nn.Linear(1, 1, bias=False)
+            partial_optimizer = torch.optim.SGD(partial_model.parameters(), lr=1.0)
+
+            def partial_step(
+                module: torch.nn.Module,
+                batch: Any,
+                context: StepContext,
+            ) -> StepOutput:
+                del context
+                return StepOutput(loss=module(batch[0]).mean())
+
+            with Trainer(
+                model=partial_model,
+                optimizer=partial_optimizer,
+                train_loader=partial_loader,
+                train_step=partial_step,
+                config=TrainerConfig(
+                    epochs=1,
+                    device="cpu",
+                    strategy="ddp",
+                    checkpoint_every_epochs=None,
+                ),
+                accumulation_policy=UnevenPartialAccumulationPolicy(),
+                runtime=runtime,
+            ) as partial_trainer:
+                partial_initial_weight = partial_model.weight.detach().item()
+                partial_trainer.fit()
+            partial_weight_delta = (
+                partial_model.weight.detach().item() - partial_initial_weight
+            )
+            last_accumulator = MetricAccumulator({"rank1": MetricSpec("last")})
+            if rank == 1:
+                last_accumulator.update({"rank1": 7.0})
+            try:
+                last_accumulator.compute(device=runtime.device, distributed=True)
+            except ValueError as error:
+                last_error = str(error)
+            else:
+                last_error = None
+            primary_last_accumulator = MetricAccumulator(
+                {"primary": MetricSpec("last")}
+            )
+            if rank == 0:
+                primary_last_accumulator.update({"primary": 9.0})
+            primary_last_metrics = primary_last_accumulator.compute(
+                device=runtime.device,
+                distributed=True,
+            )
+            local_accumulator = MetricAccumulator(
+                {"local": MetricSpec("mean", distributed=False)}
+            )
+            if rank == 1:
+                local_accumulator.update({"local": 7.0})
+            local_metrics = local_accumulator.compute(
+                device=runtime.device,
+                distributed=True,
+            )
+            try:
+                compute_stateful_metrics(
+                    {"shape": RankShapedMetric(rank)},
+                    device=runtime.device,
+                    distributed=True,
+                )
+            except ValueError as error:
+                shape_error = str(error)
+            else:
+                shape_error = None
+            try:
+                compute_stateful_metrics(
+                    {
+                        "first": RankFailingComputeMetric(rank),
+                        "second": NamedCountMetric("second"),
+                    },
+                    device=runtime.device,
+                    distributed=True,
+                )
+            except RuntimeError as error:
+                metric_compute_error = str(error)
+            else:
+                metric_compute_error = None
+            failing_model = torch.nn.Linear(1, 1, bias=False)
+            failing_optimizer = torch.optim.SGD(failing_model.parameters(), lr=0.0)
+            failing_loader = DataLoader(
+                TensorDataset(torch.ones(1, 1)),
+                batch_size=1,
+            )
+            try:
+                with Trainer(
+                    model=failing_model,
+                    optimizer=failing_optimizer,
+                    train_loader=failing_loader,
+                    train_step=distributed_regression_step,
+                    config=TrainerConfig(
+                        epochs=1,
+                        device="cpu",
+                        strategy="ddp",
+                        checkpoint_every_epochs=None,
+                    ),
+                    accumulation_policy=RankConditionalInvalidPolicy(),
+                    runtime=runtime,
+                ) as failing_trainer:
+                    failing_trainer.fit()
+            except RuntimeError as error:
+                planning_error = str(error)
+            else:
+                planning_error = None
+            step_failure_model = torch.nn.Linear(1, 1, bias=False)
+            step_failure_optimizer = torch.optim.SGD(
+                step_failure_model.parameters(),
+                lr=0.0,
+            )
+            step_failure_count = 6 if rank == 0 else 2
+            step_failure_loader = DataLoader(
+                TensorDataset(torch.ones(step_failure_count, 1)),
+                batch_size=1,
+            )
+
+            def rank_failing_step(
+                module: torch.nn.Module,
+                batch: Any,
+                context: StepContext,
+            ) -> StepOutput:
+                del context
+                if rank == 1:
+                    raise ValueError("rank-one step failed")
+                prediction = module(batch[0])
+                return StepOutput(loss=prediction.sum())
+
+            try:
+                with Trainer(
+                    model=step_failure_model,
+                    optimizer=step_failure_optimizer,
+                    train_loader=step_failure_loader,
+                    train_step=rank_failing_step,
+                    config=TrainerConfig(
+                        epochs=1,
+                        device="cpu",
+                        strategy="ddp",
+                        checkpoint_every_epochs=None,
+                    ),
+                    accumulation_policy=UnevenAccumulationPolicy(),
+                    runtime=runtime,
+                ) as step_failure_trainer:
+                    step_failure_trainer.fit()
+            except RuntimeError as error:
+                step_error = str(error)
+            else:
+                step_error = None
+            sampler_failure_model = torch.nn.Linear(1, 1, bias=False)
+            sampler_failure_optimizer = torch.optim.SGD(
+                sampler_failure_model.parameters(),
+                lr=0.0,
+            )
+            sampler_failure_loader = DataLoader(
+                TensorDataset(torch.ones(1, 1)),
+                batch_size=1,
+                sampler=RankFailingSampler(rank),
+            )
+            try:
+                with Trainer(
+                    model=sampler_failure_model,
+                    optimizer=sampler_failure_optimizer,
+                    train_loader=sampler_failure_loader,
+                    train_step=step,
+                    config=TrainerConfig(
+                        epochs=1,
+                        device="cpu",
+                        strategy="ddp",
+                        checkpoint_every_epochs=None,
+                    ),
+                    runtime=runtime,
+                ) as sampler_failure_trainer:
+                    sampler_failure_trainer.fit()
+            except RuntimeError as error:
+                sampler_error = str(error)
+            else:
+                sampler_error = None
+            restore_model = torch.nn.Linear(1, 1, bias=False)
+            restore_optimizer = torch.optim.SGD(restore_model.parameters(), lr=0.0)
+            try:
+                with Trainer(
+                    model=restore_model,
+                    optimizer=restore_optimizer,
+                    train_loader=DataLoader(
+                        TensorDataset(torch.ones(1, 1)),
+                        batch_size=1,
+                    ),
+                    train_step=distributed_regression_step,
+                    config=TrainerConfig(
+                        epochs=1,
+                        device="cpu",
+                        strategy="ddp",
+                        checkpoint_every_epochs=None,
+                    ),
+                    checkpoint_policy=RankFailingRestorePolicy(
+                        Path(checkpoint_dir),
+                        rank,
+                    ),
+                    runtime=runtime,
+                ) as restore_trainer:
+                    restore_trainer.load_checkpoint(Path("unused.pt"))
+            except RuntimeError as error:
+                restore_error = str(error)
+            else:
+                restore_error = None
+            divergent_model = torch.nn.Linear(1, 1, bias=False)
+            divergent_optimizer = torch.optim.SGD(
+                divergent_model.parameters(),
+                lr=0.0,
+            )
+            try:
+                with Trainer(
+                    model=divergent_model,
+                    optimizer=divergent_optimizer,
+                    train_loader=DataLoader(
+                        TensorDataset(torch.ones(1, 1)),
+                        batch_size=1,
+                    ),
+                    train_step=distributed_regression_step,
+                    config=TrainerConfig(
+                        epochs=1,
+                        device="cpu",
+                        strategy="ddp",
+                        checkpoint_every_epochs=None,
+                    ),
+                    checkpoint_policy=RankDivergentRestorePolicy(
+                        Path(checkpoint_dir),
+                        rank,
+                    ),
+                    runtime=runtime,
+                ) as divergent_trainer:
+                    divergent_trainer.load_checkpoint(Path("unused.pt"))
+            except RuntimeError as error:
+                divergent_restore_error = str(error)
+            else:
+                divergent_restore_error = None
+            result_queue.put(
+                (
+                    rank,
+                    result.state.optimizer_step,
+                    [observation.metrics.get("sample") for observation in progress],
+                    [observation.metrics.get("batch/count") for observation in progress],
+                    [observation.logical_step for observation in progress],
+                    partial_weight_delta,
+                    last_error,
+                    primary_last_metrics,
+                    local_metrics,
+                    shape_error,
+                    metric_compute_error,
+                    planning_error,
+                    step_error,
+                    sampler_error,
+                    restore_error,
+                    divergent_restore_error,
+                    None,
+                )
+            )
+    except BaseException as error:
+        result_queue.put(
+            (
+                rank,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                str(error),
+            )
+        )
+
+
+def run_uneven_accumulation(tmp_path: Path) -> list[tuple[Any, ...]]:
+    """Launch the unequal-window CPU DDP fixture."""
+    process_context = multiprocessing.get_context("spawn")
+    result_queue = process_context.Queue()
+    rendezvous = f"file://{tmp_path / 'uneven-rendezvous'}"
+    checkpoint_dir = str(tmp_path / "primary-checkpoints")
+    processes = [
+        process_context.Process(
+            target=_uneven_accumulation_worker,
+            args=(rank, rendezvous, checkpoint_dir, result_queue),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=40)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            pytest.fail("Uneven accumulation worker did not shut down coherently")
+        assert process.exitcode == 0
+    return sorted(result_queue.get(timeout=5) for _ in processes)
+
+
 def test_same_trainer_handles_classification_and_mapping_regression(tmp_path: Path) -> None:
     torch.manual_seed(7)
     features = torch.randn(16, 2)
@@ -289,8 +935,441 @@ def test_same_trainer_handles_classification_and_mapping_regression(tmp_path: Pa
     assert {"loss", "accuracy"}.issubset(classification_result.training_history[-1])
     assert len(list((tmp_path / "classification").glob("checkpoint-*.pt"))) == 3
     assert any(observation.event == "progress" for observation in sink.observations)
+    assert all(
+        not observation.metrics
+        for observation in sink.observations
+        if observation.event == "task_completed"
+    )
     assert len(regression_result.training_history) == 2
     assert {"loss", "mae"}.issubset(regression_result.training_history[-1])
+
+
+def test_uneven_ddp_accumulation_reduces_each_logical_batch(tmp_path: Path) -> None:
+    results = run_uneven_accumulation(tmp_path)
+
+    assert [result[0] for result in results] == [0, 1]
+    assert all(result[1] == 2 for result in results)
+    assert all(result[2] == pytest.approx([1.5, 1.5]) for result in results)
+    assert all(result[3] == pytest.approx([4.0, 4.0]) for result in results)
+    assert all(result[4] == [1, 2] for result in results)
+    assert all(result[5] == pytest.approx(-3.5) for result in results), results
+    assert all("was not reported on rank 0" in result[6] for result in results)
+    assert all(result[7] == {"primary": 9.0} for result in results)
+    assert results[0][8] == {}
+    assert results[1][8] == {"local": 7.0}
+    assert all("tensor metadata differs" in result[9] for result in results)
+    assert all(
+        "stateful metric computation failed: ValueError: "
+        "rank-one metric compute failed" in result[10]
+        for result in results
+    )
+    assert all("accumulation planning failed" in result[11] for result in results)
+    assert all(
+        "train step failed: ValueError: rank-one step failed" in result[12]
+        for result in results
+    )
+    assert all(
+        "train sampler epoch failed: ValueError: rank-one sampler failed" in result[13]
+        for result in results
+    )
+    assert all(
+        "checkpoint restore failed: ValueError: rank-one restore failed" in result[14]
+        for result in results
+    )
+    assert all(
+        "restored trainer state differs across ranks" in result[15]
+        for result in results
+    )
+    assert all(result[16] is None for result in results)
+    assert len(list((tmp_path / "primary-checkpoints").glob("checkpoint-*.pt"))) == 1
+
+
+def test_incomplete_accumulation_window_requires_an_explicit_scale() -> None:
+    plan = AccumulationPlan(
+        local_microbatches_per_step=3,
+        loss_scale=0.5,
+    )
+
+    assert plan.window_sizes(4) == (3, 1)
+    assert plan.scale_for_window(3, window_index=0) == pytest.approx(0.5)
+    with pytest.raises(ValueError, match="explicit window_loss_scales"):
+        plan.scale_for_window(1, window_index=1)
+
+
+def test_trainer_advances_project_batch_sampler_epochs() -> None:
+    batch_sampler = EpochRecordingBatchSampler()
+    loader = DataLoader(
+        TensorDataset(torch.ones(1, 1)),
+        batch_sampler=batch_sampler,
+    )
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+
+    def step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del context
+        return StepOutput(loss=module(batch[0]).sum() * 0)
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=step,
+        config=TrainerConfig(
+            epochs=2,
+            device="cpu",
+            checkpoint_every_epochs=None,
+        ),
+    ) as trainer:
+        trainer.fit()
+
+    assert batch_sampler.epochs == [0, 1]
+
+
+def test_stateful_metrics_and_routes_remain_project_named() -> None:
+    features = torch.ones(4, 1)
+    loader = DataLoader(TensorDataset(features), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = RecordingSink()
+
+    def step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del context
+        prediction = module(batch[0])
+        return StepOutput(
+            loss=prediction.sum() * 0,
+            metric_updates={"project": len(batch[0])},
+        )
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=step,
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        train_stateful_metrics={"project": AdditiveCountMetric()},
+        train_metric_routes={
+            "count": MetricRoute(batch_name=None, epoch_name="project/count")
+        },
+        observer=RunObserver((sink,)),
+    ) as trainer:
+        result = trainer.fit()
+
+    assert result.training_history == ({"count": 4.0, "loss": 0.0},)
+    completed = [
+        observation
+        for observation in sink.observations
+        if observation.event == "task_completed"
+    ]
+    assert completed[-1].metrics == {"project/count": 4.0}
+
+
+def test_validation_progress_preserves_routed_dense_metrics() -> None:
+    features = torch.ones(2, 1)
+    loader = DataLoader(TensorDataset(features), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = RecordingSink()
+
+    def train_step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del context
+        return StepOutput(loss=module(batch[0]).sum() * 0)
+
+    def validation_step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del module, batch, context
+        return StepOutput(metrics={"score": 2.0})
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=train_step,
+        validation_loader=loader,
+        validation_step=validation_step,
+        config=TrainerConfig(
+            epochs=1,
+            device="cpu",
+            checkpoint_every_epochs=None,
+            display_metric_names=("validation/score",),
+        ),
+        validation_metric_routes={
+            "score": MetricRoute(
+                batch_name="validation/score",
+                epoch_name="validation/score_epoch",
+            )
+        },
+        observer=RunObserver((sink,)),
+    ) as trainer:
+        trainer.fit()
+
+    progress = [
+        observation
+        for observation in sink.observations
+        if observation.event == "progress"
+        and observation.fields.get("phase") == "validation"
+    ]
+    assert [observation.metrics for observation in progress] == [
+        {"validation/score": 2.0},
+        {"validation/score": 2.0},
+    ]
+    assert [observation.display_metrics for observation in progress] == [
+        {"validation/score": 2.0},
+        {"validation/score": 2.0},
+    ]
+
+
+def test_empty_training_loader_remains_a_completed_noop_epoch() -> None:
+    loader = DataLoader(TensorDataset(torch.empty(0, 1)), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = RecordingSink()
+
+    def unreachable_step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        raise AssertionError("empty loader invoked its step function")
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=unreachable_step,
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        observer=RunObserver((sink,)),
+    ) as trainer:
+        result = trainer.fit()
+
+    assert result.training_history == ({},)
+    assert result.state.state_dict() == {
+        "epoch": 0,
+        "global_step": 0,
+        "optimizer_step": 0,
+        "stopped_early": False,
+    }
+    assert [observation.event for observation in sink.observations][-2:] == [
+        "task_completed",
+        "phase_completed",
+    ]
+
+
+def test_stateful_reset_failure_balances_task_and_phase_events() -> None:
+    loader = DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = RecordingSink()
+    with pytest.raises(RuntimeError, match="reset failed"), Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=lambda module, batch, context: StepOutput(
+            loss=module(batch[0]).sum() * 0
+        ),
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        train_stateful_metrics={"broken": RaisingResetMetric()},
+        observer=RunObserver((sink,)),
+    ) as trainer:
+        trainer.fit()
+
+    assert [observation.event for observation in sink.observations] == [
+        "phase_started",
+        "task_started",
+        "task_failed",
+        "phase_failed",
+    ]
+
+
+@pytest.mark.parametrize("hook", ["start", "end"])
+def test_callback_failure_reports_phase_failed_without_phase_completed(hook: str) -> None:
+    loader = DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = RecordingSink()
+    with pytest.raises(RuntimeError, match=f"{hook} callback failed"), Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=lambda module, batch, context: StepOutput(
+            loss=module(batch[0]).sum() * 0
+        ),
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        callbacks=(RaisingCallback(hook),),
+        observer=RunObserver((sink,)),
+    ) as trainer:
+        trainer.fit()
+
+    events = [observation.event for observation in sink.observations]
+    assert events.count("phase_failed") == 1
+    assert "phase_completed" not in events
+
+
+def test_duplicate_train_epoch_routes_fail_with_balanced_task_events() -> None:
+    loader = DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = RecordingSink()
+
+    def step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del context
+        return StepOutput(
+            loss=module(batch[0]).sum() * 0,
+            metrics={"a": 1.0, "b": 2.0},
+        )
+
+    duplicate_routes = {
+        "a": MetricRoute(batch_name=None, epoch_name="duplicate"),
+        "b": MetricRoute(batch_name=None, epoch_name="duplicate"),
+    }
+    with pytest.raises(ValueError, match="multiple metrics route"), Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=step,
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        train_metric_routes=duplicate_routes,
+        observer=RunObserver((sink,)),
+    ) as trainer:
+        trainer.fit()
+
+    assert [observation.event for observation in sink.observations][-2:] == [
+        "task_failed",
+        "phase_failed",
+    ]
+
+
+def test_duplicate_validation_epoch_routes_balance_both_lifecycle_scopes() -> None:
+    loader = DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = RecordingSink()
+
+    def train_step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del context
+        return StepOutput(loss=module(batch[0]).sum() * 0)
+
+    def validation_step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del module, batch, context
+        return StepOutput(metrics={"a": 1.0, "b": 2.0})
+
+    duplicate_routes = {
+        "a": MetricRoute(batch_name=None, epoch_name="duplicate"),
+        "b": MetricRoute(batch_name=None, epoch_name="duplicate"),
+    }
+    with pytest.raises(ValueError, match="multiple metrics route"), Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=train_step,
+        validation_loader=loader,
+        validation_step=validation_step,
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        validation_metric_routes=duplicate_routes,
+        observer=RunObserver((sink,)),
+    ) as trainer:
+        trainer.fit()
+
+    events = [observation.event for observation in sink.observations]
+    assert events[-3:] == ["task_failed", "phase_failed", "phase_failed"]
+
+
+def test_checkpoint_heartbeat_does_not_reactivate_completed_epoch_task(
+    tmp_path: Path,
+) -> None:
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = RecordingSink()
+    observer = RunObserver((sink,), heartbeat_interval_seconds=0.01)
+    policy = SlowRecordingCheckpointPolicy(tmp_path / "slow-checkpoint")
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(epochs=1, device="cpu"),
+        checkpoint_policy=policy,
+        observer=observer,
+    ) as trainer:
+        trainer.fit()
+
+    heartbeats = [
+        observation
+        for observation in sink.observations
+        if observation.event == "heartbeat"
+        and observation.fields.get("message") == "Checkpoint publication is still active."
+    ]
+    assert heartbeats
+    assert all("task_id" not in observation.fields for observation in heartbeats)
+
+
+def test_project_checkpoint_policy_uses_ordered_publication_and_restore(
+    tmp_path: Path,
+) -> None:
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    policy = RecordingCheckpointPolicy(tmp_path / "project-checkpoints")
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(epochs=1, device="cpu"),
+        checkpoint_policy=policy,
+    ) as trainer:
+        trainer.fit()
+
+    assert (tmp_path / "project-checkpoints" / "project.checkpoint").read_text(
+        encoding="utf-8"
+    ) == "epoch=0\n"
+    assert len(policy.contexts) == 1
+    assert policy.contexts[0].training_metrics.keys() == {"loss", "mae"}
+
+    restored_model = torch.nn.Linear(1, 1)
+    restored_optimizer = torch.optim.SGD(restored_model.parameters(), lr=0.0)
+    with Trainer(
+        model=restored_model,
+        optimizer=restored_optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(epochs=4, device="cpu", checkpoint_every_epochs=None),
+        checkpoint_policy=policy,
+    ) as trainer:
+        trainer.load_checkpoint(tmp_path / "opaque.pt")
+        assert trainer.state.state_dict() == {
+            "epoch": 2,
+            "global_step": 7,
+            "optimizer_step": 3,
+            "stopped_early": False,
+        }
 
 
 def test_recursive_batch_transfer_preserves_common_container_structure() -> None:
@@ -320,6 +1399,14 @@ def test_metric_accumulator_supports_mean_sum_and_last() -> None:
     accumulator.update({"mean": 4, "sum": 4, "last": 4}, weight=3)
 
     assert accumulator.compute() == {"last": 4.0, "mean": 3.5, "sum": 14.0}
+    with pytest.raises(ValueError, match="distinct sink names"):
+        MetricRoute(batch_name="loss", epoch_name="loss")
+
+
+@pytest.mark.parametrize("value", [0, False, "2"])
+def test_uniform_accumulation_rejects_invalid_window_size(value: Any) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        UniformAccumulationPolicy(value)
 
 
 def test_validation_callback_stops_early_on_project_metric() -> None:
