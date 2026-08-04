@@ -28,6 +28,7 @@ from mammoth.core.artifacts import (
     publish_prepared_artifact,
     sync_directory_descriptor,
 )
+from mammoth.torch.state import TrainerState
 
 CHECKPOINT_SCHEMA_VERSION = 1
 
@@ -57,6 +58,36 @@ class CheckpointPublication:
 
     published: tuple[Path, ...]
     retired: tuple[Path, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TrainerCheckpointContext:
+    """Completed-epoch inputs supplied to a project checkpoint policy."""
+
+    epoch: int
+    global_step: int
+    optimizer_step: int
+    stopped_early: bool
+    training_metrics: Mapping[str, float]
+    validation_metrics: Mapping[str, float] | None
+
+
+class TrainerCheckpointPolicy(Protocol):
+    """Retain project checkpoint meaning behind Mammoth trainer mechanics."""
+
+    def restore(
+        self,
+        path: Path,
+        state: TrainerState,
+        *,
+        device: torch.device,
+    ) -> None:
+        """Restore project objects and generic trainer coordinates."""
+        ...
+
+    def plan(self, context: TrainerCheckpointContext) -> CheckpointPlan | None:
+        """Return an immutable ordered publication plan or skip this epoch."""
+        ...
 
 
 @dataclass(frozen=True)
