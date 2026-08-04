@@ -190,7 +190,7 @@ Install only the features your project uses:
 ```bash
 uv sync --extra monitor       # Textual dashboard, Rich renderables, and psutil telemetry
 uv sync --extra tensorboard   # TensorBoard logging sink
-uv sync --extra torch         # Generic PyTorch runtime and trainer
+uv sync --extra torch         # Generic PyTorch runtime, trainer, and profiler
 ```
 
 Multiple extras may be installed together:
@@ -198,6 +198,33 @@ Multiple extras may be installed together:
 ```bash
 uv sync --extra monitor --extra tensorboard --extra torch
 ```
+
+## Profile an arbitrary PyTorch workload
+
+The optional profiler measures a caller-owned zero-argument callable, so the
+project retains its model construction, inputs, call signature, contexts, and
+output meaning:
+
+```python
+from mammoth.torch import ProfileConfig, profile_callable, write_profile_report
+
+report = profile_callable(
+    lambda: model(images, prompts=prompts),
+    config=ProfileConfig(
+        device="cuda:0",
+        work_units_per_iteration=len(images),
+        work_unit="image",
+    ),
+    components={"encoder": model.encoder, "decoder": model.decoder},
+)
+write_profile_report(run_dir / "profile.json", report)
+```
+
+Cold-start timing, synchronized steady-state latency, caller-labelled
+throughput, CUDA allocator peaks, explicit component ranges, normalized
+operation rows, and optional Chrome traces remain operational evidence.
+Projects can replace the generic nested-tensor output summary when they need a
+semantic comparison such as predicted classes or generated-token checks.
 
 ## Use the PyTorch trainer
 

@@ -211,6 +211,24 @@ ordered replacements may expose a prefix of the plan, so the caller places its
 commit-marker artifact last. True multi-file transactions require a different
 generation-directory and atomic-index layout and are not implied by this API.
 
+## Generic PyTorch profiling
+
+The optional PyTorch layer profiles arbitrary caller-owned zero-argument
+callables. The caller constructs the model and inputs, captures positional or
+keyword arguments, selects inference, autocast, or autograd contexts, and owns
+the semantic interpretation of every output. Mammoth owns synchronized cold
+and steady-state timing, caller-labelled throughput, CUDA allocator evidence,
+explicit caller-selected component ranges, normalized operation summaries,
+optional traces, reversible Torch runtime settings, and versioned report
+publication.
+
+The default output summary records only project-neutral tensor and container
+metadata. Callers provide semantic summarizers for predicted classes, masks,
+tokens, numerical tolerances, or scientific metrics. Mammoth does not discover
+architecture components, generate inputs, load checkpoints, select compile
+scopes, or define what one work unit means. Instrumented profiler time remains
+separate from the uninstrumented latency distribution.
+
 ## Compatibility policy
 
 Artifact readers preserve compatibility with schema-version-1 execution and
