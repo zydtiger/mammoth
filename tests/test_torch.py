@@ -1219,6 +1219,40 @@ def test_callback_failure_reports_phase_failed_without_phase_completed(hook: str
     assert "phase_completed" not in events
 
 
+def test_trainer_can_leave_outer_fit_phase_lifecycle_to_its_caller() -> None:
+    loader = DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = RecordingSink()
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=lambda module, batch, context: StepOutput(
+            loss=module(batch[0]).sum() * 0
+        ),
+        config=TrainerConfig(
+            epochs=1,
+            device="cpu",
+            checkpoint_every_epochs=None,
+            emit_fit_phase_events=False,
+        ),
+        observer=RunObserver((sink,)),
+    ) as trainer:
+        trainer.fit()
+
+    assert not any(
+        observation.event.startswith("phase_")
+        and observation.fields.get("phase") == "train"
+        for observation in sink.observations
+    )
+    assert [observation.event for observation in sink.observations] == [
+        "task_started",
+        "progress",
+        "task_completed",
+    ]
+
+
 def test_duplicate_train_epoch_routes_fail_with_balanced_task_events() -> None:
     loader = DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1)
     model = torch.nn.Linear(1, 1)
@@ -1370,6 +1404,72 @@ def test_project_checkpoint_policy_uses_ordered_publication_and_restore(
             "optimizer_step": 3,
             "stopped_early": False,
         }
+
+
+def test_project_checkpoint_policy_plans_after_publisher_backpressure(
+    tmp_path: Path,
+) -> None:
+    checkpoint_root = tmp_path / "project-checkpoints"
+    checkpoint_root.mkdir()
+    writer_started = threading.Event()
+    release_writer = threading.Event()
+    captures: list[int] = []
+
+    class RetainingPolicy(RecordingCheckpointPolicy):
+        def plan(self, context: TrainerCheckpointContext) -> CheckpointPlan:
+            captures.append(context.epoch)
+            destination = checkpoint_root / f"latest-{context.epoch}.pt"
+
+            def writer(path: Path) -> None:
+                if context.epoch == 0:
+                    writer_started.set()
+                    if not release_writer.wait(timeout=5):
+                        raise TimeoutError("test did not release checkpoint writer")
+                path.write_text(str(context.epoch), encoding="utf-8")
+
+            return CheckpointPlan(
+                checkpoint_root=checkpoint_root,
+                artifacts=(CheckpointArtifact(destination, writer),),
+                retire_after_commit=tuple(
+                    path
+                    for path in checkpoint_root.glob("latest-*.pt")
+                    if path != destination
+                ),
+            )
+
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    trainer = Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(epochs=2, device="cpu"),
+        checkpoint_policy=RetainingPolicy(checkpoint_root),
+    )
+    errors: list[BaseException] = []
+
+    def fit() -> None:
+        try:
+            trainer.fit()
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=fit)
+    worker.start()
+    assert writer_started.wait(timeout=5)
+    worker.join(timeout=0.1)
+    assert worker.is_alive()
+    assert captures == [0]
+    release_writer.set()
+    worker.join(timeout=5)
+    trainer.close()
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert captures == [0, 1]
+    assert [path.name for path in checkpoint_root.glob("latest-*.pt")] == ["latest-1.pt"]
 
 
 def test_recursive_batch_transfer_preserves_common_container_structure() -> None:

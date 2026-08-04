@@ -199,6 +199,9 @@ then applies separate batch and epoch routes. Validation batch routes and
 metrics configured with `distributed=False` remain rank-local. The trainer
 emits generic phase, task, progress, heartbeat, completion, and failure
 observations; projects select phase names, metric names, and display fields.
+When a surrounding command already owns the outer training phase, it disables
+the trainer's fit-level phase records while retaining Mammoth's nested task,
+progress, validation-phase, heartbeat, and metric observations.
 
 An accumulation policy receives rank identity and the local loader length, then
 returns the local microbatch count and loss scale for each shared optimizer
@@ -226,9 +229,11 @@ restores its own format into caller-owned objects. Mammoth coordinates restore
 failures and requires restored trainer loop coordinates to agree across DDP
 ranks before training resumes.
 
-The publisher snapshots or receives caller-owned immutable state before
-background work, bounds pending publications, prepares and syncs every artifact
-before the first commit, replaces destinations in declared order, and retires
+The trainer applies publisher backpressure before asking a project checkpoint
+policy to capture state or select retention paths. The publisher snapshots or
+receives caller-owned immutable state before background work, bounds pending
+publications, prepares and syncs every artifact before the first commit,
+replaces destinations in declared order, and retires
 old artifacts only after every commit succeeds. Paths are confined to the
 declared checkpoint root. Mammoth does not choose filenames, serializers,
 payload fields, compatibility rules, best-model policy, or retention targets.

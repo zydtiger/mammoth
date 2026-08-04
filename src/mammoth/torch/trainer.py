@@ -110,6 +110,7 @@ class TrainerConfig:
     train_phase: str = "train"
     validation_phase: str = "validation"
     display_metric_names: tuple[str, ...] = ("loss",)
+    emit_fit_phase_events: bool = True
 
     def __post_init__(self) -> None:
         positive_integer("epochs", self.epochs)
@@ -131,6 +132,8 @@ class TrainerConfig:
             or self.max_gradient_norm <= 0
         ):
             raise ValueError("max_gradient_norm must be positive and finite")
+        if not isinstance(self.emit_fit_phase_events, bool):
+            raise ValueError("emit_fit_phase_events must be a boolean")
         for name, value in (
             ("train_phase", self.train_phase),
             ("validation_phase", self.validation_phase),
@@ -254,7 +257,8 @@ class Trainer:
         """Execute configured epochs and return project metric summaries."""
         training_history: list[Mapping[str, float]] = []
         validation_history: list[Mapping[str, float]] = []
-        self.observer.emit("phase_started", phase=self.config.train_phase)
+        if self.config.emit_fit_phase_events:
+            self.observer.emit("phase_started", phase=self.config.train_phase)
         fit_error: BaseException | None = None
         try:
             self.coordinate(
@@ -325,10 +329,16 @@ class Trainer:
                 "train-end callbacks",
                 self.run_train_end_callbacks,
             )
-            self.observer.emit("phase_completed", phase=self.config.train_phase)
+            if self.config.emit_fit_phase_events:
+                self.observer.emit("phase_completed", phase=self.config.train_phase)
         except BaseException as error:
             fit_error = error
-            self.observer.emit("phase_failed", phase=self.config.train_phase, message=str(error))
+            if self.config.emit_fit_phase_events:
+                self.observer.emit(
+                    "phase_failed",
+                    phase=self.config.train_phase,
+                    message=str(error),
+                )
             raise
         finally:
             if fit_error is not None:
@@ -822,6 +832,7 @@ class Trainer:
     ) -> None:
         """Submit a project plan or the default registered-state snapshot."""
         if self.checkpoint_policy is not None:
+            self.publisher.wait_for_submission_slot()
             plan = self.checkpoint_policy.plan(
                 TrainerCheckpointContext(
                     epoch=epoch,

@@ -168,6 +168,13 @@ class AsyncCheckpointPublisher:
             self._discard_completed()
             return len(self._pending)
 
+    def wait_for_submission_slot(self) -> None:
+        """Apply queue backpressure before a caller captures its next snapshot."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("checkpoint publisher is closed")
+            self._await_submission_slot()
+
     def publish(self, path: Path, payload: Mapping[str, Any]) -> Future[Path]:
         """Clone state to CPU and submit one bounded atomic publication."""
         with self._lock:

@@ -269,6 +269,10 @@ project-owned; Mammoth uses these policies to coordinate logical optimizer
 steps, distributed reductions, generic observations, and ordered checkpoint
 publication.
 
+Set `TrainerConfig(emit_fit_phase_events=False, ...)` when a surrounding
+command already owns the outer training phase lifecycle. Mammoth continues to
+emit nested tasks, progress, validation phases, heartbeats, and metrics.
+
 For a direct single-process or `torchrun` invocation, initialize Mammoth's
 runtime before the trainer. Rank zero creates the immutable execution, every
 rank joins it and receives its own JSONL and text stream, and the trainer uses
