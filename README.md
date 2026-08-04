@@ -262,6 +262,13 @@ gradient accumulation, validation, callbacks, scheduling, and checkpoints. It
 does not choose your architecture, dataset, batch format, loss, or metric
 meaning.
 
+Projects that need more control can supply an `AccumulationPolicy`, scalar
+`MetricSpec` values, additive `StatefulMetric` objects, `MetricRoute` mappings,
+and a `TrainerCheckpointPolicy`. The train and validation step functions remain
+project-owned; Mammoth uses these policies to coordinate logical optimizer
+steps, distributed reductions, generic observations, and ordered checkpoint
+publication.
+
 For a direct single-process or `torchrun` invocation, initialize Mammoth's
 runtime before the trainer. Rank zero creates the immutable execution, every
 rank joins it and receives its own JSONL and text stream, and the trainer uses
