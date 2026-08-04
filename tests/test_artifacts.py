@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
@@ -110,6 +111,35 @@ def test_prepared_artifact_rejects_fifo_output_without_blocking(tmp_path: Path) 
     assert not list(tmp_path.glob(".*.tmp"))
 
 
+def test_prepared_artifact_cleans_directory_output_without_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "checkpoint.bin"
+    destination.write_bytes(b"old")
+    original_unlink = os.unlink
+
+    def reject_directory_unlink(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if path == destination.name:
+            raise PermissionError(errno.EPERM, "directory unlink is not permitted")
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", reject_directory_unlink)
+
+    def write_directory(temporary: Path) -> None:
+        temporary.mkdir()
+
+    with pytest.raises(FileNotFoundError, match="did not create a file"):
+        prepare_artifact(destination, write_directory)
+
+    assert destination.read_bytes() == b"old"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
 def test_prepared_artifact_reapplies_mode_after_writer_replaces_temporary(
     tmp_path: Path,
 ) -> None:
@@ -183,6 +213,24 @@ def test_prepared_artifact_can_retain_serializer_mode_for_new_files(tmp_path: Pa
 
     assert stat.S_IMODE(created.stat().st_mode) == 0o640
     assert stat.S_IMODE(existing.stat().st_mode) == 0o400
+
+
+def test_prepared_artifact_supports_create_without_truncation(tmp_path: Path) -> None:
+    destination = tmp_path / "checkpoint.bin"
+
+    def write_created(temporary: Path) -> None:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            os.write(descriptor, b"checkpoint")
+        finally:
+            os.close(descriptor)
+
+    prepared = prepare_artifact(destination, write_created, mode=None)
+    try:
+        assert prepared.temporary.read_bytes() == b"checkpoint"
+        assert stat.S_IMODE(prepared.temporary.stat().st_mode) == 0o600
+    finally:
+        discard_prepared_artifact(prepared)
 
 
 def test_prepared_artifact_cleans_temporary_when_permission_setup_fails(
