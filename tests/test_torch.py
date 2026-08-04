@@ -839,6 +839,7 @@ def _uneven_accumulation_worker(
                     sampler_error,
                     restore_error,
                     divergent_restore_error,
+                    result.state.global_step,
                     None,
                 )
             )
@@ -846,6 +847,7 @@ def _uneven_accumulation_worker(
         result_queue.put(
             (
                 rank,
+                None,
                 None,
                 None,
                 None,
@@ -980,7 +982,8 @@ def test_uneven_ddp_accumulation_reduces_each_logical_batch(tmp_path: Path) -> N
         "restored trainer state differs across ranks" in result[15]
         for result in results
     )
-    assert all(result[16] is None for result in results)
+    assert all(result[16] == 8 for result in results)
+    assert all(result[17] is None for result in results)
     assert len(list((tmp_path / "primary-checkpoints").glob("checkpoint-*.pt"))) == 1
 
 
@@ -2902,7 +2905,7 @@ def test_two_process_runtime_owns_ddp_execution_collectives_and_rank_streams(
     assert {result[2] for result in results} == {"ready"}
     assert {result[3] for result in results} == {(0, 1)}
     assert {result[4] for result in results} == {3}
-    assert {result[5] for result in results} == {2}
+    assert {result[5] for result in results} == {4}
     assert {result[6] for result in results} == {None}
     execution_dir = tmp_path / "ddp-run" / "logs" / "executions" / "ddp-attempt"
     for rank in range(2):

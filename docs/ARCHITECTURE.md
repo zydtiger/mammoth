@@ -209,7 +209,9 @@ window. Every rank must produce the same number of optimizer windows. Explicit
 per-window scales cover unequal partial windows without assigning workload
 meaning to Mammoth. DDP forwards and backwards remain local until each shared
 window boundary, where Mammoth first reaches failure consensus and then
-averages gradients in stable parameter order.
+averages gradients in stable parameter order. The persisted global-step cursor
+counts all ranks' microbatches at completed windows; step callbacks receive a
+deterministic rank-ordered position inside the active window.
 
 Complex algorithms with several optimizers, alternating updates, reinforcement
 learning control flow, or custom collectives keep their loop in the consuming

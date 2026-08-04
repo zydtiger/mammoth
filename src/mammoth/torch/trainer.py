@@ -54,7 +54,11 @@ SchedulerInterval = Literal["optimizer", "epoch", "validation"]
 
 @dataclass(frozen=True, slots=True)
 class StepContext:
-    """Ordinary loop coordinates supplied to a project step function."""
+    """Ordinary loop coordinates supplied to a project step function.
+
+    In DDP, ``global_step`` gives each rank's microbatches a deterministic
+    position within the current globally counted accumulation window.
+    """
 
     training: bool
     epoch: int
@@ -374,7 +378,9 @@ class Trainer:
             planning_error = error
         self.raise_distributed_failure("accumulation planning", planning_error)
         assert plan is not None
-        self.validate_optimizer_window_count(len(window_sizes))
+        global_window_sizes, rank_window_offsets = self.distributed_window_layout(
+            window_sizes
+        )
         task_id = f"epoch-{epoch}"
         self.observer.emit(
             "task_started",
@@ -407,9 +413,10 @@ class Trainer:
                 window_accumulator = MetricAccumulator(self.metric_specs)
                 for window_offset, window_size in enumerate(window_sizes):
                     window_index = window_offset + 1
+                    window_global_step = self.state.global_step
                     window_error: BaseException | None = None
                     last_batch_index = batch_index
-                    for _ in range(window_size):
+                    for local_window_offset in range(window_size):
                         if window_error is not None:
                             break
                         try:
@@ -419,7 +426,11 @@ class Trainer:
                                 training=True,
                                 epoch=epoch,
                                 batch_index=batch_index,
-                                global_step=self.state.global_step,
+                                global_step=(
+                                    window_global_step
+                                    + rank_window_offsets[window_offset]
+                                    + local_window_offset
+                                ),
                                 optimizer_step=self.state.optimizer_step,
                             )
                             with self.gradient_accumulation_context():
@@ -449,12 +460,12 @@ class Trainer:
                         except BaseException as error:
                             window_error = error
                         else:
-                            self.state.global_step += 1
                             last_batch_index = batch_index
                             batch_index += 1
                     self.raise_distributed_failure("train step", window_error)
                     self.synchronize_gradients()
                     self.coordinate("optimizer step", self.optimizer_step)
+                    self.state.global_step += global_window_sizes[window_offset]
 
                     window_metrics, window_stateful_baseline = self.coordinate(
                         "training metric reduction",
@@ -957,16 +968,36 @@ class Trainer:
         self.raise_distributed_failure(operation, local_error)
         return cast(T, result)
 
-    def validate_optimizer_window_count(self, local_count: int) -> None:
-        """Require every DDP rank to reach the same optimizer-step collectives."""
-        counts = self.all_gather_object(local_count)
-        if any(not isinstance(count, int) or isinstance(count, bool) for count in counts):
-            raise RuntimeError("accumulation policy returned invalid distributed step counts")
-        if len(set(counts)) != 1:
+    def distributed_window_layout(
+        self,
+        local_sizes: tuple[int, ...],
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Return global window sizes and this rank's deterministic offsets."""
+        gathered = self.all_gather_object(local_sizes)
+        if any(
+            not isinstance(sizes, tuple)
+            or any(
+                not isinstance(size, int) or isinstance(size, bool) or size < 1
+                for size in sizes
+            )
+            for sizes in gathered
+        ):
+            raise RuntimeError("accumulation policy returned invalid distributed window sizes")
+        window_counts = tuple(len(sizes) for sizes in gathered)
+        if len(set(window_counts)) != 1:
             raise ValueError(
                 "accumulation plans must produce the same optimizer-step count on every rank; "
-                f"received {counts}"
+                f"received {window_counts}"
             )
+        global_sizes = tuple(
+            sum(sizes[index] for sizes in gathered)
+            for index in range(window_counts[0])
+        )
+        rank_offsets = tuple(
+            sum(gathered[rank][index] for rank in range(self.rank))
+            for index in range(window_counts[0])
+        )
+        return global_sizes, rank_offsets
 
     def all_gather_object(self, value: Any) -> tuple[Any, ...]:
         """Gather a small policy or failure value on every configured rank."""
