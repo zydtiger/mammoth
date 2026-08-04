@@ -7,10 +7,14 @@ standard library and never imports model, dataset, or project code.
 from __future__ import annotations
 
 from mammoth.core.artifacts import (
+    PreparedArtifact,
     atomic_publish,
     atomic_write_bytes,
     atomic_write_json,
     atomic_write_text,
+    discard_prepared_artifact,
+    prepare_artifact,
+    publish_prepared_artifact,
 )
 from mammoth.core.events import (
     ExecutionEvent,
@@ -45,6 +49,7 @@ __all__ = [
     "ExecutionEventWriter",
     "ExecutionMetadata",
     "LogicalRunLease",
+    "PreparedArtifact",
     "RunLayout",
     "atomic_publish",
     "atomic_write_bytes",
@@ -52,11 +57,14 @@ __all__ = [
     "atomic_write_text",
     "claim_logical_run_lease",
     "create_execution_context",
+    "discard_prepared_artifact",
     "execution_id_from_environment",
     "generate_execution_id",
     "iter_execution_events",
     "join_execution_context",
     "latest_execution_id",
+    "prepare_artifact",
+    "publish_prepared_artifact",
     "read_execution_events",
     "sanitize_command",
     "sanitize_metadata_fields",

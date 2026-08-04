@@ -191,6 +191,26 @@ learning control flow, or custom collectives keep their loop in the consuming
 project and use Mammoth only for orchestration, logging, monitoring, and
 artifact mechanics.
 
+## Checkpoint publication
+
+Mammoth's optional PyTorch layer provides two checkpoint paths. The generic
+trainer may use Mammoth's versioned registered-state payload and restore it
+directly. Projects with established checkpoint schemas instead submit ordered
+publication plans containing opaque serializer callbacks and exact retirement
+paths.
+
+The publisher snapshots or receives caller-owned immutable state before
+background work, bounds pending publications, prepares and syncs every artifact
+before the first commit, replaces destinations in declared order, and retires
+old artifacts only after every commit succeeds. Paths are confined to the
+declared checkpoint root. Mammoth does not choose filenames, serializers,
+payload fields, compatibility rules, best-model policy, or retention targets.
+
+Atomic replacement applies to each file independently. An interruption between
+ordered replacements may expose a prefix of the plan, so the caller places its
+commit-marker artifact last. True multi-file transactions require a different
+generation-directory and atomic-index layout and are not implied by this API.
+
 ## Compatibility policy
 
 Artifact readers preserve compatibility with schema-version-1 execution and
