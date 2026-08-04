@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
-from tensorboardX import SummaryWriter  # type: ignore[import-untyped]
+from tensorboardX import SummaryWriter
 
 from mammoth.logging.model import Media, Observation
 
@@ -101,7 +101,10 @@ class TensorBoardSink:
         """Write dense scalar and media history while ignoring lifecycle-only events."""
         if not self.enabled or (not observation.metrics and not observation.media):
             return
-        step = self._logical_step(observation.fields.get("coordinates"))
+        step = self._logical_step(
+            observation.logical_step,
+            observation.fields.get("coordinates"),
+        )
         for name, value in observation.metrics.items():
             self.writer.add_scalar(name, value, step)
         for name, media in observation.media.items():
@@ -115,7 +118,10 @@ class TensorBoardSink:
         """Flush and close TensorBoard's event writer."""
         self.writer.close()
 
-    def _logical_step(self, coordinates: object) -> int:
+    def _logical_step(self, explicit_step: int | None, coordinates: object) -> int:
+        if explicit_step is not None:
+            self._step = max(self._step, explicit_step + 1)
+            return explicit_step
         if isinstance(coordinates, Mapping):
             for name in ("global_step", "optimizer_step", "step", "epoch", "batch"):
                 value = coordinates.get(name)

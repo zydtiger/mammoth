@@ -152,6 +152,37 @@ Mammoth validates unknown settings, missing dependencies, and dependency
 cycles before launching commands. Run `uv run mammoth workflow run --help` for
 the full CLI reference.
 
+## Compose execution observability
+
+For a process that already has an `ExecutionContext`, create JSONL and optional
+TensorBoard output without claiming its text log:
+
+```python
+from mammoth.logging import create_execution_observability
+from mammoth.logging.tensorboard import TensorBoardSink
+
+tensorboard = TensorBoardSink(context.run_dir / "logs", rank=rank)
+with create_execution_observability(
+    context,
+    rank=rank,
+    additional_sinks=(tensorboard,),
+) as observability:
+    with observability.observer.periodic_heartbeats(phase="train"):
+        observability.observer.progress(
+            phase="train",
+            task_id="epoch-0",
+            completed=1,
+            total=10,
+            metrics={"train/loss": 0.5},
+            coordinates={"epoch": 0, "batch": 0},
+            logical_step=0,
+        )
+```
+
+Use `create_execution_logging` instead when Mammoth should also own the
+process-exclusive plain-text handler. Applications attach that returned handler
+to their chosen Python logger.
+
 ## Optional integrations
 
 Install only the features your project uses:
