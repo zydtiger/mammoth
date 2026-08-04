@@ -142,7 +142,12 @@ def prepare_artifact_in_directory(
     preserve_permissions: bool = True,
 ) -> PreparedArtifact:
     """Prepare an artifact while taking ownership of an opened parent directory."""
-    validate_artifact_writer(writer, mode)
+    try:
+        validate_artifact_writer(writer, mode)
+    except BaseException:
+        with suppress(OSError):
+            os.close(directory_descriptor)
+        raise
     destination = Path(path)
     if not directory_path_matches_descriptor(destination.parent, directory_descriptor):
         with suppress(OSError):
@@ -177,6 +182,7 @@ def prepare_artifact_in_directory(
                 mode = destination_mode
     except BaseException:
         if staging_descriptor is not None:
+            _remove_staged_artifact(artifact_name, staging_descriptor)
             with suppress(OSError):
                 os.close(staging_descriptor)
         with suppress(OSError):
@@ -212,8 +218,7 @@ def prepare_artifact_in_directory(
         finally:
             os.close(serialized_descriptor)
     except BaseException:
-        with suppress(OSError):
-            os.unlink(artifact_name, dir_fd=staging_descriptor)
+        _remove_staged_artifact(artifact_name, staging_descriptor)
         with suppress(OSError):
             os.close(staging_descriptor)
         with suppress(OSError):
@@ -235,16 +240,20 @@ def prepare_artifact_in_directory(
 
 def descriptor_relative_writer_path(directory_descriptor: int, name: str) -> Path:
     """Return a serializer path anchored to an already opened directory."""
+    return descriptor_filesystem_path(directory_descriptor) / name
+
+
+def descriptor_filesystem_path(descriptor: int) -> Path:
+    """Return the descriptor-filesystem path for one open descriptor."""
     for descriptor_root in (Path("/proc/self/fd"), Path("/dev/fd")):
-        anchored_parent = descriptor_root / str(directory_descriptor)
+        anchored_path = descriptor_root / str(descriptor)
         try:
-            anchored_stat = anchored_parent.stat()
+            anchored_path.stat()
         except OSError:
             continue
-        if stat.S_ISDIR(anchored_stat.st_mode):
-            return anchored_parent / name
+        return anchored_path
     raise NotImplementedError(
-        "prepared artifact serializers require a descriptor filesystem at "
+        "prepared artifact operations require a descriptor filesystem at "
         "/proc/self/fd or /dev/fd"
     )
 
@@ -257,6 +266,22 @@ def validate_artifact_writer(writer: Callable[[Path], None], mode: int | None) -
         raise ValueError("mode must be None or an integer from 0o000 through 0o777")
     if not callable(writer):
         raise TypeError("artifact writer must be callable")
+
+
+def _remove_staged_artifact(name: str, directory_descriptor: int) -> None:
+    """Best-effort removal for a writer-created file or empty directory."""
+    try:
+        staged_stat = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if stat.S_ISDIR(staged_stat.st_mode):
+            os.rmdir(name, dir_fd=directory_descriptor)
+        else:
+            os.unlink(name, dir_fd=directory_descriptor)
+    except OSError:
+        return
 
 
 def publish_prepared_artifact(artifact: PreparedArtifact) -> Path:
