@@ -220,7 +220,10 @@ the semantic interpretation of every output. Mammoth owns synchronized cold
 and steady-state timing, caller-labelled throughput, CUDA allocator evidence,
 explicit caller-selected component ranges, normalized operation summaries,
 optional traces, reversible Torch runtime settings, and versioned report
-publication.
+publication. Shape recording groups operation rows by input shape. When a
+caller supplies both the newer matmul-precision control and the legacy CUDA
+TF32 boolean, Mammoth expresses the legacy boolean's precedence through the
+new API so PyTorch never enters an unreadable mixed-API state.
 
 The default output summary records only project-neutral tensor and container
 metadata. Callers provide semantic summarizers for predicted classes, masks,

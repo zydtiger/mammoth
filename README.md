@@ -222,7 +222,8 @@ write_profile_report(run_dir / "profile.json", report)
 
 Cold-start timing, synchronized steady-state latency, caller-labelled
 throughput, CUDA allocator peaks, explicit component ranges, normalized
-operation rows, and optional Chrome traces remain operational evidence.
+operation rows with optional input shapes, FLOPs, and memory, and optional
+Chrome traces remain operational evidence.
 Projects can replace the generic nested-tensor output summary when they need a
 semantic comparison such as predicted classes or generated-token checks.
 
