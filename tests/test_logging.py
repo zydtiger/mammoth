@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from mammoth.logging import (
     RunObserver,
     claim_process_text_log,
     create_execution_logging,
+    create_execution_observability,
 )
 from mammoth.logging.tensorboard import NullSummaryWriter, TensorBoardSink
 from mammoth.logging.text import create_process_text_handler
@@ -39,9 +41,11 @@ class RecordingSink:
         self.observations: list[Observation] = []
         self.flushed = 0
         self.closed = 0
+        self.observed = threading.Event()
 
     def observe(self, observation: Observation) -> None:
         self.observations.append(observation)
+        self.observed.set()
 
     def flush(self) -> None:
         self.flushed += 1
@@ -53,6 +57,25 @@ class RecordingSink:
 class FailingSink(RecordingSink):
     def observe(self, observation: Observation) -> None:
         raise OSError("backend unavailable")
+
+
+class BlockingSerialSink(RecordingSink):
+    def __init__(self) -> None:
+        super().__init__()
+        self._active = threading.Lock()
+        self.heartbeat_entered = threading.Event()
+        self.release_heartbeat = threading.Event()
+
+    def observe(self, observation: Observation) -> None:
+        if not self._active.acquire(blocking=False):
+            raise RuntimeError("concurrent sink access")
+        try:
+            super().observe(observation)
+            if observation.event == "heartbeat":
+                self.heartbeat_entered.set()
+                assert self.release_heartbeat.wait(timeout=1.0)
+        finally:
+            self._active.release()
 
 
 class FakeSummaryWriter:
@@ -141,6 +164,64 @@ def test_phase_and_task_contexts_emit_balanced_terminal_records() -> None:
     ]
 
 
+def test_observer_manages_periodic_heartbeats_while_idle() -> None:
+    recording = RecordingSink()
+    observer = RunObserver((recording,), heartbeat_interval_seconds=0.01)
+
+    with observer.periodic_heartbeats(phase="phase", task_id="task", message="working"):
+        assert recording.observed.wait(timeout=1.0)
+    observer.close()
+
+    heartbeat = recording.observations[0]
+    assert heartbeat.event == "heartbeat"
+    assert heartbeat.fields == {
+        "phase": "phase",
+        "force": False,
+        "task_id": "task",
+        "message": "working",
+    }
+
+
+def test_periodic_heartbeat_serializes_sink_fanout_with_foreground_emit() -> None:
+    sink = BlockingSerialSink()
+    observer = RunObserver((sink,), heartbeat_interval_seconds=0.01)
+    foreground_done = threading.Event()
+
+    def emit_foreground() -> None:
+        observer.emit("phase_started", phase="phase")
+        foreground_done.set()
+
+    with observer.periodic_heartbeats(phase="phase"):
+        assert sink.heartbeat_entered.wait(timeout=1.0)
+        foreground = threading.Thread(target=emit_foreground)
+        foreground.start()
+        assert not foreground_done.wait(timeout=0.05)
+        sink.release_heartbeat.set()
+        assert foreground_done.wait(timeout=1.0)
+        foreground.join()
+    observer.close()
+
+    assert observer.disabled_sink_count == 0
+    assert [item.event for item in sink.observations] == ["heartbeat", "phase_started"]
+
+
+def test_close_stops_active_periodic_heartbeat_threads() -> None:
+    observer = RunObserver(heartbeat_interval_seconds=1.0)
+    existing_threads = set(threading.enumerate())
+    heartbeat_scope = observer.periodic_heartbeats(phase="phase")
+    heartbeat_scope.__enter__()
+    heartbeat_thread = next(
+        thread
+        for thread in threading.enumerate()
+        if thread not in existing_threads and thread.name == "mammoth-observer-heartbeat"
+    )
+
+    observer.close()
+
+    assert not heartbeat_thread.is_alive()
+    heartbeat_scope.__exit__(None, None, None)
+
+
 def test_tensorboard_sink_uses_project_metric_names_and_logical_step(tmp_path: Path) -> None:
     writer = FakeSummaryWriter()
     sink = TensorBoardSink(tmp_path, writer=writer)
@@ -163,6 +244,22 @@ def test_tensorboard_sink_uses_project_metric_names_and_logical_step(tmp_path: P
     assert writer.text == [("note", "hello", 12, {})]
     assert writer.flush_count == 1
     assert writer.close_count == 1
+
+
+def test_tensorboard_sink_prefers_explicit_logical_step(tmp_path: Path) -> None:
+    writer = FakeSummaryWriter()
+    sink = TensorBoardSink(tmp_path, writer=writer)
+
+    sink.observe(
+        Observation(
+            event="progress",
+            fields={"coordinates": {"global_step": 12}},
+            metrics={"custom/loss": 0.5},
+            logical_step=37,
+        )
+    )
+
+    assert writer.scalars == [("custom/loss", 0.5, 37)]
 
 
 def test_tensorboard_sink_is_noop_on_secondary_rank(tmp_path: Path) -> None:
@@ -229,3 +326,20 @@ def test_execution_logging_composes_jsonl_text_and_additional_sinks(tmp_path: Pa
     assert [event.event for event in events] == ["process_started"]
     assert [observation.event for observation in recording.observations] == ["process_started"]
     assert "bundle diagnostic" in context.rank_log_path(0).read_text()
+
+
+def test_execution_observability_does_not_claim_text_log(tmp_path: Path) -> None:
+    context = execution_context(tmp_path)
+    recording = RecordingSink()
+
+    with create_execution_observability(
+        context,
+        rank=0,
+        additional_sinks=(recording,),
+    ) as observability:
+        observability.observer.emit("process_started", phase="phase")
+        assert not context.rank_log_path(0).exists()
+
+    events = read_execution_events(context.execution_dir / "rank-0.jsonl")
+    assert [event.event for event in events] == ["process_started"]
+    assert [observation.event for observation in recording.observations] == ["process_started"]

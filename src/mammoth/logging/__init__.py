@@ -6,7 +6,12 @@ Import ``mammoth.logging.tensorboard`` explicitly when the optional
 
 from __future__ import annotations
 
-from mammoth.logging.execution import ExecutionLogging, create_execution_logging
+from mammoth.logging.execution import (
+    ExecutionLogging,
+    ExecutionObservability,
+    create_execution_logging,
+    create_execution_observability,
+)
 from mammoth.logging.jsonl import JsonlEventSink
 from mammoth.logging.model import Media, Observation
 from mammoth.logging.observer import ObservationSink, RunObserver
@@ -19,6 +24,7 @@ from mammoth.logging.text import (
 
 __all__ = [
     "ExecutionLogging",
+    "ExecutionObservability",
     "JsonlEventSink",
     "Media",
     "Observation",
@@ -28,5 +34,6 @@ __all__ = [
     "RunObserver",
     "claim_process_text_log",
     "create_execution_logging",
+    "create_execution_observability",
     "create_process_text_handler",
 ]
