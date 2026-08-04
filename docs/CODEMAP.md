@@ -42,6 +42,7 @@ src/mammoth/
 │   ├── callbacks.py
 │   ├── checkpoint.py
 │   ├── metrics.py
+│   ├── profiling.py
 │   ├── runtime.py
 │   ├── state.py
 │   └── trainer.py
@@ -58,7 +59,7 @@ src/mammoth/
 | `mammoth.logging.tensorboard` | `TensorBoardSink` |
 | `mammoth.monitor` | `ExecutionMonitor`, `RunMonitor`, `MonitorSnapshot`, `RunSnapshot`, `ProducerKey`, `ProducerState`, `TaskState`, `MetricPoint`, `ViewerTelemetry`, discovery/folding/rendering functions, and viewer telemetry sampling |
 | `mammoth.workflow` | `WorkflowConfig`, `RunConfig`, `StepConfig`, `CommandPlan`, `SupervisedProcess`, `ProcessResult`, `WorkflowResult`, `RunResult`, `StepResult`, workflow loading/planning/running functions, and command construction |
-| `mammoth.torch` | `TorchExecutionRuntime`, `TorchRuntimeConfig`, `TorchExecutionRequest`, `initialize_torch_runtime`, `Trainer`, `TrainerConfig`, `TrainerState`, `TrainerResult`, `StepContext`, `StepOutput`, `Callback`, `EarlyStopping`, `MetricSpec`, `MetricAccumulator`, `StateRegistry`, `CheckpointArtifact`, `CheckpointPlan`, `CheckpointPublication`, `AsyncCheckpointPublisher`, batch movement, ordered checkpoint publication, checkpoint creation, and checkpoint restoration |
+| `mammoth.torch` | `TorchExecutionRuntime`, `TorchRuntimeConfig`, `TorchExecutionRequest`, `initialize_torch_runtime`, `Trainer`, `TrainerConfig`, `TrainerState`, `TrainerResult`, `StepContext`, `StepOutput`, callable profiling configuration/results/runtime controls/report publication, `Callback`, `EarlyStopping`, `MetricSpec`, `MetricAccumulator`, `StateRegistry`, `CheckpointArtifact`, `CheckpointPlan`, `CheckpointPublication`, `AsyncCheckpointPublisher`, batch movement, ordered checkpoint publication, checkpoint creation, and checkpoint restoration |
 
 ## Command Routes
 
@@ -94,7 +95,7 @@ mammoth
 ├── mammoth.torch
 │   ├── mammoth.core
 │   ├── mammoth.logging
-│   └── PyTorch (optional extra)
+│   └── PyTorch and torch.profiler (optional extra)
 ├── mammoth.logging
 │   ├── mammoth.core
 │   └── tensorboardX (optional module only)

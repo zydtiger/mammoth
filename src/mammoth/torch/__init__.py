@@ -1,4 +1,4 @@
-"""Optional generic PyTorch trainer, metrics, callbacks, and checkpoints.
+"""Optional generic PyTorch runtime, trainer, profiler, and state utilities.
 
 Install the ``torch`` extra before importing this package.
 """
@@ -18,6 +18,23 @@ from mammoth.torch.checkpoint import (
     restore_checkpoint,
 )
 from mammoth.torch.metrics import MetricAccumulator, MetricSpec
+from mammoth.torch.profiling import (
+    CudaMemoryStats,
+    LatencySummary,
+    OperationProfile,
+    ProfileConfig,
+    ProfileReport,
+    ProfileTiming,
+    ThroughputSummary,
+    TorchRuntimeOptions,
+    TorchRuntimeState,
+    current_torch_runtime_state,
+    profile_callable,
+    summarize_latency,
+    summarize_output_value,
+    torch_runtime_options,
+    write_profile_report,
+)
 from mammoth.torch.runtime import (
     TorchExecutionRequest,
     TorchExecutionRuntime,
@@ -39,9 +56,15 @@ __all__ = [
     "CheckpointArtifact",
     "CheckpointPlan",
     "CheckpointPublication",
+    "CudaMemoryStats",
     "EarlyStopping",
+    "LatencySummary",
     "MetricAccumulator",
     "MetricSpec",
+    "OperationProfile",
+    "ProfileConfig",
+    "ProfileReport",
+    "ProfileTiming",
     "StateRegistry",
     "StepContext",
     "StepOutput",
@@ -52,9 +75,18 @@ __all__ = [
     "TorchExecutionRequest",
     "TorchExecutionRuntime",
     "TorchRuntimeConfig",
+    "TorchRuntimeOptions",
+    "TorchRuntimeState",
+    "ThroughputSummary",
     "checkpoint_payload",
+    "current_torch_runtime_state",
     "initialize_torch_runtime",
     "move_batch_to_device",
     "publish_checkpoint_plan",
+    "profile_callable",
     "restore_checkpoint",
+    "summarize_latency",
+    "summarize_output_value",
+    "torch_runtime_options",
+    "write_profile_report",
 ]
