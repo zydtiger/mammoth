@@ -37,7 +37,7 @@ class CheckpointArtifact:
     """One opaque checkpoint artifact and its caller-owned serializer."""
 
     destination: Path
-    writer: Callable[[Path], None]
+    writer: Callable[[Path], object]
     mode: int | None = 0o600
     preserve_permissions: bool = True
 

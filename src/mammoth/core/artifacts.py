@@ -92,7 +92,7 @@ def atomic_write_json(
     return atomic_write_text(Path(path), f"{serialized}\n", mode=mode)
 
 
-def atomic_publish(path: Path, writer: Callable[[Path], None]) -> Path:
+def atomic_publish(path: Path, writer: Callable[[Path], object]) -> Path:
     """Publish a caller-written opaque file by same-directory atomic replace."""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -114,7 +114,7 @@ def atomic_publish(path: Path, writer: Callable[[Path], None]) -> Path:
 
 def prepare_artifact(
     path: Path,
-    writer: Callable[[Path], None],
+    writer: Callable[[Path], object],
     *,
     mode: int | None = 0o600,
     preserve_permissions: bool = True,
@@ -135,7 +135,7 @@ def prepare_artifact(
 
 def prepare_artifact_in_directory(
     path: Path,
-    writer: Callable[[Path], None],
+    writer: Callable[[Path], object],
     *,
     directory_descriptor: int,
     mode: int | None = 0o600,
@@ -258,7 +258,7 @@ def descriptor_filesystem_path(descriptor: int) -> Path:
     )
 
 
-def validate_artifact_writer(writer: Callable[[Path], None], mode: int | None) -> None:
+def validate_artifact_writer(writer: Callable[[Path], object], mode: int | None) -> None:
     """Validate shared prepared-artifact writer arguments."""
     if mode is not None and (
         isinstance(mode, bool) or not isinstance(mode, int) or not 0 <= mode <= 0o777
