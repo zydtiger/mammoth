@@ -178,6 +178,12 @@ The trainer accepts constructed objects:
 - training and optional validation `DataLoader` objects; and
 - project functions that interpret batches and return scalar loss/metrics.
 
+The project may also provide an accumulation policy, scalar reduction specs,
+additive stateful metrics, metric sink routes, and a checkpoint policy. These
+contracts describe mechanics only: names and update values remain opaque to
+Mammoth, while project code owns every metric calculation and checkpoint
+serializer.
+
 Mammoth may own the ordinary loop mechanics: mode switching, device transfer,
 precision, backward, accumulation, clipping, optimizer/scheduler steps,
 standard DDP, callbacks, logging, interruption handling, and registered-state
@@ -185,6 +191,22 @@ checkpoint publication. A trainer may consume a `TorchExecutionRuntime` for
 device/rank identity and its active execution observer; constructing the
 trainer without a runtime remains supported for callers that already own their
 process group.
+
+`StepOutput` carries the optional loss, already-computed scalar metrics, and
+opaque updates for registered stateful metrics. Mammoth reduces configured
+distributed training-window summaries and train/validation epoch summaries,
+then applies separate batch and epoch routes. Validation batch routes and
+metrics configured with `distributed=False` remain rank-local. The trainer
+emits generic phase, task, progress, heartbeat, completion, and failure
+observations; projects select phase names, metric names, and display fields.
+
+An accumulation policy receives rank identity and the local loader length, then
+returns the local microbatch count and loss scale for each shared optimizer
+window. Every rank must produce the same number of optimizer windows. Explicit
+per-window scales cover unequal partial windows without assigning workload
+meaning to Mammoth. DDP forwards and backwards remain local until each shared
+window boundary, where Mammoth first reaches failure consensus and then
+averages gradients in stable parameter order.
 
 Complex algorithms with several optimizers, alternating updates, reinforcement
 learning control flow, or custom collectives keep their loop in the consuming
@@ -198,6 +220,11 @@ trainer may use Mammoth's versioned registered-state payload and restore it
 directly. Projects with established checkpoint schemas instead submit ordered
 publication plans containing opaque serializer callbacks and exact retirement
 paths.
+
+A trainer checkpoint policy chooses when a completed epoch produces a plan and
+restores its own format into caller-owned objects. Mammoth coordinates restore
+failures and requires restored trainer loop coordinates to agree across DDP
+ranks before training resumes.
 
 The publisher snapshots or receives caller-owned immutable state before
 background work, bounds pending publications, prepares and syncs every artifact

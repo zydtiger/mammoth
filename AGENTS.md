@@ -82,11 +82,12 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/torch/runtime.py` | Generic single/DDP process-group, collective, execution-startup, and rank-logging lifecycle. | PyTorch runtime identity, collectives, startup consensus, or cleanup changes. |
 | `src/mammoth/torch/batch.py` | Recursive common-container tensor transfer to one torch device. | Default batch transfer behavior changes. |
 | `src/mammoth/torch/callbacks.py` | Generic trainer lifecycle callbacks and metric-based early stopping. | Callback hooks or early-stopping behavior changes. |
-| `src/mammoth/torch/checkpoint.py` | Registered state, CPU snapshots, restore, and bounded asynchronous atomic publication. | Trainer checkpoint mechanics or schema change. |
-| `src/mammoth/torch/metrics.py` | Mean, sum, last, and optional DDP scalar reductions. | Metric aggregation policy changes. |
+| `src/mammoth/torch/checkpoint.py` | Registered state, project trainer-checkpoint contracts, restore, and bounded asynchronous atomic publication. | Trainer checkpoint policy, publication mechanics, or schema changes. |
+| `src/mammoth/torch/metrics.py` | Scalar reductions, additive stateful metrics, and batch/epoch sink routing. | Metric aggregation or routing policy changes. |
 | `src/mammoth/torch/profiling.py` | Model-independent callable timing, Torch operation profiling, runtime controls, and versioned reports. | Generic PyTorch profiling behavior or report schema changes. |
+| `src/mammoth/torch/scheduling.py` | Generic rank-local accumulation plans, policies, and logical-window loss scales. | Accumulation policy contracts or scaling behavior changes. |
 | `src/mammoth/torch/state.py` | Serializable ordinary trainer loop coordinates. | Trainer resume coordinates change. |
-| `src/mammoth/torch/trainer.py` | Constructed-object single/DDP loops, precision, accumulation, validation, scheduling, logging, and checkpoints. | Generic trainer behavior changes. |
+| `src/mammoth/torch/trainer.py` | Constructed-object single/DDP loops, project policy integration, validation, observability, and checkpoint lifecycle. | Generic trainer behavior or policy integration changes. |
 | `tests/test_artifacts.py` | Atomic artifact publication unit coverage. | Artifact publication behavior changes. |
 | `tests/test_events.py` | Event validation, writer, replay, tailing, and legacy-field unit coverage. | Event behavior changes. |
 | `tests/test_execution.py` | Execution metadata, lineage, sanitization, compatibility, and lease unit coverage. | Execution behavior changes. |
