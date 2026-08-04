@@ -13,7 +13,11 @@ from typing import Any
 
 @dataclass(slots=True)
 class TrainerState:
-    """Mutable ordinary-loop coordinates restored from Mammoth checkpoints."""
+    """Mutable ordinary-loop coordinates restored from Mammoth checkpoints.
+
+    ``global_step`` counts microbatches across all ranks at completed optimizer
+    windows, so checkpointed DDP coordinates remain rank-invariant.
+    """
 
     epoch: int = -1
     global_step: int = 0
