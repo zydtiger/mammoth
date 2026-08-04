@@ -194,6 +194,25 @@ Exit condition: a consuming project can publish inference and resume artifacts
 from one immutable snapshot while retaining its formats, compatibility rules,
 commit order, and retention policy.
 
+## Phase 10: Generic PyTorch callable profiling
+
+Status: complete.
+
+Add model-independent profiling to the optional PyTorch layer:
+
+- arbitrary caller-owned zero-argument workloads;
+- separate cold-start, warmup, steady-state, and instrumented passes;
+- synchronized wall and CUDA timing with caller-labelled throughput;
+- CUDA allocator peaks and normalized operation evidence;
+- explicit caller-selected component ranges and optional Chrome traces;
+- generic nested tensor output metadata with semantic summarizer overrides;
+- reversible process-global Torch runtime controls; and
+- immutable versioned reports with atomic JSON publication.
+
+Exit condition: unrelated PyTorch models with different calls and output
+containers can use the same profiler without Mammoth constructing or
+interpreting either workload.
+
 ## Deferred capabilities
 
 Defer these until another real project supplies requirements:
