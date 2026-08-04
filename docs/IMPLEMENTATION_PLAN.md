@@ -177,6 +177,23 @@ Exit condition: one direct invocation can use the same API in single-process or
 two-rank DDP mode, and a rank-local startup failure reaches every participant
 without moving project hardware or workload policy into Mammoth.
 
+## Phase 9: Ordered checkpoint publication
+
+Status: complete.
+
+Extend the optional PyTorch checkpoint layer for projects whose checkpoint
+meaning remains local but whose publication mechanics are reusable:
+
+- caller-owned opaque serializers and payloads;
+- preparation of every artifact before ordered atomic replacement;
+- exact post-commit retirement confined to the checkpoint root;
+- bounded asynchronous publication with explicit failure propagation; and
+- compatibility with the existing registered-state single-file API.
+
+Exit condition: a consuming project can publish inference and resume artifacts
+from one immutable snapshot while retaining its formats, compatibility rules,
+commit order, and retention policy.
+
 ## Deferred capabilities
 
 Defer these until another real project supplies requirements:
