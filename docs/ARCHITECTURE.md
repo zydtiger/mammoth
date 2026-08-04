@@ -97,8 +97,10 @@ only that writer and must not terminate the workload.
 
 TensorBoard stores dense numerical and media history. Mammoth manages writer
 ownership, logical steps, flushing, and shutdown. Projects choose metric names
-and compute every value. The primary process writes by default; other ranks use
-a no-op sink unless explicitly configured otherwise.
+and compute every value. An observation may select its dense-history logical
+step explicitly; otherwise the sink infers it from generic coordinates and then
+falls back to its local sequence. The primary process writes by default; other
+ranks use a no-op sink unless explicitly configured otherwise.
 
 ### Text logs
 
@@ -106,7 +108,15 @@ Per-producer text logs contain diagnostics and tracebacks. Monitoring never
 parses them for state; it consumes immutable metadata and JSONL events. Each
 process holds an exclusive append lease for its rank log until logging closes.
 `ExecutionLogging` composes that handler with the rank's JSONL sink and any
-caller-selected sinks, including rank-aware TensorBoard.
+caller-selected sinks, including rank-aware TensorBoard. Consumers that own a
+different text presentation use `ExecutionObservability` to obtain the same
+JSONL-first observer lifecycle without claiming the rank log; the structured
+bundle remains independently composable with Mammoth's text handler.
+
+`RunObserver` owns optional periodic-heartbeat scopes above its sink fan-out.
+Heartbeat scheduling stays process-local, observes the configured idle interval,
+and retains sink failure isolation. Projects continue to choose phase, task, and
+message policy.
 
 ## Monitoring
 
