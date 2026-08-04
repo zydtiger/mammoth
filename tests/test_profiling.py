@@ -103,6 +103,10 @@ def test_profile_callable_supports_custom_summary_trace_and_json(tmp_path: Path)
     assert payload["operations_profiled"] is True
     assert payload["output_summary"] == {"kind": "matrix_product", "sum": 30.0}
     assert payload["top_operations"]
+    assert any(
+        operation["input_shapes"] == [[2, 3], [3, 2]]
+        for operation in payload["top_operations"]
+    )
 
 
 def test_default_output_summary_handles_nested_tensors_without_argmax() -> None:
@@ -179,6 +183,73 @@ def test_runtime_options_restore_state_after_success_and_failure() -> None:
         profile_callable(fail, runtime_options=options)
     assert current_torch_runtime_state() == before
 
+
+@pytest.mark.parametrize(
+    ("matmul_precision", "allow_tf32", "expected_precision"),
+    [
+        ("highest", False, "highest"),
+        ("high", False, "highest"),
+        ("medium", False, "highest"),
+        ("highest", True, "high"),
+        ("high", True, "high"),
+        ("medium", True, "medium"),
+    ],
+)
+def test_mixed_matmul_apis_use_one_effective_precision_without_getter_failure(
+    matmul_precision: str,
+    allow_tf32: bool,
+    expected_precision: str,
+) -> None:
+    before = current_torch_runtime_state()
+    report = profile_callable(
+        lambda: torch.ones(1),
+        config=ProfileConfig(
+            device="cpu",
+            warmup_iterations=0,
+            measured_iterations=1,
+            profiler_iterations=1,
+            profile_operations=False,
+        ),
+        runtime_options=TorchRuntimeOptions(
+            matmul_precision=matmul_precision,  # type: ignore[arg-type]
+            cuda_matmul_allow_tf32=allow_tf32,
+        ),
+    )
+
+    assert report.runtime.matmul_precision == expected_precision
+    assert report.runtime.cuda_matmul_allow_tf32 is allow_tf32
+    assert current_torch_runtime_state() == before
+
+
+@pytest.mark.parametrize(
+    ("allow_tf32", "expected_precision"),
+    [(False, "highest"), (True, "medium")],
+)
+def test_legacy_tf32_only_uses_new_api_and_restores_medium_state(
+    allow_tf32: bool,
+    expected_precision: str,
+) -> None:
+    original = current_torch_runtime_state()
+    try:
+        torch.set_float32_matmul_precision("medium")
+        before = current_torch_runtime_state()
+        report = profile_callable(
+            lambda: torch.ones(1),
+            config=ProfileConfig(
+                device="cpu",
+                warmup_iterations=0,
+                measured_iterations=1,
+                profiler_iterations=1,
+                profile_operations=False,
+            ),
+            runtime_options=TorchRuntimeOptions(cuda_matmul_allow_tf32=allow_tf32),
+        )
+
+        assert report.runtime.matmul_precision == expected_precision
+        assert report.runtime.cuda_matmul_allow_tf32 is allow_tf32
+        assert current_torch_runtime_state() == before
+    finally:
+        torch.set_float32_matmul_precision(original.matmul_precision)
 
 def test_disabled_operation_profile_is_explicit_in_report() -> None:
     report = profile_callable(

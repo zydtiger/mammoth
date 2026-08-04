@@ -75,7 +75,12 @@ class ProfileConfig:
 
 @dataclass(frozen=True, slots=True)
 class TorchRuntimeOptions:
-    """Optional process-global Torch settings applied only during profiling."""
+    """Optional process-global Torch settings applied only during profiling.
+
+    When both matmul precision APIs are requested, the legacy TF32 boolean has
+    precedence and is expressed through the newer precision API. This avoids a
+    PyTorch mixed-API state whose precision getter raises at report time.
+    """
 
     matmul_precision: MatmulPrecision | None = None
     cuda_matmul_allow_tf32: bool | None = None
@@ -157,6 +162,7 @@ class OperationProfile:
     device_memory_usage_bytes: int
     self_device_memory_usage_bytes: int
     flops: int
+    input_shapes: tuple[tuple[int | str, ...], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +268,7 @@ def profile_callable(
                 device=device,
                 row_limit=selected_config.row_limit,
                 sort_by=selected_config.sort_by,
+                record_shapes=selected_config.record_shapes,
             )
             if selected_config.chrome_trace is not None:
                 selected_config.chrome_trace.parent.mkdir(parents=True, exist_ok=True)
@@ -332,11 +339,10 @@ def torch_runtime_options(options: TorchRuntimeOptions) -> Iterator[None]:
     if not isinstance(options, TorchRuntimeOptions):
         raise TypeError("options must be TorchRuntimeOptions")
     previous = current_torch_runtime_state()
+    matmul_precision = _normalized_matmul_precision(options, previous)
     try:
-        if options.matmul_precision is not None:
-            torch.set_float32_matmul_precision(options.matmul_precision)
-        if options.cuda_matmul_allow_tf32 is not None:
-            torch.backends.cuda.matmul.allow_tf32 = options.cuda_matmul_allow_tf32
+        if matmul_precision is not None:
+            torch.set_float32_matmul_precision(matmul_precision)
         if options.cudnn_allow_tf32 is not None:
             torch.backends.cudnn.allow_tf32 = options.cudnn_allow_tf32
         if options.cudnn_benchmark is not None:
@@ -351,7 +357,6 @@ def torch_runtime_options(options: TorchRuntimeOptions) -> Iterator[None]:
         yield
     finally:
         torch.set_float32_matmul_precision(previous.matmul_precision)
-        torch.backends.cuda.matmul.allow_tf32 = previous.cuda_matmul_allow_tf32
         torch.backends.cudnn.allow_tf32 = previous.cudnn_allow_tf32
         torch.backends.cudnn.benchmark = previous.cudnn_benchmark
         torch.backends.cudnn.deterministic = previous.cudnn_deterministic
@@ -468,9 +473,14 @@ def _top_operations(
     device: torch.device,
     row_limit: int,
     sort_by: str | None,
+    record_shapes: bool = False,
 ) -> tuple[OperationProfile, ...]:
     selected_sort = sort_by or ("device_time_total" if device.type == "cuda" else "cpu_time_total")
-    rows = list(profiler.key_averages())
+    rows = list(
+        profiler.key_averages(group_by_input_shape=True)
+        if record_shapes
+        else profiler.key_averages()
+    )
     rows.sort(key=lambda row: _row_sort_value(row, selected_sort), reverse=True)
     return tuple(
         OperationProfile(
@@ -495,9 +505,44 @@ def _top_operations(
                 )
             ),
             flops=int(getattr(row, "flops", 0) or 0),
+            input_shapes=_input_shapes(row),
         )
         for row in rows[:row_limit]
     )
+
+
+def _normalized_matmul_precision(
+    options: TorchRuntimeOptions,
+    previous: TorchRuntimeState,
+) -> MatmulPrecision | None:
+    precision = options.matmul_precision
+    allow_tf32 = options.cuda_matmul_allow_tf32
+    if allow_tf32 is None:
+        return precision
+    if not allow_tf32:
+        return "highest"
+    if precision == "medium" or (precision is None and previous.matmul_precision == "medium"):
+        return "medium"
+    return "high"
+
+
+def _input_shapes(row: Any) -> tuple[tuple[int | str, ...], ...]:
+    raw_shapes = getattr(row, "input_shapes", ())
+    if not isinstance(raw_shapes, tuple | list):
+        return ()
+    shapes: list[tuple[int | str, ...]] = []
+    for raw_shape in raw_shapes:
+        if not isinstance(raw_shape, tuple | list):
+            continue
+        shapes.append(
+            tuple(
+                int(dimension)
+                if isinstance(dimension, int) and not isinstance(dimension, bool)
+                else str(dimension)
+                for dimension in raw_shape
+            )
+        )
+    return tuple(shapes)
 
 
 def _row_number(row: Any, name: str, fallback: str | None = None) -> float:
