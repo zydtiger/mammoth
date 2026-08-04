@@ -137,11 +137,23 @@ def test_default_output_summary_handles_non_strided_tensor() -> None:
 
 def test_runtime_options_restore_state_after_success_and_failure() -> None:
     before = current_torch_runtime_state()
-    options = TorchRuntimeOptions(cudnn_benchmark=not before.cudnn_benchmark)
-    observed: list[bool] = []
+    options = TorchRuntimeOptions(
+        cudnn_benchmark=not before.cudnn_benchmark,
+        cudnn_deterministic=not before.cudnn_deterministic,
+    )
+    observed: list[tuple[bool, bool]] = []
+
+    def observe_runtime() -> torch.Tensor:
+        observed.append(
+            (
+                torch.backends.cudnn.benchmark,
+                torch.backends.cudnn.deterministic,
+            )
+        )
+        return torch.ones(1)
 
     profile_callable(
-        lambda: observed.append(torch.backends.cudnn.benchmark) or torch.ones(1),
+        observe_runtime,
         config=ProfileConfig(
             device="cpu",
             warmup_iterations=0,
@@ -152,11 +164,15 @@ def test_runtime_options_restore_state_after_success_and_failure() -> None:
         runtime_options=options,
     )
 
-    assert observed == [not before.cudnn_benchmark, not before.cudnn_benchmark]
+    assert observed == [
+        (not before.cudnn_benchmark, not before.cudnn_deterministic),
+        (not before.cudnn_benchmark, not before.cudnn_deterministic),
+    ]
     assert current_torch_runtime_state() == before
 
     def fail() -> torch.Tensor:
         assert torch.backends.cudnn.benchmark is not before.cudnn_benchmark
+        assert torch.backends.cudnn.deterministic is not before.cudnn_deterministic
         raise RuntimeError("profile failed")
 
     with pytest.raises(RuntimeError, match="profile failed"):
@@ -233,6 +249,26 @@ def test_legacy_cuda_time_field_is_used_for_operation_sorting() -> None:
         device=torch.device("cuda"),
         row_limit=2,
         sort_by=None,
+    )
+
+    assert [row.key for row in rows] == ["slow", "fast"]
+
+
+def test_current_cuda_time_field_is_used_for_legacy_requested_sort() -> None:
+    class Row:
+        def __init__(self, key: str, device_time_total: float) -> None:
+            self.key = key
+            self.device_time_total = device_time_total
+
+    class Profiler:
+        def key_averages(self) -> list[Row]:
+            return [Row("slow", 20.0), Row("fast", 2.0)]
+
+    rows = profiling_module._top_operations(  # type: ignore[attr-defined]
+        Profiler(),  # type: ignore[arg-type]
+        device=torch.device("cuda"),
+        row_limit=2,
+        sort_by="cuda_time_total",
     )
 
     assert [row.key for row in rows] == ["slow", "fast"]
