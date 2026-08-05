@@ -50,6 +50,7 @@ from mammoth.torch.state import TrainerState
 
 Precision = Literal["fp32", "bf16", "fp16"]
 SchedulerInterval = Literal["optimizer", "epoch", "validation"]
+OptimizerStepLogicalClock = Literal["completed", "zero_based"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +117,7 @@ class TrainerConfig:
     validation_phase: str = "validation"
     display_metric_names: tuple[str, ...] = ("loss",)
     emit_fit_phase_events: bool = True
+    optimizer_step_logical_clock: OptimizerStepLogicalClock = "completed"
 
     def __post_init__(self) -> None:
         positive_integer("epochs", self.epochs)
@@ -131,6 +133,10 @@ class TrainerConfig:
             raise ValueError(f"Unsupported trainer precision: {self.precision!r}")
         if self.scheduler_interval not in {"optimizer", "epoch", "validation"}:
             raise ValueError(f"Unsupported scheduler interval: {self.scheduler_interval!r}")
+        if self.optimizer_step_logical_clock not in {"completed", "zero_based"}:
+            raise ValueError(
+                "optimizer_step_logical_clock must be 'completed' or 'zero_based'"
+            )
         if self.max_gradient_norm is not None and (
             isinstance(self.max_gradient_norm, bool)
             or not math.isfinite(self.max_gradient_norm)
@@ -519,7 +525,7 @@ class Trainer:
                                 "global_step": self.state.global_step,
                                 "optimizer_step": self.state.optimizer_step,
                             },
-                            logical_step=self.state.optimizer_step,
+                            logical_step=self.optimizer_step_logical_step(),
                             final=window_index == len(window_sizes),
                             unit="optimizer step",
                         )
@@ -717,6 +723,12 @@ class Trainer:
     ) -> dict[str, float]:
         """Validate consumer metrics after one optimizer/scheduler boundary."""
         return scalar_metrics(provider(self.state))
+
+    def optimizer_step_logical_step(self) -> int:
+        """Return the configured sink clock without changing completed-step state."""
+        if self.config.optimizer_step_logical_clock == "zero_based":
+            return self.state.optimizer_step - 1
+        return self.state.optimizer_step
 
     def compute_training_window(
         self,
