@@ -38,6 +38,7 @@ src/mammoth/
 │   └── runner.py
 ├── torch/
 │   ├── __init__.py
+│   ├── backend.py
 │   ├── batch.py
 │   ├── callbacks.py
 │   ├── checkpoint.py
@@ -60,7 +61,7 @@ src/mammoth/
 | `mammoth.logging.tensorboard` | `TensorBoardSink` |
 | `mammoth.monitor` | `ExecutionMonitor`, `RunMonitor`, `MonitorSnapshot`, `RunSnapshot`, `ProducerKey`, `ProducerState`, `TaskState`, `MetricPoint`, `ViewerTelemetry`, discovery/folding/rendering functions, and viewer telemetry sampling |
 | `mammoth.workflow` | `WorkflowConfig`, `RunConfig`, `StepConfig`, `CommandPlan`, `SupervisedProcess`, `ProcessResult`, `WorkflowResult`, `RunResult`, `StepResult`, workflow loading/planning/running functions, and command construction |
-| `mammoth.torch` | `TorchExecutionRuntime`, `TorchRuntimeConfig`, `TorchExecutionRequest`, `initialize_torch_runtime`, `Trainer`, `TrainerConfig`, `TrainerState`, `TrainerResult`, `StepContext`, `StepOutput`, `AccumulationPlan`, `AccumulationPolicy`, `UniformAccumulationPolicy`, `MetricSpec`, `MetricRoute`, `MetricAccumulator`, `StatefulMetric`, callable profiling configuration/results/runtime controls/report publication, `Callback`, `EarlyStopping`, `TrainerCheckpointContext`, `TrainerCheckpointPolicy`, `StateRegistry`, `CheckpointArtifact`, `CheckpointPlan`, `CheckpointPublication`, `AsyncCheckpointPublisher`, batch movement, ordered checkpoint publication, checkpoint creation, and checkpoint restoration |
+| `mammoth.torch` | `TorchBackendConfig`, `TorchBackendState`, `TorchSeedPolicy`, backend/seed application and reversible backend context, `TorchExecutionRuntime`, `TorchRuntimeConfig`, `TorchExecutionRequest`, `initialize_torch_runtime`, `Trainer`, `TrainerConfig`, `TorchCompileConfig`, `TrainerState`, `TrainerResult`, `StepContext`, `StepFunction`, `StepOutput`, `WarmupLinearLR`, `AccumulationPlan`, `AccumulationPolicy`, `UniformAccumulationPolicy`, `WeightedAccumulationPolicy`, `WeightedDistributedBatchSampler`, weighted count/index partition helpers, `MetricSpec`, `MetricRoute`, `MetricAccumulator`, `StatefulMetric`, callable profiling configuration/results/runtime controls/report publication, `Callback`, `EarlyStopping`, `TrainerCheckpointContext`, `TrainerCheckpointRestore`, `TrainerCheckpointPolicy`, `StateRegistry`, `CheckpointArtifact`, `CheckpointPlan`, `CheckpointPublication`, `AsyncCheckpointPublisher`, batch movement, ordered checkpoint publication, checkpoint creation, and checkpoint restoration |
 
 ## Command Routes
 

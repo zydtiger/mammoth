@@ -119,6 +119,7 @@ Add the optional `mammoth.torch` layer with a deliberately bounded first API:
 
 - one constructed `nn.Module`;
 - one optimizer and optional scheduler;
+- reusable warmup-linear scheduling with extended-horizon resume;
 - constructed train and optional validation `DataLoader` objects;
 - project-supplied train and validation step functions;
 - recursive batch-to-device transfer with an override;
@@ -145,17 +146,18 @@ Adopt Mammoth incrementally in the originating project:
 3. Replace the monitor with the generic monitor plus project view definitions.
 4. Move workflow process supervision to Mammoth while keeping project command
    construction local.
-5. Adopt the generic trainer only where its bounded contract matches exactly.
-6. Retain project-owned loops for specialized behavior.
+5. Adopt the generic trainer directly with project-owned step and checkpoint
+   policies.
+6. Retain project-owned loops only for algorithms outside the trainer contract.
 
 No artifact migration or destructive rewrite should be required.
 
 The originating project now uses compatibility facades for execution metadata
 and JSONL streams, defaults to the generic monitor while retaining an explicit
 project view, and delegates subprocess supervision without moving command
-construction or scheduling. Its training managers remain project-owned because
-their multi-model loss, metric, manifest, and checkpoint contracts do not match
-the bounded generic trainer exactly.
+construction or scheduling. Its ordinary segmentation training now constructs
+Mammoth's trainer directly; the project retains architecture steps, semantic
+metrics, manifest behavior, and checkpoint formats as injected policies.
 
 ## Phase 8: Unified PyTorch execution runtime
 
@@ -175,7 +177,8 @@ training loops:
 
 Exit condition: one direct invocation can use the same API in single-process or
 two-rank DDP mode, and a rank-local startup failure reaches every participant
-without moving project hardware or workload policy into Mammoth.
+without moving project hardware policy or concrete workload weights into
+Mammoth.
 
 ## Phase 9: Ordered checkpoint publication
 
@@ -212,6 +215,38 @@ Add model-independent profiling to the optional PyTorch layer:
 Exit condition: unrelated PyTorch models with different calls and output
 containers can use the same profiler without Mammoth constructing or
 interpreting either workload.
+
+## Phase 11: Generic weighted distributed workload
+
+Status: complete.
+
+Generalize the integer scheduling mechanics needed by heterogeneous DDP while
+leaving every concrete workload decision with the consuming project:
+
+- deterministic weighted integer counts and contiguous index ranges;
+- arbitrary positive rank weights and world sizes;
+- a dataset-independent distributed batch sampler over opaque indices;
+- full global accumulation windows with rank-local batch counts; and
+- correct mean-loss scaling after standard DDP gradient averaging.
+
+Exit condition: a consumer can supply its own rank weights and datasets while
+Mammoth owns the matching sampler, partition, and accumulation mechanics.
+
+## Phase 12: Generic Torch backend configuration
+
+Status: complete.
+
+Promote reusable process-global numerical controls out of profiler-specific
+code:
+
+- caller-selected TF32, float32 matmul precision, and cuDNN benchmarking;
+- caller-selected cuDNN and Torch deterministic modes;
+- effective backend-state capture and reversible overrides; and
+- selective Python, Torch CPU, and available CUDA generator seeding.
+
+Exit condition: training, inference, and profiling consumers share one backend
+implementation while retaining their concrete values, logging policy, and data
+seeding behavior.
 
 ## Deferred capabilities
 

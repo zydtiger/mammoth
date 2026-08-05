@@ -15,7 +15,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import torch
 
@@ -28,9 +28,9 @@ from mammoth.core.artifacts import (
     publish_prepared_artifact,
     sync_directory_descriptor,
 )
-from mammoth.torch.state import TrainerState
 
 CHECKPOINT_SCHEMA_VERSION = 1
+CheckpointReason = Literal["scheduled", "manual", "interrupted"]
 
 
 @dataclass(frozen=True)
@@ -70,6 +70,29 @@ class TrainerCheckpointContext:
     stopped_early: bool
     training_metrics: Mapping[str, float]
     validation_metrics: Mapping[str, float] | None
+    reason: CheckpointReason = "scheduled"
+
+
+@dataclass(frozen=True, slots=True)
+class TrainerCheckpointRestore:
+    """Project-restored coordinates that Mammoth applies to its loop state."""
+
+    epoch: int
+    optimizer_step: int | None = None
+    global_step: int | None = None
+    stopped_early: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.epoch, bool) or not isinstance(self.epoch, int) or self.epoch < -1:
+            raise ValueError("restored epoch must be an integer >= -1")
+        for name in ("optimizer_step", "global_step"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"restored {name} must be a non-negative integer or None")
+        if not isinstance(self.stopped_early, bool):
+            raise ValueError("restored stopped_early must be a boolean")
 
 
 class TrainerCheckpointPolicy(Protocol):
@@ -78,11 +101,10 @@ class TrainerCheckpointPolicy(Protocol):
     def restore(
         self,
         path: Path,
-        state: TrainerState,
         *,
         device: torch.device,
-    ) -> None:
-        """Restore project objects and generic trainer coordinates."""
+    ) -> TrainerCheckpointRestore:
+        """Restore project objects and return generic trainer coordinates."""
         ...
 
     def plan(self, context: TrainerCheckpointContext) -> CheckpointPlan | None:
