@@ -2826,6 +2826,37 @@ def test_trainer_flushes_each_logged_optimizer_window_to_jsonl(tmp_path: Path) -
     assert all("loss" in event.display_metrics for event in progress)
 
 
+def test_zero_based_optimizer_logical_clock_preserves_resume_history() -> None:
+    loader = DataLoader(MappingDataset(), batch_size=8)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = RecordingSink()
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        observer=RunObserver((sink,)),
+        config=TrainerConfig(
+            epochs=1,
+            device="cpu",
+            checkpoint_every_epochs=None,
+            optimizer_step_logical_clock="zero_based",
+        ),
+    ) as trainer:
+        trainer.state.optimizer_step = 4
+        trainer.fit()
+
+    progress = [
+        observation
+        for observation in sink.observations
+        if observation.event == "progress"
+    ]
+    assert progress[0].logical_step == 4
+    assert progress[0].fields["coordinates"]["optimizer_step"] == 5
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_fp16_precision_uses_cuda_scaling() -> None:
     features = torch.randn(4, 2)

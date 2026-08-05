@@ -215,6 +215,8 @@ deterministic rank-ordered position inside the active window.
 Consumers may supply post-optimizer metric providers for values, such as the
 current scheduler rate, that only become authoritative after Mammoth completes
 the optimizer and scheduler boundary.
+The completed optimizer cursor remains checkpoint state, while consumers may
+select a completed-step or zero-based logical clock for routed sink history.
 
 Complex algorithms with several optimizers, alternating updates, reinforcement
 learning control flow, or custom collectives keep their loop in the consuming
