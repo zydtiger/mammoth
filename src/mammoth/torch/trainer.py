@@ -91,6 +91,7 @@ class StepOutput:
 
 StepFunction = Callable[[torch.nn.Module, Any, StepContext], StepOutput]
 BatchMover = Callable[[Any, torch.device], Any]
+OptimizerStepMetrics = Callable[[TrainerState], Mapping[str, float | torch.Tensor]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +175,7 @@ class Trainer:
         scheduler: Any | None = None,
         observer: RunObserver | None = None,
         callbacks: Sequence[Callback] = (),
+        optimizer_step_metrics: OptimizerStepMetrics | None = None,
         metric_specs: Mapping[str, MetricSpec] | None = None,
         train_metric_routes: Mapping[str, MetricRoute] | None = None,
         validation_metric_routes: Mapping[str, MetricRoute] | None = None,
@@ -228,6 +230,7 @@ class Trainer:
         )
         self.observer = observer or runtime_observer or RunObserver()
         self.callbacks = tuple(callbacks)
+        self.optimizer_step_metrics = optimizer_step_metrics
         self.metric_specs = dict(metric_specs or {})
         self.train_metric_routes = dict(train_metric_routes or {})
         self.validation_metric_routes = dict(validation_metric_routes or {})
@@ -252,9 +255,7 @@ class Trainer:
             self.registry.register(f"callback-{index}", callback)
         for name, value in (extra_state or {}).items():
             self.registry.register(f"project-{name}", value)
-        self.publisher = AsyncCheckpointPublisher(
-            max_pending=config.max_pending_checkpoints
-        )
+        self.publisher = AsyncCheckpointPublisher(max_pending=config.max_pending_checkpoints)
         self._closed = False
 
     def fit(self) -> TrainerResult:
@@ -312,9 +313,7 @@ class Trainer:
 
                 local_should_stop = self.coordinate(
                     "stop callbacks",
-                    lambda: any(
-                        callback.should_stop(self.state) for callback in self.callbacks
-                    ),
+                    lambda: any(callback.should_stop(self.state) for callback in self.callbacks),
                 )
                 stop_decisions = self.all_gather_object(local_should_stop)
                 if not isinstance(stop_decisions[0], bool):
@@ -378,9 +377,7 @@ class Trainer:
             planning_error = error
         self.raise_distributed_failure("accumulation planning", planning_error)
         assert plan is not None
-        global_window_sizes, rank_window_offsets = self.distributed_window_layout(
-            window_sizes
-        )
+        global_window_sizes, rank_window_offsets = self.distributed_window_layout(window_sizes)
         task_id = f"epoch-{epoch}"
         self.observer.emit(
             "task_started",
@@ -392,9 +389,7 @@ class Trainer:
         try:
             window_stateful_baseline = self.coordinate(
                 "training metric setup",
-                lambda: reset_and_snapshot_stateful_metrics(
-                    self.train_stateful_metrics
-                ),
+                lambda: reset_and_snapshot_stateful_metrics(self.train_stateful_metrics),
             )
             with self.observer.periodic_heartbeats(
                 phase=self.config.train_phase,
@@ -437,9 +432,7 @@ class Trainer:
                                 with self.autocast_context():
                                     output = self.train_step(self.model, moved, context)
                                     if output.loss is None:
-                                        raise ValueError(
-                                            "train step must return a scalar loss"
-                                        )
+                                        raise ValueError("train step must return a scalar loss")
                                     scaled = output.loss * plan.scale_for_window(
                                         window_size,
                                         window_index=window_offset,
@@ -466,6 +459,17 @@ class Trainer:
                     self.synchronize_gradients()
                     self.coordinate("optimizer step", self.optimizer_step)
                     self.state.global_step += global_window_sizes[window_offset]
+                    optimizer_step_metrics = self.optimizer_step_metrics
+                    if optimizer_step_metrics is not None:
+                        optimizer_metrics = self.coordinate(
+                            "optimizer-step metrics",
+                            partial(
+                                self.compute_optimizer_step_metrics,
+                                optimizer_step_metrics,
+                            ),
+                        )
+                        accumulator.update(optimizer_metrics)
+                        window_accumulator.update(optimizer_metrics)
 
                     window_metrics, window_stateful_baseline = self.coordinate(
                         "training metric reduction",
@@ -476,9 +480,8 @@ class Trainer:
                         ),
                     )
                     window_accumulator = MetricAccumulator(self.metric_specs)
-                    if (
-                        window_index % self.config.log_every_batches == 0
-                        or window_index == len(window_sizes)
+                    if window_index % self.config.log_every_batches == 0 or window_index == len(
+                        window_sizes
                     ):
                         routed = self.coordinate(
                             "training metric routing",
@@ -509,6 +512,7 @@ class Trainer:
                             final=window_index == len(window_sizes),
                             unit="optimizer step",
                         )
+
             def compute_summary() -> tuple[dict[str, float], dict[str, float]]:
                 scalar_summary = accumulator.compute(
                     device=self.device,
@@ -561,19 +565,20 @@ class Trainer:
         )
         task_id = f"epoch-{epoch}"
         self.observer.emit("phase_started", phase=self.config.validation_phase)
-        self.observer.emit(
-            "task_started", phase=self.config.validation_phase, task_id=task_id
-        )
+        self.observer.emit("task_started", phase=self.config.validation_phase, task_id=task_id)
         try:
             self.coordinate(
                 "validation metric setup",
                 lambda: reset_stateful_metrics(self.validation_stateful_metrics),
             )
-            with self.observer.periodic_heartbeats(
-                phase=self.config.validation_phase,
-                task_id=task_id,
-                message="Validation epoch is still active.",
-            ), torch.no_grad():
+            with (
+                self.observer.periodic_heartbeats(
+                    phase=self.config.validation_phase,
+                    task_id=task_id,
+                    message="Validation epoch is still active.",
+                ),
+                torch.no_grad(),
+            ):
                 validation_error: BaseException | None = None
                 validation_iterator = self.coordinate(
                     "validation loader setup",
@@ -629,6 +634,7 @@ class Trainer:
                     "validation step",
                     validation_error,
                 )
+
             def compute_validation_summary() -> tuple[
                 dict[str, float],
                 dict[str, float],
@@ -695,6 +701,13 @@ class Trainer:
         self.state.optimizer_step += 1
         if self.scheduler is not None and self.config.scheduler_interval == "optimizer":
             self.scheduler.step()
+
+    def compute_optimizer_step_metrics(
+        self,
+        provider: OptimizerStepMetrics,
+    ) -> dict[str, float]:
+        """Validate consumer metrics after one optimizer/scheduler boundary."""
+        return scalar_metrics(provider(self.state))
 
     def compute_training_window(
         self,
@@ -790,9 +803,7 @@ class Trainer:
             scheduler.step()
             return
         if self.config.scheduler_monitor not in metrics:
-            raise KeyError(
-                f"Scheduler metric {self.config.scheduler_monitor!r} was not reported"
-            )
+            raise KeyError(f"Scheduler metric {self.config.scheduler_monitor!r} was not reported")
         scheduler.step(metrics[self.config.scheduler_monitor])
 
     def should_checkpoint(self, epoch: int) -> bool:
@@ -948,9 +959,7 @@ class Trainer:
         if not bool(failure_flag.item()):
             return
         local_status = (
-            None
-            if local_error is None
-            else f"{type(local_error).__name__}: {local_error}"
+            None if local_error is None else f"{type(local_error).__name__}: {local_error}"
         )
         statuses = self.all_gather_object(local_status)
         failure = next((status for status in statuses if status is not None), None)
@@ -977,8 +986,7 @@ class Trainer:
         if any(
             not isinstance(sizes, tuple)
             or any(
-                not isinstance(size, int) or isinstance(size, bool) or size < 1
-                for size in sizes
+                not isinstance(size, int) or isinstance(size, bool) or size < 1 for size in sizes
             )
             for sizes in gathered
         ):
@@ -990,8 +998,7 @@ class Trainer:
                 f"received {window_counts}"
             )
         global_sizes = tuple(
-            sum(sizes[index] for sizes in gathered)
-            for index in range(window_counts[0])
+            sum(sizes[index] for sizes in gathered) for index in range(window_counts[0])
         )
         rank_offsets = tuple(
             sum(gathered[rank][index] for rank in range(self.rank))
@@ -1058,9 +1065,7 @@ def reset_and_snapshot_stateful_metrics(
     return snapshot_stateful_metrics(metrics)
 
 
-def display_metrics(
-    metrics: Mapping[str, float], names: Sequence[str]
-) -> dict[str, float]:
+def display_metrics(metrics: Mapping[str, float], names: Sequence[str]) -> dict[str, float]:
     """Select the explicitly configured bounded live metric subset."""
     selected = {name: metrics[name] for name in names if name in metrics}
     if len(selected) > 16:

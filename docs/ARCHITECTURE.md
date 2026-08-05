@@ -212,6 +212,9 @@ window boundary, where Mammoth first reaches failure consensus and then
 averages gradients in stable parameter order. The persisted global-step cursor
 counts all ranks' microbatches at completed windows; step callbacks receive a
 deterministic rank-ordered position inside the active window.
+Consumers may supply post-optimizer metric providers for values, such as the
+current scheduler rate, that only become authoritative after Mammoth completes
+the optimizer and scheduler boundary.
 
 Complex algorithms with several optimizers, alternating updates, reinforcement
 learning control flow, or custom collectives keep their loop in the consuming
