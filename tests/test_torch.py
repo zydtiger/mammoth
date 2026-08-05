@@ -575,7 +575,9 @@ def _uneven_accumulation_worker(
             ) as trainer:
                 result = trainer.fit()
             progress = [
-                observation for observation in sink.observations if observation.event == "progress"
+                observation
+                for observation in sink.observations
+                if observation.event == "progress"
             ]
             partial_count = 4 if rank == 0 else 2
             partial_value = 1.0 if rank == 0 else 3.0
@@ -610,7 +612,9 @@ def _uneven_accumulation_worker(
             ) as partial_trainer:
                 partial_initial_weight = partial_model.weight.detach().item()
                 partial_trainer.fit()
-            partial_weight_delta = partial_model.weight.detach().item() - partial_initial_weight
+            partial_weight_delta = (
+                partial_model.weight.detach().item() - partial_initial_weight
+            )
             last_accumulator = MetricAccumulator({"rank1": MetricSpec("last")})
             if rank == 1:
                 last_accumulator.update({"rank1": 7.0})
@@ -620,14 +624,18 @@ def _uneven_accumulation_worker(
                 last_error = str(error)
             else:
                 last_error = None
-            primary_last_accumulator = MetricAccumulator({"primary": MetricSpec("last")})
+            primary_last_accumulator = MetricAccumulator(
+                {"primary": MetricSpec("last")}
+            )
             if rank == 0:
                 primary_last_accumulator.update({"primary": 9.0})
             primary_last_metrics = primary_last_accumulator.compute(
                 device=runtime.device,
                 distributed=True,
             )
-            local_accumulator = MetricAccumulator({"local": MetricSpec("mean", distributed=False)})
+            local_accumulator = MetricAccumulator(
+                {"local": MetricSpec("mean", distributed=False)}
+            )
             if rank == 1:
                 local_accumulator.update({"local": 7.0})
             local_metrics = local_accumulator.compute(
@@ -959,7 +967,8 @@ def test_uneven_ddp_accumulation_reduces_each_logical_batch(tmp_path: Path) -> N
     )
     assert all("accumulation planning failed" in result[11] for result in results)
     assert all(
-        "train step failed: ValueError: rank-one step failed" in result[12] for result in results
+        "train step failed: ValueError: rank-one step failed" in result[12]
+        for result in results
     )
     assert all(
         "train sampler epoch failed: ValueError: rank-one sampler failed" in result[13]
@@ -969,7 +978,10 @@ def test_uneven_ddp_accumulation_reduces_each_logical_batch(tmp_path: Path) -> N
         "checkpoint restore failed: ValueError: rank-one restore failed" in result[14]
         for result in results
     )
-    assert all("restored trainer state differs across ranks" in result[15] for result in results)
+    assert all(
+        "restored trainer state differs across ranks" in result[15]
+        for result in results
+    )
     assert all(result[16] == 8 for result in results)
     assert all(result[17] is None for result in results)
     assert len(list((tmp_path / "primary-checkpoints").glob("checkpoint-*.pt"))) == 1
@@ -1046,14 +1058,18 @@ def test_stateful_metrics_and_routes_remain_project_named() -> None:
         train_step=step,
         config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
         train_stateful_metrics={"project": AdditiveCountMetric()},
-        train_metric_routes={"count": MetricRoute(batch_name=None, epoch_name="project/count")},
+        train_metric_routes={
+            "count": MetricRoute(batch_name=None, epoch_name="project/count")
+        },
         observer=RunObserver((sink,)),
     ) as trainer:
         result = trainer.fit()
 
     assert result.training_history == ({"count": 4.0, "loss": 0.0},)
     completed = [
-        observation for observation in sink.observations if observation.event == "task_completed"
+        observation
+        for observation in sink.observations
+        if observation.event == "task_completed"
     ]
     assert completed[-1].metrics == {"project/count": 4.0}
 
@@ -1107,7 +1123,8 @@ def test_validation_progress_preserves_routed_dense_metrics() -> None:
     progress = [
         observation
         for observation in sink.observations
-        if observation.event == "progress" and observation.fields.get("phase") == "validation"
+        if observation.event == "progress"
+        and observation.fields.get("phase") == "validation"
     ]
     assert [observation.metrics for observation in progress] == [
         {"validation/score": 2.0},
@@ -1160,18 +1177,17 @@ def test_stateful_reset_failure_balances_task_and_phase_events() -> None:
     model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
     sink = RecordingSink()
-    with (
-        pytest.raises(RuntimeError, match="reset failed"),
-        Trainer(
-            model=model,
-            optimizer=optimizer,
-            train_loader=loader,
-            train_step=lambda module, batch, context: StepOutput(loss=module(batch[0]).sum() * 0),
-            config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
-            train_stateful_metrics={"broken": RaisingResetMetric()},
-            observer=RunObserver((sink,)),
-        ) as trainer,
-    ):
+    with pytest.raises(RuntimeError, match="reset failed"), Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=lambda module, batch, context: StepOutput(
+            loss=module(batch[0]).sum() * 0
+        ),
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        train_stateful_metrics={"broken": RaisingResetMetric()},
+        observer=RunObserver((sink,)),
+    ) as trainer:
         trainer.fit()
 
     assert [observation.event for observation in sink.observations] == [
@@ -1188,18 +1204,17 @@ def test_callback_failure_reports_phase_failed_without_phase_completed(hook: str
     model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
     sink = RecordingSink()
-    with (
-        pytest.raises(RuntimeError, match=f"{hook} callback failed"),
-        Trainer(
-            model=model,
-            optimizer=optimizer,
-            train_loader=loader,
-            train_step=lambda module, batch, context: StepOutput(loss=module(batch[0]).sum() * 0),
-            config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
-            callbacks=(RaisingCallback(hook),),
-            observer=RunObserver((sink,)),
-        ) as trainer,
-    ):
+    with pytest.raises(RuntimeError, match=f"{hook} callback failed"), Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=lambda module, batch, context: StepOutput(
+            loss=module(batch[0]).sum() * 0
+        ),
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        callbacks=(RaisingCallback(hook),),
+        observer=RunObserver((sink,)),
+    ) as trainer:
         trainer.fit()
 
     events = [observation.event for observation in sink.observations]
@@ -1216,7 +1231,9 @@ def test_trainer_can_leave_outer_fit_phase_lifecycle_to_its_caller() -> None:
         model=model,
         optimizer=optimizer,
         train_loader=loader,
-        train_step=lambda module, batch, context: StepOutput(loss=module(batch[0]).sum() * 0),
+        train_step=lambda module, batch, context: StepOutput(
+            loss=module(batch[0]).sum() * 0
+        ),
         config=TrainerConfig(
             epochs=1,
             device="cpu",
@@ -1228,7 +1245,8 @@ def test_trainer_can_leave_outer_fit_phase_lifecycle_to_its_caller() -> None:
         trainer.fit()
 
     assert not any(
-        observation.event.startswith("phase_") and observation.fields.get("phase") == "train"
+        observation.event.startswith("phase_")
+        and observation.fields.get("phase") == "train"
         for observation in sink.observations
     )
     assert [observation.event for observation in sink.observations] == [
@@ -1259,18 +1277,15 @@ def test_duplicate_train_epoch_routes_fail_with_balanced_task_events() -> None:
         "a": MetricRoute(batch_name=None, epoch_name="duplicate"),
         "b": MetricRoute(batch_name=None, epoch_name="duplicate"),
     }
-    with (
-        pytest.raises(ValueError, match="multiple metrics route"),
-        Trainer(
-            model=model,
-            optimizer=optimizer,
-            train_loader=loader,
-            train_step=step,
-            config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
-            train_metric_routes=duplicate_routes,
-            observer=RunObserver((sink,)),
-        ) as trainer,
-    ):
+    with pytest.raises(ValueError, match="multiple metrics route"), Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=step,
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        train_metric_routes=duplicate_routes,
+        observer=RunObserver((sink,)),
+    ) as trainer:
         trainer.fit()
 
     assert [observation.event for observation in sink.observations][-2:] == [
@@ -1305,20 +1320,17 @@ def test_duplicate_validation_epoch_routes_balance_both_lifecycle_scopes() -> No
         "a": MetricRoute(batch_name=None, epoch_name="duplicate"),
         "b": MetricRoute(batch_name=None, epoch_name="duplicate"),
     }
-    with (
-        pytest.raises(ValueError, match="multiple metrics route"),
-        Trainer(
-            model=model,
-            optimizer=optimizer,
-            train_loader=loader,
-            train_step=train_step,
-            validation_loader=loader,
-            validation_step=validation_step,
-            config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
-            validation_metric_routes=duplicate_routes,
-            observer=RunObserver((sink,)),
-        ) as trainer,
-    ):
+    with pytest.raises(ValueError, match="multiple metrics route"), Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=train_step,
+        validation_loader=loader,
+        validation_step=validation_step,
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        validation_metric_routes=duplicate_routes,
+        observer=RunObserver((sink,)),
+    ) as trainer:
         trainer.fit()
 
     events = [observation.event for observation in sink.observations]
@@ -1422,7 +1434,9 @@ def test_project_checkpoint_policy_plans_after_publisher_backpressure(
                 checkpoint_root=checkpoint_root,
                 artifacts=(CheckpointArtifact(destination, writer),),
                 retire_after_commit=tuple(
-                    path for path in checkpoint_root.glob("latest-*.pt") if path != destination
+                    path
+                    for path in checkpoint_root.glob("latest-*.pt")
+                    if path != destination
                 ),
             )
 
@@ -1929,7 +1943,8 @@ def test_checkpoint_plan_syncs_each_new_directory_link(
     )
 
     required_directories = {
-        (path.stat().st_dev, path.stat().st_ino) for path in (tmp_path, checkpoint_root, nested)
+        (path.stat().st_dev, path.stat().st_ino)
+        for path in (tmp_path, checkpoint_root, nested)
     }
     assert required_directories <= synced_directories
     assert destination.read_bytes() == b"latest"
@@ -2757,7 +2772,8 @@ def test_optimizer_step_metrics_observe_post_scheduler_state() -> None:
     completed = [
         observation
         for observation in sink.observations
-        if observation.event == "task_completed" and observation.fields.get("phase") == "train"
+        if observation.event == "task_completed"
+        and observation.fields.get("phase") == "train"
     ]
     assert completed[-1].metrics == {
         "Learning_Rate": pytest.approx(0.025),
