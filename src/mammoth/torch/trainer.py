@@ -8,9 +8,10 @@ checkpoint publication.
 from __future__ import annotations
 
 import math
+import pickle
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -25,14 +26,18 @@ from mammoth.torch.batch import move_batch_to_device
 from mammoth.torch.callbacks import Callback
 from mammoth.torch.checkpoint import (
     AsyncCheckpointPublisher,
+    CheckpointComponent,
+    CheckpointInspection,
     CheckpointReason,
+    RestoreOptions,
     Stateful,
     StateRegistry,
     TrainerCheckpointContext,
     TrainerCheckpointPolicy,
     TrainerCheckpointRestore,
     checkpoint_payload,
-    restore_checkpoint,
+    load_checkpoint_state,
+    snapshot_to_cpu,
 )
 from mammoth.torch.metrics import (
     MetricAccumulator,
@@ -304,6 +309,14 @@ class Trainer:
             self.registry.register(f"callback-{index}", callback)
         for name, value in (extra_state or {}).items():
             self.registry.register(f"project-{name}", value)
+        self._initial_optimizer_state = snapshot_to_cpu(self.optimizer.state_dict())
+        self._initial_scheduler_state = (
+            None if self.scheduler is None else snapshot_to_cpu(self.scheduler.state_dict())
+        )
+        self._initial_callback_states = tuple(
+            snapshot_to_cpu(callback.state_dict()) for callback in self.callbacks
+        )
+        self._checkpoint_restore: TrainerCheckpointRestore | None = None
         self.publisher = AsyncCheckpointPublisher(
             max_pending=config.max_pending_checkpoints
         )
@@ -940,6 +953,7 @@ class Trainer:
                         None if validation_metrics is None else dict(validation_metrics)
                     ),
                     reason=reason,
+                    restore=self._checkpoint_restore,
                 )
             )
             if plan is not None:
@@ -991,8 +1005,69 @@ class Trainer:
         self.raise_distributed_failure("forced checkpoint publication", local_error)
         self.flush_checkpoints()
 
-    def load_checkpoint(self, path: Path, *, strict: bool = True) -> None:
-        """Restore project-owned or registered state before calling :meth:`fit`."""
+    def inspect_checkpoint(self, path: Path) -> CheckpointInspection:
+        """Inspect one checkpoint on rank zero and share the typed result."""
+        checkpoint_path = Path(path)
+
+        def inspect_primary() -> CheckpointInspection | None:
+            if self.rank != 0:
+                return None
+            if self.checkpoint_policy is not None:
+                inspection = self.checkpoint_policy.inspect(
+                    checkpoint_path,
+                )
+                if not isinstance(inspection, CheckpointInspection):
+                    raise TypeError("checkpoint policy must return CheckpointInspection")
+                pickle.dumps(inspection)
+                return inspection
+            state = load_checkpoint_state(checkpoint_path, map_location="cpu")
+            return CheckpointInspection(
+                available_components=self.checkpoint_components(state),
+            )
+
+        local_inspection = self.coordinate("checkpoint inspection", inspect_primary)
+        gathered = self.all_gather_object(local_inspection)
+        inspection = gathered[0]
+        if not isinstance(inspection, CheckpointInspection):
+            raise RuntimeError("rank zero returned an invalid checkpoint inspection")
+        return inspection
+
+    def load_checkpoint(
+        self,
+        path: Path,
+        *,
+        options: RestoreOptions | None = None,
+        strict: bool = True,
+    ) -> TrainerCheckpointRestore:
+        """Restore selected generic state and return the synchronized typed report."""
+        checkpoint_path = Path(path)
+        restore_request = (str(checkpoint_path), options, strict)
+        self.coordinate(
+            "checkpoint restore request serialization",
+            partial(pickle.dumps, restore_request),
+        )
+        gathered_requests = self.all_gather_object(restore_request)
+        for request in gathered_requests:
+            if (
+                not isinstance(request, tuple)
+                or len(request) != 3
+                or not isinstance(request[0], str)
+                or (
+                    request[1] is not None
+                    and not isinstance(request[1], RestoreOptions)
+                )
+                or not isinstance(request[2], bool)
+            ):
+                raise TypeError(
+                    "checkpoint restore request must contain a path, "
+                    "RestoreOptions or None, and strict boolean"
+                )
+        if any(request != gathered_requests[0] for request in gathered_requests[1:]):
+            raise RuntimeError("checkpoint restore request differs across ranks")
+        restore_options = options
+        if restore_options is None:
+            restore_options = self.inspect_checkpoint(checkpoint_path).restore_options
+
         if self.checkpoint_policy is not None:
             if not strict:
                 raise ValueError("strict=False applies only to registered-state checkpoints")
@@ -1000,41 +1075,192 @@ class Trainer:
                 "checkpoint restore",
                 partial(
                     self.checkpoint_policy.restore,
-                    Path(path),
+                    checkpoint_path,
                     device=self.device,
+                    options=restore_options,
                 ),
             )
-            self.coordinate(
-                "checkpoint coordinate restore",
-                partial(self.apply_checkpoint_restore, restored),
+        else:
+            state = self.coordinate(
+                "checkpoint restore",
+                partial(
+                    load_checkpoint_state,
+                    checkpoint_path,
+                    map_location=self.device,
+                ),
             )
-            self.validate_restored_trainer_state()
-            return
-        self.coordinate(
-            "checkpoint restore",
+            restored = self.coordinate(
+                "registered checkpoint translation",
+                partial(self.registered_checkpoint_restore, state, strict=strict),
+            )
+        restored = self.synchronize_checkpoint_restore_payload(restored)
+        local_window_sizes = self.coordinate(
+            "checkpoint restore accumulation planning",
+            self.checkpoint_restore_window_sizes,
+        )
+        global_window_sizes, _ = self.distributed_window_layout(local_window_sizes)
+        applied = self.coordinate(
+            "checkpoint state application",
             partial(
-                restore_checkpoint,
-                path,
-                self.registry,
-                strict=strict,
-                map_location=self.device,
+                self.apply_checkpoint_restore,
+                restored,
+                restore_options,
+                global_window_sizes=global_window_sizes,
             ),
         )
-        self.validate_restored_trainer_state()
+        self.validate_restored_trainer_state(applied)
+        self._checkpoint_restore = applied
+        return applied
 
-    def apply_checkpoint_restore(self, restored: TrainerCheckpointRestore) -> None:
-        """Apply project-restored coordinates and infer absent generic cursors."""
+    def checkpoint_components(
+        self,
+        state: Mapping[str, Any],
+    ) -> frozenset[CheckpointComponent]:
+        """Return generic component categories present in registered state."""
+        components: set[CheckpointComponent] = set()
+        if "model" in state:
+            components.add("model")
+        if "optimizer" in state:
+            components.add("optimizer")
+        if "scheduler" in state:
+            components.add("scheduler")
+        if "trainer" in state:
+            components.update(("trainer", "stopped_early"))
+        if "scaler" in state:
+            components.add("scaler")
+        if any(name.startswith("callback-") for name in state):
+            components.add("callbacks")
+        if any(name.startswith("project-") for name in state):
+            components.add("project")
+        return frozenset(components)
+
+    def registered_checkpoint_restore(
+        self,
+        state: Mapping[str, Any],
+        *,
+        strict: bool,
+    ) -> TrainerCheckpointRestore:
+        """Translate registered state into the same typed restore contract."""
+        missing = sorted(self.registry.names.difference(state))
+        unexpected = sorted(set(state).difference(self.registry.names))
+        if strict and (missing or unexpected):
+            raise ValueError(
+                f"checkpoint state mismatch; missing={missing}, unexpected={unexpected}"
+            )
+        if any(not isinstance(value, Mapping) for value in state.values()):
+            raise ValueError("registered checkpoint component states must be mappings")
+
+        managed_names = {
+            "optimizer",
+            "scheduler",
+            "trainer",
+            *(name for name in state if name.startswith("callback-")),
+        }
+        direct_state = {
+            name: value
+            for name, value in state.items()
+            if name in self.registry.names and name not in managed_names
+        }
+        self.registry.load_state_dict(direct_state, strict=False)
+        components = set(self.checkpoint_components(direct_state))
+
+        restored_state = TrainerState()
+        trainer_state = state.get("trainer")
+        if trainer_state is not None:
+            restored_state.load_state_dict(cast(Mapping[str, Any], trainer_state))
+        else:
+            restored_state.load_state_dict(self.state.state_dict())
+        callback_states: dict[int, Mapping[str, Any]] = {}
+        for name, value in state.items():
+            if not name.startswith("callback-"):
+                continue
+            if name not in self.registry.names:
+                continue
+            index_text = name.removeprefix("callback-")
+            if not index_text.isdecimal():
+                raise ValueError(f"invalid registered callback state name: {name!r}")
+            callback_states[int(index_text)] = cast(Mapping[str, Any], value)
+        return TrainerCheckpointRestore(
+            epoch=restored_state.epoch,
+            optimizer_step=restored_state.optimizer_step,
+            global_step=restored_state.global_step,
+            stopped_early=restored_state.stopped_early,
+            optimizer_state_dict=cast(
+                Mapping[str, Any] | None,
+                state.get("optimizer"),
+            ),
+            scheduler_state_dict=cast(
+                Mapping[str, Any] | None,
+                state.get("scheduler"),
+            ),
+            callback_state_dicts=callback_states,
+            restored_components=frozenset(components),
+        )
+
+    def apply_checkpoint_restore(
+        self,
+        restored: TrainerCheckpointRestore,
+        options: RestoreOptions,
+        *,
+        global_window_sizes: tuple[int, ...],
+    ) -> TrainerCheckpointRestore:
+        """Apply generic component actions and infer absent loop cursors."""
         if not isinstance(restored, TrainerCheckpointRestore):
             raise TypeError("checkpoint policy must return TrainerCheckpointRestore")
-        local_batch_count = len(self.train_loader)
-        plan = self.accumulation_policy.plan(
-            rank=self.rank,
-            world_size=self.world_size,
-            local_batch_count=local_batch_count,
-        )
-        global_window_sizes, _ = self.distributed_window_layout(
-            plan.window_sizes(local_batch_count)
-        )
+        if not isinstance(options, RestoreOptions):
+            raise TypeError("checkpoint restore options must be RestoreOptions")
+        managed_components = {
+            "optimizer",
+            "scheduler",
+            "callbacks",
+            "trainer",
+            "stopped_early",
+        }
+        pre_reported_managed = (
+            restored.restored_components | restored.reset_components
+        ) & managed_components
+        if pre_reported_managed:
+            raise ValueError(
+                "checkpoint policies cannot pre-report Mammoth-managed components: "
+                f"{sorted(pre_reported_managed)}"
+            )
+        restored_components = set(restored.restored_components)
+        reset_components = set(restored.reset_components)
+
+        if options.optimizer == "restore" and restored.optimizer_state_dict is not None:
+            self.optimizer.load_state_dict(dict(restored.optimizer_state_dict))
+            restored_components.add("optimizer")
+        elif options.optimizer == "reset":
+            self.optimizer.load_state_dict(self._initial_optimizer_state)
+            reset_components.add("optimizer")
+
+        if self.scheduler is not None:
+            if options.scheduler == "restore" and restored.scheduler_state_dict is not None:
+                self.scheduler.load_state_dict(dict(restored.scheduler_state_dict))
+                self.synchronize_optimizer_scheduler_rates()
+                restored_components.add("scheduler")
+            elif options.scheduler == "reset":
+                assert self._initial_scheduler_state is not None
+                self.scheduler.load_state_dict(self._initial_scheduler_state)
+                self.synchronize_optimizer_scheduler_rates()
+                reset_components.add("scheduler")
+
+        if options.callbacks == "restore":
+            for index, state in restored.callback_state_dicts.items():
+                if index >= len(self.callbacks):
+                    raise ValueError(f"checkpoint callback index {index} is not registered")
+                self.callbacks[index].load_state_dict(state)
+            if restored.callback_state_dicts:
+                restored_components.add("callbacks")
+        else:
+            for callback, initial_state in zip(
+                self.callbacks,
+                self._initial_callback_states,
+                strict=True,
+            ):
+                callback.load_state_dict(initial_state)
+            reset_components.add("callbacks")
+
         completed_epochs = restored.epoch + 1
         self.state.epoch = restored.epoch
         self.state.optimizer_step = (
@@ -1047,12 +1273,84 @@ class Trainer:
             if restored.global_step is not None
             else completed_epochs * sum(global_window_sizes)
         )
-        self.state.stopped_early = restored.stopped_early
+        restored_components.add("trainer")
+        if options.stopped_early == "restore":
+            self.state.stopped_early = restored.stopped_early
+            restored_components.add("stopped_early")
+        else:
+            self.state.stopped_early = False
+            reset_components.add("stopped_early")
 
-    def validate_restored_trainer_state(self) -> None:
-        """Require identical restored loop coordinates on every DDP rank."""
+        return replace(
+            restored,
+            stopped_early=self.state.stopped_early,
+            optimizer_state_dict=None,
+            scheduler_state_dict=None,
+            callback_state_dicts={},
+            restored_components=frozenset(restored_components),
+            reset_components=frozenset(reset_components),
+        )
+
+    def checkpoint_restore_window_sizes(self) -> tuple[int, ...]:
+        """Plan local accumulation without entering a distributed collective."""
+        local_batch_count = len(self.train_loader)
+        plan = self.accumulation_policy.plan(
+            rank=self.rank,
+            world_size=self.world_size,
+            local_batch_count=local_batch_count,
+        )
+        return plan.window_sizes(local_batch_count)
+
+    def synchronize_checkpoint_restore_payload(
+        self,
+        restored: object,
+    ) -> TrainerCheckpointRestore:
+        """Use rank zero's validated generic restore payload on every rank."""
+        validated = self.coordinate(
+            "checkpoint restore payload contract",
+            partial(self.require_checkpoint_restore, restored),
+        )
+        self.coordinate(
+            "checkpoint restore payload serialization",
+            partial(pickle.dumps, validated),
+        )
+        synchronized = self.broadcast_object(validated if self.rank == 0 else None)
+        if not isinstance(synchronized, TrainerCheckpointRestore):
+            raise RuntimeError("rank zero returned an invalid checkpoint restore payload")
+        return synchronized
+
+    def require_checkpoint_restore(self, restored: object) -> TrainerCheckpointRestore:
+        """Validate one rank-local project restore result before collectives."""
+        if not isinstance(restored, TrainerCheckpointRestore):
+            raise TypeError("checkpoint policy must return TrainerCheckpointRestore")
+        return restored
+
+    def synchronize_optimizer_scheduler_rates(self) -> None:
+        """Apply a reset scheduler's initial rates to optimizer parameter groups."""
+        if self.scheduler is None:
+            return
+        learning_rates = self.scheduler.get_last_lr()
+        if len(learning_rates) != len(self.optimizer.param_groups):
+            raise ValueError("scheduler learning-rate count does not match optimizer groups")
+        for parameter_group, learning_rate in zip(
+            self.optimizer.param_groups,
+            learning_rates,
+            strict=True,
+        ):
+            parameter_group["lr"] = learning_rate
+
+    def validate_restored_trainer_state(
+        self,
+        restored: TrainerCheckpointRestore,
+    ) -> None:
+        """Require identical restored coordinates and reports on every DDP rank."""
         local_state = self.state.state_dict()
-        gathered_states = self.all_gather_object(local_state)
+        local_report = {
+            "state": local_state,
+            "restored_components": sorted(restored.restored_components),
+            "reset_components": sorted(restored.reset_components),
+        }
+        gathered_states = self.all_gather_object(local_report)
         primary_state = gathered_states[0]
         if any(state != primary_state for state in gathered_states[1:]):
             raise RuntimeError("restored trainer state differs across ranks")
@@ -1156,6 +1454,16 @@ class Trainer:
         gathered: list[Any] = [None] * self.world_size
         torch.distributed.all_gather_object(gathered, value)
         return tuple(gathered)
+
+    def broadcast_object(self, value: Any, *, source_rank: int = 0) -> Any:
+        """Broadcast a small authoritative value from one configured rank."""
+        if self.config.strategy == "single":
+            return value
+        if self.runtime is not None:
+            return self.runtime.broadcast_object(value, source_rank=source_rank)
+        objects = [value]
+        torch.distributed.broadcast_object_list(objects, src=source_rank)
+        return objects[0]
 
     def close(self) -> None:
         """Flush and close checkpoint publication resources."""

@@ -128,6 +128,7 @@ Add the optional `mammoth.torch` layer with a deliberately bounded first API:
 - standard single-process and DDP strategies;
 - scalar metric aggregation policies;
 - callback-based validation and early stopping;
+- typed two-phase checkpoint inspection and selective generic restore/reset;
 - registered `state_dict` checkpoint state;
 - bounded asynchronous atomic publication; and
 - direct integration with `RunObserver`.

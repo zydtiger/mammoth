@@ -265,14 +265,19 @@ publication plans containing opaque serializer callbacks and exact retirement
 paths.
 
 A trainer checkpoint policy chooses when a completed epoch produces a plan and
-restores its own format into caller-owned objects. It returns a
-`TrainerCheckpointRestore` containing the persisted epoch and any available
-optimizer/global cursors and terminal early-stop decision. Mammoth infers absent
-cursors from the active accumulation plan, applies the coordinates, coordinates
-restore failures, and requires the result to agree across DDP ranks before
-training resumes. Projects may also request a synchronized manual or
-interruption publication; the checkpoint context identifies that reason while
-the project still selects the artifact plan.
+translates its own format into Mammoth's typed restore contract. The trainer
+first calls the policy once on rank zero through `inspect_checkpoint()`, then
+shares its `CheckpointInspection`, including the immutable `RestoreOptions`
+selection, with every rank. `load_checkpoint()` restores the project-owned
+model representation and lets Mammoth restore or reset generic optimizer,
+scheduler, callback, and terminal early-stop state while restoring trainer coordinates. Its
+returned `TrainerCheckpointRestore` reports restored and reset components plus
+opaque project metadata. Mammoth infers absent cursors from the active
+accumulation plan and requires coordinates, terminal state, component reports,
+and metadata to agree across DDP ranks before training resumes. Projects may
+also request a synchronized manual or interruption publication; the checkpoint
+context identifies that reason and exposes the prior restore report while the
+project still selects the artifact plan.
 
 The trainer applies publisher backpressure before asking a project checkpoint
 policy to capture state or select retention paths. The publisher snapshots or
