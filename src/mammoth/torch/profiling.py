@@ -16,18 +16,23 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any
 
 import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils.hooks import RemovableHandle
 
 from mammoth.core import atomic_write_json
+from mammoth.torch.backend import (
+    TorchBackendConfig,
+    TorchBackendState,
+    configured_torch_backend,
+    current_torch_backend_state,
+)
 from mammoth.torch.runtime import resolve_device
 
 PROFILE_SCHEMA_VERSION = 1
 
-type MatmulPrecision = Literal["highest", "high", "medium"]
 type JsonScalar = str | int | float | bool | None
 type FrozenJson = JsonScalar | tuple["FrozenJson", ...] | Mapping[str, "FrozenJson"]
 type OutputSummarizer = Callable[[Any], Mapping[str, Any]]
@@ -73,39 +78,8 @@ class ProfileConfig:
                 raise ValueError("chrome_trace requires profile_operations=True")
 
 
-@dataclass(frozen=True, slots=True)
-class TorchRuntimeOptions:
-    """Optional process-global Torch settings applied only during profiling.
-
-    When both matmul precision APIs are requested, the legacy TF32 boolean has
-    precedence and is expressed through the newer precision API. This avoids a
-    PyTorch mixed-API state whose precision getter raises at report time.
-    """
-
-    matmul_precision: MatmulPrecision | None = None
-    cuda_matmul_allow_tf32: bool | None = None
-    cudnn_allow_tf32: bool | None = None
-    cudnn_benchmark: bool | None = None
-    cudnn_deterministic: bool | None = None
-    deterministic_algorithms: bool | None = None
-    deterministic_warn_only: bool = False
-
-    def __post_init__(self) -> None:
-        if self.matmul_precision not in {None, "highest", "high", "medium"}:
-            raise ValueError(f"Unsupported matmul precision: {self.matmul_precision!r}")
-
-
-@dataclass(frozen=True, slots=True)
-class TorchRuntimeState:
-    """Effective Torch backend state used for one profile."""
-
-    matmul_precision: str
-    cuda_matmul_allow_tf32: bool
-    cudnn_allow_tf32: bool
-    cudnn_benchmark: bool
-    cudnn_deterministic: bool
-    deterministic_algorithms: bool
-    deterministic_warn_only: bool
+TorchRuntimeOptions = TorchBackendConfig
+TorchRuntimeState = TorchBackendState
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,45 +312,13 @@ def torch_runtime_options(options: TorchRuntimeOptions) -> Iterator[None]:
     """Apply Torch backend settings and restore all prior values on exit."""
     if not isinstance(options, TorchRuntimeOptions):
         raise TypeError("options must be TorchRuntimeOptions")
-    previous = current_torch_runtime_state()
-    matmul_precision = _normalized_matmul_precision(options, previous)
-    try:
-        if matmul_precision is not None:
-            torch.set_float32_matmul_precision(matmul_precision)
-        if options.cudnn_allow_tf32 is not None:
-            torch.backends.cudnn.allow_tf32 = options.cudnn_allow_tf32
-        if options.cudnn_benchmark is not None:
-            torch.backends.cudnn.benchmark = options.cudnn_benchmark
-        if options.cudnn_deterministic is not None:
-            torch.backends.cudnn.deterministic = options.cudnn_deterministic
-        if options.deterministic_algorithms is not None:
-            torch.use_deterministic_algorithms(
-                options.deterministic_algorithms,
-                warn_only=options.deterministic_warn_only,
-            )
+    with configured_torch_backend(options):
         yield
-    finally:
-        torch.set_float32_matmul_precision(previous.matmul_precision)
-        torch.backends.cudnn.allow_tf32 = previous.cudnn_allow_tf32
-        torch.backends.cudnn.benchmark = previous.cudnn_benchmark
-        torch.backends.cudnn.deterministic = previous.cudnn_deterministic
-        torch.use_deterministic_algorithms(
-            previous.deterministic_algorithms,
-            warn_only=previous.deterministic_warn_only,
-        )
 
 
 def current_torch_runtime_state() -> TorchRuntimeState:
     """Capture the process-global Torch settings relevant to profiling."""
-    return TorchRuntimeState(
-        matmul_precision=torch.get_float32_matmul_precision(),
-        cuda_matmul_allow_tf32=bool(torch.backends.cuda.matmul.allow_tf32),
-        cudnn_allow_tf32=bool(torch.backends.cudnn.allow_tf32),
-        cudnn_benchmark=bool(torch.backends.cudnn.benchmark),
-        cudnn_deterministic=bool(torch.backends.cudnn.deterministic),
-        deterministic_algorithms=torch.are_deterministic_algorithms_enabled(),
-        deterministic_warn_only=torch.is_deterministic_algorithms_warn_only_enabled(),
-    )
+    return current_torch_backend_state()
 
 
 def _measure_invocation(
@@ -509,21 +451,6 @@ def _top_operations(
         )
         for row in rows[:row_limit]
     )
-
-
-def _normalized_matmul_precision(
-    options: TorchRuntimeOptions,
-    previous: TorchRuntimeState,
-) -> MatmulPrecision | None:
-    precision = options.matmul_precision
-    allow_tf32 = options.cuda_matmul_allow_tf32
-    if allow_tf32 is None:
-        return precision
-    if not allow_tf32:
-        return "highest"
-    if precision == "medium" or (precision is None and previous.matmul_precision == "medium"):
-        return "medium"
-    return "high"
 
 
 def _input_shapes(row: Any) -> tuple[tuple[int | str, ...], ...]:

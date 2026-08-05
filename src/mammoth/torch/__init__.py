@@ -5,6 +5,15 @@ Install the ``torch`` extra before importing this package.
 
 from __future__ import annotations
 
+from mammoth.torch.backend import (
+    TorchBackendConfig,
+    TorchBackendState,
+    TorchSeedPolicy,
+    apply_torch_backend_config,
+    apply_torch_seed_policy,
+    configured_torch_backend,
+    current_torch_backend_state,
+)
 from mammoth.torch.batch import move_batch_to_device
 from mammoth.torch.callbacks import Callback, EarlyStopping
 from mammoth.torch.checkpoint import (
@@ -15,6 +24,7 @@ from mammoth.torch.checkpoint import (
     StateRegistry,
     TrainerCheckpointContext,
     TrainerCheckpointPolicy,
+    TrainerCheckpointRestore,
     checkpoint_payload,
     publish_checkpoint_plan,
     restore_checkpoint,
@@ -52,11 +62,18 @@ from mammoth.torch.scheduling import (
     AccumulationPlan,
     AccumulationPolicy,
     UniformAccumulationPolicy,
+    WarmupLinearLR,
+    WeightedAccumulationPolicy,
+    WeightedDistributedBatchSampler,
+    weighted_partition_counts,
+    weighted_partition_indices,
 )
 from mammoth.torch.state import TrainerState
 from mammoth.torch.trainer import (
     StepContext,
+    StepFunction,
     StepOutput,
+    TorchCompileConfig,
     Trainer,
     TrainerConfig,
     TrainerResult,
@@ -83,21 +100,34 @@ __all__ = [
     "StateRegistry",
     "StatefulMetric",
     "StepContext",
+    "StepFunction",
     "StepOutput",
     "Trainer",
     "TrainerConfig",
     "TrainerCheckpointContext",
     "TrainerCheckpointPolicy",
+    "TrainerCheckpointRestore",
     "TrainerResult",
     "TrainerState",
+    "TorchCompileConfig",
     "TorchExecutionRequest",
     "TorchExecutionRuntime",
     "TorchRuntimeConfig",
     "TorchRuntimeOptions",
     "TorchRuntimeState",
+    "TorchBackendConfig",
+    "TorchBackendState",
+    "TorchSeedPolicy",
     "ThroughputSummary",
     "UniformAccumulationPolicy",
+    "WarmupLinearLR",
+    "WeightedAccumulationPolicy",
+    "WeightedDistributedBatchSampler",
     "checkpoint_payload",
+    "apply_torch_backend_config",
+    "apply_torch_seed_policy",
+    "configured_torch_backend",
+    "current_torch_backend_state",
     "current_torch_runtime_state",
     "initialize_torch_runtime",
     "move_batch_to_device",
@@ -107,5 +137,7 @@ __all__ = [
     "summarize_latency",
     "summarize_output_value",
     "torch_runtime_options",
+    "weighted_partition_counts",
+    "weighted_partition_indices",
     "write_profile_report",
 ]

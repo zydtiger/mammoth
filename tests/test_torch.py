@@ -8,7 +8,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from queue import Empty
 from typing import Any, cast
@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler, TensorDataset
 
 import mammoth.torch.checkpoint as checkpoint_module
 import mammoth.torch.runtime as torch_runtime_module
+import mammoth.torch.trainer as trainer_module
 from mammoth.core import (
     PreparedArtifact,
     claim_logical_run_lease,
@@ -43,19 +44,158 @@ from mammoth.torch import (
     StateRegistry,
     StepContext,
     StepOutput,
+    TorchCompileConfig,
     TorchExecutionRequest,
     TorchRuntimeConfig,
     Trainer,
     TrainerCheckpointContext,
+    TrainerCheckpointRestore,
     TrainerConfig,
     TrainerState,
     UniformAccumulationPolicy,
+    WarmupLinearLR,
+    WeightedAccumulationPolicy,
+    WeightedDistributedBatchSampler,
+    checkpoint_payload,
     initialize_torch_runtime,
     move_batch_to_device,
     publish_checkpoint_plan,
     restore_checkpoint,
+    weighted_partition_counts,
+    weighted_partition_indices,
 )
 from mammoth.torch.metrics import compute_stateful_metrics
+
+
+def build_warmup_linear_stack(
+    *,
+    total_steps: int,
+    warmup_ratio: float = 0.0,
+) -> tuple[torch.optim.Optimizer, WarmupLinearLR]:
+    """Build a two-group optimizer and reusable warmup-linear scheduler."""
+    parameters = [torch.nn.Parameter(torch.tensor([1.0])) for _ in range(2)]
+    optimizer = torch.optim.SGD(
+        [
+            {"params": [parameters[0]], "lr": 1.0},
+            {"params": [parameters[1]], "lr": 0.1},
+        ]
+    )
+    return optimizer, WarmupLinearLR(
+        optimizer,
+        warmup_ratio=warmup_ratio,
+        total_steps=total_steps,
+    )
+
+
+def advance_optimizer_scheduler(
+    optimizer: torch.optim.Optimizer,
+    scheduler: WarmupLinearLR,
+    count: int,
+) -> None:
+    """Advance a scheduler using PyTorch's optimizer-before-scheduler order."""
+    for _ in range(count):
+        optimizer.step()
+        scheduler.step()
+
+
+def test_warmup_linear_lr_validates_configuration_and_boundaries() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+
+    for total_steps in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="total_steps must be a positive integer"):
+            WarmupLinearLR(optimizer, warmup_ratio=0.5, total_steps=cast(Any, total_steps))
+    for warmup_ratio in (-0.1, 1.0, float("inf"), True):
+        with pytest.raises(ValueError, match="warmup_ratio must be finite"):
+            WarmupLinearLR(
+                optimizer,
+                warmup_ratio=cast(Any, warmup_ratio),
+                total_steps=4,
+            )
+
+    scheduler = WarmupLinearLR(optimizer, warmup_ratio=0.5, total_steps=4)
+    observed = [scheduler.get_last_lr()[0]]
+    for _ in range(4):
+        optimizer.step()
+        scheduler.step()
+        observed.append(scheduler.get_last_lr()[0])
+    assert observed == pytest.approx([0.0, 0.05, 0.1, 0.05, 0.0])
+
+
+def test_warmup_linear_lr_preserves_multiple_parameter_group_ratios() -> None:
+    optimizer, scheduler = build_warmup_linear_stack(total_steps=4, warmup_ratio=0.5)
+    observed = [scheduler.get_last_lr()]
+    for _ in range(4):
+        optimizer.step()
+        scheduler.step()
+        observed.append(scheduler.get_last_lr())
+    torch.testing.assert_close(
+        torch.tensor(observed),
+        torch.tensor(
+            [
+                [0.0, 0.0],
+                [0.5, 0.05],
+                [1.0, 0.1],
+                [0.5, 0.05],
+                [0.0, 0.0],
+            ]
+        ),
+    )
+
+
+def test_warmup_linear_lr_checkpoint_round_trip_preserves_same_horizon(
+    tmp_path: Path,
+) -> None:
+    optimizer, scheduler = build_warmup_linear_stack(total_steps=8)
+    advance_optimizer_scheduler(optimizer, scheduler, 2)
+    registry = StateRegistry()
+    registry.register("optimizer", optimizer)
+    registry.register("scheduler", scheduler)
+    checkpoint = tmp_path / "warmup-linear.pt"
+    torch.save(checkpoint_payload(registry), checkpoint)
+    scheduler_state = scheduler.state_dict()
+
+    restored_optimizer, restored_scheduler = build_warmup_linear_stack(total_steps=8)
+    restored_registry = StateRegistry()
+    restored_registry.register("optimizer", restored_optimizer)
+    restored_registry.register("scheduler", restored_scheduler)
+    restore_checkpoint(checkpoint, restored_registry)
+
+    assert restored_scheduler.state_dict() == scheduler_state
+    assert [group["lr"] for group in restored_optimizer.param_groups] == pytest.approx(
+        [0.75, 0.075]
+    )
+
+
+def test_warmup_linear_lr_rebases_extended_horizon() -> None:
+    optimizer, scheduler = build_warmup_linear_stack(total_steps=4)
+    advance_optimizer_scheduler(optimizer, scheduler, 4)
+    optimizer_state = optimizer.state_dict()
+    scheduler_state = scheduler.state_dict()
+
+    restored_optimizer, restored_scheduler = build_warmup_linear_stack(total_steps=8)
+    restored_optimizer.load_state_dict(optimizer_state)
+    restored_scheduler.load_state_dict(scheduler_state)
+
+    assert restored_scheduler.last_epoch == 4
+    assert restored_scheduler.total_steps == 8
+    assert restored_scheduler.get_last_lr() == pytest.approx([0.5, 0.05])
+    assert [group["lr"] for group in restored_optimizer.param_groups] == pytest.approx(
+        [0.5, 0.05]
+    )
+
+
+def test_warmup_linear_lr_rejects_shorter_resume_horizon() -> None:
+    optimizer, scheduler = build_warmup_linear_stack(total_steps=8)
+    advance_optimizer_scheduler(optimizer, scheduler, 2)
+    scheduler_state = scheduler.state_dict()
+    _, shorter_scheduler = build_warmup_linear_stack(total_steps=4)
+
+    with pytest.raises(
+        ValueError,
+        match=r"checkpoint total_steps=8, configured total_steps=4",
+    ):
+        shorter_scheduler.load_state_dict(scheduler_state)
 
 
 class RecordingSink:
@@ -299,14 +439,11 @@ class RecordingCheckpointPolicy:
     def restore(
         self,
         path: Path,
-        state: TrainerState,
         *,
         device: torch.device,
-    ) -> None:
+    ) -> TrainerCheckpointRestore:
         del path, device
-        state.epoch = 2
-        state.global_step = 7
-        state.optimizer_step = 3
+        return TrainerCheckpointRestore(epoch=2, global_step=7, optimizer_step=3)
 
     def plan(self, context: TrainerCheckpointContext) -> CheckpointPlan:
         self.contexts.append(context)
@@ -323,6 +460,32 @@ class RecordingCheckpointPolicy:
                 ),
             ),
         )
+
+
+class CursorlessCheckpointPolicy(RecordingCheckpointPolicy):
+    """Restore only an epoch so Mammoth must infer ordinary loop cursors."""
+
+    def restore(
+        self,
+        path: Path,
+        *,
+        device: torch.device,
+    ) -> TrainerCheckpointRestore:
+        del path, device
+        return TrainerCheckpointRestore(epoch=1)
+
+
+class InitialCheckpointPolicy(RecordingCheckpointPolicy):
+    """Restore Mammoth's valid pre-training coordinate."""
+
+    def restore(
+        self,
+        path: Path,
+        *,
+        device: torch.device,
+    ) -> TrainerCheckpointRestore:
+        del path, device
+        return TrainerCheckpointRestore(epoch=-1)
 
 
 class SlowRecordingCheckpointPolicy(RecordingCheckpointPolicy):
@@ -343,13 +506,12 @@ class RankFailingRestorePolicy(RecordingCheckpointPolicy):
     def restore(
         self,
         path: Path,
-        state: TrainerState,
         *,
         device: torch.device,
-    ) -> None:
+    ) -> TrainerCheckpointRestore:
         if self.rank == 1:
             raise ValueError("rank-one restore failed")
-        super().restore(path, state, device=device)
+        return super().restore(path, device=device)
 
 
 class RankDivergentRestorePolicy(RecordingCheckpointPolicy):
@@ -362,13 +524,14 @@ class RankDivergentRestorePolicy(RecordingCheckpointPolicy):
     def restore(
         self,
         path: Path,
-        state: TrainerState,
         *,
         device: torch.device,
-    ) -> None:
+    ) -> TrainerCheckpointRestore:
         del path, device
-        state.epoch = self.rank
-        state.global_step = self.rank * 10
+        return TrainerCheckpointRestore(
+            epoch=self.rank,
+            global_step=self.rank * 10,
+        )
 
 
 def classification_step(
@@ -1000,6 +1163,162 @@ def test_incomplete_accumulation_window_requires_an_explicit_scale() -> None:
         plan.scale_for_window(1, window_index=1)
 
 
+@pytest.mark.parametrize(
+    ("total_count", "rank_weights", "expected"),
+    [
+        (16, (3, 1), (12, 4)),
+        (6, (3, 1), (4, 2)),
+        (14, (3, 1), (10, 4)),
+        (12, (3, 2, 1), (6, 4, 2)),
+        (7, (1e308, 1e308, 1e308), (2, 2, 3)),
+        (1, (2**53 + 1, 2**53), (1, 0)),
+        (1, (10**400, 1), (1, 0)),
+        (1, (3, 1), (1, 0)),
+        (0, (3, 2, 1), (0, 0, 0)),
+    ],
+)
+def test_weighted_partition_counts_support_arbitrary_rank_weights(
+    total_count: int,
+    rank_weights: tuple[int, ...],
+    expected: tuple[int, ...],
+) -> None:
+    assert weighted_partition_counts(total_count, rank_weights) == expected
+
+
+def test_weighted_partition_counts_can_require_work_on_every_rank() -> None:
+    assert weighted_partition_counts(4, (100, 1), require_nonempty=True) == (3, 1)
+    with pytest.raises(ValueError, match="at least one item per rank"):
+        weighted_partition_counts(2, (3, 2, 1), require_nonempty=True)
+
+
+def test_weighted_partition_indices_cover_each_item_once() -> None:
+    ranges = tuple(weighted_partition_indices(17, rank, (4, 2, 1)) for rank in range(3))
+
+    assert [len(rank_range) for rank_range in ranges] == [10, 5, 2]
+    assert [index for rank_range in ranges for index in rank_range] == list(range(17))
+
+
+def test_weighted_partition_conserves_totals_above_float_integer_precision() -> None:
+    total_count = 2**53 + 3
+    counts = weighted_partition_counts(total_count, (1, 1))
+    ranges = tuple(weighted_partition_indices(total_count, rank, (1, 1)) for rank in range(2))
+
+    assert sum(counts) == total_count
+    assert ranges[0].start == 0
+    assert ranges[0].stop == ranges[1].start
+    assert ranges[1].stop == total_count
+
+
+@pytest.mark.parametrize(("rank", "local_count"), [(0, 6), (1, 2)])
+def test_weighted_accumulation_policy_scales_one_global_window(
+    rank: int,
+    local_count: int,
+) -> None:
+    policy = WeightedAccumulationPolicy(8, (3, 1))
+    plan = policy.plan(rank=rank, world_size=2, local_batch_count=local_count * 2)
+
+    assert plan.local_microbatches_per_step == local_count
+    assert plan.window_sizes(local_count * 2) == (local_count, local_count)
+    assert plan.loss_scale == pytest.approx(0.25)
+
+
+def test_weighted_accumulation_policy_supports_more_than_two_ranks() -> None:
+    policy = WeightedAccumulationPolicy(6, [3, 2, 1])
+
+    plans = tuple(
+        policy.plan(rank=rank, world_size=3, local_batch_count=local_count * 2)
+        for rank, local_count in enumerate((3, 2, 1))
+    )
+
+    assert [plan.local_microbatches_per_step for plan in plans] == [3, 2, 1]
+    assert all(plan.loss_scale == pytest.approx(0.5) for plan in plans)
+
+
+def test_weighted_accumulation_policy_can_preserve_a_fixed_partial_scale() -> None:
+    policy = WeightedAccumulationPolicy(4, (1,), partial_window="fixed")
+    plan = policy.plan(rank=0, world_size=1, local_batch_count=5)
+
+    assert plan.window_sizes(5) == (4, 1)
+    assert plan.scale_for_window(4, window_index=0) == pytest.approx(0.25)
+    assert plan.scale_for_window(1, window_index=1) == pytest.approx(0.25)
+
+
+def test_weighted_batch_sampler_assigns_complete_windows_across_three_ranks() -> None:
+    samplers = tuple(
+        WeightedDistributedBatchSampler(
+            13,
+            batch_size=1,
+            global_microbatches_per_step=6,
+            rank=rank,
+            rank_weights=(3, 2, 1),
+            shuffle=False,
+        )
+        for rank in range(3)
+    )
+
+    assert [list(sampler) for sampler in samplers] == [
+        [[0], [1], [2], [6], [7], [8]],
+        [[3], [4], [9], [10]],
+        [[5], [11]],
+    ]
+    assert [len(sampler) for sampler in samplers] == [6, 4, 2]
+
+
+@pytest.mark.parametrize("seed", [-(2**63), 2**64 - 1])
+def test_weighted_batch_sampler_accepts_torch_seed_bounds(seed: int) -> None:
+    sampler = WeightedDistributedBatchSampler(
+        2,
+        batch_size=1,
+        global_microbatches_per_step=1,
+        rank=0,
+        rank_weights=(1,),
+        seed=seed,
+    )
+
+    assert len(list(sampler)) == 2
+
+
+def test_weighted_batch_sampler_rejects_out_of_range_shuffle_seed() -> None:
+    with pytest.raises(ValueError, match="when shuffling"):
+        WeightedDistributedBatchSampler(
+            1,
+            batch_size=1,
+            global_microbatches_per_step=1,
+            rank=0,
+            rank_weights=(1,),
+            seed=2**100,
+        )
+
+
+def test_weighted_batch_sampler_rejects_epoch_seed_overflow() -> None:
+    sampler = WeightedDistributedBatchSampler(
+        1,
+        batch_size=1,
+        global_microbatches_per_step=1,
+        rank=0,
+        rank_weights=(1,),
+        seed=2**64 - 1,
+    )
+
+    with pytest.raises(ValueError, match=r"seed \+ epoch"):
+        sampler.set_epoch(1)
+
+
+def test_unshuffled_weighted_batch_sampler_ignores_arbitrary_seed() -> None:
+    sampler = WeightedDistributedBatchSampler(
+        1,
+        batch_size=1,
+        global_microbatches_per_step=1,
+        rank=0,
+        rank_weights=(1,),
+        seed=2**100,
+        shuffle=False,
+    )
+    sampler.set_epoch(2**100)
+
+    assert list(sampler) == [[0]]
+
+
 def test_trainer_advances_project_batch_sampler_epochs() -> None:
     batch_sampler = EpochRecordingBatchSampler()
     loader = DataLoader(
@@ -1408,6 +1727,137 @@ def test_project_checkpoint_policy_uses_ordered_publication_and_restore(
             "optimizer_step": 3,
             "stopped_early": False,
         }
+
+
+def test_checkpoint_restore_infers_missing_loop_cursors(tmp_path: Path) -> None:
+    loader = DataLoader(TensorDataset(torch.ones(3, 1)), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(
+            epochs=4,
+            device="cpu",
+            gradient_accumulation_steps=2,
+            checkpoint_every_epochs=None,
+        ),
+        checkpoint_policy=CursorlessCheckpointPolicy(tmp_path),
+    ) as trainer:
+        trainer.load_checkpoint(tmp_path / "opaque.pt")
+
+        assert trainer.state.epoch == 1
+        assert trainer.state.optimizer_step == 4
+        assert trainer.state.global_step == 6
+
+
+def test_checkpoint_restore_accepts_pretraining_coordinate(tmp_path: Path) -> None:
+    loader = DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        checkpoint_policy=InitialCheckpointPolicy(tmp_path),
+    ) as trainer:
+        trainer.load_checkpoint(tmp_path / "pretraining.pt")
+
+        assert trainer.state.state_dict() == {
+            "epoch": -1,
+            "global_step": 0,
+            "optimizer_step": 0,
+            "stopped_early": False,
+        }
+
+
+def test_forced_checkpoint_reports_interruption_reason(tmp_path: Path) -> None:
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    policy = RecordingCheckpointPolicy(tmp_path / "project-checkpoints")
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        checkpoint_policy=policy,
+    ) as trainer:
+        trainer.publish_checkpoint_now(reason="interrupted")
+
+    assert policy.contexts[-1].reason == "interrupted"
+    assert (tmp_path / "project-checkpoints" / "project.checkpoint").is_file()
+
+
+def test_compile_runs_after_ddp_and_preserves_ddp_no_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeDDP(torch.nn.Module):
+        def __init__(self, module: torch.nn.Module) -> None:
+            super().__init__()
+            self.module = module
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return self.module(value)
+
+        def no_sync(self) -> Any:
+            return nullcontext()
+
+    class CompiledModule(torch.nn.Module):
+        def __init__(self, module: torch.nn.Module) -> None:
+            super().__init__()
+            self.module = module
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return self.module(value)
+
+    observed: dict[str, Any] = {}
+    base_model = torch.nn.Linear(1, 1)
+    ddp_model = FakeDDP(base_model)
+    compiled_model = CompiledModule(ddp_model)
+
+    monkeypatch.setattr(trainer_module, "DistributedDataParallel", FakeDDP)
+    monkeypatch.setattr(trainer_module, "distributed_identity", lambda strategy: (0, 1))
+    monkeypatch.setattr(trainer_module, "wrap_model", lambda model, device, strategy: ddp_model)
+
+    def fake_compile(model: torch.nn.Module, **kwargs: Any) -> torch.nn.Module:
+        observed.update(model=model, kwargs=kwargs)
+        return compiled_model
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    optimizer = torch.optim.SGD(base_model.parameters(), lr=0.0)
+    with Trainer(
+        model=base_model,
+        optimizer=optimizer,
+        train_loader=DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1),
+        train_step=distributed_regression_step,
+        config=TrainerConfig(
+            epochs=1,
+            device="cpu",
+            strategy="ddp",
+            checkpoint_every_epochs=None,
+            compile_config=TorchCompileConfig(mode="default", fullgraph=False),
+        ),
+    ) as trainer:
+        assert trainer.base_model is base_model
+        assert observed["model"] is ddp_model
+        assert trainer.execution_model is compiled_model
+        assert trainer.gradient_accumulation_context() is not None
+
+
+def test_compile_config_rejects_mode_with_explicit_options() -> None:
+    with pytest.raises(ValueError, match="mode and options are mutually exclusive"):
+        TorchCompileConfig(mode="default", options={"epilogue_fusion": True})
+
+
+def test_compile_config_rejects_empty_backend_name() -> None:
+    with pytest.raises(ValueError, match="non-empty string"):
+        TorchCompileConfig(backend="")
 
 
 def test_project_checkpoint_policy_plans_after_publisher_backpressure(

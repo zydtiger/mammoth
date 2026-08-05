@@ -262,12 +262,29 @@ gradient accumulation, validation, callbacks, scheduling, and checkpoints. It
 does not choose your architecture, dataset, batch format, loss, or metric
 meaning.
 
+`WarmupLinearLR` supplies a reusable optimizer-step schedule with linear
+warmup and decay. Projects choose its warmup ratio and total-step horizon; an
+extended resume rebases optimizer learning rates, while a shortened horizon is
+rejected.
+
 Projects that need more control can supply an `AccumulationPolicy`, scalar
 `MetricSpec` values, additive `StatefulMetric` objects, `MetricRoute` mappings,
 and a `TrainerCheckpointPolicy`. The train and validation step functions remain
 project-owned; Mammoth uses these policies to coordinate logical optimizer
 steps, distributed reductions, generic observations, and ordered checkpoint
 publication.
+
+Set `TrainerConfig.compile_config` to a `TorchCompileConfig` when the ordinary
+forward path should be compiled. Mammoth keeps the supplied module as
+`trainer.base_model`, wraps it with DDP when requested, and only then derives
+`trainer.execution_model` with `torch.compile`; accumulation still targets the
+underlying DDP wrapper's `no_sync()` context.
+
+For heterogeneous ranks, `WeightedAccumulationPolicy` and
+`WeightedDistributedBatchSampler` accept arbitrary caller-defined rank weights.
+The matching `weighted_partition_counts` and `weighted_partition_indices`
+helpers can shard other opaque workloads. Projects still choose the weights,
+eligible hardware, datasets, and `DataLoader` settings.
 
 Set `TrainerConfig(emit_fit_phase_events=False, ...)` when a surrounding
 command already owns the outer training phase lifecycle. Mammoth continues to
@@ -312,8 +329,8 @@ with initialize_torch_runtime(runtime_config) as runtime:
 ```
 
 Use `strategy="single"` without `torchrun` for the corresponding local
-lifecycle. Project-specific GPU validation, sampler policy, and custom
-collectives stay in the consuming project.
+lifecycle. Project-specific GPU validation, concrete workload policy, and
+custom collectives stay in the consuming project.
 
 Projects with custom checkpoint formats can use the same bounded publisher
 without adopting Mammoth's checkpoint schema. A plan stages every artifact
@@ -348,6 +365,12 @@ to `0o600`; `mode=None` retains serializer-created permissions for a new file
 while still preserving an existing regular destination's mode. This confined
 durability path requires POSIX descriptor-relative filesystem operations and raises
 `NotImplementedError` before publication when they are unavailable.
+
+Projects can also apply process-global Torch numerical settings without using
+the trainer or profiler. `TorchBackendConfig` controls TF32, float32 matmul
+precision, cuDNN benchmarking, and deterministic modes; `TorchSeedPolicy`
+selects which generic Python and Torch generators receive the caller's seed.
+Mammoth does not choose those values or configure dataset workers.
 
 ## Learn more
 

@@ -25,10 +25,12 @@ from mammoth.torch.batch import move_batch_to_device
 from mammoth.torch.callbacks import Callback
 from mammoth.torch.checkpoint import (
     AsyncCheckpointPublisher,
+    CheckpointReason,
     Stateful,
     StateRegistry,
     TrainerCheckpointContext,
     TrainerCheckpointPolicy,
+    TrainerCheckpointRestore,
     checkpoint_payload,
     restore_checkpoint,
 )
@@ -51,6 +53,35 @@ from mammoth.torch.state import TrainerState
 Precision = Literal["fp32", "bf16", "fp16"]
 SchedulerInterval = Literal["optimizer", "epoch", "validation"]
 OptimizerStepLogicalClock = Literal["completed", "zero_based"]
+
+
+@dataclass(frozen=True, slots=True)
+class TorchCompileConfig:
+    """Project-selected ``torch.compile`` options for the execution model."""
+
+    mode: str | None = "default"
+    fullgraph: bool = False
+    dynamic: bool | None = None
+    backend: str | Callable[..., Any] | None = None
+    options: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode is not None and (not isinstance(self.mode, str) or not self.mode):
+            raise ValueError("compile mode must be a non-empty string or None")
+        if not isinstance(self.fullgraph, bool):
+            raise ValueError("compile fullgraph must be a boolean")
+        if self.dynamic is not None and not isinstance(self.dynamic, bool):
+            raise ValueError("compile dynamic must be a boolean or None")
+        if isinstance(self.backend, str) and not self.backend:
+            raise ValueError("compile backend must be a non-empty string")
+        if self.backend is not None and not isinstance(self.backend, str) and not callable(
+            self.backend
+        ):
+            raise ValueError("compile backend must be a string, callable, or None")
+        if self.options is not None and not isinstance(self.options, Mapping):
+            raise ValueError("compile options must be a mapping or None")
+        if self.mode is not None and self.options is not None:
+            raise ValueError("compile mode and options are mutually exclusive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +149,7 @@ class TrainerConfig:
     display_metric_names: tuple[str, ...] = ("loss",)
     emit_fit_phase_events: bool = True
     optimizer_step_logical_clock: OptimizerStepLogicalClock = "completed"
+    compile_config: TorchCompileConfig | None = None
 
     def __post_init__(self) -> None:
         positive_integer("epochs", self.epochs)
@@ -145,6 +177,10 @@ class TrainerConfig:
             raise ValueError("max_gradient_norm must be positive and finite")
         if not isinstance(self.emit_fit_phase_events, bool):
             raise ValueError("emit_fit_phase_events must be a boolean")
+        if self.compile_config is not None and not isinstance(
+            self.compile_config, TorchCompileConfig
+        ):
+            raise ValueError("compile_config must be TorchCompileConfig or None")
         for name, value in (
             ("train_phase", self.train_phase),
             ("validation_phase", self.validation_phase),
@@ -222,7 +258,14 @@ class Trainer:
         else:
             self.rank, self.world_size = runtime.rank, runtime.world_size
         self.base_model = model.to(self.device)
-        self.model = wrap_model(self.base_model, self.device, config.strategy)
+        wrapped_model = wrap_model(self.base_model, self.device, config.strategy)
+        self._ddp_model = (
+            wrapped_model if isinstance(wrapped_model, DistributedDataParallel) else None
+        )
+        self.execution_model = compile_execution_model(
+            wrapped_model,
+            config.compile_config,
+        )
         self.optimizer = optimizer
         self.train_loader = train_loader
         self.train_step = train_step
@@ -373,7 +416,7 @@ class Trainer:
 
     def train_epoch(self, epoch: int) -> Mapping[str, float]:
         """Run one ordinary gradient epoch with accumulation and clipping."""
-        self.coordinate("training mode setup", self.model.train)
+        self.coordinate("training mode setup", self.execution_model.train)
         accumulator = MetricAccumulator(self.metric_specs)
         total_batches = self.coordinate(
             "training loader length",
@@ -450,7 +493,7 @@ class Trainer:
                             )
                             with self.gradient_accumulation_context():
                                 with self.autocast_context():
-                                    output = self.train_step(self.model, moved, context)
+                                    output = self.train_step(self.execution_model, moved, context)
                                     if output.loss is None:
                                         raise ValueError(
                                             "train step must return a scalar loss"
@@ -580,7 +623,7 @@ class Trainer:
         """Run one no-gradient validation epoch through the project step function."""
         assert self.validation_loader is not None and self.validation_step is not None
         validation_loader = self.validation_loader
-        self.coordinate("validation mode setup", self.model.eval)
+        self.coordinate("validation mode setup", self.execution_model.eval)
         accumulator = MetricAccumulator(self.metric_specs)
         total_batches = self.coordinate(
             "validation loader length",
@@ -623,7 +666,7 @@ class Trainer:
                             self.gradient_accumulation_context(),
                             self.autocast_context(),
                         ):
-                            output = self.validation_step(self.model, moved, context)
+                            output = self.validation_step(self.execution_model, moved, context)
                         metrics = output_metrics(output)
                         accumulator.update(metrics, weight=output.weight)
                         update_stateful_metrics(
@@ -777,8 +820,8 @@ class Trainer:
 
     def gradient_accumulation_context(self) -> Any:
         """Suppress automatic DDP reduction until the shared logical-step boundary."""
-        if isinstance(self.model, DistributedDataParallel):
-            return self.model.no_sync()
+        if self._ddp_model is not None:
+            return self._ddp_model.no_sync()
         return nullcontext()
 
     def synchronize_gradients(self) -> None:
@@ -880,6 +923,8 @@ class Trainer:
         epoch: int,
         training_metrics: Mapping[str, float],
         validation_metrics: Mapping[str, float] | None,
+        *,
+        reason: CheckpointReason = "scheduled",
     ) -> None:
         """Submit a project plan or the default registered-state snapshot."""
         if self.checkpoint_policy is not None:
@@ -894,6 +939,7 @@ class Trainer:
                     validation_metrics=(
                         None if validation_metrics is None else dict(validation_metrics)
                     ),
+                    reason=reason,
                 )
             )
             if plan is not None:
@@ -913,19 +959,54 @@ class Trainer:
             checkpoint_payload(self.registry),
         )
 
+    def publish_checkpoint_now(
+        self,
+        *,
+        reason: Literal["manual", "interrupted"] = "manual",
+        training_metrics: Mapping[str, float] | None = None,
+        validation_metrics: Mapping[str, float] | None = None,
+    ) -> None:
+        """Force one synchronous checkpoint publication on rank zero."""
+        if reason not in {"manual", "interrupted"}:
+            raise ValueError("forced checkpoint reason must be 'manual' or 'interrupted'")
+        local_available = self.rank == 0 and (
+            self.checkpoint_dir is not None or self.checkpoint_policy is not None
+        )
+        decisions = self.all_gather_object(local_available if self.rank == 0 else None)
+        if not isinstance(decisions[0], bool):
+            raise RuntimeError("rank zero returned an invalid checkpoint availability decision")
+        if not decisions[0]:
+            return
+        local_error: BaseException | None = None
+        if self.rank == 0:
+            try:
+                self.publish_checkpoint(
+                    self.state.epoch,
+                    training_metrics or {},
+                    validation_metrics,
+                    reason=reason,
+                )
+            except BaseException as error:
+                local_error = error
+        self.raise_distributed_failure("forced checkpoint publication", local_error)
+        self.flush_checkpoints()
+
     def load_checkpoint(self, path: Path, *, strict: bool = True) -> None:
         """Restore project-owned or registered state before calling :meth:`fit`."""
         if self.checkpoint_policy is not None:
             if not strict:
                 raise ValueError("strict=False applies only to registered-state checkpoints")
-            self.coordinate(
+            restored = self.coordinate(
                 "checkpoint restore",
                 partial(
                     self.checkpoint_policy.restore,
                     Path(path),
-                    self.state,
                     device=self.device,
                 ),
+            )
+            self.coordinate(
+                "checkpoint coordinate restore",
+                partial(self.apply_checkpoint_restore, restored),
             )
             self.validate_restored_trainer_state()
             return
@@ -940,6 +1021,33 @@ class Trainer:
             ),
         )
         self.validate_restored_trainer_state()
+
+    def apply_checkpoint_restore(self, restored: TrainerCheckpointRestore) -> None:
+        """Apply project-restored coordinates and infer absent generic cursors."""
+        if not isinstance(restored, TrainerCheckpointRestore):
+            raise TypeError("checkpoint policy must return TrainerCheckpointRestore")
+        local_batch_count = len(self.train_loader)
+        plan = self.accumulation_policy.plan(
+            rank=self.rank,
+            world_size=self.world_size,
+            local_batch_count=local_batch_count,
+        )
+        global_window_sizes, _ = self.distributed_window_layout(
+            plan.window_sizes(local_batch_count)
+        )
+        completed_epochs = restored.epoch + 1
+        self.state.epoch = restored.epoch
+        self.state.optimizer_step = (
+            restored.optimizer_step
+            if restored.optimizer_step is not None
+            else completed_epochs * len(global_window_sizes)
+        )
+        self.state.global_step = (
+            restored.global_step
+            if restored.global_step is not None
+            else completed_epochs * sum(global_window_sizes)
+        )
+        self.state.stopped_early = restored.stopped_early
 
     def validate_restored_trainer_state(self) -> None:
         """Require identical restored loop coordinates on every DDP rank."""
@@ -1131,6 +1239,24 @@ def wrap_model(
         device_ids=device_ids,
         broadcast_buffers=False,
     )
+
+
+def compile_execution_model(
+    model: torch.nn.Module,
+    config: TorchCompileConfig | None,
+) -> torch.nn.Module:
+    """Apply caller-selected compilation after device placement and DDP wrapping."""
+    if config is None:
+        return model
+    compiled = torch.compile(
+        model,
+        fullgraph=config.fullgraph,
+        dynamic=config.dynamic,
+        backend="inductor" if config.backend is None else config.backend,
+        mode=config.mode,
+        options=None if config.options is None else dict(config.options),
+    )
+    return cast(torch.nn.Module, compiled)
 
 
 def set_sampler_epoch(loader: DataLoader[Any], epoch: int) -> None:
