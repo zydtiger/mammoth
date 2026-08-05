@@ -11,7 +11,7 @@ from concurrent.futures import Future
 from contextlib import nullcontext, suppress
 from pathlib import Path
 from queue import Empty
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 import torch
@@ -35,12 +35,14 @@ from mammoth.torch import (
     AsyncCheckpointPublisher,
     Callback,
     CheckpointArtifact,
+    CheckpointInspection,
     CheckpointPlan,
     CheckpointPublication,
     EarlyStopping,
     MetricAccumulator,
     MetricRoute,
     MetricSpec,
+    RestoreOptions,
     StateRegistry,
     StepContext,
     StepOutput,
@@ -436,13 +438,23 @@ class RecordingCheckpointPolicy:
         self.checkpoint_dir = checkpoint_dir
         self.contexts: list[TrainerCheckpointContext] = []
 
+    def inspect(
+        self,
+        path: Path,
+    ) -> CheckpointInspection:
+        del path
+        return CheckpointInspection(
+            available_components=frozenset({"model", "trainer", "stopped_early"}),
+        )
+
     def restore(
         self,
         path: Path,
         *,
         device: torch.device,
+        options: RestoreOptions,
     ) -> TrainerCheckpointRestore:
-        del path, device
+        del path, device, options
         return TrainerCheckpointRestore(epoch=2, global_step=7, optimizer_step=3)
 
     def plan(self, context: TrainerCheckpointContext) -> CheckpointPlan:
@@ -470,8 +482,9 @@ class CursorlessCheckpointPolicy(RecordingCheckpointPolicy):
         path: Path,
         *,
         device: torch.device,
+        options: RestoreOptions,
     ) -> TrainerCheckpointRestore:
-        del path, device
+        del path, device, options
         return TrainerCheckpointRestore(epoch=1)
 
 
@@ -483,8 +496,9 @@ class InitialCheckpointPolicy(RecordingCheckpointPolicy):
         path: Path,
         *,
         device: torch.device,
+        options: RestoreOptions,
     ) -> TrainerCheckpointRestore:
-        del path, device
+        del path, device, options
         return TrainerCheckpointRestore(epoch=-1)
 
 
@@ -508,14 +522,15 @@ class RankFailingRestorePolicy(RecordingCheckpointPolicy):
         path: Path,
         *,
         device: torch.device,
+        options: RestoreOptions,
     ) -> TrainerCheckpointRestore:
         if self.rank == 1:
             raise ValueError("rank-one restore failed")
-        return super().restore(path, device=device)
+        return super().restore(path, device=device, options=options)
 
 
 class RankDivergentRestorePolicy(RecordingCheckpointPolicy):
-    """Restore different successful trainer coordinates on each rank."""
+    """Return rank-local generic state that Mammoth must synchronize from rank zero."""
 
     def __init__(self, checkpoint_dir: Path, rank: int) -> None:
         super().__init__(checkpoint_dir)
@@ -526,11 +541,153 @@ class RankDivergentRestorePolicy(RecordingCheckpointPolicy):
         path: Path,
         *,
         device: torch.device,
+        options: RestoreOptions,
     ) -> TrainerCheckpointRestore:
-        del path, device
+        del path, device, options
+        parameter = torch.nn.Parameter(torch.tensor([1.0]))
+        optimizer = torch.optim.SGD((parameter,), lr=0.1 + self.rank)
         return TrainerCheckpointRestore(
-            epoch=self.rank,
-            global_step=self.rank * 10,
+            epoch=0,
+            global_step=1,
+            optimizer_step=1,
+            optimizer_state_dict=optimizer.state_dict(),
+        )
+
+
+class UnpickleableInspectionPolicy(RecordingCheckpointPolicy):
+    """Return metadata that rank zero cannot serialize for DDP inspection."""
+
+    def inspect(self, path: Path) -> CheckpointInspection:
+        del path
+        return CheckpointInspection(
+            available_components=frozenset({"model"}),
+            metadata={"unpickleable": lambda: None},
+        )
+
+
+class FalseResetReportingPolicy(RecordingCheckpointPolicy):
+    """Falsely claim a Mammoth-managed reset for contract validation."""
+
+    def restore(
+        self,
+        path: Path,
+        *,
+        device: torch.device,
+        options: RestoreOptions,
+    ) -> TrainerCheckpointRestore:
+        del path, device, options
+        return TrainerCheckpointRestore(
+            epoch=0,
+            reset_components=frozenset({"optimizer"}),
+        )
+
+
+class CallbackRestorePolicy(RecordingCheckpointPolicy):
+    """Return callback state to exercise rank-local application failures."""
+
+    def restore(
+        self,
+        path: Path,
+        *,
+        device: torch.device,
+        options: RestoreOptions,
+    ) -> TrainerCheckpointRestore:
+        del path, device, options
+        return TrainerCheckpointRestore(
+            epoch=0,
+            callback_state_dicts={0: {"best": 0.5, "bad_checks": 1}},
+        )
+
+
+class TensorMetadataRestorePolicy(RecordingCheckpointPolicy):
+    """Return identical tensor-valued opaque metadata on every rank."""
+
+    def restore(
+        self,
+        path: Path,
+        *,
+        device: torch.device,
+        options: RestoreOptions,
+    ) -> TrainerCheckpointRestore:
+        del path, device, options
+        return TrainerCheckpointRestore(
+            epoch=0,
+            metadata={
+                "tensor": torch.tensor([1, 2]),
+                "components": frozenset({"model", "scaler", "project"}),
+            },
+        )
+
+
+class RankInvalidRestorePolicy(RecordingCheckpointPolicy):
+    """Return an invalid checkpoint result on only one rank."""
+
+    def __init__(self, checkpoint_dir: Path, rank: int) -> None:
+        super().__init__(checkpoint_dir)
+        self.rank = rank
+
+    def restore(
+        self,
+        path: Path,
+        *,
+        device: torch.device,
+        options: RestoreOptions,
+    ) -> Any:
+        if self.rank == 1:
+            return {"epoch": 0}
+        return super().restore(path, device=device, options=options)
+
+
+class TypedStateCheckpointPolicy(RecordingCheckpointPolicy):
+    """Return normalized generic states with an inspection-selected callback reset."""
+
+    def __init__(
+        self,
+        checkpoint_dir: Path,
+        *,
+        optimizer_state: Mapping[str, Any],
+        scheduler_state: Mapping[str, Any],
+        callback_state: Mapping[str, Any],
+    ) -> None:
+        super().__init__(checkpoint_dir)
+        self.optimizer_state = optimizer_state
+        self.scheduler_state = scheduler_state
+        self.callback_state = callback_state
+
+    def inspect(
+        self,
+        path: Path,
+    ) -> CheckpointInspection:
+        del path
+        return CheckpointInspection(
+            available_components=frozenset(
+                {"model", "optimizer", "scheduler", "callbacks", "trainer", "stopped_early"}
+            ),
+            restore_options=RestoreOptions(
+                callbacks="reset",
+                stopped_early="reset",
+            ),
+            metadata={"objective_changed": True},
+        )
+
+    def restore(
+        self,
+        path: Path,
+        *,
+        device: torch.device,
+        options: RestoreOptions,
+    ) -> TrainerCheckpointRestore:
+        del path, device, options
+        return TrainerCheckpointRestore(
+            epoch=1,
+            optimizer_step=4,
+            global_step=8,
+            stopped_early=True,
+            optimizer_state_dict=self.optimizer_state,
+            scheduler_state_dict=self.scheduler_state,
+            callback_state_dicts={0: self.callback_state},
+            metadata={"objective_changed": True},
+            restored_components=frozenset({"model"}),
         )
 
 
@@ -981,10 +1138,139 @@ def _uneven_accumulation_worker(
                     runtime=runtime,
                 ) as divergent_trainer:
                     divergent_trainer.load_checkpoint(Path("unused.pt"))
+                    divergent_restore_result = divergent_optimizer.param_groups[0]["lr"]
             except RuntimeError as error:
-                divergent_restore_error = str(error)
+                divergent_restore_result = str(error)
+            inspection_model = torch.nn.Linear(1, 1, bias=False)
+            inspection_optimizer = torch.optim.SGD(
+                inspection_model.parameters(),
+                lr=0.0,
+            )
+            try:
+                with Trainer(
+                    model=inspection_model,
+                    optimizer=inspection_optimizer,
+                    train_loader=DataLoader(
+                        TensorDataset(torch.ones(1, 1)),
+                        batch_size=1,
+                    ),
+                    train_step=distributed_regression_step,
+                    config=TrainerConfig(
+                        epochs=1,
+                        device="cpu",
+                        strategy="ddp",
+                        checkpoint_every_epochs=None,
+                    ),
+                    checkpoint_policy=UnpickleableInspectionPolicy(
+                        Path(checkpoint_dir),
+                    ),
+                    runtime=runtime,
+                ) as inspection_trainer:
+                    inspection_trainer.inspect_checkpoint(Path("unused.pt"))
+            except RuntimeError as error:
+                inspection_error = str(error)
             else:
-                divergent_restore_error = None
+                inspection_error = None
+            callback_model = torch.nn.Linear(1, 1, bias=False)
+            callback_optimizer = torch.optim.SGD(callback_model.parameters(), lr=0.0)
+            try:
+                with Trainer(
+                    model=callback_model,
+                    optimizer=callback_optimizer,
+                    train_loader=DataLoader(
+                        TensorDataset(torch.ones(1, 1)),
+                        batch_size=1,
+                    ),
+                    train_step=distributed_regression_step,
+                    config=TrainerConfig(
+                        epochs=1,
+                        device="cpu",
+                        strategy="ddp",
+                        checkpoint_every_epochs=None,
+                    ),
+                    callbacks=(EarlyStopping("loss", patience=2),) if rank == 0 else (),
+                    checkpoint_policy=CallbackRestorePolicy(Path(checkpoint_dir)),
+                    runtime=runtime,
+                ) as callback_trainer:
+                    callback_trainer.load_checkpoint(Path("unused.pt"))
+            except RuntimeError as error:
+                callback_restore_error = str(error)
+            else:
+                callback_restore_error = None
+            metadata_model = torch.nn.Linear(1, 1, bias=False)
+            metadata_optimizer = torch.optim.SGD(metadata_model.parameters(), lr=0.0)
+            with Trainer(
+                model=metadata_model,
+                optimizer=metadata_optimizer,
+                train_loader=DataLoader(
+                    TensorDataset(torch.ones(1, 1)),
+                    batch_size=1,
+                ),
+                train_step=distributed_regression_step,
+                config=TrainerConfig(
+                    epochs=1,
+                    device="cpu",
+                    strategy="ddp",
+                    checkpoint_every_epochs=None,
+                ),
+                checkpoint_policy=TensorMetadataRestorePolicy(Path(checkpoint_dir)),
+                runtime=runtime,
+            ) as metadata_trainer:
+                metadata_restore = metadata_trainer.load_checkpoint(Path("unused.pt"))
+                metadata_value = metadata_restore.metadata["tensor"].tolist()
+            invalid_model = torch.nn.Linear(1, 1, bias=False)
+            invalid_optimizer = torch.optim.SGD(invalid_model.parameters(), lr=0.0)
+            try:
+                with Trainer(
+                    model=invalid_model,
+                    optimizer=invalid_optimizer,
+                    train_loader=DataLoader(
+                        TensorDataset(torch.ones(1, 1)),
+                        batch_size=1,
+                    ),
+                    train_step=distributed_regression_step,
+                    config=TrainerConfig(
+                        epochs=1,
+                        device="cpu",
+                        strategy="ddp",
+                        checkpoint_every_epochs=None,
+                    ),
+                    checkpoint_policy=RankInvalidRestorePolicy(Path(checkpoint_dir), rank),
+                    runtime=runtime,
+                ) as invalid_trainer:
+                    invalid_trainer.load_checkpoint(Path("unused.pt"))
+            except RuntimeError as error:
+                invalid_restore_error = str(error)
+            else:
+                invalid_restore_error = None
+            options_model = torch.nn.Linear(1, 1, bias=False)
+            options_optimizer = torch.optim.SGD(options_model.parameters(), lr=0.0)
+            try:
+                with Trainer(
+                    model=options_model,
+                    optimizer=options_optimizer,
+                    train_loader=DataLoader(
+                        TensorDataset(torch.ones(1, 1)),
+                        batch_size=1,
+                    ),
+                    train_step=distributed_regression_step,
+                    config=TrainerConfig(
+                        epochs=1,
+                        device="cpu",
+                        strategy="ddp",
+                        checkpoint_every_epochs=None,
+                    ),
+                    checkpoint_policy=RecordingCheckpointPolicy(Path(checkpoint_dir)),
+                    runtime=runtime,
+                ) as options_trainer:
+                    options_trainer.load_checkpoint(
+                        Path("unused.pt"),
+                        options=None if rank == 0 else RestoreOptions(),
+                    )
+            except RuntimeError as error:
+                options_restore_error = str(error)
+            else:
+                options_restore_error = None
             result_queue.put(
                 (
                     rank,
@@ -1002,8 +1288,13 @@ def _uneven_accumulation_worker(
                     step_error,
                     sampler_error,
                     restore_error,
-                    divergent_restore_error,
+                    divergent_restore_result,
                     result.state.global_step,
+                    inspection_error,
+                    callback_restore_error,
+                    metadata_value,
+                    invalid_restore_error,
+                    options_restore_error,
                     None,
                 )
             )
@@ -1011,6 +1302,11 @@ def _uneven_accumulation_worker(
         result_queue.put(
             (
                 rank,
+                None,
+                None,
+                None,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1142,12 +1438,17 @@ def test_uneven_ddp_accumulation_reduces_each_logical_batch(tmp_path: Path) -> N
         "checkpoint restore failed: ValueError: rank-one restore failed" in result[14]
         for result in results
     )
+    assert all(result[15] == pytest.approx(0.1) for result in results)
+    assert all(result[16] == 8 for result in results)
+    assert all("checkpoint inspection failed" in result[17] for result in results)
+    assert all("checkpoint state application failed" in result[18] for result in results)
+    assert all(result[19] == [1, 2] for result in results)
+    assert all("checkpoint restore payload contract failed" in result[20] for result in results)
     assert all(
-        "restored trainer state differs across ranks" in result[15]
+        "checkpoint restore request differs across ranks" in result[21]
         for result in results
     )
-    assert all(result[16] == 8 for result in results)
-    assert all(result[17] is None for result in results)
+    assert all(result[22] is None for result in results)
     assert len(list((tmp_path / "primary-checkpoints").glob("checkpoint-*.pt"))) == 1
 
 
@@ -1729,6 +2030,180 @@ def test_project_checkpoint_policy_uses_ordered_publication_and_restore(
         }
 
 
+def test_typed_checkpoint_inspection_selects_generic_restore_and_reset(
+    tmp_path: Path,
+) -> None:
+    loader = DataLoader(TensorDataset(torch.ones(2, 1)), batch_size=1)
+    source_model = torch.nn.Linear(1, 1)
+    source_optimizer = torch.optim.SGD(source_model.parameters(), lr=0.2, momentum=0.9)
+    source_scheduler = WarmupLinearLR(source_optimizer, warmup_ratio=0.0, total_steps=8)
+    source_model(torch.ones(1, 1)).sum().backward()
+    source_optimizer.step()
+    source_scheduler.step()
+    source_callback = EarlyStopping("loss", patience=3)
+    source_callback.load_state_dict({"best": 0.5, "bad_checks": 2})
+
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    scheduler = WarmupLinearLR(optimizer, warmup_ratio=0.0, total_steps=8)
+    callback = EarlyStopping("loss", patience=3)
+    policy = TypedStateCheckpointPolicy(
+        tmp_path,
+        optimizer_state=source_optimizer.state_dict(),
+        scheduler_state=source_scheduler.state_dict(),
+        callback_state=source_callback.state_dict(),
+    )
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(epochs=4, device="cpu", checkpoint_every_epochs=None),
+        scheduler=scheduler,
+        callbacks=(callback,),
+        checkpoint_policy=policy,
+    ) as trainer:
+        inspection = trainer.inspect_checkpoint(tmp_path / "typed.pt")
+        restored = trainer.load_checkpoint(
+            tmp_path / "typed.pt",
+            options=inspection.restore_options,
+        )
+
+        assert inspection.metadata == {"objective_changed": True}
+        assert trainer.state.state_dict() == {
+            "epoch": 1,
+            "global_step": 8,
+            "optimizer_step": 4,
+            "stopped_early": False,
+        }
+        assert callback.state_dict() == {"best": None, "bad_checks": 0}
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(0.175)
+        assert scheduler.last_epoch == 1
+        assert restored.restored_components == frozenset(
+            {"model", "optimizer", "scheduler", "trainer"}
+        )
+        assert restored.reset_components == frozenset({"callbacks", "stopped_early"})
+        assert restored.optimizer_state_dict is None
+        assert restored.scheduler_state_dict is None
+        assert restored.callback_state_dicts == {}
+
+
+def test_restore_options_reset_optimizer_scheduler_and_restore_terminal_callback(
+    tmp_path: Path,
+) -> None:
+    loader = DataLoader(TensorDataset(torch.ones(2, 1)), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+    scheduler = WarmupLinearLR(optimizer, warmup_ratio=0.0, total_steps=4)
+    callback = EarlyStopping("loss", patience=3)
+    policy = TypedStateCheckpointPolicy(
+        tmp_path,
+        optimizer_state={"state": {}, "param_groups": []},
+        scheduler_state=scheduler.state_dict(),
+        callback_state={"best": 0.25, "bad_checks": 3},
+    )
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(epochs=4, device="cpu", checkpoint_every_epochs=None),
+        scheduler=scheduler,
+        callbacks=(callback,),
+        checkpoint_policy=policy,
+    ) as trainer:
+        optimizer.param_groups[0]["lr"] = 0.5
+        optimizer.step()
+        scheduler.step()
+        restored = trainer.load_checkpoint(
+            tmp_path / "typed.pt",
+            options=RestoreOptions(
+                optimizer="reset",
+                scheduler="reset",
+            ),
+        )
+
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+        assert scheduler.last_epoch == 0
+        assert callback.state_dict() == {"best": 0.25, "bad_checks": 3}
+        assert trainer.state.stopped_early
+        parameter_before_fit = model.weight.detach().clone()
+        terminal_result = trainer.fit()
+        torch.testing.assert_close(model.weight, parameter_before_fit)
+        assert terminal_result.training_history == ()
+        assert terminal_result.validation_history == ()
+        assert restored.restored_components == frozenset(
+            {"model", "callbacks", "trainer", "stopped_early"}
+        )
+        assert restored.reset_components == frozenset({"optimizer", "scheduler"})
+
+
+@pytest.mark.parametrize(
+    ("optimizer_action", "scheduler_action", "expected_lr"),
+    [
+        ("reset", "restore", 0.175),
+        ("restore", "reset", 0.01),
+    ],
+)
+def test_mixed_optimizer_scheduler_restore_actions_synchronize_learning_rate(
+    tmp_path: Path,
+    optimizer_action: Literal["restore", "reset"],
+    scheduler_action: Literal["restore", "reset"],
+    expected_lr: float,
+) -> None:
+    loader = DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1)
+    source_model = torch.nn.Linear(1, 1)
+    source_optimizer = torch.optim.SGD(source_model.parameters(), lr=0.2)
+    source_scheduler = WarmupLinearLR(source_optimizer, warmup_ratio=0.0, total_steps=8)
+    source_optimizer.step()
+    source_scheduler.step()
+
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    scheduler = WarmupLinearLR(optimizer, warmup_ratio=0.0, total_steps=8)
+    policy = TypedStateCheckpointPolicy(
+        tmp_path,
+        optimizer_state=source_optimizer.state_dict(),
+        scheduler_state=source_scheduler.state_dict(),
+        callback_state={},
+    )
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(epochs=2, device="cpu", checkpoint_every_epochs=None),
+        scheduler=scheduler,
+        checkpoint_policy=policy,
+    ) as trainer:
+        trainer.load_checkpoint(
+            tmp_path / "typed.pt",
+            options=RestoreOptions(
+                optimizer=optimizer_action,
+                scheduler=scheduler_action,
+                callbacks="reset",
+                stopped_early="reset",
+            ),
+        )
+
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(expected_lr)
+    assert scheduler.get_last_lr() == pytest.approx([expected_lr])
+
+
+def test_checkpoint_policy_cannot_pre_report_generic_resets(tmp_path: Path) -> None:
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1),
+        train_step=regression_step,
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        checkpoint_policy=FalseResetReportingPolicy(tmp_path),
+    ) as trainer, pytest.raises(ValueError, match="cannot pre-report Mammoth-managed"):
+        trainer.load_checkpoint(tmp_path / "typed.pt")
+
+
 def test_checkpoint_restore_infers_missing_loop_cursors(tmp_path: Path) -> None:
     loader = DataLoader(TensorDataset(torch.ones(3, 1)), batch_size=1)
     model = torch.nn.Linear(1, 1)
@@ -2089,6 +2564,45 @@ def test_registered_checkpoint_round_trip_resumes_next_epoch(tmp_path: Path) -> 
 
     assert result.state.epoch == 1
     assert len(result.training_history) == 1
+
+
+def test_registered_checkpoint_non_strict_restore_ignores_removed_callback(
+    tmp_path: Path,
+) -> None:
+    loader = DataLoader(
+        TensorDataset(torch.randn(2, 2), torch.tensor([0, 1])),
+        batch_size=2,
+    )
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    checkpoint_dir = tmp_path / "checkpoints"
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=classification_step,
+        config=TrainerConfig(epochs=1, device="cpu"),
+        callbacks=(EarlyStopping("loss", patience=2),),
+        checkpoint_dir=checkpoint_dir,
+    ) as trainer:
+        trainer.fit()
+
+    restored_model = torch.nn.Linear(2, 2)
+    restored_optimizer = torch.optim.SGD(restored_model.parameters(), lr=0.1)
+    with Trainer(
+        model=restored_model,
+        optimizer=restored_optimizer,
+        train_loader=loader,
+        train_step=classification_step,
+        config=TrainerConfig(epochs=2, device="cpu", checkpoint_every_epochs=None),
+    ) as restored:
+        report = restored.load_checkpoint(
+            checkpoint_dir / "checkpoint-0000.pt",
+            strict=False,
+        )
+
+    assert "callbacks" not in report.restored_components
+    assert report.epoch == 0
 
 
 def test_async_checkpoint_publication_is_atomic_and_bounded(tmp_path: Path) -> None:

@@ -267,6 +267,14 @@ warmup and decay. Projects choose its warmup ratio and total-step horizon; an
 extended resume rebases optimizer learning rates, while a shortened horizon is
 rejected.
 
+Checkpoint policies expose a two-phase typed restore path. Call
+`trainer.inspect_checkpoint(path)` to receive a rank-coordinated
+`CheckpointInspection`, then pass its `restore_options` to
+`trainer.load_checkpoint(path, options=...)`. Mammoth applies and synchronizes
+generic optimizer, scheduler, and callback restore/reset actions, trainer-coordinate
+restoration, and terminal-state restore/reset; the project keeps its payload parsing, model
+compatibility, and metadata policy.
+
 Projects that need more control can supply an `AccumulationPolicy`, scalar
 `MetricSpec` values, additive `StatefulMetric` objects, `MetricRoute` mappings,
 and a `TrainerCheckpointPolicy`. The train and validation step functions remain

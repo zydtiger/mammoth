@@ -12,7 +12,7 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
 from typing import Any, Literal, Protocol
@@ -31,6 +31,124 @@ from mammoth.core.artifacts import (
 
 CHECKPOINT_SCHEMA_VERSION = 1
 CheckpointReason = Literal["scheduled", "manual", "interrupted"]
+CheckpointComponent = Literal[
+    "model",
+    "optimizer",
+    "scheduler",
+    "callbacks",
+    "trainer",
+    "stopped_early",
+    "scaler",
+    "project",
+]
+RestoreAction = Literal["restore", "reset"]
+_CHECKPOINT_COMPONENTS = frozenset(
+    {
+        "model",
+        "optimizer",
+        "scheduler",
+        "callbacks",
+        "trainer",
+        "stopped_early",
+        "scaler",
+        "project",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreOptions:
+    """Select whether generic mutable training state is restored or reset."""
+
+    optimizer: RestoreAction = "restore"
+    scheduler: RestoreAction = "restore"
+    callbacks: RestoreAction = "restore"
+    stopped_early: RestoreAction = "restore"
+
+    def __post_init__(self) -> None:
+        for name in ("optimizer", "scheduler", "callbacks", "stopped_early"):
+            if getattr(self, name) not in {"restore", "reset"}:
+                raise ValueError(f"{name} restore action must be 'restore' or 'reset'")
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointInspection:
+    """Project-neutral summary produced before checkpoint state is applied."""
+
+    available_components: frozenset[CheckpointComponent]
+    restore_options: RestoreOptions = RestoreOptions()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.available_components, frozenset):
+            raise TypeError("available_components must be a frozenset")
+        invalid_components = self.available_components.difference(_CHECKPOINT_COMPONENTS)
+        if invalid_components:
+            raise ValueError(f"unsupported checkpoint components: {invalid_components}")
+        if not isinstance(self.restore_options, RestoreOptions):
+            raise TypeError("restore_options must be RestoreOptions")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("checkpoint inspection metadata must be a mapping")
+
+
+@dataclass(frozen=True, slots=True)
+class TrainerCheckpointRestore:
+    """Normalized project checkpoint state and Mammoth's applied-state report."""
+
+    epoch: int
+    optimizer_step: int | None = None
+    global_step: int | None = None
+    stopped_early: bool = False
+    optimizer_state_dict: Mapping[str, Any] | None = field(default=None, repr=False)
+    scheduler_state_dict: Mapping[str, Any] | None = field(default=None, repr=False)
+    callback_state_dicts: Mapping[int, Mapping[str, Any]] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    restored_components: frozenset[CheckpointComponent] = frozenset()
+    reset_components: frozenset[CheckpointComponent] = frozenset()
+
+    def __post_init__(self) -> None:
+        if isinstance(self.epoch, bool) or not isinstance(self.epoch, int) or self.epoch < -1:
+            raise ValueError("restored epoch must be an integer >= -1")
+        for name in ("optimizer_step", "global_step"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"restored {name} must be a non-negative integer or None")
+        if not isinstance(self.stopped_early, bool):
+            raise ValueError("restored stopped_early must be a boolean")
+        for name in ("optimizer_state_dict", "scheduler_state_dict"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, Mapping):
+                raise TypeError(f"{name} must be a mapping or None")
+        if not isinstance(self.callback_state_dicts, Mapping) or any(
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            or not isinstance(state, Mapping)
+            for index, state in self.callback_state_dicts.items()
+        ):
+            raise TypeError(
+                "callback_state_dicts must map non-negative callback indices to mappings"
+            )
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("checkpoint restore metadata must be a mapping")
+        if not isinstance(self.restored_components, frozenset) or not isinstance(
+            self.reset_components,
+            frozenset,
+        ):
+            raise TypeError("restored and reset components must be frozensets")
+        invalid_components = (
+            self.restored_components | self.reset_components
+        ).difference(_CHECKPOINT_COMPONENTS)
+        if invalid_components:
+            raise ValueError(f"unsupported checkpoint components: {invalid_components}")
+        overlap = self.restored_components & self.reset_components
+        if overlap:
+            raise ValueError(f"checkpoint components cannot be restored and reset: {overlap}")
 
 
 @dataclass(frozen=True)
@@ -71,38 +189,25 @@ class TrainerCheckpointContext:
     training_metrics: Mapping[str, float]
     validation_metrics: Mapping[str, float] | None
     reason: CheckpointReason = "scheduled"
-
-
-@dataclass(frozen=True, slots=True)
-class TrainerCheckpointRestore:
-    """Project-restored coordinates that Mammoth applies to its loop state."""
-
-    epoch: int
-    optimizer_step: int | None = None
-    global_step: int | None = None
-    stopped_early: bool = False
-
-    def __post_init__(self) -> None:
-        if isinstance(self.epoch, bool) or not isinstance(self.epoch, int) or self.epoch < -1:
-            raise ValueError("restored epoch must be an integer >= -1")
-        for name in ("optimizer_step", "global_step"):
-            value = getattr(self, name)
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or value < 0
-            ):
-                raise ValueError(f"restored {name} must be a non-negative integer or None")
-        if not isinstance(self.stopped_early, bool):
-            raise ValueError("restored stopped_early must be a boolean")
+    restore: TrainerCheckpointRestore | None = None
 
 
 class TrainerCheckpointPolicy(Protocol):
     """Retain project checkpoint meaning behind Mammoth trainer mechanics."""
+
+    def inspect(
+        self,
+        path: Path,
+    ) -> CheckpointInspection:
+        """Inspect project metadata and recommend generic restore actions."""
+        ...
 
     def restore(
         self,
         path: Path,
         *,
         device: torch.device,
+        options: RestoreOptions,
     ) -> TrainerCheckpointRestore:
         """Restore project objects and return generic trainer coordinates."""
         ...
@@ -153,6 +258,11 @@ class StateRegistry:
     def state_dict(self) -> dict[str, Mapping[str, Any]]:
         """Snapshot every registered object by stable name."""
         return {name: value.state_dict() for name, value in self._objects.items()}
+
+    @property
+    def names(self) -> frozenset[str]:
+        """Return the registered state names used by checkpoint selection."""
+        return frozenset(self._objects)
 
     def load_state_dict(self, state: Mapping[str, Any], *, strict: bool = True) -> None:
         """Restore registered objects and optionally reject missing or extra names."""
@@ -590,6 +700,16 @@ def restore_checkpoint(
     map_location: str | torch.device = "cpu",
 ) -> None:
     """Load one Mammoth checkpoint into an existing registry."""
+    state = load_checkpoint_state(path, map_location=map_location)
+    registry.load_state_dict(state, strict=strict)
+
+
+def load_checkpoint_state(
+    path: Path,
+    *,
+    map_location: str | torch.device = "cpu",
+) -> Mapping[str, Any]:
+    """Load and validate one Mammoth registered-state checkpoint payload."""
     payload = torch.load(Path(path), map_location=map_location, weights_only=True)
     if not isinstance(payload, Mapping):
         raise ValueError("Mammoth checkpoint must contain a mapping")
@@ -600,7 +720,7 @@ def restore_checkpoint(
     state = payload.get("state")
     if not isinstance(state, Mapping):
         raise ValueError("Mammoth checkpoint state must be a mapping")
-    registry.load_state_dict(state, strict=strict)
+    return state
 
 
 def snapshot_to_cpu(value: Any) -> Any:
