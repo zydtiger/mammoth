@@ -1544,6 +1544,59 @@ def test_validation_callback_stops_early_on_project_metric() -> None:
     assert len(result.validation_history) == 2
 
 
+def test_early_stopping_stops_on_patience_threshold_and_signals_improvement() -> None:
+    callback = EarlyStopping("score", mode="max", patience=3)
+    state = TrainerState()
+
+    assert not callback.should_stop(state)
+    callback.on_validation_end(state, {"score": 1.0})
+    assert callback.improved
+    assert not callback.should_stop(state)
+
+    for bad_check in range(1, 4):
+        callback.on_validation_end(state, {"score": 1.0})
+        assert not callback.improved
+        assert callback.bad_checks == bad_check
+        assert callback.should_stop(state) is (bad_check >= 3)
+
+    assert callback.state_dict() == {"best": 1.0, "bad_checks": 3}
+
+
+def test_restored_early_stop_makes_fit_a_no_op() -> None:
+    class FailingCallback(Callback):
+        def on_train_start(self, state: TrainerState) -> None:
+            raise AssertionError("callbacks must not run for a terminal restored state")
+
+    model = torch.nn.Linear(1, 1)
+    initial_parameters = tuple(parameter.detach().clone() for parameter in model.parameters())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+    optimizer_state = optimizer.state_dict()
+    sink = RecordingSink()
+
+    def train_step(module: torch.nn.Module, batch: Any, context: StepContext) -> StepOutput:
+        raise AssertionError("the loader and step function must not run")
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1),
+        train_step=train_step,
+        callbacks=(FailingCallback(),),
+        observer=RunObserver((sink,)),
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+    ) as trainer:
+        trainer.state.stopped_early = True
+        result = trainer.fit()
+
+    assert result.state is trainer.state
+    assert result.training_history == ()
+    assert result.validation_history == ()
+    assert sink.observations == []
+    assert optimizer.state_dict() == optimizer_state
+    for initial, current in zip(initial_parameters, model.parameters(), strict=True):
+        assert torch.equal(initial, current)
+
+
 def test_registered_checkpoint_round_trip_resumes_next_epoch(tmp_path: Path) -> None:
     torch.manual_seed(3)
     loader = DataLoader(

@@ -270,6 +270,12 @@ class Trainer:
         """Execute configured epochs and return project metric summaries."""
         training_history: list[Mapping[str, float]] = []
         validation_history: list[Mapping[str, float]] = []
+        if self.state.stopped_early:
+            return TrainerResult(
+                state=self.state,
+                training_history=(),
+                validation_history=(),
+            )
         if self.config.emit_fit_phase_events:
             self.observer.emit("phase_started", phase=self.config.train_phase)
         fit_error: BaseException | None = None
