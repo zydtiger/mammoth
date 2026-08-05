@@ -27,7 +27,8 @@ from mammoth.core import (
     publish_prepared_artifact,
     read_execution_events,
 )
-from mammoth.logging import Observation, RunObserver
+from mammoth.core.events import ExecutionEventWriter
+from mammoth.logging import JsonlEventSink, Observation, RunObserver
 from mammoth.torch import (
     AccumulationPlan,
     AsyncCheckpointPublisher,
@@ -2780,6 +2781,49 @@ def test_optimizer_step_metrics_observe_post_scheduler_state() -> None:
         "optimizer_step": 2.0,
     }
     assert result.training_history[0]["post_step_lr"] == pytest.approx(0.025)
+
+
+def test_trainer_flushes_each_logged_optimizer_window_to_jsonl(tmp_path: Path) -> None:
+    context = create_execution_context(
+        tmp_path / "run",
+        run_name="trainer-jsonl",
+        invocation_kind="test",
+        intended_phases=("train",),
+        world_size=1,
+        execution_mode="single",
+        command=("python", "train.py"),
+        execution_id="attempt",
+    )
+    writer = ExecutionEventWriter.for_process(
+        context,
+        rank=0,
+        monotonic_clock=lambda: 1.0,
+    )
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+
+    with RunObserver((JsonlEventSink(writer),)) as observer, Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        observer=observer,
+        config=TrainerConfig(
+            epochs=1,
+            device="cpu",
+            checkpoint_every_epochs=None,
+        ),
+    ) as trainer:
+        trainer.fit()
+
+    progress = [
+        event
+        for event in read_execution_events(context.execution_dir / "rank-0.jsonl")
+        if event.event == "progress" and event.phase == "train"
+    ]
+    assert [event.completed for event in progress] == [1, 2, 3, 4]
+    assert all("loss" in event.display_metrics for event in progress)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

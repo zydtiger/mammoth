@@ -523,6 +523,7 @@ class Trainer:
                             final=window_index == len(window_sizes),
                             unit="optimizer step",
                         )
+                        self.observer.flush()
             def compute_summary() -> tuple[dict[str, float], dict[str, float]]:
                 scalar_summary = accumulator.compute(
                     device=self.device,
