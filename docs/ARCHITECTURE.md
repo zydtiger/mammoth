@@ -192,6 +192,15 @@ device/rank identity and its active execution observer; constructing the
 trainer without a runtime remains supported for callers that already own their
 process group.
 
+Mammoth's validation-metric early-stopping callback owns the generic best-value
+and consecutive-failure state machine and stops on the `patience`-th failed
+check. `TrainerState.stopped_early` is the sole persisted terminal decision;
+`fit()` returns without touching loaders, callbacks, or optimizer state when a
+restored state is already terminal. The callback exposes a transient
+`improved` signal so a project checkpoint policy can publish its own best-model
+format, while the project continues to choose the metric, mode, patience, and
+minimum delta.
+
 `StepOutput` carries the optional loss, already-computed scalar metrics, and
 opaque updates for registered stateful metrics. Mammoth reduces configured
 distributed training-window summaries and train/validation epoch summaries,
