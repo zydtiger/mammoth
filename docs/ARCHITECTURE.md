@@ -45,9 +45,11 @@ applies a caller-selected bound across queued and active work, and associates
 each result or failure with the accepted submission. Accepted work is never
 cancelled. Results and failures remain owned until explicit acknowledgment;
 interruption after queue acceptance is deferred for the submitter to
-propagate after recording the handoff. Later flushes or closes therefore retain
-unacknowledged outcomes, while cleanup remains idempotent and does not replace
-an active workload exception. Optional done callbacks run on a pipeline-owned
+propagate after recording the handoff. Exact input-identity ownership checks
+cover the caller return boundary, and interruption after acknowledgment removal
+is deferred. Later flushes or closes therefore retain unacknowledged outcomes,
+while cleanup remains idempotent and does not replace an active workload
+exception. Optional done callbacks run on a pipeline-owned
 dispatcher only after the submission state is final, so reentrant waits cannot
 block the sole work thread and callback failures cannot replace worker outcomes.
 

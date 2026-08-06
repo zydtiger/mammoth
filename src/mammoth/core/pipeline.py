@@ -269,6 +269,11 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
         with self._condition:
             return any(item is submission for item in self._submissions)
 
+    def owns_input(self, input_value: InputT) -> bool:
+        """Return whether this pipeline owns a submission for the exact input object."""
+        with self._condition:
+            return any(item.input is input_value for item in self._submissions)
+
     def take_deferred_interrupt(self) -> KeyboardInterrupt | SystemExit | None:
         """Return and clear an interruption delivered after work acceptance."""
         with self._condition:
@@ -294,7 +299,13 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
                 raise RuntimeError("cannot acknowledge background work before completion")
             if not any(item is submission for item in self._submissions):
                 return
-            self._submissions.remove(submission)
+            try:
+                self._submissions.remove(submission)
+            except (KeyboardInterrupt, SystemExit) as error:
+                if any(item is submission for item in self._submissions):
+                    raise
+                if self._deferred_interrupt is None:
+                    self._deferred_interrupt = error
 
     def flush(self) -> tuple[BackgroundPipelineResult[InputT, ResultT], ...]:
         """Wait for accepted work, then expose unacknowledged results or failure."""
