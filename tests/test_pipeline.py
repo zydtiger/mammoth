@@ -186,6 +186,48 @@ def test_pipeline_defers_interruption_before_accepted_handoff_returns(
     pipeline.acknowledge(submission)
 
 
+def test_pipeline_reports_ownership_for_the_exact_input_object() -> None:
+    """Callers can resolve an ambiguous post-submit interrupt by input identity."""
+    first = [1]
+    equal_but_distinct = [1]
+    pipeline = BoundedBackgroundPipeline(lambda value: value)
+    submission = pipeline.submit(first)
+
+    assert pipeline.owns_input(first)
+    assert not pipeline.owns_input(equal_but_distinct)
+    pipeline.flush()
+    assert pipeline.owns_input(first)
+    pipeline.acknowledge(submission)
+    assert not pipeline.owns_input(first)
+    assert pipeline.close() == ()
+
+
+@pytest.mark.parametrize(
+    "interruption",
+    [KeyboardInterrupt("acknowledgement interrupted"), SystemExit(11)],
+)
+def test_pipeline_defers_interruption_after_acknowledgement_removes_submission(
+    interruption: KeyboardInterrupt | SystemExit,
+) -> None:
+    """An interrupted removal cannot consume an outcome without a deferred signal."""
+
+    class InterruptingDeque(deque[Any]):
+        def remove(self, value: Any) -> None:
+            super().remove(value)
+            raise interruption
+
+    pipeline = BoundedBackgroundPipeline(lambda value: value + 1)
+    submission = pipeline.submit(5)
+    assert submission.result(timeout=5.0) == 6
+    pipeline._submissions = InterruptingDeque(pipeline._submissions)
+
+    pipeline.acknowledge(submission)
+
+    assert not pipeline.owns(submission)
+    assert pipeline.take_deferred_interrupt() is interruption
+    assert pipeline.close() == ()
+
+
 def test_pipeline_blocked_submit_cannot_cross_concurrent_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -520,24 +562,29 @@ def test_pipeline_done_callback_runs_after_final_state_and_cannot_corrupt_it() -
     assert pipeline.close() == ()
 
 
-def test_pipeline_acknowledgment_is_retryable_after_interruption() -> None:
-    """An interrupted idempotent acknowledgment can be safely retried."""
+def test_pipeline_failed_acknowledgment_defers_interruption_after_removal() -> None:
+    """A failed outcome stays attributable when acknowledgment removal is interrupted."""
 
     class InterruptingDeque(deque[Any]):
         def remove(self, value: Any) -> None:
             super().remove(value)
             raise KeyboardInterrupt("acknowledgment interrupted")
 
-    pipeline = BoundedBackgroundPipeline(lambda value: value + 1)
+    pipeline = BoundedBackgroundPipeline(
+        lambda _: (_ for _ in ()).throw(OSError("publication failed"))
+    )
     submission = pipeline.submit(6)
-    completed = pipeline.flush()
+    with pytest.raises(BackgroundPipelineError, match="publication failed") as raised:
+        pipeline.flush()
     pipeline._submissions = InterruptingDeque(pipeline._submissions)
 
-    with pytest.raises(KeyboardInterrupt, match="acknowledgment interrupted"):
-        pipeline.acknowledge(submission)
+    pipeline.acknowledge(raised.value.submission)
 
-    assert completed[0].result == 7
-    assert submission.result() == 7
+    assert raised.value.input == 6
+    assert isinstance(raised.value.cause, OSError)
+    deferred = pipeline.take_deferred_interrupt()
+    assert isinstance(deferred, KeyboardInterrupt)
+    assert "acknowledgment interrupted" in str(deferred)
     pipeline.acknowledge(submission)
     assert not pipeline.owns(submission)
     assert pipeline.close() == ()

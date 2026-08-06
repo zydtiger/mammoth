@@ -377,6 +377,10 @@ outcome between internal state changes and caller bookkeeping. If interruption
 lands after queue acceptance, `submit()` completes the ownership transfer;
 call `take_deferred_interrupt()` after submission and propagate the returned
 `KeyboardInterrupt` or `SystemExit` once the caller has recorded that handoff.
+Callers resolving an interrupt at the return boundary may use
+`owns_input(value)` to test ownership by object identity. An interrupt after
+acknowledgment removal is likewise deferred so the observed outcome is not
+lost.
 
 An active `TorchExecutionSession` can create and own the same pipeline through
 `session.create_background_pipeline(...)`, ensuring accepted work closes before
