@@ -337,6 +337,36 @@ def test_dashboard_shortens_batch_and_microbatch_throughput_units(tmp_path: Path
         assert f"{unit}/s" not in rendered
 
 
+def test_dashboard_shows_segmentation_test_patch_rate_as_batches(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    with ExecutionEventWriter.for_process(context, rank=0) as writer:
+        writer.emit_progress(
+            phase="test/segmentation",
+            task_id="segment",
+            completed=1,
+            total=2,
+            unit="patches",
+            throughput=2.0,
+        )
+    snapshot = RunMonitor(layout).poll()
+
+    for compact, width in ((False, 120), (True, 80)):
+        console = Console(width=width, record=True, color_system=None)
+        console.print(
+            dashboard_layout(
+                snapshot,
+                host=None,
+                detail=False,
+                compact=compact,
+            )
+        )
+        rendered = console.export_text()
+
+        assert "2.0 b/s" in rendered
+        assert "patches/s" not in rendered
+
+
 def test_dashboard_omits_secondary_metrics_without_loss_or_learning_rate(
     tmp_path: Path,
 ) -> None:
