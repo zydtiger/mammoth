@@ -170,11 +170,13 @@ training loops:
 - optional sanitized runtime provenance in schema-version-1 metadata;
 - single-process and standard DDP initialization and cleanup;
 - generic rank, local-rank, world-size, backend, and device identity;
-- common object and tensor collectives;
+- common object and tensor collectives plus caller-weighted local partitions;
 - rank-wide execution creation, joining, and startup consensus;
 - exclusive rank text logs and JSONL observation streams;
+- generic process and phase lifecycle completion and cleanup;
 - primary-rank TensorBoard and checkpoint defaults; and
-- optional runtime consumption by the generic trainer.
+- optional runtime consumption by the generic trainer, including interruption
+  checkpoint publication.
 
 Exit condition: one direct invocation can use the same API in single-process or
 two-rank DDP mode, and a rank-local startup failure reaches every participant

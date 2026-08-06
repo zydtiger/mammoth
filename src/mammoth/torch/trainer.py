@@ -148,6 +148,7 @@ class TrainerConfig:
     checkpoint_every_epochs: int | None = 1
     checkpoint_filename: str = "checkpoint-{epoch:04d}.pt"
     max_pending_checkpoints: int = 1
+    checkpoint_on_interrupt: bool = True
     non_blocking_transfer: bool = False
     train_phase: str = "train"
     validation_phase: str = "validation"
@@ -182,6 +183,8 @@ class TrainerConfig:
             raise ValueError("max_gradient_norm must be positive and finite")
         if not isinstance(self.emit_fit_phase_events, bool):
             raise ValueError("emit_fit_phase_events must be a boolean")
+        if not isinstance(self.checkpoint_on_interrupt, bool):
+            raise ValueError("checkpoint_on_interrupt must be a boolean")
         if self.compile_config is not None and not isinstance(
             self.compile_config, TorchCompileConfig
         ):
@@ -408,6 +411,14 @@ class Trainer:
                 self.observer.emit("phase_completed", phase=self.config.train_phase)
         except BaseException as error:
             fit_error = error
+            if isinstance(error, KeyboardInterrupt) and self.config.checkpoint_on_interrupt:
+                try:
+                    self.publish_interrupted_checkpoint()
+                except BaseException as checkpoint_error:
+                    error.add_note(
+                        "Interrupted checkpoint publication also failed: "
+                        f"{checkpoint_error}"
+                    )
             if self.config.emit_fit_phase_events:
                 self.observer.emit(
                     "phase_failed",
@@ -418,7 +429,12 @@ class Trainer:
         finally:
             if fit_error is not None:
                 try:
-                    self.flush_checkpoints()
+                    if isinstance(fit_error, KeyboardInterrupt):
+                        self.flush_local_checkpoints(
+                            message="Interrupted checkpoint shutdown is still active."
+                        )
+                    else:
+                        self.flush_checkpoints()
                 except BaseException as flush_error:
                     fit_error.add_note(f"Checkpoint shutdown also failed: {flush_error}")
         return TrainerResult(
@@ -1005,6 +1021,22 @@ class Trainer:
         self.raise_distributed_failure("forced checkpoint publication", local_error)
         self.flush_checkpoints()
 
+    def publish_interrupted_checkpoint(self) -> None:
+        """Publish rank zero's interruption snapshot without entering collectives."""
+        if self.rank != 0 or (
+            self.checkpoint_dir is None and self.checkpoint_policy is None
+        ):
+            return
+        self.publish_checkpoint(
+            self.state.epoch,
+            {},
+            None,
+            reason="interrupted",
+        )
+        self.flush_local_checkpoints(
+            message="Interrupted checkpoint publication is still active."
+        )
+
     def inspect_checkpoint(self, path: Path) -> CheckpointInspection:
         """Inspect one checkpoint on rank zero and share the typed result."""
         checkpoint_path = Path(path)
@@ -1368,6 +1400,15 @@ class Trainer:
                 except BaseException as error:
                     local_error = error
             self.raise_distributed_failure("checkpoint flush", local_error)
+
+    def flush_local_checkpoints(self, *, message: str) -> None:
+        """Flush this rank's publisher without entering distributed collectives."""
+        with self.observer.periodic_heartbeats(
+            phase=self.config.train_phase,
+            message=message,
+        ):
+            if self.rank == 0:
+                self.publisher.flush()
 
     def raise_distributed_failure(
         self,

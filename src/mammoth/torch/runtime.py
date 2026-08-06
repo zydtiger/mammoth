@@ -8,8 +8,12 @@ or join one immutable attempt and open one process-owned stream per rank.
 from __future__ import annotations
 
 import logging
+import math
 import os
-from collections.abc import Callable, Mapping, Sequence
+import signal as signal_module
+import time
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -27,6 +31,7 @@ from mammoth.core import (
     join_execution_context,
 )
 from mammoth.logging import ExecutionLogging, ObservationSink, create_execution_logging
+from mammoth.torch.scheduling import weighted_partition_counts, weighted_partition_indices
 
 Strategy = Literal["single", "ddp"]
 
@@ -43,6 +48,9 @@ class TorchRuntimeConfig:
     rank: int | None = None
     local_rank: int | None = None
     world_size: int | None = None
+    workload_weights: tuple[float, ...] | None = None
+    strict_launch_environment: bool = False
+    require_global_local_rank_match: bool = False
 
     def __post_init__(self) -> None:
         if self.strategy not in {"single", "ddp"}:
@@ -74,6 +82,23 @@ class TorchRuntimeConfig:
             raise ValueError("rank and world_size must be provided together")
         if self.rank is not None and self.world_size is not None and self.rank >= self.world_size:
             raise ValueError("rank must be smaller than world_size")
+        if self.workload_weights is not None:
+            weights = tuple(self.workload_weights)
+            if not weights or any(
+                isinstance(weight, bool)
+                or not isinstance(weight, (int, float))
+                or not math.isfinite(weight)
+                or weight <= 0
+                for weight in weights
+            ):
+                raise ValueError("workload_weights must contain positive finite numbers")
+            object.__setattr__(self, "workload_weights", tuple(float(weight) for weight in weights))
+        for name, value in (
+            ("strict_launch_environment", self.strict_launch_environment),
+            ("require_global_local_rank_match", self.require_global_local_rank_match),
+        ):
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,19 +154,34 @@ class TorchExecutionRuntime:
         self._logical_run_lease: LogicalRunLease | None = None
         self.execution_logging: ExecutionLogging | None = None
         self.execution_context: ExecutionContext | None = None
+        self._execution_session: TorchExecutionSession | None = None
         self._closed = False
 
         if self.strategy == "single":
+            if self.config.strict_launch_environment and _environment_world_size() > 1:
+                raise RuntimeError(
+                    "Single-process strategy cannot run inside a multi-process launch"
+                )
             self.rank = 0
             self.local_rank = 0
             self.world_size = 1
             self.device = resolve_device(self.config.device)
             self.backend = None
+            self.workload_weights = self._resolve_workload_weights()
             return
 
         self.rank, self.local_rank, self.world_size = _distributed_identity(self.config)
         if self.world_size < 2:
             raise RuntimeError("DDP strategy requires a world size of at least two")
+        if (
+            self.config.require_global_local_rank_match
+            and self.rank != self.local_rank
+        ):
+            raise RuntimeError(
+                "This runtime requires global rank and local rank to match; "
+                f"got rank={self.rank}, local_rank={self.local_rank}"
+            )
+        self.workload_weights = self._resolve_workload_weights()
         self.device = _distributed_device(self.config.device, self.local_rank)
         if self.device.type == "cuda":
             torch.cuda.set_device(self.device)
@@ -178,6 +218,13 @@ class TorchExecutionRuntime:
         dist.broadcast_object_list(objects, src=source_rank)
         return objects[0]
 
+    def broadcast_bool(self, value: bool, *, source_rank: int = 0) -> bool:
+        """Broadcast one boolean decision from ``source_rank``."""
+        result = self.broadcast_object(value, source_rank=source_rank)
+        if not isinstance(result, bool):
+            raise RuntimeError("Boolean broadcast returned an invalid payload")
+        return result
+
     def gather_object(
         self,
         value: Any,
@@ -200,6 +247,36 @@ class TorchExecutionRuntime:
         gathered: list[Any] = [None] * self.world_size
         dist.all_gather_object(gathered, value)
         return tuple(gathered)
+
+    def shared_string_union(self, values: Iterable[str]) -> tuple[str, ...]:
+        """Return one sorted string union shared by every participating rank."""
+        local_values = tuple(sorted(set(values)))
+        gathered = self.all_gather_object(local_values)
+        if not all(
+            isinstance(rank_values, tuple)
+            and all(isinstance(value, str) for value in rank_values)
+            for rank_values in gathered
+        ):
+            raise RuntimeError("Distributed string union received an invalid payload")
+        return tuple(sorted({value for rank_values in gathered for value in rank_values}))
+
+    def local_partition_count(
+        self,
+        total_count: int,
+        *,
+        require_nonempty: bool = False,
+    ) -> int:
+        """Return this rank's caller-weighted share of ``total_count``."""
+        counts = weighted_partition_counts(
+            total_count,
+            self.workload_weights,
+            require_nonempty=require_nonempty,
+        )
+        return counts[self.rank]
+
+    def local_partition_indices(self, total_count: int) -> range:
+        """Return this rank's caller-weighted contiguous item range."""
+        return weighted_partition_indices(total_count, self.rank, self.workload_weights)
 
     def scatter_object(
         self,
@@ -282,7 +359,24 @@ class TorchExecutionRuntime:
         """Create or join one attempt and establish rank-local logging by consensus."""
         if self.execution_logging is not None:
             raise RuntimeError("This torch runtime has already started an execution")
-        context = self.establish_execution(request)
+        self.establish_execution(request)
+        return self.start_execution_logging(
+            additional_sinks=additional_sinks,
+            text_level=text_level,
+        )
+
+    def start_execution_logging(
+        self,
+        *,
+        additional_sinks: Sequence[ObservationSink] = (),
+        text_level: int = logging.INFO,
+    ) -> ExecutionLogging:
+        """Open rank-local logging after execution establishment and validation."""
+        if self.execution_logging is not None:
+            raise RuntimeError("This torch runtime has already started execution logging")
+        context = self.execution_context
+        if context is None:
+            raise RuntimeError("Establish an execution before starting execution logging")
         logging_bundle: ExecutionLogging | None = None
         local_error: BaseException | None = None
         try:
@@ -309,6 +403,16 @@ class TorchExecutionRuntime:
         self.execution_logging = logging_bundle
         return logging_bundle
 
+    def create_execution_session(self) -> TorchExecutionSession:
+        """Create the generic process/phase lifecycle owner for this runtime."""
+        if self._execution_session is not None:
+            raise RuntimeError("This torch runtime already has an execution session")
+        if self.execution_logging is None:
+            raise RuntimeError("Start execution logging before creating a session")
+        session = TorchExecutionSession(self)
+        self._execution_session = session
+        return session
+
     def establish_execution(self, request: TorchExecutionRequest) -> ExecutionContext:
         """Create or join and validate one immutable execution across all ranks."""
         if self.execution_context is not None:
@@ -326,6 +430,27 @@ class TorchExecutionRuntime:
                 dist.destroy_process_group()
         finally:
             self._owns_process_group = False
+
+    def prepare_session_close(self) -> None:
+        """Run fallible non-observer cleanup before a terminal process event."""
+        first_error: BaseException | None = None
+        if self.execution_logging is not None:
+            try:
+                self.execution_logging.text_handler.close()
+            except BaseException as error:
+                first_error = error
+        try:
+            self._release_logical_run_lease()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        try:
+            self.close_process_group()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
 
     def close(self) -> None:
         """Close logging, release the primary lease, and destroy an owned group."""
@@ -474,6 +599,17 @@ class TorchExecutionRuntime:
             )
         self.backend = actual_backend
 
+    def _resolve_workload_weights(self) -> tuple[float, ...]:
+        weights = self.config.workload_weights
+        if weights is None:
+            return (1.0,) * self.world_size
+        if len(weights) != self.world_size:
+            raise RuntimeError(
+                "workload_weights must contain one value per rank; "
+                f"got {len(weights)} weights for world_size={self.world_size}"
+            )
+        return weights
+
     def _release_logical_run_lease(self) -> None:
         lease = self._logical_run_lease
         if lease is None:
@@ -490,6 +626,184 @@ class TorchExecutionRuntime:
             "backend": self.backend,
             "device_type": self.device.type,
         }
+
+
+class TorchExecutionSession:
+    """Own one process stream's phase lifecycle and coordinated cleanup."""
+
+    def __init__(self, runtime: TorchExecutionRuntime) -> None:
+        logging_bundle = runtime.execution_logging
+        if logging_bundle is None:
+            raise RuntimeError("Execution logging is required for an execution session")
+        self.runtime = runtime
+        self.context = logging_bundle.context
+        self.execution_logging = logging_bundle
+        self.observer = logging_bundle.observer
+        self.event_writer = logging_bundle.event_writer
+        self._phase: str | None = None
+        self._phase_terminal = False
+        self._phase_outcome: Literal["completed", "failed", "interrupted", "skipped"] | None = None
+        self._process_started_at: float | None = None
+        self._phase_started_at: float | None = None
+        self._closed = False
+
+    @property
+    def phase(self) -> str | None:
+        """Return the active or most recently completed phase name."""
+        return self._phase
+
+    def start_phase(self, phase: str) -> None:
+        """Start one phase and, on first use, this process lifecycle."""
+        if self._closed:
+            raise RuntimeError("Cannot start a phase after execution-session closure")
+        if not isinstance(phase, str) or not phase:
+            raise ValueError("phase must be a non-empty string")
+        if self._phase is not None and not self._phase_terminal:
+            raise RuntimeError(f"Execution phase {self._phase!r} is still active")
+        now = time.monotonic()
+        if self._process_started_at is None:
+            self._process_started_at = now
+            self.observer.emit("process_started", phase=phase)
+        self._phase = phase
+        self._phase_terminal = False
+        self._phase_outcome = None
+        self._phase_started_at = now
+        self.observer.emit("phase_started", phase=phase)
+
+    @contextmanager
+    def phase_scope(self, phase: str) -> Iterator[TorchExecutionSession]:
+        """Own one phase's success, failure, and interruption transition."""
+        self.start_phase(phase)
+        try:
+            yield self
+        except BaseException as error:
+            self.fail_phase(error, interrupted=isinstance(error, KeyboardInterrupt))
+            raise
+        else:
+            self.complete_phase()
+
+    def complete_phase(self, *, message: str | None = None) -> None:
+        """Mark the active phase successful."""
+        phase = self._active_phase()
+        fields: dict[str, Any] = {
+            "phase": phase,
+            "duration_seconds": self._phase_duration(),
+        }
+        if message is not None:
+            fields["message"] = message
+        self.observer.emit("phase_completed", **fields)
+        self._phase_terminal = True
+        self._phase_outcome = "completed"
+
+    def fail_phase(self, error: BaseException, *, interrupted: bool = False) -> None:
+        """Mark the active phase failed or interrupted."""
+        phase = self._active_phase()
+        self.observer.emit(
+            "phase_failed",
+            phase=phase,
+            duration_seconds=self._phase_duration(),
+            message=_error_text(error),
+            status="interrupted" if interrupted else "failed",
+            error_type=type(error).__name__,
+        )
+        self._phase_terminal = True
+        self._phase_outcome = "interrupted" if interrupted else "failed"
+
+    def skip_phase(self, message: str) -> None:
+        """Mark the active phase skipped."""
+        phase = self._active_phase()
+        self.observer.emit(
+            "phase_skipped",
+            phase=phase,
+            duration_seconds=self._phase_duration(),
+            message=message,
+        )
+        self._phase_terminal = True
+        self._phase_outcome = "skipped"
+
+    def close(
+        self,
+        *,
+        error: BaseException | None = None,
+        exit_code: int | None = None,
+        signal: int | str | None = None,
+        message: str | None = None,
+        before_close: Callable[[], None] | None = None,
+    ) -> None:
+        """Finish lifecycle events, run presentation cleanup, and close runtime IO."""
+        if self._closed:
+            return
+        cleanup_error: BaseException | None = None
+        if before_close is not None:
+            try:
+                before_close()
+            except BaseException as callback_error:
+                cleanup_error = callback_error
+        try:
+            self.runtime.prepare_session_close()
+        except BaseException as runtime_cleanup_error:
+            if cleanup_error is None:
+                cleanup_error = runtime_cleanup_error
+        terminal_error = error or cleanup_error
+        try:
+            if self._phase is not None:
+                if not self._phase_terminal:
+                    lifecycle_error = terminal_error or RuntimeError(
+                        "Execution session closed before recording a phase outcome"
+                    )
+                    self.fail_phase(
+                        lifecycle_error,
+                        interrupted=isinstance(lifecycle_error, KeyboardInterrupt),
+                    )
+                effective_exit_code = _process_exit_code(
+                    terminal_error,
+                    requested=exit_code,
+                    phase_outcome=self._phase_outcome,
+                    cleanup_failed=cleanup_error is not None,
+                )
+                fields: dict[str, Any] = {
+                    "phase": self._phase,
+                    "duration_seconds": self._process_duration(),
+                    "exit_code": effective_exit_code,
+                }
+                effective_signal = signal
+                if effective_signal is None and isinstance(terminal_error, KeyboardInterrupt):
+                    effective_signal = signal_module.SIGINT
+                if effective_signal is not None:
+                    fields["signal"] = effective_signal
+                if message is not None:
+                    fields["message"] = message
+                elif terminal_error is not None:
+                    fields["message"] = _error_text(terminal_error)
+                self.observer.emit("process_completed", **fields)
+        except BaseException as lifecycle_error:
+            if cleanup_error is None:
+                cleanup_error = lifecycle_error
+        try:
+            self.runtime.close()
+        except BaseException as runtime_error:
+            if cleanup_error is None:
+                cleanup_error = runtime_error
+        self._closed = True
+        if cleanup_error is not None and error is None and exit_code in {None, 0}:
+            raise cleanup_error
+
+    def _active_phase(self) -> str:
+        if self._phase is None:
+            raise RuntimeError("No execution phase has been started")
+        if self._phase_terminal:
+            raise RuntimeError(f"Execution phase {self._phase!r} is already terminal")
+        return self._phase
+
+    def _phase_duration(self) -> float:
+        if self._phase_started_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._phase_started_at)
+
+    def _process_duration(self) -> float:
+        if self._process_started_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._process_started_at)
 
 
 def initialize_torch_runtime(
@@ -563,6 +877,39 @@ def _environment_integer(name: str) -> int:
     return value
 
 
+def _environment_world_size() -> int:
+    raw = os.environ.get("WORLD_SIZE", "1")
+    try:
+        world_size = int(raw)
+    except ValueError as error:
+        raise RuntimeError(f"WORLD_SIZE must be an integer, got {raw!r}") from error
+    if world_size <= 0:
+        raise RuntimeError(f"WORLD_SIZE must be positive, got {world_size}")
+    return world_size
+
+
 def _error_text(error: BaseException) -> str:
     message = str(error).strip()
     return f"{type(error).__name__}: {message}" if message else type(error).__name__
+
+
+def _process_exit_code(
+    error: BaseException | None,
+    *,
+    requested: int | None,
+    phase_outcome: str | None,
+    cleanup_failed: bool,
+) -> int:
+    if requested is not None:
+        exit_code = requested
+    elif isinstance(error, KeyboardInterrupt):
+        exit_code = 130
+    elif isinstance(error, SystemExit):
+        exit_code = error.code if isinstance(error.code, int) else 1
+    elif error is not None:
+        exit_code = 1
+    else:
+        exit_code = 0
+    if exit_code == 0 and (cleanup_failed or phase_outcome in {"failed", "interrupted"}):
+        return 1
+    return exit_code

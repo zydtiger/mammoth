@@ -2269,6 +2269,100 @@ def test_forced_checkpoint_reports_interruption_reason(tmp_path: Path) -> None:
     assert (tmp_path / "project-checkpoints" / "project.checkpoint").is_file()
 
 
+def test_fit_publishes_interrupted_checkpoint_before_reraising(tmp_path: Path) -> None:
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    policy = RecordingCheckpointPolicy(tmp_path / "interrupted-checkpoint")
+
+    class InterruptingCallback(Callback):
+        def on_train_start(self, state: TrainerState) -> None:
+            del state
+            raise KeyboardInterrupt("stop training")
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        checkpoint_policy=policy,
+        callbacks=(InterruptingCallback(),),
+    ) as trainer, pytest.raises(KeyboardInterrupt, match="stop training"):
+        trainer.all_gather_object = lambda value: pytest.fail(
+            f"interruption checkpoint entered a collective with {value!r}"
+        )
+        trainer.fit()
+
+    assert [context.reason for context in policy.contexts] == ["interrupted"]
+    assert (tmp_path / "interrupted-checkpoint" / "project.checkpoint").is_file()
+
+
+def test_fit_can_disable_interrupted_checkpoint_publication(tmp_path: Path) -> None:
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    policy = RecordingCheckpointPolicy(tmp_path / "disabled-interrupted-checkpoint")
+
+    def interrupt_step(
+        model: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del model, batch, context
+        raise KeyboardInterrupt("stop training")
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=interrupt_step,
+        config=TrainerConfig(
+            epochs=1,
+            device="cpu",
+            checkpoint_every_epochs=None,
+            checkpoint_on_interrupt=False,
+        ),
+        checkpoint_policy=policy,
+    ) as trainer, pytest.raises(KeyboardInterrupt, match="stop training"):
+        trainer.fit()
+
+    assert policy.contexts == []
+    assert not (tmp_path / "disabled-interrupted-checkpoint").exists()
+
+
+def test_nonprimary_interruption_does_not_enter_checkpoint_collectives(
+    tmp_path: Path,
+) -> None:
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    policy = RecordingCheckpointPolicy(tmp_path / "nonprimary-interrupted-checkpoint")
+
+    class InterruptingCallback(Callback):
+        def on_train_start(self, state: TrainerState) -> None:
+            del state
+            raise KeyboardInterrupt("stop nonprimary training")
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        checkpoint_policy=policy,
+        callbacks=(InterruptingCallback(),),
+    ) as trainer, pytest.raises(KeyboardInterrupt, match="stop nonprimary training"):
+        trainer.rank = 1
+        trainer.all_gather_object = lambda value: pytest.fail(
+            f"nonprimary interruption entered a collective with {value!r}"
+        )
+        trainer.fit()
+
+    assert policy.contexts == []
+    assert not (tmp_path / "nonprimary-interrupted-checkpoint").exists()
+
+
 def test_compile_runs_after_ddp_and_preserves_ddp_no_sync(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3982,6 +4076,232 @@ def test_single_runtime_establishes_execution_and_supplies_trainer_observer(
         "process_completed",
     }
     assert (run_dir / "checkpoints" / "checkpoint-0000.pt").is_file()
+
+
+def test_single_runtime_owns_weighted_helpers_and_execution_lifecycle(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "runtime-session"
+    runtime = initialize_torch_runtime(
+        TorchRuntimeConfig(device="cpu", workload_weights=(2,))
+    )
+    runtime.start_execution(
+        TorchExecutionRequest(
+            run_dir=run_dir,
+            run_name="runtime-session",
+            invocation_kind="test",
+            intended_phases=("validate",),
+            command=("python", "validate.py"),
+            execution_id="runtime-session-attempt",
+        )
+    )
+    session = runtime.create_execution_session()
+
+    assert runtime.workload_weights == (2.0,)
+    assert runtime.local_partition_count(7, require_nonempty=True) == 7
+    assert runtime.local_partition_indices(7) == range(0, 7)
+    assert runtime.broadcast_bool(True)
+    assert runtime.shared_string_union(("dice", "loss", "dice")) == ("dice", "loss")
+
+    session.start_phase("validate")
+    session.complete_phase(message="validation complete")
+    session.close()
+
+    events = read_execution_events(
+        run_dir / "logs" / "executions" / "runtime-session-attempt" / "rank-0.jsonl"
+    )
+    assert [event.event for event in events] == [
+        "process_started",
+        "phase_started",
+        "phase_completed",
+        "process_completed",
+    ]
+    assert events[-1].exit_code == 0
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_exit_code", "expected_signal", "expected_status"),
+    [
+        (RuntimeError("validation failed"), 1, None, "failed"),
+        (KeyboardInterrupt("validation interrupted"), 130, 2, "interrupted"),
+        (SystemExit(7), 7, None, "failed"),
+    ],
+)
+def test_execution_session_scope_derives_terminal_process_state(
+    tmp_path: Path,
+    error: BaseException,
+    expected_exit_code: int,
+    expected_signal: int | None,
+    expected_status: str,
+) -> None:
+    run_dir = tmp_path / f"session-{type(error).__name__}"
+    runtime = initialize_torch_runtime(TorchRuntimeConfig(device="cpu"))
+    runtime.start_execution(
+        TorchExecutionRequest(
+            run_dir=run_dir,
+            run_name="runtime-session",
+            invocation_kind="test",
+            intended_phases=("validate",),
+            command=("python", "validate.py"),
+            execution_id=f"session-{type(error).__name__.lower()}",
+        )
+    )
+    session = runtime.create_execution_session()
+
+    with pytest.raises(type(error)) as raised, session.phase_scope("validate"):
+        raise error
+    session.close(error=raised.value)
+
+    events = read_execution_events(
+        run_dir
+        / "logs"
+        / "executions"
+        / f"session-{type(error).__name__.lower()}"
+        / "rank-0.jsonl"
+    )
+    assert [event.event for event in events] == [
+        "process_started",
+        "phase_started",
+        "phase_failed",
+        "process_completed",
+    ]
+    assert events[-2].extensions["status"] == expected_status
+    assert events[-1].exit_code == expected_exit_code
+    assert events[-1].signal == expected_signal
+
+
+def test_execution_session_cannot_report_failed_phase_as_success(tmp_path: Path) -> None:
+    run_dir = tmp_path / "failed-session"
+    runtime = initialize_torch_runtime(TorchRuntimeConfig(device="cpu"))
+    runtime.start_execution(
+        TorchExecutionRequest(
+            run_dir=run_dir,
+            run_name="failed-session",
+            invocation_kind="test",
+            intended_phases=("validate",),
+            command=("python", "validate.py"),
+            execution_id="failed-session-attempt",
+        )
+    )
+    session = runtime.create_execution_session()
+    session.start_phase("validate")
+    session.fail_phase(RuntimeError("failed"))
+    session.close(exit_code=0)
+
+    events = read_execution_events(
+        run_dir / "logs" / "executions" / "failed-session-attempt" / "rank-0.jsonl"
+    )
+    assert events[-1].event == "process_completed"
+    assert events[-1].exit_code == 1
+
+
+def test_execution_session_records_runtime_cleanup_failure_before_reraising(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "cleanup-failed-session"
+    runtime = initialize_torch_runtime(TorchRuntimeConfig(device="cpu"))
+    runtime.start_execution(
+        TorchExecutionRequest(
+            run_dir=run_dir,
+            run_name="cleanup-failed-session",
+            invocation_kind="test",
+            intended_phases=("validate",),
+            command=("python", "validate.py"),
+            execution_id="cleanup-failed-session-attempt",
+        )
+    )
+    session = runtime.create_execution_session()
+    session.start_phase("validate")
+    session.complete_phase()
+    runtime.close_process_group = lambda: (_ for _ in ()).throw(
+        RuntimeError("process group cleanup failed")
+    )
+
+    with pytest.raises(RuntimeError, match="process group cleanup failed"):
+        session.close()
+
+    events = read_execution_events(
+        run_dir
+        / "logs"
+        / "executions"
+        / "cleanup-failed-session-attempt"
+        / "rank-0.jsonl"
+    )
+    assert events[-1].event == "process_completed"
+    assert events[-1].exit_code == 1
+    assert events[-1].message == "RuntimeError: process group cleanup failed"
+
+
+def test_execution_session_derives_interrupt_from_presentation_cleanup(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "cleanup-interrupted-session"
+    runtime = initialize_torch_runtime(TorchRuntimeConfig(device="cpu"))
+    runtime.start_execution(
+        TorchExecutionRequest(
+            run_dir=run_dir,
+            run_name="cleanup-interrupted-session",
+            invocation_kind="test",
+            intended_phases=("validate",),
+            command=("python", "validate.py"),
+            execution_id="cleanup-interrupted-session-attempt",
+        )
+    )
+    session = runtime.create_execution_session()
+    session.start_phase("validate")
+
+    def interrupt_cleanup() -> None:
+        raise KeyboardInterrupt("cleanup interrupted")
+
+    with pytest.raises(KeyboardInterrupt, match="cleanup interrupted"):
+        session.close(before_close=interrupt_cleanup)
+
+    events = read_execution_events(
+        run_dir
+        / "logs"
+        / "executions"
+        / "cleanup-interrupted-session-attempt"
+        / "rank-0.jsonl"
+    )
+    assert events[-2].event == "phase_failed"
+    assert events[-2].extensions["status"] == "interrupted"
+    assert events[-1].event == "process_completed"
+    assert events[-1].exit_code == 130
+    assert events[-1].signal == 2
+
+
+def test_runtime_validates_launch_and_weight_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    with pytest.raises(RuntimeError, match="multi-process launch"):
+        initialize_torch_runtime(
+            TorchRuntimeConfig(device="cpu", strict_launch_environment=True)
+        )
+
+    with pytest.raises(RuntimeError, match="one value per rank"):
+        initialize_torch_runtime(
+            TorchRuntimeConfig(
+                strategy="ddp",
+                device="cpu",
+                rank=0,
+                local_rank=0,
+                world_size=2,
+                workload_weights=(1,),
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="global rank and local rank"):
+        initialize_torch_runtime(
+            TorchRuntimeConfig(
+                strategy="ddp",
+                device="cpu",
+                rank=1,
+                local_rank=0,
+                world_size=2,
+                require_global_local_rank_match=True,
+            )
+        )
 
 
 def test_single_runtime_joins_runner_execution_from_environment(
