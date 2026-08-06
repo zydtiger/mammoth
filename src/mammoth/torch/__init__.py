@@ -58,6 +58,7 @@ from mammoth.torch.profiling import (
 from mammoth.torch.runtime import (
     TorchExecutionRequest,
     TorchExecutionRuntime,
+    TorchExecutionSession,
     TorchRuntimeConfig,
     initialize_torch_runtime,
 )
@@ -118,6 +119,7 @@ __all__ = [
     "TorchCompileConfig",
     "TorchExecutionRequest",
     "TorchExecutionRuntime",
+    "TorchExecutionSession",
     "TorchRuntimeConfig",
     "TorchRuntimeOptions",
     "TorchRuntimeState",

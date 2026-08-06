@@ -151,12 +151,12 @@ producers, or controls an execution.
 `TorchExecutionRuntime` owns framework-level single-process or standard DDP
 state. It resolves rank, local rank, world size, and device; initializes an
 uninitialized default process group; exposes common object and tensor
-collectives; and destroys only a process group that it created. Execution
-establishment is available separately from the combined rank-logging startup
-so compatibility adapters can retain a project-specific logging facade. The
-runtime does not encode GPU models, concrete workload weights, or project
-topology rules. Separate scheduling utilities apportion caller-supplied weights
-without attaching hardware or dataset meaning to them.
+collectives; validates optional caller-selected launch constraints; applies
+caller-supplied rank weights to generic count and index partitions; and destroys
+only a process group that it created. Execution establishment is available
+separately from rank-logging startup so projects can validate their own lineage
+and attach presentation sinks without recreating the runtime. The runtime does
+not encode GPU models, concrete workload weights, or project topology rules.
 
 Rank zero creates a direct execution and holds its logical-run lease, or joins
 an execution already identified by `MAMMOTH_EXECUTION_ID` or the compatible
@@ -164,6 +164,11 @@ an execution already identified by `MAMMOTH_EXECUTION_ID` or the compatible
 opens its own JSONL and text streams, and reaches startup consensus. A failure
 on any rank is reported coherently before project work begins. TensorBoard's
 rank-aware sink and trainer checkpoints default to rank zero.
+
+`TorchExecutionSession` owns process and phase lifecycle events after logging
+starts. Projects may attach presentation cleanup through its close hook, but
+Mammoth decides unfinished-phase failure, terminal process status, duration,
+stream closure, lease release, and process-group teardown.
 
 A workflow execution is owned by its single runner and may launch steps with
 different process counts. Joined workflow children therefore validate run and
@@ -275,9 +280,16 @@ returned `TrainerCheckpointRestore` reports restored and reset components plus
 opaque project metadata. Mammoth infers absent cursors from the active
 accumulation plan and requires coordinates, terminal state, component reports,
 and metadata to agree across DDP ranks before training resumes. Projects may
-also request a synchronized manual or interruption publication; the checkpoint
-context identifies that reason and exposes the prior restore report while the
-project still selects the artifact plan.
+also request a synchronized manual publication. Rank zero publishes an
+interruption snapshot without entering collectives that could deadlock when a
+signal reaches only one process. The checkpoint context identifies the reason
+and exposes the prior restore report while the project still selects the
+artifact plan.
+
+`Trainer.fit()` publishes that interruption plan automatically when
+`KeyboardInterrupt` escapes the loop, then preserves and re-raises the original
+interruption. Callers may disable this behavior explicitly when an outer system
+owns interruption persistence.
 
 The trainer applies publisher backpressure before asking a project checkpoint
 policy to capture state or select retention paths. The publisher snapshots or
