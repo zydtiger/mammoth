@@ -69,6 +69,8 @@ from mammoth.torch.scheduling import (
     WarmupLinearLR,
     WeightedAccumulationPolicy,
     WeightedDistributedBatchSampler,
+    WeightedTaskAssignment,
+    allocate_weighted_tasks,
     weighted_partition_counts,
     weighted_partition_indices,
 )
@@ -131,6 +133,8 @@ __all__ = [
     "WarmupLinearLR",
     "WeightedAccumulationPolicy",
     "WeightedDistributedBatchSampler",
+    "WeightedTaskAssignment",
+    "allocate_weighted_tasks",
     "checkpoint_payload",
     "apply_torch_backend_config",
     "apply_torch_seed_policy",

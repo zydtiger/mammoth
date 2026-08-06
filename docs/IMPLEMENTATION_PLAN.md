@@ -228,6 +228,7 @@ leaving every concrete workload decision with the consuming project:
 
 - deterministic weighted integer counts and contiguous index ranges;
 - arbitrary positive rank weights and world sizes;
+- deterministic weighted-cost allocation for opaque task IDs;
 - a dataset-independent distributed batch sampler over opaque indices;
 - full global accumulation windows with rank-local batch counts; and
 - correct mean-loss scaling after standard DDP gradient averaging.

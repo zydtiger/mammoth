@@ -58,6 +58,7 @@ from mammoth.torch import (
     WarmupLinearLR,
     WeightedAccumulationPolicy,
     WeightedDistributedBatchSampler,
+    allocate_weighted_tasks,
     checkpoint_payload,
     initialize_torch_runtime,
     move_batch_to_device,
@@ -1582,6 +1583,52 @@ def test_weighted_partition_counts_can_require_work_on_every_rank() -> None:
     assert weighted_partition_counts(4, (100, 1), require_nonempty=True) == (3, 1)
     with pytest.raises(ValueError, match="at least one item per rank"):
         weighted_partition_counts(2, (3, 2, 1), require_nonempty=True)
+
+
+def test_weighted_task_allocation_uses_projected_normalized_load() -> None:
+    assignments = allocate_weighted_tasks(
+        [
+            ("slide-0", 1200),
+            ("slide-1", 800),
+            ("slide-2", 500),
+            ("slide-3", 300),
+        ],
+        (3, 1),
+    )
+
+    assert [(assignment.task_id, assignment.rank) for assignment in assignments] == [
+        ("slide-0", 0),
+        ("slide-1", 0),
+        ("slide-2", 1),
+        ("slide-3", 0),
+    ]
+
+
+def test_weighted_task_allocation_is_input_order_independent() -> None:
+    tasks = [(f"task-{index}", cost) for index, cost in enumerate((10, 10, 10, 10))]
+
+    forward = allocate_weighted_tasks(tasks, (3, 1))
+    reverse = allocate_weighted_tasks(list(reversed(tasks)), (3, 1))
+
+    assert forward == reverse
+    assert [assignment.rank for assignment in forward] == [0, 0, 0, 1]
+
+
+@pytest.mark.parametrize(
+    "tasks",
+    [
+        [("", 1)],
+        [("duplicate", 1), ("duplicate", 2)],
+        [("negative", -1)],
+        [("infinite", float("inf"))],
+        [("boolean", True)],
+    ],
+)
+def test_weighted_task_allocation_rejects_invalid_tasks(
+    tasks: list[tuple[str, Any]],
+) -> None:
+    with pytest.raises(ValueError):
+        allocate_weighted_tasks(tasks, (1, 1))
 
 
 def test_weighted_partition_indices_cover_each_item_once() -> None:
