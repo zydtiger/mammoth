@@ -18,6 +18,10 @@ def test_pipeline_validates_configuration() -> None:
     for value in (True, 0, -1, 1.5):
         with pytest.raises(ValueError, match="max_pending"):
             BoundedBackgroundPipeline(lambda item: item, max_pending=value)  # type: ignore[arg-type]
+    pipeline = BoundedBackgroundPipeline(lambda item: item)
+    with pytest.raises(TypeError, match="on_done"):
+        pipeline.submit(1, on_done=42)  # type: ignore[arg-type]
+    assert pipeline.close() == ()
 
 
 def test_pipeline_executes_in_order_and_applies_bounded_backpressure() -> None:
@@ -388,6 +392,97 @@ def test_pipeline_failure_remains_after_interrupted_observation(
     assert pipeline.close() == ()
 
 
+def test_pipeline_does_not_publish_failure_before_future_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure observation waits until submission completion is internally final."""
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    finalization_started = threading.Event()
+    allow_finalization = threading.Event()
+    flush_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def fail(_: int) -> int:
+        worker_started.set()
+        assert release_worker.wait(timeout=5.0)
+        raise OSError("worker failed")
+
+    pipeline = BoundedBackgroundPipeline(fail)
+    submission = pipeline.submit(1)
+    assert worker_started.wait(timeout=5.0)
+    real_set_exception = submission._future.set_exception
+
+    def block_finalization(error: BaseException) -> None:
+        finalization_started.set()
+        assert allow_finalization.wait(timeout=5.0)
+        real_set_exception(error)
+
+    monkeypatch.setattr(submission._future, "set_exception", block_finalization)
+
+    def flush() -> None:
+        try:
+            pipeline.flush()
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            flush_finished.set()
+
+    waiter = threading.Thread(target=flush)
+    waiter.start()
+    release_worker.set()
+    assert finalization_started.wait(timeout=5.0)
+    assert not flush_finished.wait(timeout=0.1)
+    assert not submission.done()
+    allow_finalization.set()
+    waiter.join(timeout=5.0)
+
+    assert not waiter.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], BackgroundPipelineError)
+    assert submission.done()
+    pipeline.acknowledge(submission)
+    assert pipeline.close() == ()
+
+
+def test_pipeline_result_waits_until_acknowledgment_state_is_final(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A returned result can always be acknowledged immediately."""
+    release_worker = threading.Event()
+    future_finalized = threading.Event()
+    allow_state_finalization = threading.Event()
+    result_finished = threading.Event()
+    pipeline = BoundedBackgroundPipeline(lambda value: release_worker.wait(5.0) or value)
+    submission = pipeline.submit(1)
+    real_set_result = submission._future.set_result
+
+    def pause_after_future(result: int) -> None:
+        real_set_result(result)
+        future_finalized.set()
+        assert allow_state_finalization.wait(timeout=5.0)
+
+    monkeypatch.setattr(submission._future, "set_result", pause_after_future)
+    results: list[int] = []
+
+    def read_result() -> None:
+        results.append(submission.result())
+        pipeline.acknowledge(submission)
+        result_finished.set()
+
+    reader = threading.Thread(target=read_result)
+    reader.start()
+    release_worker.set()
+    assert future_finalized.wait(timeout=5.0)
+    assert not result_finished.wait(timeout=0.1)
+    allow_state_finalization.set()
+    reader.join(timeout=5.0)
+
+    assert results == [1]
+    assert not pipeline.owns(submission)
+    assert pipeline.close() == ()
+
+
 def test_pipeline_submission_exposes_read_only_completion() -> None:
     """Callers can wait for outcomes without mutating pipeline-owned state."""
     pipeline = BoundedBackgroundPipeline(lambda value: value * 2)
@@ -399,6 +494,28 @@ def test_pipeline_submission_exposes_read_only_completion() -> None:
     assert not hasattr(submission, "cancel")
     assert not hasattr(submission, "set_result")
     pipeline.flush()
+    pipeline.acknowledge(submission)
+    assert pipeline.close() == ()
+
+
+def test_pipeline_done_callback_runs_after_final_state_and_cannot_corrupt_it() -> None:
+    """Callback re-entry sees completion and callback failure stays isolated."""
+    callback_results: list[tuple[int, ...]] = []
+    callback_finished = threading.Event()
+    pipeline = BoundedBackgroundPipeline(lambda value: value * 2)
+
+    def inspect_and_interrupt(_: Any) -> None:
+        callback_results.append(tuple(item.result for item in pipeline.flush()))
+        callback_finished.set()
+        raise KeyboardInterrupt("callback interrupted")
+
+    submission = pipeline.submit(3, on_done=inspect_and_interrupt)
+
+    assert submission.result(timeout=5.0) == 6
+    assert callback_finished.wait(timeout=5.0)
+    assert callback_results == [(6,)]
+    completed = pipeline.flush()
+    assert [item.result for item in completed] == [6]
     pipeline.acknowledge(submission)
     assert pipeline.close() == ()
 

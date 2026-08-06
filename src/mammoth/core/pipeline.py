@@ -10,8 +10,9 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future
+from contextlib import suppress
 from dataclasses import dataclass
-from threading import Condition, RLock, Thread, current_thread
+from threading import Condition, Event, RLock, Thread, current_thread
 from types import TracebackType
 from typing import Literal
 
@@ -21,18 +22,51 @@ type _SubmissionState = Literal["queued", "running", "completed", "failed"]
 class BackgroundPipelineSubmission[InputT, ResultT]:
     """Provide read-only access to one accepted input and its worker outcome."""
 
-    __slots__ = ("_error", "_future", "_input", "_pipeline_token", "_state")
+    __slots__ = (
+        "_callback_dispatch",
+        "_callback_lock",
+        "_callbacks",
+        "_callbacks_closed",
+        "_error",
+        "_future",
+        "_input",
+        "_pipeline_token",
+        "_state",
+        "_state_finalized",
+    )
 
-    def __init__(self, input_value: InputT, pipeline_token: object) -> None:
+    def __init__(
+        self,
+        input_value: InputT,
+        pipeline_token: object,
+        callback_dispatch: Callable[
+            [
+                BackgroundPipelineSubmission[InputT, ResultT],
+                Callable[[BackgroundPipelineSubmission[InputT, ResultT]], object],
+                bool,
+            ],
+            None,
+        ],
+    ) -> None:
         self._input = input_value
         self._future: Future[ResultT] = Future()
         self._state: _SubmissionState = "queued"
+        self._state_finalized = Event()
         self._pipeline_token = pipeline_token
         self._error: BackgroundPipelineError[InputT, ResultT] | None = None
+        self._callback_dispatch = callback_dispatch
+        self._callback_lock = RLock()
+        self._callbacks: list[
+            tuple[
+                Callable[[BackgroundPipelineSubmission[InputT, ResultT]], object],
+                bool,
+            ]
+        ] = []
+        self._callbacks_closed = False
 
     def done(self) -> bool:
         """Return whether the worker has produced a result or failure."""
-        return self._future.done()
+        return self._future.done() and self._state_finalized.is_set()
 
     @property
     def input(self) -> InputT:
@@ -41,7 +75,46 @@ class BackgroundPipelineSubmission[InputT, ResultT]:
 
     def result(self, timeout: float | None = None) -> ResultT:
         """Wait for and return the worker result, or raise its original failure."""
-        return self._future.result(timeout=timeout)
+        try:
+            result = self._future.result(timeout=timeout)
+        except BaseException:
+            self._state_finalized.wait()
+            raise
+        self._state_finalized.wait()
+        return result
+
+    def add_done_callback(
+        self,
+        callback: Callable[[BackgroundPipelineSubmission[InputT, ResultT]], object],
+        *,
+        after_idle: bool = True,
+    ) -> None:
+        """Invoke a best-effort callback after pipeline outcome state is final."""
+        if not callable(callback):
+            raise TypeError("done callback must be callable")
+        if not isinstance(after_idle, bool):
+            raise TypeError("after_idle must be a boolean")
+
+        with self._callback_lock:
+            if not self._callbacks_closed:
+                self._callbacks.append((callback, after_idle))
+                return
+        self._callback_dispatch(self, callback, after_idle)
+
+    def _release_done_callbacks(
+        self,
+    ) -> tuple[
+        tuple[
+            Callable[[BackgroundPipelineSubmission[InputT, ResultT]], object],
+            bool,
+        ],
+        ...,
+    ]:
+        with self._callback_lock:
+            self._callbacks_closed = True
+            callbacks = tuple(self._callbacks)
+            self._callbacks.clear()
+            return callbacks
 
     def __repr__(self) -> str:
         return f"BackgroundPipelineSubmission(input={self.input!r})"
@@ -117,6 +190,19 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
         self._accepting = True
         self._closed = False
         self._worker_stop = False
+        self._callback_stop = False
+        self._callback_queue: deque[
+            tuple[
+                BackgroundPipelineSubmission[InputT, ResultT],
+                Callable[[BackgroundPipelineSubmission[InputT, ResultT]], object],
+            ]
+        ] = deque()
+        self._idle_callback_queue: deque[
+            tuple[
+                BackgroundPipelineSubmission[InputT, ResultT],
+                Callable[[BackgroundPipelineSubmission[InputT, ResultT]], object],
+            ]
+        ] = deque()
         self._deferred_interrupt: KeyboardInterrupt | SystemExit | None = None
         self._lock = RLock()
         self._condition = Condition(self._lock)
@@ -125,6 +211,12 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
             name=f"{thread_name_prefix}_0",
             daemon=True,
         )
+        self._callback_thread = Thread(
+            target=self._callback_loop,
+            name=f"{thread_name_prefix}-callbacks",
+            daemon=True,
+        )
+        self._callback_thread.start()
         self._worker_thread.start()
 
     @property
@@ -143,23 +235,31 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
     def submit(
         self,
         input_value: InputT,
+        *,
+        on_done: Callable[[BackgroundPipelineSubmission[InputT, ResultT]], object]
+        | None = None,
     ) -> BackgroundPipelineSubmission[InputT, ResultT]:
         """Transfer one input to the ordered worker after bounded backpressure."""
+        if on_done is not None and not callable(on_done):
+            raise TypeError("on_done must be callable or None")
         with self._condition:
             self._require_accepting()
             self._await_submission_slot()
             submission = BackgroundPipelineSubmission[InputT, ResultT](
                 input_value,
                 self._pipeline_token,
+                self._queue_done_callback,
             )
+            if on_done is not None:
+                submission.add_done_callback(on_done, after_idle=False)
             try:
                 self._submissions.append(submission)
-                self._condition.notify()
+                self._condition.notify_all()
                 return self._complete_submission_handoff(submission)
             except (KeyboardInterrupt, SystemExit) as error:
                 if not any(item is submission for item in self._submissions):
                     raise
-                self._condition.notify()
+                self._condition.notify_all()
                 if self._deferred_interrupt is None:
                     self._deferred_interrupt = error
             return submission
@@ -214,8 +314,10 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
             completed = self.flush()
         except BaseException:
             self._shutdown_worker()
+            self._shutdown_callbacks()
             raise
         self._shutdown_worker()
+        self._shutdown_callbacks()
         with self._condition:
             self._closed = True
         return completed
@@ -278,16 +380,70 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
             try:
                 result = self.worker(submission.input)
             except BaseException as cause:
+                with suppress(BaseException):
+                    submission._future.set_exception(cause)
                 with self._condition:
                     submission._state = "failed"
                     submission._error = BackgroundPipelineError(submission, cause)
-                    submission._future.set_exception(cause)
+                    submission._state_finalized.set()
                     self._condition.notify_all()
+                self._dispatch_submission_callbacks(submission)
             else:
+                with suppress(BaseException):
+                    submission._future.set_result(result)
                 with self._condition:
                     submission._state = "completed"
-                    submission._future.set_result(result)
+                    submission._state_finalized.set()
                     self._condition.notify_all()
+                self._dispatch_submission_callbacks(submission)
+
+    def _callback_loop(self) -> None:
+        """Dispatch completed-submission callbacks without blocking the worker."""
+        while True:
+            with self._condition:
+                while True:
+                    if self._callback_queue:
+                        submission, callback = self._callback_queue.popleft()
+                        break
+                    if self._idle_callback_queue and self._active_count() == 0:
+                        submission, callback = self._idle_callback_queue.popleft()
+                        break
+                    if self._callback_stop:
+                        return
+                    self._condition.wait()
+            with suppress(BaseException):
+                callback(submission)
+
+    def _dispatch_submission_callbacks(
+        self,
+        submission: BackgroundPipelineSubmission[InputT, ResultT],
+    ) -> None:
+        callbacks = submission._release_done_callbacks()
+        if not callbacks:
+            return
+        with self._condition:
+            for callback, after_idle in callbacks:
+                queue = self._idle_callback_queue if after_idle else self._callback_queue
+                queue.append((submission, callback))
+            self._condition.notify_all()
+
+    def _queue_done_callback(
+        self,
+        submission: BackgroundPipelineSubmission[InputT, ResultT],
+        callback: Callable[[BackgroundPipelineSubmission[InputT, ResultT]], object],
+        after_idle: bool,
+    ) -> None:
+        run_inline = False
+        with self._condition:
+            if self._callback_stop and not self._callback_thread.is_alive():
+                run_inline = True
+            else:
+                queue = self._idle_callback_queue if after_idle else self._callback_queue
+                queue.append((submission, callback))
+                self._condition.notify_all()
+        if run_inline:
+            with suppress(BaseException):
+                callback(submission)
 
     def _next_queued_submission(
         self,
@@ -350,3 +506,10 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
             self._condition.notify_all()
         if current_thread() is not self._worker_thread:
             self._worker_thread.join()
+
+    def _shutdown_callbacks(self) -> None:
+        with self._condition:
+            self._callback_stop = True
+            self._condition.notify_all()
+        if current_thread() is not self._callback_thread:
+            self._callback_thread.join()
