@@ -16,6 +16,7 @@ import torch.distributed
 
 Reduction = Literal["mean", "sum", "last"]
 MetricCadence = Literal["batch", "epoch"]
+MetricScalar = float | torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,9 +76,9 @@ class StatefulMetric(Protocol):
 class MetricValue:
     """Mutable accumulator state for one metric."""
 
-    total: float = 0.0
+    total: MetricScalar = 0.0
     weight: float = 0.0
-    last: float = 0.0
+    last: MetricScalar = 0.0
     seen: bool = False
 
 
@@ -94,22 +95,18 @@ class MetricAccumulator:
         self.default = default or MetricSpec()
         self.values: dict[str, MetricValue] = {}
 
-    def update(self, metrics: Mapping[str, float], *, weight: float = 1.0) -> None:
-        """Accumulate one step's already-computed finite scalar metrics."""
+    def update(
+        self,
+        metrics: Mapping[str, float | torch.Tensor],
+        *,
+        weight: float = 1.0,
+    ) -> None:
+        """Accumulate detached scalar metrics without forcing host materialization."""
         if not math.isfinite(weight) or weight <= 0:
             raise ValueError("metric weight must be positive and finite")
-        for name, raw_value in metrics.items():
-            if not isinstance(name, str) or not name:
-                raise ValueError("metric names must be non-empty strings")
-            if (
-                isinstance(raw_value, bool)
-                or not isinstance(raw_value, int | float)
-                or not math.isfinite(raw_value)
-            ):
-                raise ValueError(f"metric {name!r} must be finite")
-            value = float(raw_value)
+        for name, value in prepared_scalar_metrics(metrics).items():
             state = self.values.setdefault(name, MetricValue())
-            state.total += value * weight
+            state.total = _add_metric_scalars(state.total, _scale_metric_scalar(value, weight))
             state.weight += weight
             state.last = value
             state.seen = True
@@ -121,7 +118,7 @@ class MetricAccumulator:
         distributed: bool = False,
     ) -> dict[str, float]:
         """Return reduced metrics, optionally combining initialized DDP ranks."""
-        results: dict[str, float] = {}
+        results: dict[str, MetricScalar] = {}
         use_distributed = distributed and torch.distributed.is_initialized()
         local_names = sorted(self.values)
         names = local_names
@@ -158,7 +155,9 @@ class MetricAccumulator:
         for name in names:
             state = self.values.get(name, MetricValue())
             spec = self.specs.get(name, self.default)
-            total, weight, last = state.total, state.weight, state.last
+            total = state.total
+            reduced_weight: MetricScalar = state.weight
+            last = state.last
             if use_distributed and spec.distributed:
                 reduction_device = device or torch.device("cpu")
                 if spec.reduction == "last":
@@ -166,24 +165,32 @@ class MetricAccumulator:
                         raise ValueError(
                             f"distributed last metric {name!r} was not reported on rank 0"
                         )
-                    tensor = torch.tensor(last, dtype=torch.float64, device=reduction_device)
+                    tensor = _distributed_metric_tensor(last, reduction_device)
                     torch.distributed.broadcast(tensor, src=0)
-                    last = float(tensor.item())
+                    last = tensor
                 else:
-                    tensor = torch.tensor(
-                        [total, weight], dtype=torch.float64, device=reduction_device
+                    total_tensor = _distributed_metric_tensor(total, reduction_device)
+                    tensor = torch.stack(
+                        (
+                            total_tensor,
+                            torch.tensor(
+                                state.weight,
+                                dtype=torch.float64,
+                                device=reduction_device,
+                            ),
+                        )
                     )
                     torch.distributed.all_reduce(tensor)
-                    total, weight = (float(value) for value in tensor.tolist())
+                    total, reduced_weight = tensor[0], tensor[1]
             if spec.reduction == "mean":
-                if weight <= 0:
+                if not isinstance(reduced_weight, torch.Tensor) and reduced_weight <= 0:
                     raise ValueError(f"metric {name!r} has no globally reduced weight")
-                results[name] = total / weight
+                results[name] = total / reduced_weight
             elif spec.reduction == "sum":
                 results[name] = total
             else:
                 results[name] = last
-        return results
+        return scalar_metrics(results)
 
 
 def reset_stateful_metrics(metrics: Mapping[str, StatefulMetric]) -> None:
@@ -397,25 +404,72 @@ def route_metrics(
     return routed
 
 
-def scalar_metrics(metrics: Mapping[str, float | torch.Tensor]) -> dict[str, float]:
-    """Validate and detach one mapping of project-computed scalar values."""
+def prepared_scalar_metrics(
+    metrics: Mapping[str, float | torch.Tensor],
+) -> dict[str, MetricScalar]:
+    """Validate scalar shapes and detach tensors without materializing them on the host."""
     if not isinstance(metrics, Mapping):
         raise TypeError("computed metric values must be a mapping")
-    values: dict[str, float] = {}
+    values: dict[str, MetricScalar] = {}
     for name, raw_value in metrics.items():
         validate_metric_name(name)
+        value: MetricScalar
         if isinstance(raw_value, torch.Tensor):
             if raw_value.ndim != 0:
                 raise ValueError(f"metric {name!r} tensor must be scalar")
-            value = float(raw_value.detach().item())
+            value = raw_value.detach()
         elif isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
             raise TypeError(f"metric {name!r} must be a number or scalar tensor")
         else:
             value = float(raw_value)
-        if not math.isfinite(value):
+        if not isinstance(value, torch.Tensor) and not math.isfinite(value):
             raise ValueError(f"metric {name!r} must be finite")
         values[name] = value
     return values
+
+
+def scalar_metrics(metrics: Mapping[str, float | torch.Tensor]) -> dict[str, float]:
+    """Materialize validated scalar metrics, batching transfers by device and dtype."""
+    values = prepared_scalar_metrics(metrics)
+    materialized: dict[str, float] = {}
+    tensors: dict[tuple[torch.device, torch.dtype], list[tuple[str, torch.Tensor]]] = {}
+    for name, value in values.items():
+        if isinstance(value, torch.Tensor):
+            tensors.setdefault((value.device, value.dtype), []).append((name, value))
+        else:
+            materialized[name] = value
+    for grouped_values in tensors.values():
+        names, tensor_values = zip(*grouped_values, strict=True)
+        transferred = torch.stack(tensor_values).cpu().tolist()
+        for name, value in zip(names, transferred, strict=True):
+            materialized[name] = float(value)
+    for name, value in materialized.items():
+        if not math.isfinite(value):
+            raise ValueError(f"metric {name!r} must be finite")
+    return {name: materialized[name] for name in values}
+
+
+def _scale_metric_scalar(value: MetricScalar, weight: float) -> MetricScalar:
+    """Multiply one detached scalar without changing its device residency."""
+    return value * weight
+
+
+def _add_metric_scalars(left: MetricScalar, right: MetricScalar) -> MetricScalar:
+    """Add scalar values, preserving tensor residency when either value is a tensor."""
+    if isinstance(left, torch.Tensor):
+        if isinstance(right, torch.Tensor):
+            return left + right.to(device=left.device, dtype=left.dtype)
+        return left + right
+    if isinstance(right, torch.Tensor):
+        return right + left
+    return left + right
+
+
+def _distributed_metric_tensor(value: MetricScalar, device: torch.device) -> torch.Tensor:
+    """Return one detached float64 scalar on the collective device."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device=device, dtype=torch.float64)
+    return torch.tensor(value, dtype=torch.float64, device=device)
 
 
 def validate_metric_name(name: object) -> None:
