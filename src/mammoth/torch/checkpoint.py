@@ -11,11 +11,12 @@ import os
 import stat
 from collections import deque
 from collections.abc import Callable, Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from threading import RLock
+from threading import Condition, RLock, Thread
 from typing import Any, Literal, Protocol
 
 import torch
@@ -28,6 +29,11 @@ from mammoth.core.artifacts import (
     prepare_artifact_in_directory,
     publish_prepared_artifact,
     sync_directory_descriptor,
+)
+from mammoth.core.pipeline import (
+    BackgroundPipelineError,
+    BackgroundPipelineSubmission,
+    BoundedBackgroundPipeline,
 )
 
 CHECKPOINT_SCHEMA_VERSION = 1
@@ -348,42 +354,153 @@ class StateRegistry:
             value.load_state_dict(item)
 
 
+@dataclass(frozen=True, slots=True)
+class _CheckpointPublicationTask[ResultT]:
+    """Bridge one public checkpoint future to generic background execution."""
+
+    operation: Callable[[], ResultT]
+    future: _CheckpointPublicationFuture[ResultT]
+
+
+class _CheckpointPublicationFuture[ResultT](Future[ResultT]):
+    """Finalize results before dispatching user callbacks through the pipeline."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._callback_lock = RLock()
+        self._user_callbacks: list[Callable[[Future[ResultT]], object]] = []
+        self._callbacks_finalized = False
+
+    def add_done_callback(
+        self,
+        fn: Callable[[Future[ResultT]], object],
+    ) -> None:
+        if not callable(fn):
+            raise TypeError("done callback must be callable")
+        with self._callback_lock:
+            if not self._callbacks_finalized:
+                self._user_callbacks.append(fn)
+                return
+        fn(self)
+
+    def complete_result(
+        self,
+        result: ResultT,
+    ) -> None:
+        with self._callback_lock:
+            with suppress(BaseException):
+                super().set_result(result)
+            callbacks = self._finalize_callbacks_locked()
+        self._dispatch_callbacks(callbacks)
+
+    def complete_exception(
+        self,
+        error: BaseException,
+    ) -> None:
+        with self._callback_lock:
+            with suppress(BaseException):
+                super().set_exception(error)
+            callbacks = self._finalize_callbacks_locked()
+        self._dispatch_callbacks(callbacks)
+
+    def _finalize_callbacks_locked(
+        self,
+    ) -> tuple[Callable[[Future[ResultT]], object], ...]:
+        self._callbacks_finalized = True
+        callbacks = tuple(self._user_callbacks)
+        self._user_callbacks.clear()
+        return callbacks
+
+    def _dispatch_callbacks(
+        self,
+        callbacks: tuple[Callable[[Future[ResultT]], object], ...],
+    ) -> None:
+        if callbacks:
+            Thread(
+                target=self._invoke_user_callbacks,
+                args=(callbacks,),
+                name="mammoth-checkpoint-future-callbacks",
+                daemon=True,
+            ).start()
+
+    def _invoke_user_callbacks(
+        self,
+        callbacks: tuple[Callable[[Future[ResultT]], object], ...],
+    ) -> None:
+        for callback in callbacks:
+            with suppress(BaseException):
+                callback(self)
+
+
+def _run_checkpoint_publication[ResultT](
+    task: _CheckpointPublicationTask[ResultT],
+) -> ResultT:
+    """Run one checkpoint operation before generic state completes its future."""
+    return task.operation()
+
+
 class AsyncCheckpointPublisher:
-    """Publish cloned CPU state on one worker with a bounded pending queue."""
+    """Adapt checkpoint publication to Mammoth's bounded background pipeline."""
 
     def __init__(self, *, max_pending: int = 1) -> None:
         if isinstance(max_pending, bool) or not isinstance(max_pending, int) or max_pending < 1:
             raise ValueError("max_pending must be a positive integer")
         self.max_pending = max_pending
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mammoth-checkpoint")
-        self._pending: deque[Future[Any]] = deque()
+        self._pipeline: BoundedBackgroundPipeline[
+            _CheckpointPublicationTask[Any],
+            Any,
+        ] = BoundedBackgroundPipeline(
+            _run_checkpoint_publication,
+            max_pending=max_pending,
+            thread_name_prefix="mammoth-checkpoint",
+        )
+        self._deferred_failures: deque[
+            tuple[
+                BackgroundPipelineSubmission[_CheckpointPublicationTask[Any], Any],
+                BaseException,
+            ]
+        ] = deque()
+        self._recorded_failure_submissions: set[
+            BackgroundPipelineSubmission[_CheckpointPublicationTask[Any], Any]
+        ] = set()
+        self._deferred_interrupt: KeyboardInterrupt | SystemExit | None = None
+        self._closing = False
         self._closed = False
         self._lock = RLock()
+        self._lifecycle_condition = Condition(self._lock)
 
     @property
     def pending_count(self) -> int:
         """Return queued or running publications."""
         with self._lock:
-            self._discard_completed()
-            return len(self._pending)
+            if self._closing:
+                raise RuntimeError("checkpoint publisher is closing")
+            self._raise_deferred_failure()
+            self._consume_completed()
+            try:
+                return self._pipeline.pending_count
+            except BackgroundPipelineError as error:
+                self._preserve_and_acknowledge_failure(error)
+                self._raise_deferred_failure()
+                raise error.cause from None
 
     def wait_for_submission_slot(self) -> None:
         """Apply queue backpressure before a caller captures its next snapshot."""
         with self._lock:
-            if self._closed:
+            if self._closed or self._closing:
                 raise RuntimeError("checkpoint publisher is closed")
             self._await_submission_slot()
 
     def publish(self, path: Path, payload: Mapping[str, Any]) -> Future[Path]:
         """Clone state to CPU and submit one bounded atomic publication."""
         with self._lock:
-            if self._closed:
+            if self._closed or self._closing:
                 raise RuntimeError("checkpoint publisher is closed")
             self._await_submission_slot()
             snapshot = snapshot_to_cpu(payload)
-            future = self._executor.submit(publish_torch_payload, Path(path), snapshot)
-            self._pending.append(future)
-            return future
+            return self._submit_operation(
+                partial(publish_torch_payload, Path(path), snapshot)
+            )
 
     def publish_with_receipt(
         self,
@@ -395,57 +512,92 @@ class AsyncCheckpointPublisher:
     ) -> Future[CheckpointPublication]:
         """Publish one generic payload and report its exact committed bytes."""
         with self._lock:
-            if self._closed:
+            if self._closed or self._closing:
                 raise RuntimeError("checkpoint publisher is closed")
             self._await_submission_slot()
             snapshot = snapshot_to_cpu(payload)
-            future = self._executor.submit(
-                publish_torch_payload_with_receipt,
-                Path(path),
-                snapshot,
-                role=role,
-                epoch=epoch,
+            return self._submit_operation(
+                partial(
+                    publish_torch_payload_with_receipt,
+                    Path(path),
+                    snapshot,
+                    role=role,
+                    epoch=epoch,
+                )
             )
-            self._pending.append(future)
-            return future
 
     def submit(self, plan: CheckpointPlan) -> Future[CheckpointPublication]:
         """Submit one caller-owned immutable ordered checkpoint plan."""
         with self._lock:
-            if self._closed:
+            if self._closed or self._closing:
                 raise RuntimeError("checkpoint publisher is closed")
             validated = validate_checkpoint_plan(plan)
             anchored = anchor_checkpoint_plan(validated)
             self._await_submission_slot()
-            future = self._executor.submit(publish_anchored_checkpoint_plan, anchored)
-            self._pending.append(future)
-            return future
+            return self._submit_operation(
+                partial(publish_anchored_checkpoint_plan, anchored)
+            )
 
     def flush(self) -> None:
         """Wait for and surface every pending publication result."""
-        with self._lock:
-            first_error: BaseException | None = None
-            while self._pending:
-                try:
-                    self._resolve_oldest()
-                except (KeyboardInterrupt, SystemExit):
-                    raise
-                except BaseException as error:
-                    if first_error is None:
-                        first_error = error
-            if first_error is not None:
-                raise first_error
+        with self._lifecycle_condition:
+            while self._closing and not self._closed:
+                self._lifecycle_condition.wait()
+            if self._closed:
+                return
+            self._raise_deferred_interrupt()
+            self._flush_pipeline(close=False)
 
     def close(self) -> None:
         """Flush and shut down the worker exactly once."""
-        with self._lock:
+        with self._lifecycle_condition:
+            while self._closing and not self._closed:
+                self._lifecycle_condition.wait()
             if self._closed:
                 return
+            self._closing = True
+            deferred_interrupt = self._remember_deferred_interrupt()
+        try:
+            cleanup_error = self._flush_pipeline(close=True, raise_error=False)
+        except BaseException:
+            with self._lifecycle_condition:
+                self._closing = False
+                self._lifecycle_condition.notify_all()
+            raise
+        with self._lifecycle_condition:
+            if deferred_interrupt is not None:
+                try:
+                    if cleanup_error is not None:
+                        deferred_interrupt.add_note(
+                            "Checkpoint cleanup failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                        for note in getattr(cleanup_error, "__notes__", ()):
+                            deferred_interrupt.add_note(
+                                f"Checkpoint cleanup detail: {note}"
+                            )
+                    self._deferred_interrupt = None
+                    self._closing = False
+                    self._closed = True
+                    self._lifecycle_condition.notify_all()
+                    raise deferred_interrupt
+                except (KeyboardInterrupt, SystemExit) as delivery_interrupt:
+                    if delivery_interrupt is deferred_interrupt:
+                        raise
+                    self._deferred_interrupt = deferred_interrupt
+                    self._closing = False
+                    self._closed = False
+                    self._lifecycle_condition.notify_all()
+                    raise
+                except BaseException:
+                    self._closing = False
+                    self._lifecycle_condition.notify_all()
+                    raise
+            self._closing = False
             self._closed = True
-            try:
-                self.flush()
-            finally:
-                self._executor.shutdown(wait=True, cancel_futures=False)
+            self._lifecycle_condition.notify_all()
+            if cleanup_error is not None:
+                raise cleanup_error
 
     def __enter__(self) -> AsyncCheckpointPublisher:
         return self
@@ -453,28 +605,161 @@ class AsyncCheckpointPublisher:
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         self.close()
 
-    def _discard_completed(self) -> None:
-        while self._pending and self._pending[0].done():
-            self._resolve_oldest()
-
     def _await_submission_slot(self) -> None:
-        self._discard_completed()
-        while len(self._pending) >= self.max_pending:
-            self._resolve_oldest()
-
-    def _resolve_oldest(self) -> None:
-        pending = self._pending[0]
+        self._raise_deferred_interrupt()
+        self._raise_deferred_failure()
         try:
-            pending.result()
-        except (KeyboardInterrupt, SystemExit) as error:
-            if pending.done() and pending.exception() is error:
-                self._pending.popleft()
+            self._pipeline.wait_for_submission_slot()
+        except BackgroundPipelineError as error:
+            self._preserve_and_acknowledge_failure(error)
+            self._raise_deferred_failure()
+            raise error.cause from None
+        self._consume_completed()
+
+    def _submit_operation[ResultT](
+        self,
+        operation: Callable[[], ResultT],
+    ) -> Future[ResultT]:
+        future = _CheckpointPublicationFuture[ResultT]()
+        if not future.set_running_or_notify_cancel():
+            raise RuntimeError("checkpoint publication future could not start")
+        task = _CheckpointPublicationTask(operation, future)
+        while True:
+            try:
+                self._pipeline.submit(
+                    task,
+                    on_done=lambda completed: self._complete_public_future(
+                        future,
+                        completed,
+                    ),
+                )
+            except BackgroundPipelineError as error:
+                self._preserve_and_acknowledge_failure(error)
+                continue
+            break
+        return future
+
+    @staticmethod
+    def _complete_public_future[ResultT](
+        future: _CheckpointPublicationFuture[ResultT],
+        submission: BackgroundPipelineSubmission[
+            _CheckpointPublicationTask[ResultT],
+            ResultT,
+        ],
+    ) -> None:
+        try:
+            result = submission.result()
+        except BaseException as error:
+            future.complete_exception(error)
+            return
+        future.complete_result(result)
+
+    def _consume_completed(self) -> None:
+        try:
+            completed = self._pipeline.take_completed()
+        except BackgroundPipelineError as error:
+            self._preserve_and_acknowledge_failure(error)
+            self._raise_deferred_failure()
+            raise error.cause from None
+        for result in completed:
+            self._acknowledge(result.submission)
+
+    def _flush_pipeline(
+        self,
+        *,
+        close: bool,
+        raise_error: bool = True,
+    ) -> BaseException | None:
+        error_entries = list(self._deferred_failures)
+        while True:
+            try:
+                completed = self._pipeline.close() if close else self._pipeline.flush()
+            except BackgroundPipelineError as error:
+                if self._preserve_and_acknowledge_failure(error):
+                    error_entries.append(self._deferred_failures[-1])
+                continue
+            for result in completed:
+                self._acknowledge(result.submission)
+            break
+        for submission, _cause in error_entries:
+            if not self._pipeline.owns(submission):
+                self._recorded_failure_submissions.discard(submission)
+        errors = [cause for _submission, cause in error_entries]
+        if not errors:
+            self._deferred_failures.clear()
+            return None
+        primary_index = next(
+            (
+                index
+                for index, error in enumerate(errors)
+                if isinstance(error, (KeyboardInterrupt, SystemExit))
+            ),
+            0,
+        )
+        first_error = errors[primary_index]
+        for index, additional_error in enumerate(errors):
+            if index == primary_index:
+                continue
+            try:
+                first_error.add_note(
+                    "Additional checkpoint publication failure: "
+                    f"{type(additional_error).__name__}: {additional_error}"
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
+                continue
+        try:
+            self._deferred_failures.clear()
+            if raise_error:
+                raise first_error
+            return first_error
+        except (KeyboardInterrupt, SystemExit) as delivery_interrupt:
+            if raise_error and delivery_interrupt is first_error:
+                raise
+            self._deferred_failures.extend(error_entries)
             raise
-        except BaseException:
-            self._pending.popleft()
-            raise
-        else:
-            self._pending.popleft()
+
+    def _acknowledge(
+        self,
+        submission: BackgroundPipelineSubmission[
+            _CheckpointPublicationTask[Any],
+            Any,
+        ],
+    ) -> None:
+        submission.input.future.exception()
+        self._pipeline.acknowledge(submission)
+
+    def _raise_deferred_interrupt(self) -> None:
+        deferred_interrupt = self._remember_deferred_interrupt()
+        if deferred_interrupt is not None:
+            self._deferred_interrupt = None
+            raise deferred_interrupt
+
+    def _remember_deferred_interrupt(self) -> KeyboardInterrupt | SystemExit | None:
+        if self._deferred_interrupt is None:
+            self._deferred_interrupt = self._pipeline.take_deferred_interrupt()
+        return self._deferred_interrupt
+
+    def _raise_deferred_failure(self) -> None:
+        if self._deferred_failures:
+            submission, cause = self._deferred_failures.popleft()
+            if not self._pipeline.owns(submission):
+                self._recorded_failure_submissions.discard(submission)
+            raise cause
+
+    def _preserve_and_acknowledge_failure(
+        self,
+        error: BackgroundPipelineError[_CheckpointPublicationTask[Any], Any],
+    ) -> bool:
+        submission = error.submission
+        newly_recorded = submission not in self._recorded_failure_submissions
+        if newly_recorded:
+            self._recorded_failure_submissions.add(submission)
+            self._deferred_failures.append((submission, error.cause))
+        self._acknowledge(submission)
+        self._recorded_failure_submissions.discard(submission)
+        return newly_recorded
 
 
 def validate_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPlan:

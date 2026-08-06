@@ -47,7 +47,14 @@ cancelled. Results and failures remain owned until explicit acknowledgment;
 interruption after queue acceptance is deferred for the submitter to
 propagate after recording the handoff. Later flushes or closes therefore retain
 unacknowledged outcomes, while cleanup remains idempotent and does not replace
-an active workload exception.
+an active workload exception. Optional done callbacks run on a pipeline-owned
+dispatcher only after the submission state is final, so reentrant waits cannot
+block the sole work thread and callback failures cannot replace worker outcomes.
+
+`AsyncCheckpointPublisher` is a compatibility adapter over this pipeline. It
+retains checkpoint-specific snapshot, plan, receipt, and `Future` APIs while
+delegating ordered execution, pending bounds, failure ownership, and shutdown
+to the framework-neutral lifecycle.
 
 ## Runtime model
 
