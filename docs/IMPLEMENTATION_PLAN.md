@@ -198,6 +198,8 @@ meaning remains local but whose publication mechanics are reusable:
 - preparation of every artifact before ordered atomic replacement;
 - exact post-commit retirement confined to the checkpoint root;
 - bounded asynchronous publication with explicit failure propagation; and
+- exact-byte publication receipts delivered through trainer lifecycle hooks;
+- persistent checkpoint catalogs deferred until receipt consumers require one;
 - compatibility with the existing registered-state single-file API.
 
 Exit condition: a consuming project can publish inference and resume artifacts

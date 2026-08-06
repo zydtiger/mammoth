@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import hashlib
 import multiprocessing
 import os
 import stat
@@ -43,6 +44,7 @@ from mammoth.torch import (
     MetricAccumulator,
     MetricRoute,
     MetricSpec,
+    PublishedCheckpoint,
     RestoreOptions,
     StateRegistry,
     StepContext,
@@ -2185,6 +2187,99 @@ def test_checkpoint_save_policy_validates_configuration() -> None:
         CheckpointSavePolicy(save_best=cast(Any, 1))
 
 
+def test_trainer_delivers_checkpoint_receipts_to_callbacks_and_observer(
+    tmp_path: Path,
+) -> None:
+    class PublicationCallback(Callback):
+        def __init__(self) -> None:
+            self.publications: list[CheckpointPublication] = []
+
+        def on_checkpoint_published(
+            self,
+            state: TrainerState,
+            publication: CheckpointPublication,
+        ) -> None:
+            assert state.epoch == 0
+            self.publications.append(publication)
+
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    callback = PublicationCallback()
+    sink = RecordingSink()
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(epochs=1, device="cpu"),
+        checkpoint_dir=tmp_path,
+        checkpoint_policy=RecordingCheckpointPolicy(tmp_path),
+        checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
+        callbacks=(callback,),
+        observer=RunObserver((sink,)),
+    ) as trainer:
+        trainer.fit()
+
+    assert len(callback.publications) == 1
+    receipt = callback.publications[0].published[0]
+    assert receipt.path == (tmp_path / "latest_epoch_0.pt").resolve()
+    assert receipt.role == "latest"
+    assert receipt.epoch == 0
+    assert receipt.size_bytes == receipt.path.stat().st_size
+    assert receipt.sha256 == hashlib.sha256(receipt.path.read_bytes()).hexdigest()
+    publication_events = [
+        observation
+        for observation in sink.observations
+        if observation.event == "task_completed"
+        and observation.fields.get("task_id") == "checkpoint-publication"
+    ]
+    assert len(publication_events) == 1
+    assert publication_events[0].fields["checkpoints"] == [
+        {
+            "path": str(receipt.path),
+            "role": "latest",
+            "epoch": 0,
+            "size_bytes": receipt.size_bytes,
+            "sha256": receipt.sha256,
+        }
+    ]
+
+
+def test_checkpoint_receipt_callback_failure_surfaces_from_flush(tmp_path: Path) -> None:
+    class FailingPublicationCallback(Callback):
+        def on_checkpoint_published(
+            self,
+            state: TrainerState,
+            publication: CheckpointPublication,
+        ) -> None:
+            del state, publication
+            raise RuntimeError("receipt consumer failed")
+
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    trainer = Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        checkpoint_dir=tmp_path,
+        checkpoint_policy=RecordingCheckpointPolicy(tmp_path),
+        checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
+        callbacks=(FailingPublicationCallback(),),
+    )
+    trainer.publish_checkpoint(
+        epoch=0,
+        training_metrics={},
+        validation_metrics=None,
+    )
+    with pytest.raises(RuntimeError, match="receipt consumer failed"):
+        trainer.flush_local_checkpoints(message="testing receipt failure")
+    trainer.close()
+
+
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [
@@ -3156,8 +3251,18 @@ def test_checkpoint_plan_prepares_all_artifacts_before_ordered_commit(
         CheckpointPlan(
             checkpoint_root=checkpoint_root,
             artifacts=(
-                CheckpointArtifact(first, writer("best", b"best")),
-                CheckpointArtifact(second, writer("resume", b"resume")),
+                CheckpointArtifact(
+                    first,
+                    writer("best", b"best"),
+                    role="best",
+                    epoch=1,
+                ),
+                CheckpointArtifact(
+                    second,
+                    writer("resume", b"resume"),
+                    role="latest",
+                    epoch=1,
+                ),
             ),
             retire_after_commit=(previous,),
         )
@@ -3170,7 +3275,22 @@ def test_checkpoint_plan_prepares_all_artifacts_before_ordered_commit(
         "commit:checkpoint-0001.pt",
     ]
     assert result == CheckpointPublication(
-        published=(first, second),
+        published=(
+            PublishedCheckpoint(
+                path=first.resolve(),
+                role="best",
+                epoch=1,
+                size_bytes=4,
+                sha256=hashlib.sha256(b"best").hexdigest(),
+            ),
+            PublishedCheckpoint(
+                path=second.resolve(),
+                role="latest",
+                epoch=1,
+                size_bytes=6,
+                sha256=hashlib.sha256(b"resume").hexdigest(),
+            ),
+        ),
         retired=(previous,),
     )
     assert first.read_bytes() == b"best"
@@ -3178,6 +3298,79 @@ def test_checkpoint_plan_prepares_all_artifacts_before_ordered_commit(
     assert not previous.exists()
     assert retained.read_bytes() == b"retained"
     assert not list(checkpoint_root.glob(".*.tmp"))
+
+
+def test_checkpoint_artifact_preserves_legacy_positional_mode_arguments(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "legacy-mode.pt"
+
+    def write(temporary: Path) -> None:
+        temporary.write_bytes(b"checkpoint")
+
+    artifact = CheckpointArtifact(destination, write, 0o640, False)
+    publish_checkpoint_plan(
+        CheckpointPlan(
+            checkpoint_root=tmp_path,
+            artifacts=(artifact,),
+        )
+    )
+
+    assert artifact.mode == 0o640
+    assert artifact.preserve_permissions is False
+    assert artifact.role == "epoch"
+    assert artifact.epoch == -1
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o640
+
+
+def test_checkpoint_receipt_supports_unreadable_final_artifact_mode(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "sealed.pt"
+    payload = b"sealed checkpoint"
+
+    publication = publish_checkpoint_plan(
+        CheckpointPlan(
+            checkpoint_root=tmp_path,
+            artifacts=(
+                CheckpointArtifact(
+                    destination,
+                    lambda temporary: temporary.write_bytes(payload),
+                    0o000,
+                    False,
+                ),
+            ),
+        )
+    )
+
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o000
+    assert publication.published == (
+        PublishedCheckpoint(
+            path=destination.resolve(),
+            role="epoch",
+            epoch=-1,
+            size_bytes=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+        ),
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs require POSIX")
+def test_checkpoint_receipt_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    destination = tmp_path / "fifo.pt"
+
+    with pytest.raises(FileNotFoundError, match="did not create a file"):
+        publish_checkpoint_plan(
+            CheckpointPlan(
+                checkpoint_root=tmp_path,
+                artifacts=(
+                    CheckpointArtifact(
+                        destination,
+                        lambda temporary: os.mkfifo(temporary),
+                    ),
+                ),
+            )
+        )
 
 
 def test_checkpoint_plan_preparation_failure_preserves_all_destinations(
@@ -3562,6 +3755,141 @@ def test_checkpoint_plan_rejects_missing_descriptor_relative_operations(
     assert not checkpoint_root.exists()
 
 
+def test_registered_checkpoint_publication_does_not_require_ordered_plan_support(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "supports_dir_fd", set())
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(epochs=1, device="cpu"),
+        checkpoint_dir=tmp_path,
+    ) as trainer:
+        trainer.fit()
+
+    assert (tmp_path / "checkpoint-0000.pt").is_file()
+
+
+def test_generic_receipt_publication_replaces_destination_symlink(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside.pt"
+    outside.write_bytes(b"sentinel")
+    destination = tmp_path / "checkpoint.pt"
+    destination.symlink_to(outside)
+
+    with AsyncCheckpointPublisher() as publisher:
+        future = publisher.publish_with_receipt(
+            destination,
+            {"value": torch.tensor([1])},
+            role="epoch",
+            epoch=0,
+        )
+        publisher.flush()
+
+    receipt = future.result().published[0]
+    assert outside.read_bytes() == b"sentinel"
+    assert destination.is_file()
+    assert not destination.is_symlink()
+    assert receipt.path == destination.absolute()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs require POSIX")
+def test_generic_receipt_rejects_fifo_without_blocking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def write_fifo(payload: Any, temporary: Path) -> None:
+        del payload
+        os.mkfifo(temporary)
+
+    monkeypatch.setattr(torch, "save", write_fifo)
+    publisher = AsyncCheckpointPublisher()
+    future = publisher.publish_with_receipt(
+        tmp_path / "checkpoint.pt",
+        {"value": 1},
+        role="epoch",
+        epoch=0,
+    )
+    with pytest.raises(FileNotFoundError, match="did not create"):
+        future.result(timeout=1)
+    with pytest.raises(FileNotFoundError, match="did not create"):
+        publisher.close()
+
+
+def test_generic_receipt_publication_applies_backpressure_before_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    snapshots: list[int] = []
+    original_publish = checkpoint_module.publish_torch_payload_with_receipt
+
+    def record_snapshot(payload: Mapping[str, Any]) -> Any:
+        snapshots.append(cast(int, payload["sequence"]))
+        return dict(payload)
+
+    def blocking_publish(
+        path: Path,
+        payload: Mapping[str, Any],
+        *,
+        role: checkpoint_module.CheckpointRole,
+        epoch: int,
+    ) -> CheckpointPublication:
+        if payload["sequence"] == 1:
+            started.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("test did not release generic checkpoint writer")
+        return original_publish(path, payload, role=role, epoch=epoch)
+
+    monkeypatch.setattr(checkpoint_module, "snapshot_to_cpu", record_snapshot)
+    monkeypatch.setattr(
+        checkpoint_module,
+        "publish_torch_payload_with_receipt",
+        blocking_publish,
+    )
+    errors: list[BaseException] = []
+    with AsyncCheckpointPublisher(max_pending=1) as publisher:
+        publisher.publish_with_receipt(
+            tmp_path / "first.pt",
+            {"sequence": 1},
+            role="epoch",
+            epoch=0,
+        )
+        assert started.wait(timeout=5)
+
+        def publish_second() -> None:
+            try:
+                publisher.publish_with_receipt(
+                    tmp_path / "second.pt",
+                    {"sequence": 2},
+                    role="epoch",
+                    epoch=1,
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        submitter = threading.Thread(target=publish_second)
+        submitter.start()
+        submitter.join(timeout=0.1)
+        assert submitter.is_alive()
+        assert snapshots == [1]
+        release.set()
+        submitter.join(timeout=5)
+        assert not submitter.is_alive()
+        publisher.flush()
+
+    assert errors == []
+    assert snapshots == [1, 2]
+
+
 def test_async_checkpoint_plan_submission_applies_bounded_backpressure(
     tmp_path: Path,
 ) -> None:
@@ -3739,7 +4067,15 @@ def test_async_checkpoint_plan_freezes_relative_paths_before_worker_execution(
 
     publication = future.result()
     resolved_root = (tmp_path / "checkpoints").resolve()
-    assert publication.published == (resolved_root / "latest.pt",)
+    assert publication.published == (
+        PublishedCheckpoint(
+            path=resolved_root / "latest.pt",
+            role="epoch",
+            epoch=-1,
+            size_bytes=8,
+            sha256=hashlib.sha256(b"relative").hexdigest(),
+        ),
+    )
     assert publication.retired == (resolved_root / "previous.pt",)
     assert (resolved_root / "latest.pt").read_bytes() == b"relative"
     assert not (other_directory / "checkpoints").exists()
