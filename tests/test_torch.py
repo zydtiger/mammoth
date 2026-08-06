@@ -4497,6 +4497,229 @@ def test_single_runtime_owns_weighted_helpers_and_execution_lifecycle(
     assert events[-1].exit_code == 0
 
 
+class _RecordingSessionSink:
+    """Record observer closure for execution-session ownership tests."""
+
+    def __init__(self, order: list[str], label: str = "observer") -> None:
+        self.order = order
+        self.label = label
+        self.closed = False
+
+    def observe(self, observation: Observation) -> None:
+        del observation
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+        self.order.append(self.label)
+
+
+def _create_test_execution_session(
+    tmp_path: Path,
+    name: str,
+) -> tuple[Any, Any]:
+    """Create one started single-process runtime/session test fixture."""
+    runtime = initialize_torch_runtime(TorchRuntimeConfig(device="cpu"))
+    runtime.start_execution(
+        TorchExecutionRequest(
+            run_dir=tmp_path / name,
+            run_name=name,
+            invocation_kind="test",
+            intended_phases=("train",),
+            command=("python", "train.py"),
+            execution_id=f"{name}-attempt",
+        )
+    )
+    return runtime, runtime.create_execution_session()
+
+
+def test_execution_session_closes_owned_resources_before_runtime_in_reverse_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    runtime, session = _create_test_execution_session(tmp_path, "owned-resource-order")
+    sink = _RecordingSessionSink(order)
+    original_logging_close = runtime.execution_logging.close
+    original_release_lease = runtime._release_logical_run_lease
+
+    class RecordingTrainer:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def close(self) -> None:
+            order.append("trainer-checkpoint-flush")
+
+    def close_logging() -> None:
+        order.append("execution-logging")
+        original_logging_close()
+
+    def release_lease() -> None:
+        order.append("lease")
+        original_release_lease()
+
+    monkeypatch.setattr(torch_runtime_module, "Trainer", RecordingTrainer)
+    monkeypatch.setattr(runtime.execution_logging, "close", close_logging)
+    monkeypatch.setattr(runtime, "_release_logical_run_lease", release_lease)
+    monkeypatch.setattr(runtime, "close_process_group", lambda: order.append("process-group"))
+
+    observer = session.create_observer((sink,))
+    session.create_trainer(observer=observer)
+    session.start_phase("train")
+    session.complete_phase()
+    session.close()
+
+    assert order == [
+        "trainer-checkpoint-flush",
+        "observer",
+        "execution-logging",
+        "lease",
+        "process-group",
+    ]
+
+
+def test_execution_session_closes_trainers_before_later_created_observers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    _, session = _create_test_execution_session(tmp_path, "resource-class-order")
+
+    class RecordingTrainer:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def close(self) -> None:
+            order.append("trainer")
+
+    monkeypatch.setattr(torch_runtime_module, "Trainer", RecordingTrainer)
+    session.create_trainer()
+    session.create_observer((_RecordingSessionSink(order),))
+    session.close()
+
+    assert order == ["trainer", "observer"]
+
+
+def test_execution_session_close_is_idempotent_without_duplicate_terminal_events(
+    tmp_path: Path,
+) -> None:
+    runtime, session = _create_test_execution_session(tmp_path, "idempotent-session")
+    session.start_phase("train")
+    session.complete_phase()
+
+    session.close()
+    session.close()
+
+    events = read_execution_events(
+        tmp_path
+        / "idempotent-session"
+        / "logs"
+        / "executions"
+        / "idempotent-session-attempt"
+        / "rank-0.jsonl"
+    )
+    assert [event.event for event in events].count("phase_completed") == 1
+    assert [event.event for event in events].count("process_completed") == 1
+    assert runtime._closed is True
+
+
+def test_execution_session_closes_observer_after_trainer_construction_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    _, session = _create_test_execution_session(tmp_path, "construction-failure")
+    sink = _RecordingSessionSink(order)
+
+    def fail_trainer(**kwargs: Any) -> None:
+        del kwargs
+        raise RuntimeError("trainer construction failed")
+
+    monkeypatch.setattr(torch_runtime_module, "Trainer", fail_trainer)
+
+    with pytest.raises(RuntimeError, match="trainer construction failed"), session:
+        observer = session.create_observer((sink,))
+        session.create_trainer(observer=observer)
+
+    assert sink.closed is True
+
+
+def test_execution_session_borrows_directly_supplied_observer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, session = _create_test_execution_session(tmp_path, "borrowed-observer")
+    borrowed = _RecordingSessionSink([])
+
+    class RecordingTrainer:
+        def __init__(self, **kwargs: Any) -> None:
+            self.observer = kwargs["observer"]
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(torch_runtime_module, "Trainer", RecordingTrainer)
+    session.create_trainer(observer=borrowed)
+    session.close()
+
+    assert borrowed.closed is False
+
+
+def test_execution_session_preserves_workload_error_when_owned_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, session = _create_test_execution_session(tmp_path, "primary-error")
+    workload_error = RuntimeError("workload failed")
+
+    class FailingTrainer:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def close(self) -> None:
+            raise OSError("checkpoint flush failed")
+
+    monkeypatch.setattr(torch_runtime_module, "Trainer", FailingTrainer)
+
+    with pytest.raises(RuntimeError, match="workload failed") as raised, session:
+        session.create_trainer()
+        with session.phase_scope("train"):
+            raise workload_error
+
+    assert raised.value is workload_error
+    assert any("checkpoint flush failed" in note for note in workload_error.__notes__)
+
+
+def test_execution_session_destroys_only_runtime_owned_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destroyed: list[str] = []
+    monkeypatch.setattr(torch_runtime_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch_runtime_module.dist,
+        "destroy_process_group",
+        lambda: destroyed.append("destroyed"),
+    )
+
+    borrowed_runtime, borrowed_session = _create_test_execution_session(
+        tmp_path, "borrowed-process-group"
+    )
+    borrowed_session.close()
+    assert borrowed_runtime._owns_process_group is False
+    assert destroyed == []
+
+    owned_runtime, owned_session = _create_test_execution_session(
+        tmp_path, "owned-process-group"
+    )
+    owned_runtime._owns_process_group = True
+    owned_session.close()
+    assert destroyed == ["destroyed"]
+    assert owned_runtime._owns_process_group is False
+
+
 @pytest.mark.parametrize(
     ("error", "expected_exit_code", "expected_signal", "expected_status"),
     [
@@ -4573,7 +4796,7 @@ def test_execution_session_cannot_report_failed_phase_as_success(tmp_path: Path)
     assert events[-1].exit_code == 1
 
 
-def test_execution_session_records_runtime_cleanup_failure_before_reraising(
+def test_execution_session_reraises_late_runtime_cleanup_failure(
     tmp_path: Path,
 ) -> None:
     run_dir = tmp_path / "cleanup-failed-session"
@@ -4606,8 +4829,8 @@ def test_execution_session_records_runtime_cleanup_failure_before_reraising(
         / "rank-0.jsonl"
     )
     assert events[-1].event == "process_completed"
-    assert events[-1].exit_code == 1
-    assert events[-1].message == "RuntimeError: process group cleanup failed"
+    assert events[-1].exit_code == 0
+    assert events[-1].message is None
 
 
 def test_execution_session_derives_interrupt_from_presentation_cleanup(

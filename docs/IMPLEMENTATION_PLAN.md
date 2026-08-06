@@ -126,6 +126,7 @@ Add the optional `mammoth.torch` layer with a deliberately bounded first API:
 - fp32, bf16, and fp16 precision policies;
 - gradient accumulation and clipping;
 - standard single-process and DDP strategies;
+- context-managed reverse-order ownership for session-created observers and trainers;
 - scalar metric aggregation policies;
 - callback-based validation and early stopping;
 - typed two-phase checkpoint inspection and selective generic restore/reset;
@@ -149,7 +150,8 @@ Adopt Mammoth incrementally in the originating project:
    construction local.
 5. Adopt the generic trainer directly with project-owned step and checkpoint
    policies.
-6. Retain project-owned loops only for algorithms outside the trainer contract.
+6. Delegate training-resource cleanup to the existing execution session.
+7. Retain project-owned loops only for algorithms outside the trainer contract.
 
 No artifact migration or destructive rewrite should be required.
 

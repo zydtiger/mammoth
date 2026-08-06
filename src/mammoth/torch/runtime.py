@@ -13,10 +13,11 @@ import os
 import signal as signal_module
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Literal, cast
 
 import torch
@@ -30,8 +31,15 @@ from mammoth.core import (
     execution_id_from_environment,
     join_execution_context,
 )
-from mammoth.logging import ExecutionLogging, ObservationSink, create_execution_logging
+from mammoth.logging import (
+    ExecutionLogging,
+    ObservationSink,
+    RunObserver,
+    create_execution_logging,
+)
+from mammoth.torch.device import resolve_device
 from mammoth.torch.scheduling import weighted_partition_counts, weighted_partition_indices
+from mammoth.torch.trainer import Trainer
 
 Strategy = Literal["single", "ddp"]
 
@@ -431,27 +439,6 @@ class TorchExecutionRuntime:
         finally:
             self._owns_process_group = False
 
-    def prepare_session_close(self) -> None:
-        """Run fallible non-observer cleanup before a terminal process event."""
-        first_error: BaseException | None = None
-        if self.execution_logging is not None:
-            try:
-                self.execution_logging.text_handler.close()
-            except BaseException as error:
-                first_error = error
-        try:
-            self._release_logical_run_lease()
-        except BaseException as error:
-            if first_error is None:
-                first_error = error
-        try:
-            self.close_process_group()
-        except BaseException as error:
-            if first_error is None:
-                first_error = error
-        if first_error is not None:
-            raise first_error
-
     def close(self) -> None:
         """Close logging, release the primary lease, and destroy an owned group."""
         if self._closed:
@@ -629,7 +616,7 @@ class TorchExecutionRuntime:
 
 
 class TorchExecutionSession:
-    """Own one process stream's phase lifecycle and coordinated cleanup."""
+    """Own process/phase lifecycle plus resources created through this session."""
 
     def __init__(self, runtime: TorchExecutionRuntime) -> None:
         logging_bundle = runtime.execution_logging
@@ -645,12 +632,35 @@ class TorchExecutionSession:
         self._phase_outcome: Literal["completed", "failed", "interrupted", "skipped"] | None = None
         self._process_started_at: float | None = None
         self._phase_started_at: float | None = None
+        self._owned_resources = ExitStack()
+        self._owned_observers = ExitStack()
+        self._owned_trainers = ExitStack()
+        self._owned_resources.callback(self._owned_observers.close)
+        self._owned_resources.callback(self._owned_trainers.close)
+        self._owned_resource_errors: list[tuple[str, BaseException]] = []
         self._closed = False
 
     @property
     def phase(self) -> str | None:
         """Return the active or most recently completed phase name."""
         return self._phase
+
+    def create_observer(
+        self,
+        sinks: Sequence[ObservationSink] = (),
+    ) -> RunObserver:
+        """Create and own one sink-neutral observer for project training output."""
+        self._require_open()
+        observer = RunObserver(sinks)
+        self._register_owned_resource(self._owned_observers, "observer", observer.close)
+        return observer
+
+    def create_trainer(self, **kwargs: Any) -> Trainer:
+        """Create and own one generic Trainer while borrowing all supplied inputs."""
+        self._require_open()
+        trainer = Trainer(**kwargs)
+        self._register_owned_resource(self._owned_trainers, "trainer", trainer.close)
+        return trainer
 
     def start_phase(self, phase: str) -> None:
         """Start one phase and, on first use, this process lifecycle."""
@@ -730,21 +740,19 @@ class TorchExecutionSession:
         message: str | None = None,
         before_close: Callable[[], None] | None = None,
     ) -> None:
-        """Finish lifecycle events, run presentation cleanup, and close runtime IO."""
+        """Close owned resources, lifecycle logging, leases, and owned runtime state."""
         if self._closed:
             return
-        cleanup_error: BaseException | None = None
+        self._closed = True
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        self._owned_resource_errors = cleanup_errors
+        self._owned_resources.close()
         if before_close is not None:
             try:
                 before_close()
             except BaseException as callback_error:
-                cleanup_error = callback_error
-        try:
-            self.runtime.prepare_session_close()
-        except BaseException as runtime_cleanup_error:
-            if cleanup_error is None:
-                cleanup_error = runtime_cleanup_error
-        terminal_error = error or cleanup_error
+                cleanup_errors.append(("presentation lease", callback_error))
+        terminal_error = error or _first_cleanup_error(cleanup_errors)
         try:
             if self._phase is not None:
                 if not self._phase_terminal:
@@ -759,7 +767,7 @@ class TorchExecutionSession:
                     terminal_error,
                     requested=exit_code,
                     phase_outcome=self._phase_outcome,
-                    cleanup_failed=cleanup_error is not None,
+                    cleanup_failed=bool(cleanup_errors),
                 )
                 fields: dict[str, Any] = {
                     "phase": self._phase,
@@ -777,16 +785,63 @@ class TorchExecutionSession:
                     fields["message"] = _error_text(terminal_error)
                 self.observer.emit("process_completed", **fields)
         except BaseException as lifecycle_error:
-            if cleanup_error is None:
-                cleanup_error = lifecycle_error
+            cleanup_errors.append(("execution lifecycle", lifecycle_error))
         try:
-            self.runtime.close()
-        except BaseException as runtime_error:
-            if cleanup_error is None:
-                cleanup_error = runtime_error
-        self._closed = True
-        if cleanup_error is not None and error is None and exit_code in {None, 0}:
-            raise cleanup_error
+            if self.runtime.execution_logging is not None:
+                self.runtime.execution_logging.close()
+        except BaseException as logging_error:
+            cleanup_errors.append(("execution logging", logging_error))
+        try:
+            self.runtime._release_logical_run_lease()
+        except BaseException as lease_error:
+            cleanup_errors.append(("logical-run lease", lease_error))
+        try:
+            self.runtime.close_process_group()
+        except BaseException as process_group_error:
+            cleanup_errors.append(("process group", process_group_error))
+        self.runtime._closed = True
+        if error is not None:
+            _attach_cleanup_errors(error, cleanup_errors)
+        elif cleanup_errors and exit_code in {None, 0}:
+            first_label, first_error = cleanup_errors[0]
+            _attach_cleanup_errors(first_error, cleanup_errors[1:])
+            first_error.add_note(f"Cleanup stage: {first_label}")
+            raise first_error
+
+    def __enter__(self) -> TorchExecutionSession:
+        """Return this open execution session."""
+        self._require_open()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Close the session without replacing the workload exception."""
+        del exc_type, traceback
+        self.close(error=exc_value)
+
+    def _register_owned_resource(
+        self,
+        stack: ExitStack,
+        label: str,
+        close: Callable[[], None],
+    ) -> None:
+        """Register one close callback on the session's reverse-order stack."""
+        stack.callback(self._close_owned_resource, label, close)
+
+    def _close_owned_resource(self, label: str, close: Callable[[], None]) -> None:
+        """Capture one owned-resource failure while allowing later cleanup."""
+        try:
+            close()
+        except BaseException as error:
+            self._owned_resource_errors.append((label, error))
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("Execution session is already closed")
 
     def _active_phase(self) -> str:
         if self._phase is None:
@@ -811,16 +866,6 @@ def initialize_torch_runtime(
 ) -> TorchExecutionRuntime:
     """Initialize and return one generic PyTorch execution runtime."""
     return TorchExecutionRuntime(config)
-
-
-def resolve_device(value: str) -> torch.device:
-    """Resolve ``auto`` or one explicit torch device string."""
-    if value == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(value)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA device requested but CUDA is unavailable")
-    return device
 
 
 def _distributed_identity(config: TorchRuntimeConfig) -> tuple[int, int, int]:
@@ -891,6 +936,22 @@ def _environment_world_size() -> int:
 def _error_text(error: BaseException) -> str:
     message = str(error).strip()
     return f"{type(error).__name__}: {message}" if message else type(error).__name__
+
+
+def _first_cleanup_error(
+    errors: Sequence[tuple[str, BaseException]],
+) -> BaseException | None:
+    """Return the first captured cleanup failure, if any."""
+    return errors[0][1] if errors else None
+
+
+def _attach_cleanup_errors(
+    primary_error: BaseException,
+    errors: Sequence[tuple[str, BaseException]],
+) -> None:
+    """Retain cleanup failures as notes without replacing the primary error."""
+    for label, error in errors:
+        primary_error.add_note(f"{label} cleanup also failed: {_error_text(error)}")
 
 
 def _process_exit_code(
