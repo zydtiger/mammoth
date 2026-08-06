@@ -2999,6 +2999,87 @@ def test_metric_accumulator_supports_mean_sum_and_last() -> None:
         MetricRoute(batch_name="loss", epoch_name="loss")
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable"),
+        ),
+    ],
+)
+def test_output_metrics_defers_tensor_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+    device: str,
+) -> None:
+    item = torch.Tensor.item
+    materializations = 0
+
+    def count_item(value: torch.Tensor) -> Any:
+        nonlocal materializations
+        materializations += 1
+        return item(value)
+
+    monkeypatch.setattr(torch.Tensor, "item", count_item)
+
+    metrics = trainer_module.output_metrics(
+        StepOutput(
+            loss=torch.tensor(1.0, device=device),
+            metrics={
+                "score": torch.tensor(0.5, device=device),
+                "loss": torch.tensor(2.0, device=device),
+            },
+        )
+    )
+
+    assert materializations == 0
+    assert all(isinstance(value, torch.Tensor) for value in metrics.values())
+
+
+def test_training_reduces_scalar_metrics_only_at_observation_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = DataLoader(MappingDataset(), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = RecordingSink()
+    compute = MetricAccumulator.compute
+    reductions = 0
+
+    def count_compute(
+        accumulator: MetricAccumulator,
+        *,
+        device: torch.device | None = None,
+        distributed: bool = False,
+    ) -> dict[str, float]:
+        nonlocal reductions
+        reductions += 1
+        return compute(accumulator, device=device, distributed=distributed)
+
+    monkeypatch.setattr(MetricAccumulator, "compute", count_compute)
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        observer=RunObserver((sink,)),
+        config=TrainerConfig(
+            epochs=1,
+            device="cpu",
+            gradient_accumulation_steps=2,
+            log_every_batches=2,
+            checkpoint_every_epochs=None,
+        ),
+    ) as trainer:
+        trainer.fit()
+
+    progress = [observation for observation in sink.observations if observation.event == "progress"]
+    assert len(progress) == 2
+    assert reductions == 3
+
+
 @pytest.mark.parametrize("value", [0, False, "2"])
 def test_uniform_accumulation_rejects_invalid_window_size(value: Any) -> None:
     with pytest.raises(ValueError, match="positive integer"):
