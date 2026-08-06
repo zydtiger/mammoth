@@ -29,7 +29,7 @@ from mammoth.torch.backend import (
     configured_torch_backend,
     current_torch_backend_state,
 )
-from mammoth.torch.runtime import resolve_device
+from mammoth.torch.device import resolve_device
 
 PROFILE_SCHEMA_VERSION = 1
 

@@ -14,7 +14,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import torch
 import torch.distributed
@@ -42,6 +42,7 @@ from mammoth.torch.checkpoint import (
     load_checkpoint_state,
     snapshot_to_cpu,
 )
+from mammoth.torch.device import resolve_device
 from mammoth.torch.metrics import (
     MetricAccumulator,
     MetricRoute,
@@ -54,11 +55,14 @@ from mammoth.torch.metrics import (
     snapshot_stateful_metrics,
     update_stateful_metrics,
 )
-from mammoth.torch.runtime import Strategy, TorchExecutionRuntime, resolve_device
 from mammoth.torch.scheduling import AccumulationPolicy, UniformAccumulationPolicy
 from mammoth.torch.state import TrainerState
 
+if TYPE_CHECKING:
+    from mammoth.torch.runtime import TorchExecutionRuntime
+
 Precision = Literal["fp32", "bf16", "fp16"]
+Strategy = Literal["single", "ddp"]
 SchedulerInterval = Literal["optimizer", "epoch", "validation"]
 OptimizerStepLogicalClock = Literal["completed", "zero_based"]
 

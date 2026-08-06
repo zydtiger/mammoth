@@ -166,9 +166,15 @@ on any rank is reported coherently before project work begins. TensorBoard's
 rank-aware sink and trainer checkpoints default to rank zero.
 
 `TorchExecutionSession` owns process and phase lifecycle events after logging
-starts. Projects may attach presentation cleanup through its close hook, but
-Mammoth decides unfinished-phase failure, terminal process status, duration,
-stream closure, lease release, and process-group teardown.
+starts. It is also the context-managed owner of observers and trainers created
+through its factories. Factory inputs such as models, optimizers, schedulers,
+loaders, policies, serializers, metrics, and directly supplied observers remain
+borrowed. Owned trainers close before owned observers in reverse construction
+order, which flushes checkpoint publication before metric sinks. Mammoth then
+closes execution logging, releases leases, and destroys only a process group
+created by the runtime. Projects may attach presentation cleanup through the
+session close hook. Cleanup is idempotent, and cleanup failures are attached to
+an active workload exception instead of replacing it.
 
 A workflow execution is owned by its single runner and may launch steps with
 different process counts. Joined workflow children therefore validate run and
