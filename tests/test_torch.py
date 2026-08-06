@@ -830,6 +830,98 @@ def run_two_process_runtime(
     return sorted(results)
 
 
+def _distributed_interrupt_worker(
+    rank: int,
+    rendezvous: str,
+    checkpoint_dir: str,
+    result_queue: Any,
+) -> None:
+    """Report whether rank-wide interrupt consensus reaches checkpoint policy."""
+    try:
+        with initialize_torch_runtime(
+            TorchRuntimeConfig(
+                strategy="ddp",
+                device="cpu",
+                backend="gloo",
+                init_method=rendezvous,
+                timeout_seconds=30,
+                rank=rank,
+                local_rank=rank,
+                world_size=2,
+            )
+        ) as runtime:
+            loader = DataLoader(MappingDataset(), batch_size=2)
+            model = torch.nn.Linear(1, 1)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+            policy = RecordingCheckpointPolicy(Path(checkpoint_dir))
+
+            def interrupt_on_peer(
+                module: torch.nn.Module,
+                batch: Any,
+                context: StepContext,
+            ) -> StepOutput:
+                if rank == 1:
+                    raise KeyboardInterrupt("stop distributed training")
+                return regression_step(module, batch, context)
+
+            error_type = ""
+            error_message = ""
+            with Trainer(
+                model=model,
+                optimizer=optimizer,
+                train_loader=loader,
+                train_step=interrupt_on_peer,
+                config=TrainerConfig(
+                    epochs=1,
+                    device="cpu",
+                    strategy="ddp",
+                    checkpoint_every_epochs=None,
+                ),
+                checkpoint_policy=policy,
+                runtime=runtime,
+            ) as trainer:
+                try:
+                    trainer.fit()
+                except BaseException as error:
+                    error_type = type(error).__name__
+                    error_message = str(error)
+            result_queue.put(
+                (
+                    rank,
+                    error_type,
+                    error_message,
+                    [context.reason for context in policy.contexts],
+                )
+            )
+    except BaseException as error:
+        result_queue.put((rank, type(error).__name__, str(error), []))
+
+
+def run_distributed_interrupt(tmp_path: Path) -> list[tuple[Any, ...]]:
+    """Launch the two-rank interrupted-checkpoint regression fixture."""
+    process_context = multiprocessing.get_context("spawn")
+    result_queue = process_context.Queue()
+    rendezvous = f"file://{tmp_path / 'interrupt-rendezvous'}"
+    checkpoint_dir = str(tmp_path / "interrupted-checkpoint")
+    processes = [
+        process_context.Process(
+            target=_distributed_interrupt_worker,
+            args=(rank, rendezvous, checkpoint_dir, result_queue),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=40)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            pytest.fail("Distributed interrupt worker did not shut down coherently")
+        assert process.exitcode == 0
+    return sorted(result_queue.get(timeout=5) for _ in processes)
+
+
 def _uneven_accumulation_worker(
     rank: int,
     rendezvous: str,
@@ -2295,6 +2387,18 @@ def test_fit_publishes_interrupted_checkpoint_before_reraising(tmp_path: Path) -
         trainer.fit()
 
     assert [context.reason for context in policy.contexts] == ["interrupted"]
+    assert (tmp_path / "interrupted-checkpoint" / "project.checkpoint").is_file()
+
+
+def test_ddp_interrupt_reaches_primary_checkpoint_policy(tmp_path: Path) -> None:
+    """A peer-rank KeyboardInterrupt remains an interrupt on every rank."""
+    results = run_distributed_interrupt(tmp_path)
+
+    assert [result[1] for result in results] == ["KeyboardInterrupt", "KeyboardInterrupt"]
+    assert "train step interrupted" in results[0][2]
+    assert "stop distributed training" in results[1][2]
+    assert results[0][3] == ["interrupted"]
+    assert results[1][3] == []
     assert (tmp_path / "interrupted-checkpoint" / "project.checkpoint").is_file()
 
 

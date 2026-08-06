@@ -289,7 +289,10 @@ artifact plan.
 `Trainer.fit()` publishes that interruption plan automatically when
 `KeyboardInterrupt` escapes the loop, then preserves and re-raises the original
 interruption. Callers may disable this behavior explicitly when an outer system
-owns interruption persistence.
+owns interruption persistence. Under DDP, failure consensus preserves an
+interrupt as `KeyboardInterrupt` on every rank instead of converting it to an
+ordinary failure; rank zero can therefore publish while peers perform only
+local checkpoint shutdown.
 
 The trainer applies publisher backpressure before asking a project checkpoint
 policy to capture state or select retention paths. The publisher snapshots or

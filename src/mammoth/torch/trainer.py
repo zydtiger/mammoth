@@ -1437,12 +1437,36 @@ class Trainer:
         local_status = (
             None
             if local_error is None
-            else f"{type(local_error).__name__}: {local_error}"
+            else (
+                "interrupted" if isinstance(local_error, KeyboardInterrupt) else "failed",
+                f"{type(local_error).__name__}: {local_error}",
+            )
         )
         statuses = self.all_gather_object(local_status)
-        failure = next((status for status in statuses if status is not None), None)
+        interruption = next(
+            (
+                status
+                for status in statuses
+                if isinstance(status, tuple)
+                and len(status) == 2
+                and status[0] == "interrupted"
+            ),
+            None,
+        )
+        if interruption is not None:
+            if isinstance(local_error, KeyboardInterrupt):
+                raise local_error
+            raise KeyboardInterrupt(f"{operation} interrupted: {interruption[1]}")
+        failure = next(
+            (
+                status
+                for status in statuses
+                if isinstance(status, tuple) and len(status) == 2
+            ),
+            None,
+        )
         if failure is not None:
-            raise RuntimeError(f"{operation} failed: {failure}") from local_error
+            raise RuntimeError(f"{operation} failed: {failure[1]}") from local_error
 
     def coordinate[T](self, operation: str, function: Callable[[], T]) -> T:
         """Run project-controlled work behind rank-wide failure consensus."""
