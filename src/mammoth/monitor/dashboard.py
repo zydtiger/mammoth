@@ -77,7 +77,11 @@ class _MonitorSpeedColumn(ProgressColumn):
         if not isinstance(throughput, int | float):
             return Text("--")
         unit = task.fields.get("monitor_unit")
-        unit_text = _rate_unit(str(unit) if unit else None)
+        phase = task.fields.get("monitor_phase")
+        unit_text = _rate_unit(
+            str(unit) if unit else None,
+            phase=str(phase) if phase else None,
+        )
         return Text(f"{float(throughput):.1f} {unit_text}/s", style="progress.data.speed")
 
 
@@ -740,6 +744,7 @@ def _progress_renderable(progress_view: _ProgressView, *, label: str) -> Progres
         ),
         monitor_throughput=progress_view.throughput,
         monitor_unit=progress_view.unit,
+        monitor_phase=progress_view.task.phase,
     )
     return progress
 
@@ -1031,13 +1036,13 @@ def _task_counts(task: TaskState | None) -> str:
 def _task_rate(task: TaskState | None) -> str:
     if task is None or task.throughput is None:
         return "--"
-    return f"{task.throughput:.1f} {_rate_unit(task.unit)}/s"
+    return f"{task.throughput:.1f} {_rate_unit(task.unit, phase=task.phase)}/s"
 
 
 def _compact_task_rate(task: TaskState | None) -> str:
     if task is None or task.throughput is None:
         return "--"
-    return f"{task.throughput:.1f} {_rate_unit(task.unit)}/s"
+    return f"{task.throughput:.1f} {_rate_unit(task.unit, phase=task.phase)}/s"
 
 
 def _progress_text(progress: _ProgressView) -> str:
@@ -1048,7 +1053,8 @@ def _progress_text(progress: _ProgressView) -> str:
     )
     unit = f" {progress.unit}" if progress.unit else ""
     rate = (
-        f" · {progress.throughput:.1f} {_rate_unit(progress.unit)}/s"
+        f" · {progress.throughput:.1f} "
+        f"{_rate_unit(progress.unit, phase=progress.task.phase)}/s"
         if progress.throughput is not None
         else ""
     )
@@ -1057,8 +1063,11 @@ def _progress_text(progress: _ProgressView) -> str:
     return f"{counts}{unit}{rate}{eta_text}"
 
 
-def _rate_unit(unit: str | None) -> str:
-    return "b" if unit in {"batch", "microbatch"} else unit or "unit"
+def _rate_unit(unit: str | None, *, phase: str | None = None) -> str:
+    batch_units = {"batch", "microbatch"}
+    if phase == "test/segmentation":
+        batch_units.update(("patch", "patches"))
+    return "b" if unit in batch_units else unit or "unit"
 
 
 def _logical_eta_text(

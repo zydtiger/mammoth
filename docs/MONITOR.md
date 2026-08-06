@@ -56,8 +56,9 @@ small presentation conventions stated below.
   Distinct compatible counters are summed. Missing expected ranks produce an
   aggregation-pending state instead of a partial total.
 - Count units are preserved exactly. Throughput abbreviates both `batch/s` and
-  `microbatch/s` as `b/s`; one displayed batch represents one model forward
-  pass.
+  `microbatch/s` as `b/s`. The `test/segmentation` phase also presents producer
+  `patch/s` or `patches/s` throughput as `b/s`; one displayed batch represents
+  one model forward pass.
 
 ## Dashboard Information Hierarchy
 
