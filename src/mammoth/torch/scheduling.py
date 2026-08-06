@@ -26,6 +26,15 @@ _TORCH_MAX_SEED = 2**64 - 1
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class WeightedTaskAssignment:
+    """Assign one opaque caller task and its cost to a rank."""
+
+    task_id: str
+    cost: int | float
+    rank: int
+
+
 class WarmupLinearLR(LRScheduler):
     """Warm linearly from zero, then decay linearly to zero.
 
@@ -123,6 +132,54 @@ def _validated_rank_weights(
     ):
         raise ValueError("rank_weights must contain only positive finite numbers")
     return tuple(rank_weights)
+
+
+def allocate_weighted_tasks(
+    tasks: Sequence[tuple[str, int | float]],
+    rank_weights: Sequence[int | float],
+) -> tuple[WeightedTaskAssignment, ...]:
+    """Allocate opaque costed tasks by lowest projected normalized rank load.
+
+    Tasks are considered largest-cost-first with task-ID tie-breaking. Each task
+    is assigned to the rank minimizing ``(current load + cost) / rank weight``;
+    an exact tie selects the lower rank. The returned assignments are sorted by
+    task ID so input ordering never affects the result.
+    """
+    weights = _validated_rank_weights(rank_weights)
+    exact_weights = tuple(Fraction(weight) for weight in weights)
+    validated_tasks: list[tuple[str, int | float, Fraction]] = []
+    seen_task_ids: set[str] = set()
+    for task_id, cost in tasks:
+        if not isinstance(task_id, str) or not task_id:
+            raise ValueError("task IDs must be non-empty strings")
+        if task_id in seen_task_ids:
+            raise ValueError(f"task IDs must be unique; received {task_id!r} more than once")
+        if (
+            isinstance(cost, bool)
+            or not isinstance(cost, int | float)
+            or (isinstance(cost, float) and not math.isfinite(cost))
+            or cost < 0
+        ):
+            raise ValueError("task costs must be non-negative finite numbers")
+        seen_task_ids.add(task_id)
+        validated_tasks.append((task_id, cost, Fraction(cost)))
+
+    loads = [Fraction() for _ in exact_weights]
+    assignments: list[WeightedTaskAssignment] = []
+    for task_id, cost, exact_cost in sorted(
+        validated_tasks,
+        key=lambda task: (-task[2], task[0]),
+    ):
+        owner = min(
+            range(len(exact_weights)),
+            key=lambda rank: (
+                (loads[rank] + exact_cost) / exact_weights[rank],
+                rank,
+            ),
+        )
+        loads[owner] += exact_cost
+        assignments.append(WeightedTaskAssignment(task_id=task_id, cost=cost, rank=owner))
+    return tuple(sorted(assignments, key=lambda assignment: assignment.task_id))
 
 
 def weighted_partition_counts(

@@ -256,6 +256,13 @@ partitioning without constructing or interpreting a dataset. Consuming
 projects retain concrete weights, device eligibility, DataLoader construction,
 and every model and dataset policy.
 
+For coarse independently executable work, the weighted task allocator accepts
+only opaque string IDs, nonnegative numeric costs, and positive rank weights.
+It considers tasks largest-cost-first, breaks equal-cost ties by ID, minimizes
+each rank's projected cost divided by its weight, and breaks rank ties by lower
+rank. Projects retain task discovery, cost estimation, skip/resume policy,
+capacity checks, execution, artifacts, and failure reporting.
+
 Complex algorithms with several optimizers, alternating updates, reinforcement
 learning control flow, or custom collectives keep their loop in the consuming
 project and use Mammoth only for orchestration, logging, monitoring, and
@@ -318,6 +325,11 @@ policy selects Python, Torch CPU, and available Torch CUDA generators without
 assigning a concrete seed or dataset-worker policy. Consuming projects retain
 all chosen values, environment variables, logging filters, and DataLoader seed
 construction.
+
+Compile backends use `inductor` only when the caller leaves the backend unset;
+an explicitly empty backend is invalid. Deterministic warning-only behavior is
+likewise valid only when the caller explicitly selects deterministic-algorithm
+mode, so an omitted mode cannot silently inherit a warning policy.
 
 When a caller supplies both the newer matmul-precision control and the legacy
 CUDA TF32 boolean, Mammoth expresses the legacy boolean's precedence through

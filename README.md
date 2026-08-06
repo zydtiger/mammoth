@@ -291,8 +291,10 @@ underlying DDP wrapper's `no_sync()` context.
 For heterogeneous ranks, `WeightedAccumulationPolicy` and
 `WeightedDistributedBatchSampler` accept arbitrary caller-defined rank weights.
 The matching `weighted_partition_counts` and `weighted_partition_indices`
-helpers can shard other opaque workloads. Projects still choose the weights,
-eligible hardware, datasets, and `DataLoader` settings.
+helpers can shard other opaque workloads. `allocate_weighted_tasks` assigns
+opaque task IDs with caller-estimated costs by projected normalized rank load.
+Projects still choose the weights, eligible hardware, datasets, task-cost
+meaning, and `DataLoader` settings.
 
 Set `TrainerConfig(emit_fit_phase_events=False, ...)` when a surrounding
 command already owns the outer training phase lifecycle. Mammoth continues to
