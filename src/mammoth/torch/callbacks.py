@@ -1,16 +1,20 @@
 """Generic trainer callback hooks and validation-based early stopping.
 
-Callbacks receive only trainer coordinates and project-named scalar summaries;
-they never depend on a model architecture or dataset implementation.
+Callbacks receive trainer coordinates, project-named scalar summaries, and
+generic checkpoint-publication receipts; they never depend on a model
+architecture or dataset implementation.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from mammoth.torch.state import TrainerState
+
+if TYPE_CHECKING:
+    from mammoth.torch.checkpoint import CheckpointPublication
 
 
 class Callback:
@@ -27,6 +31,13 @@ class Callback:
 
     def on_train_end(self, state: TrainerState) -> None:
         """Run after normal or early completion."""
+
+    def on_checkpoint_published(
+        self,
+        state: TrainerState,
+        publication: CheckpointPublication,
+    ) -> None:
+        """Run after one checkpoint plan has committed successfully."""
 
     def should_stop(self, state: TrainerState) -> bool:
         """Return whether training should stop after the current epoch."""

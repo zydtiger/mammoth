@@ -6,6 +6,7 @@ responsibility for deciding whether their model and checkpoint states match.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 from collections import deque
@@ -32,6 +33,7 @@ from mammoth.core.artifacts import (
 CHECKPOINT_SCHEMA_VERSION = 1
 CheckpointReason = Literal["scheduled", "manual", "interrupted"]
 CheckpointMode = Literal["all", "latest"]
+CheckpointRole = Literal["epoch", "latest", "best"]
 CheckpointComponent = Literal[
     "model",
     "optimizer",
@@ -181,6 +183,8 @@ class CheckpointArtifact:
     writer: Callable[[Path], object]
     mode: int | None = 0o600
     preserve_permissions: bool = True
+    role: CheckpointRole = "epoch"
+    epoch: int = -1
 
 
 @dataclass(frozen=True)
@@ -208,10 +212,37 @@ class CheckpointPlan:
 
 @dataclass(frozen=True)
 class CheckpointPublication:
-    """Paths committed and retired by one completed checkpoint plan."""
+    """Artifact receipts committed and paths retired by one completed plan."""
 
-    published: tuple[Path, ...]
+    published: tuple[PublishedCheckpoint, ...]
     retired: tuple[Path, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedCheckpoint:
+    """Identity and exact-byte provenance for one committed checkpoint artifact."""
+
+    path: Path
+    role: CheckpointRole
+    epoch: int
+    size_bytes: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if self.role not in {"epoch", "latest", "best"}:
+            raise ValueError("checkpoint role must be 'epoch', 'latest', or 'best'")
+        if isinstance(self.epoch, bool) or not isinstance(self.epoch, int) or self.epoch < -1:
+            raise ValueError("published checkpoint epoch must be an integer >= -1")
+        if (
+            isinstance(self.size_bytes, bool)
+            or not isinstance(self.size_bytes, int)
+            or self.size_bytes < 0
+        ):
+            raise ValueError("published checkpoint size_bytes must be non-negative")
+        if len(self.sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.sha256
+        ):
+            raise ValueError("published checkpoint sha256 must be lowercase hexadecimal")
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +385,30 @@ class AsyncCheckpointPublisher:
             self._pending.append(future)
             return future
 
+    def publish_with_receipt(
+        self,
+        path: Path,
+        payload: Mapping[str, Any],
+        *,
+        role: CheckpointRole,
+        epoch: int,
+    ) -> Future[CheckpointPublication]:
+        """Publish one generic payload and report its exact committed bytes."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("checkpoint publisher is closed")
+            self._await_submission_slot()
+            snapshot = snapshot_to_cpu(payload)
+            future = self._executor.submit(
+                publish_torch_payload_with_receipt,
+                Path(path),
+                snapshot,
+                role=role,
+                epoch=epoch,
+            )
+            self._pending.append(future)
+            return future
+
     def submit(self, plan: CheckpointPlan) -> Future[CheckpointPublication]:
         """Submit one caller-owned immutable ordered checkpoint plan."""
         with self._lock:
@@ -445,6 +500,14 @@ def validate_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPlan:
             raise ValueError(f"duplicate checkpoint publication target: {destination}")
         if not callable(artifact.writer):
             raise TypeError("checkpoint artifact writer must be callable")
+        if artifact.role not in {"epoch", "latest", "best"}:
+            raise ValueError("checkpoint artifact role must be 'epoch', 'latest', or 'best'")
+        if (
+            isinstance(artifact.epoch, bool)
+            or not isinstance(artifact.epoch, int)
+            or artifact.epoch < -1
+        ):
+            raise ValueError("checkpoint artifact epoch must be an integer >= -1")
         if artifact.mode is not None and (
             isinstance(artifact.mode, bool)
             or not isinstance(artifact.mode, int)
@@ -458,6 +521,8 @@ def validate_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPlan:
             CheckpointArtifact(
                 destination=resolved,
                 writer=artifact.writer,
+                role=artifact.role,
+                epoch=artifact.epoch,
                 mode=artifact.mode,
                 preserve_permissions=artifact.preserve_permissions,
             )
@@ -525,6 +590,8 @@ def build_trainer_checkpoint_plan(
             CheckpointArtifact(
                 destination=root / "best.safetensors",
                 writer=writers.best,
+                role="best",
+                epoch=epoch,
             )
         )
 
@@ -536,6 +603,8 @@ def build_trainer_checkpoint_plan(
             CheckpointArtifact(
                 destination=destination,
                 writer=writers.resumable,
+                role="epoch" if save_policy.mode == "all" else "latest",
+                epoch=epoch,
             )
         )
         if save_policy.mode == "latest":
@@ -592,6 +661,7 @@ def anchor_checkpoint_plan(plan: CheckpointPlan) -> _AnchoredCheckpointPlan:
 def publish_anchored_checkpoint_plan(plan: _AnchoredCheckpointPlan) -> CheckpointPublication:
     """Publish one plan without rebasing its submitted root identity."""
     prepared: list[PreparedArtifact] = []
+    receipts: list[PublishedCheckpoint] = []
     committed_count = 0
     try:
         for artifact in plan.artifacts:
@@ -608,16 +678,16 @@ def publish_anchored_checkpoint_plan(plan: _AnchoredCheckpointPlan) -> Checkpoin
                     directory_descriptor=directory_descriptor,
                     mode=artifact.mode,
                     preserve_permissions=artifact.preserve_permissions,
+                    inspect_serialized=receipt_inspector(artifact, receipts),
                 )
             )
-        published: list[Path] = []
         for prepared_artifact in prepared:
             ensure_confined_path_unchanged(
                 plan.checkpoint_root,
                 prepared_artifact.destination,
                 role="publication",
             )
-            published.append(publish_prepared_artifact(prepared_artifact))
+            publish_prepared_artifact(prepared_artifact)
             committed_count += 1
 
         retired: list[Path] = []
@@ -628,10 +698,52 @@ def publish_anchored_checkpoint_plan(plan: _AnchoredCheckpointPlan) -> Checkpoin
                 root_identity=plan.root_identity,
             ):
                 retired.append(path)
-        return CheckpointPublication(published=tuple(published), retired=tuple(retired))
+        return CheckpointPublication(published=tuple(receipts), retired=tuple(retired))
     finally:
         for prepared_artifact in prepared[committed_count:]:
             discard_prepared_artifact(prepared_artifact)
+
+
+def receipt_inspector(
+    artifact: CheckpointArtifact,
+    receipts: list[PublishedCheckpoint],
+) -> Callable[[int], object]:
+    """Capture validated regular-file bytes before final permissions and rename."""
+
+    def inspect(serialized_descriptor: int) -> None:
+        receipts.append(
+            checkpoint_receipt_for_descriptor(
+                serialized_descriptor,
+                destination=artifact.destination,
+                role=artifact.role,
+                epoch=artifact.epoch,
+            )
+        )
+
+    return inspect
+
+
+def checkpoint_receipt_for_descriptor(
+    descriptor: int,
+    *,
+    destination: Path,
+    role: CheckpointRole,
+    epoch: int,
+) -> PublishedCheckpoint:
+    """Hash a validated open artifact before permissions can prevent reading."""
+    digest = hashlib.sha256()
+    size_bytes = 0
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while chunk := os.read(descriptor, 1024 * 1024):
+        size_bytes += len(chunk)
+        digest.update(chunk)
+    return PublishedCheckpoint(
+        path=destination,
+        role=role,
+        epoch=epoch,
+        size_bytes=size_bytes,
+        sha256=digest.hexdigest(),
+    )
 
 
 def retire_confined_path(
@@ -844,3 +956,32 @@ def snapshot_to_cpu(value: Any) -> Any:
 def publish_torch_payload(path: Path, payload: Mapping[str, Any]) -> Path:
     """Serialize a snapshot through the core same-directory atomic publisher."""
     return atomic_publish(path, lambda temporary: torch.save(payload, temporary))
+
+
+def publish_torch_payload_with_receipt(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    role: CheckpointRole,
+    epoch: int,
+) -> CheckpointPublication:
+    """Atomically publish one generic payload with pre-rename byte provenance."""
+    destination = Path(path).absolute()
+    receipt: PublishedCheckpoint | None = None
+
+    def inspect(serialized_descriptor: int) -> None:
+        nonlocal receipt
+        receipt = checkpoint_receipt_for_descriptor(
+            serialized_descriptor,
+            destination=destination,
+            role=role,
+            epoch=epoch,
+        )
+
+    atomic_publish(
+        destination,
+        lambda temporary: torch.save(payload, temporary),
+        inspect_serialized=inspect,
+    )
+    assert receipt is not None
+    return CheckpointPublication(published=(receipt,), retired=())

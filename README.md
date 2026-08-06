@@ -347,6 +347,11 @@ that captures resumable and best-model writers, plus a
 `CheckpointSavePolicy(mode="latest", save_best=True, every_epochs=1)`.
 Mammoth then selects publication after validation, names standard checkpoint
 files, and applies retention while the project retains payload serialization.
+After a plan commits, `Callback.on_checkpoint_published()` receives a
+`CheckpointPublication` containing one `PublishedCheckpoint` per artifact with
+its path, role, epoch, byte size, and SHA-256. The hash and size describe the
+completed temporary artifact immediately before atomic publication, so projects
+can update manifests without reopening the checkpoint.
 
 The lower-level bounded publisher remains available outside the trainer. A
 plan stages every artifact before committing its destinations in the declared

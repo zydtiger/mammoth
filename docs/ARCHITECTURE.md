@@ -316,9 +316,15 @@ interrupted saves publish resumable state only. The publisher receives
 caller-owned immutable state before background work, bounds pending
 publications, prepares and syncs every artifact before the first commit,
 replaces best before the resumable commit marker, and retires old latest files
-only after every commit succeeds. Paths are confined to the declared
+only after every commit succeeds. Before each atomic rename, Mammoth hashes the
+completed temporary artifact and records its exact size. Successful plans yield
+typed `PublishedCheckpoint` receipts with path, role, epoch, size, and SHA-256;
+the trainer retains their futures and delivers receipts through observers and
+callbacks during checkpoint flush. Paths are confined to the declared
 checkpoint root. Projects retain serializers, payload fields, compatibility
-rules, and restore policy.
+rules, receipt consumers, and restore policy. Resume discovery remains a
+filesystem concern; publication does not maintain a persistent checkpoint
+catalog.
 
 The lower-level ordered-plan API remains available for non-trainer artifact
 publication where callers need custom names and retirement targets.

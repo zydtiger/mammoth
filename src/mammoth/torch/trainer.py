@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import math
 import pickle
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -28,6 +30,7 @@ from mammoth.torch.checkpoint import (
     AsyncCheckpointPublisher,
     CheckpointComponent,
     CheckpointInspection,
+    CheckpointPublication,
     CheckpointReason,
     CheckpointSavePolicy,
     RestoreOptions,
@@ -355,6 +358,9 @@ class Trainer:
         self.publisher = AsyncCheckpointPublisher(
             max_pending=config.max_pending_checkpoints
         )
+        self._checkpoint_publication_futures: deque[
+            Future[CheckpointPublication]
+        ] = deque()
         self._closed = False
 
     def fit(self) -> TrainerResult:
@@ -879,6 +885,31 @@ class Trainer:
         for callback in self.callbacks:
             callback.on_validation_end(self.state, metrics)
 
+    def deliver_checkpoint_publication(
+        self,
+        publication: CheckpointPublication,
+    ) -> None:
+        """Deliver one committed publication through observer and callback lifecycles."""
+        checkpoints = [
+            {
+                "path": str(checkpoint.path),
+                "role": checkpoint.role,
+                "epoch": checkpoint.epoch,
+                "size_bytes": checkpoint.size_bytes,
+                "sha256": checkpoint.sha256,
+            }
+            for checkpoint in publication.published
+        ]
+        self.observer.emit(
+            "task_completed",
+            phase=self.config.train_phase,
+            task_id="checkpoint-publication",
+            checkpoints=checkpoints,
+            retired=[str(path) for path in publication.retired],
+        )
+        for callback in self.callbacks:
+            callback.on_checkpoint_published(self.state, publication)
+
     def gradient_accumulation_context(self) -> Any:
         """Suppress automatic DDP reduction until the shared logical-step boundary."""
         if self._ddp_model is not None:
@@ -1048,7 +1079,7 @@ class Trainer:
                 save_resumable=save_resumable,
                 save_best=save_best,
             )
-            self.publisher.submit(plan)
+            self._checkpoint_publication_futures.append(self.publisher.submit(plan))
             return
 
         assert self.checkpoint_dir is not None
@@ -1059,9 +1090,14 @@ class Trainer:
         )
         if Path(filename).name != filename:
             raise ValueError("formatted checkpoint filename must remain a single filename")
-        self.publisher.publish(
-            self.checkpoint_dir / filename,
-            checkpoint_payload(self.registry),
+        destination = self.checkpoint_dir / filename
+        self._checkpoint_publication_futures.append(
+            self.publisher.publish_with_receipt(
+                destination,
+                checkpoint_payload(self.registry),
+                role="epoch",
+                epoch=epoch,
+            )
         )
 
     def publish_checkpoint_now(
@@ -1477,7 +1513,7 @@ class Trainer:
         ):
             if self.rank == 0:
                 try:
-                    self.publisher.flush()
+                    self.flush_checkpoint_publications()
                 except BaseException as error:
                     local_error = error
             self.raise_distributed_failure("checkpoint flush", local_error)
@@ -1489,7 +1525,28 @@ class Trainer:
             message=message,
         ):
             if self.rank == 0:
-                self.publisher.flush()
+                self.flush_checkpoint_publications()
+
+    def flush_checkpoint_publications(self) -> None:
+        """Flush the worker and deliver every successful retained receipt once."""
+        first_error: BaseException | None = None
+        try:
+            self.publisher.flush()
+        except BaseException as error:
+            first_error = error
+        while self._checkpoint_publication_futures:
+            future = self._checkpoint_publication_futures.popleft()
+            try:
+                publication = future.result()
+            except BaseException as error:
+                first_error = combine_failures(first_error, error)
+                continue
+            try:
+                self.deliver_checkpoint_publication(publication)
+            except BaseException as error:
+                first_error = combine_failures(first_error, error)
+        if first_error is not None:
+            raise first_error
 
     def raise_distributed_failure(
         self,
@@ -1616,7 +1673,17 @@ class Trainer:
         if self._closed:
             return
         self._closed = True
-        self.publisher.close()
+        first_error: BaseException | None = None
+        try:
+            self.flush_checkpoint_publications()
+        except BaseException as error:
+            first_error = error
+        try:
+            self.publisher.close()
+        except BaseException as error:
+            first_error = combine_failures(first_error, error)
+        if first_error is not None:
+            raise first_error
 
     def __enter__(self) -> Trainer:
         return self
@@ -1639,6 +1706,21 @@ def output_metrics(output: StepOutput) -> dict[str, float]:
         loss = scalar_metrics({"loss": output.loss})["loss"]
         metrics.setdefault("loss", loss)
     return metrics
+
+
+def combine_failures(
+    primary: BaseException | None,
+    secondary: BaseException,
+) -> BaseException:
+    """Preserve the first failure while retaining later cleanup context."""
+    if primary is None:
+        return secondary
+    if secondary is not primary:
+        primary.add_note(
+            "A later checkpoint lifecycle failure also occurred: "
+            f"{type(secondary).__name__}: {secondary}"
+        )
+    return primary
 
 
 def merge_metrics(
