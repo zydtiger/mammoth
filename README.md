@@ -262,6 +262,44 @@ gradient accumulation, validation, callbacks, scheduling, and checkpoints. It
 does not choose your architecture, dataset, batch format, loss, or metric
 meaning.
 
+`WarmupLinearLR` supplies a reusable optimizer-step schedule with linear
+warmup and decay. Projects choose its warmup ratio and total-step horizon; an
+extended resume rebases optimizer learning rates, while a shortened horizon is
+rejected.
+
+Checkpoint policies expose a two-phase typed restore path. Call
+`trainer.inspect_checkpoint(path)` to receive a rank-coordinated
+`CheckpointInspection`, then pass its `restore_options` to
+`trainer.load_checkpoint(path, options=...)`. Mammoth applies and synchronizes
+generic optimizer, scheduler, and callback restore/reset actions, trainer-coordinate
+restoration, and terminal-state restore/reset; the project keeps its payload parsing, model
+compatibility, and metadata policy.
+
+Projects that need more control can supply an `AccumulationPolicy`, scalar
+`MetricSpec` values, additive `StatefulMetric` objects, `MetricRoute` mappings,
+and a `TrainerCheckpointPolicy`. The train and validation step functions remain
+project-owned; Mammoth uses these policies to coordinate logical optimizer
+steps, distributed reductions, generic observations, and ordered checkpoint
+publication.
+
+Set `TrainerConfig.compile_config` to a `TorchCompileConfig` when the ordinary
+forward path should be compiled. Mammoth keeps the supplied module as
+`trainer.base_model`, wraps it with DDP when requested, and only then derives
+`trainer.execution_model` with `torch.compile`; accumulation still targets the
+underlying DDP wrapper's `no_sync()` context.
+
+For heterogeneous ranks, `WeightedAccumulationPolicy` and
+`WeightedDistributedBatchSampler` accept arbitrary caller-defined rank weights.
+The matching `weighted_partition_counts` and `weighted_partition_indices`
+helpers can shard other opaque workloads. `allocate_weighted_tasks` assigns
+opaque task IDs with caller-estimated costs by projected normalized rank load.
+Projects still choose the weights, eligible hardware, datasets, task-cost
+meaning, and `DataLoader` settings.
+
+Set `TrainerConfig(emit_fit_phase_events=False, ...)` when a surrounding
+command already owns the outer training phase lifecycle. Mammoth continues to
+emit nested tasks, progress, validation phases, heartbeats, and metrics.
+
 For a direct single-process or `torchrun` invocation, initialize Mammoth's
 runtime before the trainer. Rank zero creates the immutable execution, every
 rank joins it and receives its own JSONL and text stream, and the trainer uses
@@ -301,12 +339,23 @@ with initialize_torch_runtime(runtime_config) as runtime:
 ```
 
 Use `strategy="single"` without `torchrun` for the corresponding local
-lifecycle. Project-specific GPU validation, sampler policy, and custom
-collectives stay in the consuming project.
+lifecycle. Project-specific GPU validation, concrete workload policy, and
+custom collectives stay in the consuming project.
 
-Projects with custom checkpoint formats can use the same bounded publisher
-without adopting Mammoth's checkpoint schema. A plan stages every artifact
-before committing its destinations in the declared order:
+Projects with custom checkpoint formats can pass a `TrainerCheckpointPolicy`
+that captures resumable and best-model writers, plus a
+`CheckpointSavePolicy(mode="latest", save_best=True, every_epochs=1)`.
+Mammoth then selects publication after validation, names standard checkpoint
+files, and applies retention while the project retains payload serialization.
+After a plan commits, `Callback.on_checkpoint_published()` receives a
+`CheckpointPublication` containing one `PublishedCheckpoint` per artifact with
+its path, role, epoch, byte size, and SHA-256. The hash and size describe the
+completed temporary artifact immediately before atomic publication, so projects
+can update manifests without reopening the checkpoint.
+
+The lower-level bounded publisher remains available outside the trainer. A
+plan stages every artifact before committing its destinations in the declared
+order:
 
 ```python
 from mammoth.torch import (
@@ -328,7 +377,8 @@ with AsyncCheckpointPublisher(max_pending=1) as publisher:
     publisher.submit(plan)
 ```
 
-Serialization callbacks and retention choices remain project-owned. Ordered
+At this lower level, serialization callbacks and retention choices remain
+project-owned. Ordered
 replacement is crash-safe per file but is not a multi-file transaction, so a
 project should place its commit-marker artifact last. Mammoth gives each
 serializer a descriptor-anchored path inside a private staging directory and
@@ -337,6 +387,12 @@ to `0o600`; `mode=None` retains serializer-created permissions for a new file
 while still preserving an existing regular destination's mode. This confined
 durability path requires POSIX descriptor-relative filesystem operations and raises
 `NotImplementedError` before publication when they are unavailable.
+
+Projects can also apply process-global Torch numerical settings without using
+the trainer or profiler. `TorchBackendConfig` controls TF32, float32 matmul
+precision, cuDNN benchmarking, and deterministic modes; `TorchSeedPolicy`
+selects which generic Python and Torch generators receive the caller's seed.
+Mammoth does not choose those values or configure dataset workers.
 
 ## Learn more
 

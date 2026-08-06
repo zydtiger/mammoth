@@ -151,11 +151,12 @@ producers, or controls an execution.
 `TorchExecutionRuntime` owns framework-level single-process or standard DDP
 state. It resolves rank, local rank, world size, and device; initializes an
 uninitialized default process group; exposes common object and tensor
-collectives; and destroys only a process group that it created. Execution
-establishment is available separately from the combined rank-logging startup
-so compatibility adapters can retain a project-specific logging facade. It
-does not encode GPU models, workload weights, samplers, or project topology
-rules.
+collectives; validates optional caller-selected launch constraints; applies
+caller-supplied rank weights to generic count and index partitions; and destroys
+only a process group that it created. Execution establishment is available
+separately from rank-logging startup so projects can validate their own lineage
+and attach presentation sinks without recreating the runtime. The runtime does
+not encode GPU models, concrete workload weights, or project topology rules.
 
 Rank zero creates a direct execution and holds its logical-run lease, or joins
 an execution already identified by `MAMMOTH_EXECUTION_ID` or the compatible
@@ -163,6 +164,17 @@ an execution already identified by `MAMMOTH_EXECUTION_ID` or the compatible
 opens its own JSONL and text streams, and reaches startup consensus. A failure
 on any rank is reported coherently before project work begins. TensorBoard's
 rank-aware sink and trainer checkpoints default to rank zero.
+
+`TorchExecutionSession` owns process and phase lifecycle events after logging
+starts. It is also the context-managed owner of observers and trainers created
+through its factories. Factory inputs such as models, optimizers, schedulers,
+loaders, policies, serializers, metrics, and directly supplied observers remain
+borrowed. Owned trainers close before owned observers in reverse construction
+order, which flushes checkpoint publication before metric sinks. Mammoth then
+closes execution logging, releases leases, and destroys only a process group
+created by the runtime. Projects may attach presentation cleanup through the
+session close hook. Cleanup is idempotent, and cleanup failures are attached to
+an active workload exception instead of replacing it.
 
 A workflow execution is owned by its single runner and may launch steps with
 different process counts. Joined workflow children therefore validate run and
@@ -178,6 +190,12 @@ The trainer accepts constructed objects:
 - training and optional validation `DataLoader` objects; and
 - project functions that interpret batches and return scalar loss/metrics.
 
+The project may also provide an accumulation policy, scalar reduction specs,
+additive stateful metrics, metric sink routes, and a checkpoint policy. These
+contracts describe mechanics only: names and update values remain opaque to
+Mammoth, while project code owns every metric calculation and checkpoint
+serializer.
+
 Mammoth may own the ordinary loop mechanics: mode switching, device transfer,
 precision, backward, accumulation, clipping, optimizer/scheduler steps,
 standard DDP, callbacks, logging, interruption handling, and registered-state
@@ -185,6 +203,71 @@ checkpoint publication. A trainer may consume a `TorchExecutionRuntime` for
 device/rank identity and its active execution observer; constructing the
 trainer without a runtime remains supported for callers that already own their
 process group.
+
+`WarmupLinearLR` provides the reusable BERT-style zero-to-base warmup followed
+by linear decay to zero. Projects choose its warmup ratio and optimizer-step
+horizon. Checkpoint restore preserves the saved cursor, accepts an unchanged or
+extended active horizon, rebases every optimizer parameter group onto an
+extended curve, and rejects horizon shrinkage.
+
+The caller-supplied module remains the canonical `base_model`. Mammoth derives
+an `execution_model` by applying device placement, then optional DDP wrapping,
+then optional caller-configured `torch.compile`. Step functions receive the
+execution model. Mammoth retains the underlying DDP wrapper privately so
+gradient accumulation continues to use `no_sync()` even when the execution
+path is compiled. Projects keep architecture-specific methods on the canonical
+model when those methods are not part of the ordinary forward contract.
+
+Mammoth's validation-metric early-stopping callback owns the generic best-value
+and consecutive-failure state machine and stops on the `patience`-th failed
+check. `TrainerState.stopped_early` is the sole persisted terminal decision;
+`fit()` returns without touching loaders, callbacks, or optimizer state when a
+restored state is already terminal. The trainer reads the callback's transient
+`improved` signal after validation to select best-model publication, while the
+project continues to choose the metric, mode, patience, minimum delta, and
+serializer.
+
+`StepOutput` carries the optional loss, already-computed scalar metrics, and
+opaque updates for registered stateful metrics. Mammoth reduces configured
+distributed training-window summaries and train/validation epoch summaries,
+then applies separate batch and epoch routes. Validation batch routes and
+metrics configured with `distributed=False` remain rank-local. The trainer
+emits generic phase, task, progress, heartbeat, completion, and failure
+observations; projects select phase names, metric names, and display fields.
+When a surrounding command already owns the outer training phase, it disables
+the trainer's fit-level phase records while retaining Mammoth's nested task,
+progress, validation-phase, heartbeat, and metric observations.
+
+An accumulation policy receives rank identity and the local loader length, then
+returns the local microbatch count and loss scale for each shared optimizer
+window. Every rank must produce the same number of optimizer windows. Explicit
+per-window scales cover unequal partial windows without assigning workload
+meaning to Mammoth. DDP forwards and backwards remain local until each shared
+window boundary, where Mammoth first reaches failure consensus and then
+averages gradients in stable parameter order. The persisted global-step cursor
+counts all ranks' microbatches at completed windows; step callbacks receive a
+deterministic rank-ordered position inside the active window.
+Consumers may supply post-optimizer metric providers for values, such as the
+current scheduler rate, that only become authoritative after Mammoth completes
+the optimizer and scheduler boundary.
+The completed optimizer cursor remains checkpoint state, while consumers may
+select a completed-step or zero-based logical clock for routed sink history.
+
+The generic weighted policy converts arbitrary positive caller-supplied rank
+weights into integer local microbatch counts and the DDP loss scale for one
+global window. The matching batch sampler partitions opaque dataset indices,
+drops incomplete global windows, and exposes `set_epoch()` for deterministic
+reshuffling. Contiguous weighted index ranges support validation or inference
+partitioning without constructing or interpreting a dataset. Consuming
+projects retain concrete weights, device eligibility, DataLoader construction,
+and every model and dataset policy.
+
+For coarse independently executable work, the weighted task allocator accepts
+only opaque string IDs, nonnegative numeric costs, and positive rank weights.
+It considers tasks largest-cost-first, breaks equal-cost ties by ID, minimizes
+each rank's projected cost divided by its weight, and breaks rank ties by lower
+rank. Projects retain task discovery, cost estimation, skip/resume policy,
+capacity checks, execution, artifacts, and failure reporting.
 
 Complex algorithms with several optimizers, alternating updates, reinforcement
 learning control flow, or custom collectives keep their loop in the consuming
@@ -195,21 +278,81 @@ artifact mechanics.
 
 Mammoth's optional PyTorch layer provides two checkpoint paths. The generic
 trainer may use Mammoth's versioned registered-state payload and restore it
-directly. Projects with established checkpoint schemas instead submit ordered
-publication plans containing opaque serializer callbacks and exact retirement
-paths.
+directly. Projects with established checkpoint schemas instead capture one
+immutable snapshot and provide resumable and best-model serializers.
 
-The publisher snapshots or receives caller-owned immutable state before
-background work, bounds pending publications, prepares and syncs every artifact
-before the first commit, replaces destinations in declared order, and retires
-old artifacts only after every commit succeeds. Paths are confined to the
-declared checkpoint root. Mammoth does not choose filenames, serializers,
-payload fields, compatibility rules, best-model policy, or retention targets.
+A trainer checkpoint policy captures project state when Mammoth's
+`CheckpointSavePolicy` selects resumable or best-model publication and
+translates its own format into Mammoth's typed restore contract. The trainer
+first calls the policy once on rank zero through `inspect_checkpoint()`, then
+shares its `CheckpointInspection`, including the immutable `RestoreOptions`
+selection, with every rank. `load_checkpoint()` restores the project-owned
+model representation and lets Mammoth restore or reset generic optimizer,
+scheduler, callback, and terminal early-stop state while restoring trainer coordinates. Its
+returned `TrainerCheckpointRestore` reports restored and reset components plus
+opaque project metadata. Mammoth infers absent cursors from the active
+accumulation plan and requires coordinates, terminal state, component reports,
+and metadata to agree across DDP ranks before training resumes. Projects may
+also request a synchronized manual publication. Rank zero publishes an
+interruption snapshot without entering collectives that could deadlock when a
+signal reaches only one process. The checkpoint context identifies the reason
+and exposes the prior restore report to the project serializer.
+
+`Trainer.fit()` publishes that interruption plan automatically when
+`KeyboardInterrupt` escapes the loop, then preserves and re-raises the original
+interruption. Callers may disable this behavior explicitly when an outer system
+owns interruption persistence. Under DDP, failure consensus preserves an
+interrupt as `KeyboardInterrupt` on every rank instead of converting it to an
+ordinary failure; rank zero can therefore publish while peers perform only
+local checkpoint shutdown.
+
+The trainer applies publisher backpressure before asking a project checkpoint
+policy to capture state. `CheckpointSavePolicy` selects `all` or `latest`
+resumable retention, periodic cadence, and optional best-model publication.
+Mammoth names zero-based `epoch_<N>.pt`, `latest_epoch_<N>.pt`, and
+`best.safetensors`; best publication follows `EarlyStopping.improved` on every
+validation epoch and is independent of resumable cadence. Manual and
+interrupted saves publish resumable state only. The publisher receives
+caller-owned immutable state before background work, bounds pending
+publications, prepares and syncs every artifact before the first commit,
+replaces best before the resumable commit marker, and retires old latest files
+only after every commit succeeds. Before each atomic rename, Mammoth hashes the
+completed temporary artifact and records its exact size. Successful plans yield
+typed `PublishedCheckpoint` receipts with path, role, epoch, size, and SHA-256;
+the trainer retains their futures and delivers receipts through observers and
+callbacks during checkpoint flush. Paths are confined to the declared
+checkpoint root. Projects retain serializers, payload fields, compatibility
+rules, receipt consumers, and restore policy. Resume discovery remains a
+filesystem concern; publication does not maintain a persistent checkpoint
+catalog.
+
+The lower-level ordered-plan API remains available for non-trainer artifact
+publication where callers need custom names and retirement targets.
 
 Atomic replacement applies to each file independently. An interruption between
 ordered replacements may expose a prefix of the plan, so the caller places its
 commit-marker artifact last. True multi-file transactions require a different
 generation-directory and atomic-index layout and are not implied by this API.
+
+## Generic PyTorch backend configuration
+
+The optional PyTorch layer applies caller-selected float32 matmul precision,
+CUDA matmul and cuDNN TF32 policy, cuDNN benchmarking, cuDNN determinism, and
+deterministic-algorithm mode as process-global backend configuration. The same
+API captures effective state and provides reversible overrides. A separate seed
+policy selects Python, Torch CPU, and available Torch CUDA generators without
+assigning a concrete seed or dataset-worker policy. Consuming projects retain
+all chosen values, environment variables, logging filters, and DataLoader seed
+construction.
+
+Compile backends use `inductor` only when the caller leaves the backend unset;
+an explicitly empty backend is invalid. Deterministic warning-only behavior is
+likewise valid only when the caller explicitly selects deterministic-algorithm
+mode, so an omitted mode cannot silently inherit a warning policy.
+
+When a caller supplies both the newer matmul-precision control and the legacy
+CUDA TF32 boolean, Mammoth expresses the legacy boolean's precedence through
+the new API so PyTorch never enters an unreadable mixed-API state.
 
 ## Generic PyTorch profiling
 
@@ -220,10 +363,8 @@ the semantic interpretation of every output. Mammoth owns synchronized cold
 and steady-state timing, caller-labelled throughput, CUDA allocator evidence,
 explicit caller-selected component ranges, normalized operation summaries,
 optional traces, reversible Torch runtime settings, and versioned report
-publication. Shape recording groups operation rows by input shape. When a
-caller supplies both the newer matmul-precision control and the legacy CUDA
-TF32 boolean, Mammoth expresses the legacy boolean's precedence through the
-new API so PyTorch never enters an unreadable mixed-API state.
+publication. Shape recording groups operation rows by input shape and delegates
+its temporary runtime settings to the generic backend configuration API.
 
 The default output summary records only project-neutral tensor and container
 metadata. Callers provide semantic summarizers for predicted classes, masks,

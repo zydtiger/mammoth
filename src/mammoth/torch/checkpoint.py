@@ -6,16 +6,17 @@ responsibility for deciding whether their model and checkpoint states match.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 from collections import deque
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import torch
 
@@ -30,6 +31,148 @@ from mammoth.core.artifacts import (
 )
 
 CHECKPOINT_SCHEMA_VERSION = 1
+CheckpointReason = Literal["scheduled", "manual", "interrupted"]
+CheckpointMode = Literal["all", "latest"]
+CheckpointRole = Literal["epoch", "latest", "best"]
+CheckpointComponent = Literal[
+    "model",
+    "optimizer",
+    "scheduler",
+    "callbacks",
+    "trainer",
+    "stopped_early",
+    "scaler",
+    "project",
+]
+RestoreAction = Literal["restore", "reset"]
+_CHECKPOINT_COMPONENTS = frozenset(
+    {
+        "model",
+        "optimizer",
+        "scheduler",
+        "callbacks",
+        "trainer",
+        "stopped_early",
+        "scaler",
+        "project",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointSavePolicy:
+    """Select generic resumable retention and metric-best publication."""
+
+    mode: CheckpointMode = "latest"
+    save_best: bool = True
+    every_epochs: int = 1
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"all", "latest"}:
+            raise ValueError("checkpoint mode must be 'all' or 'latest'")
+        if not isinstance(self.save_best, bool):
+            raise ValueError("checkpoint save_best must be a boolean")
+        if (
+            isinstance(self.every_epochs, bool)
+            or not isinstance(self.every_epochs, int)
+            or self.every_epochs < 1
+        ):
+            raise ValueError("checkpoint every_epochs must be a positive integer")
+
+
+@dataclass(frozen=True, slots=True)
+class RestoreOptions:
+    """Select whether generic mutable training state is restored or reset."""
+
+    optimizer: RestoreAction = "restore"
+    scheduler: RestoreAction = "restore"
+    callbacks: RestoreAction = "restore"
+    stopped_early: RestoreAction = "restore"
+
+    def __post_init__(self) -> None:
+        for name in ("optimizer", "scheduler", "callbacks", "stopped_early"):
+            if getattr(self, name) not in {"restore", "reset"}:
+                raise ValueError(f"{name} restore action must be 'restore' or 'reset'")
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointInspection:
+    """Project-neutral summary produced before checkpoint state is applied."""
+
+    available_components: frozenset[CheckpointComponent]
+    restore_options: RestoreOptions = RestoreOptions()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.available_components, frozenset):
+            raise TypeError("available_components must be a frozenset")
+        invalid_components = self.available_components.difference(_CHECKPOINT_COMPONENTS)
+        if invalid_components:
+            raise ValueError(f"unsupported checkpoint components: {invalid_components}")
+        if not isinstance(self.restore_options, RestoreOptions):
+            raise TypeError("restore_options must be RestoreOptions")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("checkpoint inspection metadata must be a mapping")
+
+
+@dataclass(frozen=True, slots=True)
+class TrainerCheckpointRestore:
+    """Normalized project checkpoint state and Mammoth's applied-state report."""
+
+    epoch: int
+    optimizer_step: int | None = None
+    global_step: int | None = None
+    stopped_early: bool = False
+    optimizer_state_dict: Mapping[str, Any] | None = field(default=None, repr=False)
+    scheduler_state_dict: Mapping[str, Any] | None = field(default=None, repr=False)
+    callback_state_dicts: Mapping[int, Mapping[str, Any]] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    restored_components: frozenset[CheckpointComponent] = frozenset()
+    reset_components: frozenset[CheckpointComponent] = frozenset()
+
+    def __post_init__(self) -> None:
+        if isinstance(self.epoch, bool) or not isinstance(self.epoch, int) or self.epoch < -1:
+            raise ValueError("restored epoch must be an integer >= -1")
+        for name in ("optimizer_step", "global_step"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"restored {name} must be a non-negative integer or None")
+        if not isinstance(self.stopped_early, bool):
+            raise ValueError("restored stopped_early must be a boolean")
+        for name in ("optimizer_state_dict", "scheduler_state_dict"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, Mapping):
+                raise TypeError(f"{name} must be a mapping or None")
+        if not isinstance(self.callback_state_dicts, Mapping) or any(
+            isinstance(index, bool)
+            or not isinstance(index, int)
+            or index < 0
+            or not isinstance(state, Mapping)
+            for index, state in self.callback_state_dicts.items()
+        ):
+            raise TypeError(
+                "callback_state_dicts must map non-negative callback indices to mappings"
+            )
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("checkpoint restore metadata must be a mapping")
+        if not isinstance(self.restored_components, frozenset) or not isinstance(
+            self.reset_components,
+            frozenset,
+        ):
+            raise TypeError("restored and reset components must be frozensets")
+        invalid_components = (
+            self.restored_components | self.reset_components
+        ).difference(_CHECKPOINT_COMPONENTS)
+        if invalid_components:
+            raise ValueError(f"unsupported checkpoint components: {invalid_components}")
+        overlap = self.restored_components & self.reset_components
+        if overlap:
+            raise ValueError(f"checkpoint components cannot be restored and reset: {overlap}")
 
 
 @dataclass(frozen=True)
@@ -40,6 +183,22 @@ class CheckpointArtifact:
     writer: Callable[[Path], object]
     mode: int | None = 0o600
     preserve_permissions: bool = True
+    role: CheckpointRole = "epoch"
+    epoch: int = -1
+
+
+@dataclass(frozen=True)
+class TrainerCheckpointWriters:
+    """Project serializers closed over one immutable checkpoint snapshot."""
+
+    resumable: Callable[[Path], object]
+    best: Callable[[Path], object] | None = None
+
+    def __post_init__(self) -> None:
+        if not callable(self.resumable):
+            raise TypeError("resumable checkpoint writer must be callable")
+        if self.best is not None and not callable(self.best):
+            raise TypeError("best checkpoint writer must be callable or None")
 
 
 @dataclass(frozen=True)
@@ -53,10 +212,76 @@ class CheckpointPlan:
 
 @dataclass(frozen=True)
 class CheckpointPublication:
-    """Paths committed and retired by one completed checkpoint plan."""
+    """Artifact receipts committed and paths retired by one completed plan."""
 
-    published: tuple[Path, ...]
+    published: tuple[PublishedCheckpoint, ...]
     retired: tuple[Path, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedCheckpoint:
+    """Identity and exact-byte provenance for one committed checkpoint artifact."""
+
+    path: Path
+    role: CheckpointRole
+    epoch: int
+    size_bytes: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if self.role not in {"epoch", "latest", "best"}:
+            raise ValueError("checkpoint role must be 'epoch', 'latest', or 'best'")
+        if isinstance(self.epoch, bool) or not isinstance(self.epoch, int) or self.epoch < -1:
+            raise ValueError("published checkpoint epoch must be an integer >= -1")
+        if (
+            isinstance(self.size_bytes, bool)
+            or not isinstance(self.size_bytes, int)
+            or self.size_bytes < 0
+        ):
+            raise ValueError("published checkpoint size_bytes must be non-negative")
+        if len(self.sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.sha256
+        ):
+            raise ValueError("published checkpoint sha256 must be lowercase hexadecimal")
+
+
+@dataclass(frozen=True, slots=True)
+class TrainerCheckpointContext:
+    """Completed-epoch inputs supplied to a project checkpoint policy."""
+
+    epoch: int
+    global_step: int
+    optimizer_step: int
+    stopped_early: bool
+    training_metrics: Mapping[str, float]
+    validation_metrics: Mapping[str, float] | None
+    reason: CheckpointReason = "scheduled"
+    restore: TrainerCheckpointRestore | None = None
+
+
+class TrainerCheckpointPolicy(Protocol):
+    """Retain project checkpoint meaning behind Mammoth trainer mechanics."""
+
+    def inspect(
+        self,
+        path: Path,
+    ) -> CheckpointInspection:
+        """Inspect project metadata and recommend generic restore actions."""
+        ...
+
+    def restore(
+        self,
+        path: Path,
+        *,
+        device: torch.device,
+        options: RestoreOptions,
+    ) -> TrainerCheckpointRestore:
+        """Restore project objects and return generic trainer coordinates."""
+        ...
+
+    def capture(self, context: TrainerCheckpointContext) -> TrainerCheckpointWriters:
+        """Capture immutable project state and return its two serializers."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -101,6 +326,11 @@ class StateRegistry:
         """Snapshot every registered object by stable name."""
         return {name: value.state_dict() for name, value in self._objects.items()}
 
+    @property
+    def names(self) -> frozenset[str]:
+        """Return the registered state names used by checkpoint selection."""
+        return frozenset(self._objects)
+
     def load_state_dict(self, state: Mapping[str, Any], *, strict: bool = True) -> None:
         """Restore registered objects and optionally reject missing or extra names."""
         missing = sorted(set(self._objects).difference(state))
@@ -137,6 +367,13 @@ class AsyncCheckpointPublisher:
             self._discard_completed()
             return len(self._pending)
 
+    def wait_for_submission_slot(self) -> None:
+        """Apply queue backpressure before a caller captures its next snapshot."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("checkpoint publisher is closed")
+            self._await_submission_slot()
+
     def publish(self, path: Path, payload: Mapping[str, Any]) -> Future[Path]:
         """Clone state to CPU and submit one bounded atomic publication."""
         with self._lock:
@@ -145,6 +382,30 @@ class AsyncCheckpointPublisher:
             self._await_submission_slot()
             snapshot = snapshot_to_cpu(payload)
             future = self._executor.submit(publish_torch_payload, Path(path), snapshot)
+            self._pending.append(future)
+            return future
+
+    def publish_with_receipt(
+        self,
+        path: Path,
+        payload: Mapping[str, Any],
+        *,
+        role: CheckpointRole,
+        epoch: int,
+    ) -> Future[CheckpointPublication]:
+        """Publish one generic payload and report its exact committed bytes."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("checkpoint publisher is closed")
+            self._await_submission_slot()
+            snapshot = snapshot_to_cpu(payload)
+            future = self._executor.submit(
+                publish_torch_payload_with_receipt,
+                Path(path),
+                snapshot,
+                role=role,
+                epoch=epoch,
+            )
             self._pending.append(future)
             return future
 
@@ -239,6 +500,14 @@ def validate_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPlan:
             raise ValueError(f"duplicate checkpoint publication target: {destination}")
         if not callable(artifact.writer):
             raise TypeError("checkpoint artifact writer must be callable")
+        if artifact.role not in {"epoch", "latest", "best"}:
+            raise ValueError("checkpoint artifact role must be 'epoch', 'latest', or 'best'")
+        if (
+            isinstance(artifact.epoch, bool)
+            or not isinstance(artifact.epoch, int)
+            or artifact.epoch < -1
+        ):
+            raise ValueError("checkpoint artifact epoch must be an integer >= -1")
         if artifact.mode is not None and (
             isinstance(artifact.mode, bool)
             or not isinstance(artifact.mode, int)
@@ -252,6 +521,8 @@ def validate_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPlan:
             CheckpointArtifact(
                 destination=resolved,
                 writer=artifact.writer,
+                role=artifact.role,
+                epoch=artifact.epoch,
                 mode=artifact.mode,
                 preserve_permissions=artifact.preserve_permissions,
             )
@@ -288,6 +559,79 @@ def validate_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPlan:
     )
 
 
+def build_trainer_checkpoint_plan(
+    checkpoint_root: Path,
+    *,
+    epoch: int,
+    save_policy: CheckpointSavePolicy,
+    writers: TrainerCheckpointWriters,
+    save_resumable: bool,
+    save_best: bool,
+) -> CheckpointPlan:
+    """Build Mammoth-selected names, ordering, and retirement for one capture."""
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < -1:
+        raise ValueError("checkpoint epoch must be an integer >= -1")
+    if not isinstance(save_policy, CheckpointSavePolicy):
+        raise TypeError("save_policy must be CheckpointSavePolicy")
+    if not isinstance(writers, TrainerCheckpointWriters):
+        raise TypeError("writers must be TrainerCheckpointWriters")
+    if not isinstance(save_resumable, bool) or not isinstance(save_best, bool):
+        raise TypeError("checkpoint selection flags must be booleans")
+    if not save_resumable and not save_best:
+        raise ValueError("checkpoint selection must include a resumable or best artifact")
+    if save_best and writers.best is None:
+        raise ValueError("save_best requires a project best-checkpoint writer")
+
+    root = Path(checkpoint_root)
+    artifacts: list[CheckpointArtifact] = []
+    if save_best:
+        assert writers.best is not None
+        artifacts.append(
+            CheckpointArtifact(
+                destination=root / "best.safetensors",
+                writer=writers.best,
+                role="best",
+                epoch=epoch,
+            )
+        )
+
+    retirements: tuple[Path, ...] = ()
+    if save_resumable:
+        prefix = "epoch_" if save_policy.mode == "all" else "latest_epoch_"
+        destination = root / f"{prefix}{epoch}.pt"
+        artifacts.append(
+            CheckpointArtifact(
+                destination=destination,
+                writer=writers.resumable,
+                role="epoch" if save_policy.mode == "all" else "latest",
+                epoch=epoch,
+            )
+        )
+        if save_policy.mode == "latest":
+            retirements = tuple(
+                path
+                for path in sorted(root.glob("latest_epoch_*.pt"))
+                if path != destination and _latest_checkpoint_epoch(path) is not None
+            )
+
+    return CheckpointPlan(
+        checkpoint_root=root,
+        artifacts=tuple(artifacts),
+        retire_after_commit=retirements,
+    )
+
+
+def _latest_checkpoint_epoch(path: Path) -> int | None:
+    """Parse one Mammoth-owned latest-checkpoint filename."""
+    if path.suffix != ".pt" or not path.stem.startswith("latest_epoch_"):
+        return None
+    try:
+        epoch = int(path.stem.removeprefix("latest_epoch_"))
+    except ValueError:
+        return None
+    return epoch if epoch >= -1 else None
+
+
 def resolve_confined_path(root: Path, path: Path, *, role: str) -> Path:
     """Resolve one target without following its final path component."""
     resolved = path.parent.resolve() / path.name
@@ -317,6 +661,7 @@ def anchor_checkpoint_plan(plan: CheckpointPlan) -> _AnchoredCheckpointPlan:
 def publish_anchored_checkpoint_plan(plan: _AnchoredCheckpointPlan) -> CheckpointPublication:
     """Publish one plan without rebasing its submitted root identity."""
     prepared: list[PreparedArtifact] = []
+    receipts: list[PublishedCheckpoint] = []
     committed_count = 0
     try:
         for artifact in plan.artifacts:
@@ -333,16 +678,16 @@ def publish_anchored_checkpoint_plan(plan: _AnchoredCheckpointPlan) -> Checkpoin
                     directory_descriptor=directory_descriptor,
                     mode=artifact.mode,
                     preserve_permissions=artifact.preserve_permissions,
+                    inspect_serialized=receipt_inspector(artifact, receipts),
                 )
             )
-        published: list[Path] = []
         for prepared_artifact in prepared:
             ensure_confined_path_unchanged(
                 plan.checkpoint_root,
                 prepared_artifact.destination,
                 role="publication",
             )
-            published.append(publish_prepared_artifact(prepared_artifact))
+            publish_prepared_artifact(prepared_artifact)
             committed_count += 1
 
         retired: list[Path] = []
@@ -353,10 +698,52 @@ def publish_anchored_checkpoint_plan(plan: _AnchoredCheckpointPlan) -> Checkpoin
                 root_identity=plan.root_identity,
             ):
                 retired.append(path)
-        return CheckpointPublication(published=tuple(published), retired=tuple(retired))
+        return CheckpointPublication(published=tuple(receipts), retired=tuple(retired))
     finally:
         for prepared_artifact in prepared[committed_count:]:
             discard_prepared_artifact(prepared_artifact)
+
+
+def receipt_inspector(
+    artifact: CheckpointArtifact,
+    receipts: list[PublishedCheckpoint],
+) -> Callable[[int], object]:
+    """Capture validated regular-file bytes before final permissions and rename."""
+
+    def inspect(serialized_descriptor: int) -> None:
+        receipts.append(
+            checkpoint_receipt_for_descriptor(
+                serialized_descriptor,
+                destination=artifact.destination,
+                role=artifact.role,
+                epoch=artifact.epoch,
+            )
+        )
+
+    return inspect
+
+
+def checkpoint_receipt_for_descriptor(
+    descriptor: int,
+    *,
+    destination: Path,
+    role: CheckpointRole,
+    epoch: int,
+) -> PublishedCheckpoint:
+    """Hash a validated open artifact before permissions can prevent reading."""
+    digest = hashlib.sha256()
+    size_bytes = 0
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while chunk := os.read(descriptor, 1024 * 1024):
+        size_bytes += len(chunk)
+        digest.update(chunk)
+    return PublishedCheckpoint(
+        path=destination,
+        role=role,
+        epoch=epoch,
+        size_bytes=size_bytes,
+        sha256=digest.hexdigest(),
+    )
 
 
 def retire_confined_path(
@@ -530,6 +917,16 @@ def restore_checkpoint(
     map_location: str | torch.device = "cpu",
 ) -> None:
     """Load one Mammoth checkpoint into an existing registry."""
+    state = load_checkpoint_state(path, map_location=map_location)
+    registry.load_state_dict(state, strict=strict)
+
+
+def load_checkpoint_state(
+    path: Path,
+    *,
+    map_location: str | torch.device = "cpu",
+) -> Mapping[str, Any]:
+    """Load and validate one Mammoth registered-state checkpoint payload."""
     payload = torch.load(Path(path), map_location=map_location, weights_only=True)
     if not isinstance(payload, Mapping):
         raise ValueError("Mammoth checkpoint must contain a mapping")
@@ -540,7 +937,7 @@ def restore_checkpoint(
     state = payload.get("state")
     if not isinstance(state, Mapping):
         raise ValueError("Mammoth checkpoint state must be a mapping")
-    registry.load_state_dict(state, strict=strict)
+    return state
 
 
 def snapshot_to_cpu(value: Any) -> Any:
@@ -559,3 +956,32 @@ def snapshot_to_cpu(value: Any) -> Any:
 def publish_torch_payload(path: Path, payload: Mapping[str, Any]) -> Path:
     """Serialize a snapshot through the core same-directory atomic publisher."""
     return atomic_publish(path, lambda temporary: torch.save(payload, temporary))
+
+
+def publish_torch_payload_with_receipt(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    role: CheckpointRole,
+    epoch: int,
+) -> CheckpointPublication:
+    """Atomically publish one generic payload with pre-rename byte provenance."""
+    destination = Path(path).absolute()
+    receipt: PublishedCheckpoint | None = None
+
+    def inspect(serialized_descriptor: int) -> None:
+        nonlocal receipt
+        receipt = checkpoint_receipt_for_descriptor(
+            serialized_descriptor,
+            destination=destination,
+            role=role,
+            epoch=epoch,
+        )
+
+    atomic_publish(
+        destination,
+        lambda temporary: torch.save(payload, temporary),
+        inspect_serialized=inspect,
+    )
+    assert receipt is not None
+    return CheckpointPublication(published=(receipt,), retired=())

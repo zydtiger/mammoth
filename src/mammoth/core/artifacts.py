@@ -92,17 +92,42 @@ def atomic_write_json(
     return atomic_write_text(Path(path), f"{serialized}\n", mode=mode)
 
 
-def atomic_publish(path: Path, writer: Callable[[Path], object]) -> Path:
-    """Publish a caller-written opaque file by same-directory atomic replace."""
+def atomic_publish(
+    path: Path,
+    writer: Callable[[Path], object],
+    *,
+    inspect_serialized: Callable[[int], object] | None = None,
+) -> Path:
+    """Publish a validated caller-written file by same-directory atomic replace."""
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     try:
         writer(temporary)
-        if not temporary.is_file():
+        try:
+            temporary_mode = os.lstat(temporary).st_mode
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"artifact writer did not create {temporary}"
+            ) from None
+        if not stat.S_ISREG(temporary_mode):
             raise FileNotFoundError(f"artifact writer did not create {temporary}")
-        with temporary.open("rb") as handle:
-            os.fsync(handle.fileno())
+        open_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        serialized_descriptor = os.open(temporary, open_flags)
+        try:
+            if not stat.S_ISREG(os.fstat(serialized_descriptor).st_mode):
+                raise FileNotFoundError(
+                    f"artifact writer did not create {temporary}"
+                )
+            if inspect_serialized is not None:
+                inspect_serialized(serialized_descriptor)
+            os.fsync(serialized_descriptor)
+        finally:
+            os.close(serialized_descriptor)
         os.replace(temporary, destination)
         sync_directory(destination.parent)
     except BaseException:
@@ -140,8 +165,9 @@ def prepare_artifact_in_directory(
     directory_descriptor: int,
     mode: int | None = 0o600,
     preserve_permissions: bool = True,
+    inspect_serialized: Callable[[int], object] | None = None,
 ) -> PreparedArtifact:
-    """Prepare an artifact while taking ownership of an opened parent directory."""
+    """Prepare and optionally inspect a validated artifact before final permissions."""
     try:
         validate_artifact_writer(writer, mode)
     except BaseException:
@@ -212,6 +238,8 @@ def prepare_artifact_in_directory(
                 raise FileNotFoundError(
                     f"artifact writer did not create a file for {destination}"
                 )
+            if inspect_serialized is not None:
+                inspect_serialized(serialized_descriptor)
             if mode is not None:
                 os.fchmod(serialized_descriptor, mode)
             os.fsync(serialized_descriptor)
