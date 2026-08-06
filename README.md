@@ -342,9 +342,15 @@ Use `strategy="single"` without `torchrun` for the corresponding local
 lifecycle. Project-specific GPU validation, concrete workload policy, and
 custom collectives stay in the consuming project.
 
-Projects with custom checkpoint formats can use the same bounded publisher
-without adopting Mammoth's checkpoint schema. A plan stages every artifact
-before committing its destinations in the declared order:
+Projects with custom checkpoint formats can pass a `TrainerCheckpointPolicy`
+that captures resumable and best-model writers, plus a
+`CheckpointSavePolicy(mode="latest", save_best=True, every_epochs=1)`.
+Mammoth then selects publication after validation, names standard checkpoint
+files, and applies retention while the project retains payload serialization.
+
+The lower-level bounded publisher remains available outside the trainer. A
+plan stages every artifact before committing its destinations in the declared
+order:
 
 ```python
 from mammoth.torch import (
@@ -366,7 +372,8 @@ with AsyncCheckpointPublisher(max_pending=1) as publisher:
     publisher.submit(plan)
 ```
 
-Serialization callbacks and retention choices remain project-owned. Ordered
+At this lower level, serialization callbacks and retention choices remain
+project-owned. Ordered
 replacement is crash-safe per file but is not a multi-file transaction, so a
 project should place its commit-marker artifact last. Mammoth gives each
 serializer a descriptor-anchored path inside a private staging directory and

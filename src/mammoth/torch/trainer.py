@@ -23,18 +23,21 @@ from torch.utils.data import DataLoader
 
 from mammoth.logging import RunObserver
 from mammoth.torch.batch import move_batch_to_device
-from mammoth.torch.callbacks import Callback
+from mammoth.torch.callbacks import Callback, EarlyStopping
 from mammoth.torch.checkpoint import (
     AsyncCheckpointPublisher,
     CheckpointComponent,
     CheckpointInspection,
     CheckpointReason,
+    CheckpointSavePolicy,
     RestoreOptions,
     Stateful,
     StateRegistry,
     TrainerCheckpointContext,
     TrainerCheckpointPolicy,
     TrainerCheckpointRestore,
+    TrainerCheckpointWriters,
+    build_trainer_checkpoint_plan,
     checkpoint_payload,
     load_checkpoint_state,
     snapshot_to_cpu,
@@ -234,15 +237,26 @@ class Trainer:
         accumulation_policy: AccumulationPolicy | None = None,
         checkpoint_dir: Path | None = None,
         checkpoint_policy: TrainerCheckpointPolicy | None = None,
+        checkpoint_save_policy: CheckpointSavePolicy | None = None,
         extra_state: Mapping[str, Stateful] | None = None,
         batch_mover: BatchMover | None = None,
         runtime: TorchExecutionRuntime | None = None,
     ) -> None:
         if (validation_loader is None) != (validation_step is None):
             raise ValueError("validation_loader and validation_step must be provided together")
-        if checkpoint_dir is not None and checkpoint_policy is not None:
+        if checkpoint_save_policy is not None and (
+            checkpoint_dir is None or checkpoint_policy is None
+        ):
             raise ValueError(
-                "checkpoint_dir and checkpoint_policy select different checkpoint formats"
+                "checkpoint_save_policy requires checkpoint_dir and checkpoint_policy"
+            )
+        if (
+            checkpoint_dir is not None
+            and checkpoint_policy is not None
+            and checkpoint_save_policy is None
+        ):
+            raise ValueError(
+                "project checkpoint publication requires checkpoint_save_policy"
             )
         self.config = config
         self.runtime = runtime
@@ -287,6 +301,19 @@ class Trainer:
         )
         self.observer = observer or runtime_observer or RunObserver()
         self.callbacks = tuple(callbacks)
+        early_stopping_callbacks = tuple(
+            callback for callback in self.callbacks if isinstance(callback, EarlyStopping)
+        )
+        if checkpoint_save_policy is not None and checkpoint_save_policy.save_best:
+            if validation_loader is None:
+                raise ValueError("save_best requires validation")
+            if len(early_stopping_callbacks) != 1:
+                raise ValueError(
+                    "save_best requires exactly one Mammoth EarlyStopping callback"
+                )
+        self._checkpoint_early_stopping = (
+            early_stopping_callbacks[0] if len(early_stopping_callbacks) == 1 else None
+        )
         self.optimizer_step_metrics = optimizer_step_metrics
         self.metric_specs = dict(metric_specs or {})
         self.train_metric_routes = dict(train_metric_routes or {})
@@ -298,6 +325,7 @@ class Trainer:
         )
         self.checkpoint_dir = None if checkpoint_dir is None else Path(checkpoint_dir)
         self.checkpoint_policy = checkpoint_policy
+        self.checkpoint_save_policy = checkpoint_save_policy
         self.batch_mover = batch_mover or self._default_batch_mover
         self.state = TrainerState()
         self.scaler = torch.GradScaler("cuda", enabled=config.precision == "fp16")
@@ -907,19 +935,41 @@ class Trainer:
             )
         scheduler.step(metrics[self.config.scheduler_monitor])
 
-    def should_checkpoint(self, epoch: int) -> bool:
-        """Return rank zero's authoritative checkpoint decision on every rank."""
-        every = self.config.checkpoint_every_epochs
-        local_decision = (
-            self.rank == 0
-            and (self.checkpoint_dir is not None or self.checkpoint_policy is not None)
-            and every is not None
-            and (epoch + 1) % every == 0
-        )
-        decisions = self.all_gather_object(local_decision if self.rank == 0 else None)
+    def checkpoint_selection(
+        self,
+        epoch: int,
+        validation_metrics: Mapping[str, float] | None,
+    ) -> tuple[bool, bool]:
+        """Return rank zero's resumable/best selection on every rank."""
+        local_selection: tuple[bool, bool] | None = None
+        if self.rank == 0:
+            if self.checkpoint_save_policy is not None:
+                policy = self.checkpoint_save_policy
+                save_resumable = (epoch + 1) % policy.every_epochs == 0
+                early_stopping = self._checkpoint_early_stopping
+                save_best = bool(
+                    policy.save_best
+                    and validation_metrics is not None
+                    and early_stopping is not None
+                    and early_stopping.improved
+                )
+                local_selection = (save_resumable, save_best)
+            else:
+                every = self.config.checkpoint_every_epochs
+                local_selection = (
+                    self.checkpoint_dir is not None
+                    and every is not None
+                    and (epoch + 1) % every == 0,
+                    False,
+                )
+        decisions = self.all_gather_object(local_selection)
         primary_decision = decisions[0]
-        if not isinstance(primary_decision, bool):
-            raise RuntimeError("rank zero returned an invalid checkpoint decision")
+        if (
+            not isinstance(primary_decision, tuple)
+            or len(primary_decision) != 2
+            or any(not isinstance(value, bool) for value in primary_decision)
+        ):
+            raise RuntimeError("rank zero returned an invalid checkpoint selection")
         return primary_decision
 
     def publish_checkpoint_if_due(
@@ -929,7 +979,11 @@ class Trainer:
         validation_metrics: Mapping[str, float] | None,
     ) -> None:
         """Publish on rank zero and propagate planning or submission failures."""
-        if not self.should_checkpoint(epoch):
+        save_resumable, save_best = self.checkpoint_selection(
+            epoch,
+            validation_metrics,
+        )
+        if not save_resumable and not save_best:
             return
         local_error: BaseException | None = None
         with self.observer.periodic_heartbeats(
@@ -942,6 +996,8 @@ class Trainer:
                         epoch,
                         training_metrics,
                         validation_metrics,
+                        save_resumable=save_resumable,
+                        save_best=save_best,
                     )
                 except BaseException as error:
                     local_error = error
@@ -954,11 +1010,15 @@ class Trainer:
         validation_metrics: Mapping[str, float] | None,
         *,
         reason: CheckpointReason = "scheduled",
+        save_resumable: bool = True,
+        save_best: bool = False,
     ) -> None:
-        """Submit a project plan or the default registered-state snapshot."""
+        """Capture project state and submit Mammoth-selected artifacts."""
         if self.checkpoint_policy is not None:
+            if self.checkpoint_dir is None or self.checkpoint_save_policy is None:
+                raise RuntimeError("project checkpoint publication is not configured")
             self.publisher.wait_for_submission_slot()
-            plan = self.checkpoint_policy.plan(
+            writers = self.checkpoint_policy.capture(
                 TrainerCheckpointContext(
                     epoch=epoch,
                     global_step=self.state.global_step,
@@ -972,8 +1032,19 @@ class Trainer:
                     restore=self._checkpoint_restore,
                 )
             )
-            if plan is not None:
-                self.publisher.submit(plan)
+            if not isinstance(writers, TrainerCheckpointWriters):
+                raise TypeError(
+                    "checkpoint policy must return TrainerCheckpointWriters"
+                )
+            plan = build_trainer_checkpoint_plan(
+                self.checkpoint_dir,
+                epoch=epoch,
+                save_policy=self.checkpoint_save_policy,
+                writers=writers,
+                save_resumable=save_resumable,
+                save_best=save_best,
+            )
+            self.publisher.submit(plan)
             return
 
         assert self.checkpoint_dir is not None
@@ -999,9 +1070,7 @@ class Trainer:
         """Force one synchronous checkpoint publication on rank zero."""
         if reason not in {"manual", "interrupted"}:
             raise ValueError("forced checkpoint reason must be 'manual' or 'interrupted'")
-        local_available = self.rank == 0 and (
-            self.checkpoint_dir is not None or self.checkpoint_policy is not None
-        )
+        local_available = self.rank == 0 and self.checkpoint_publication_configured()
         decisions = self.all_gather_object(local_available if self.rank == 0 else None)
         if not isinstance(decisions[0], bool):
             raise RuntimeError("rank zero returned an invalid checkpoint availability decision")
@@ -1015,6 +1084,8 @@ class Trainer:
                     training_metrics or {},
                     validation_metrics,
                     reason=reason,
+                    save_resumable=True,
+                    save_best=False,
                 )
             except BaseException as error:
                 local_error = error
@@ -1023,9 +1094,7 @@ class Trainer:
 
     def publish_interrupted_checkpoint(self) -> None:
         """Publish rank zero's interruption snapshot without entering collectives."""
-        if self.rank != 0 or (
-            self.checkpoint_dir is None and self.checkpoint_policy is None
-        ):
+        if self.rank != 0 or not self.checkpoint_publication_configured():
             return
         self.publish_checkpoint(
             self.state.epoch,
@@ -1036,6 +1105,14 @@ class Trainer:
         self.flush_local_checkpoints(
             message="Interrupted checkpoint publication is still active."
         )
+
+    def checkpoint_publication_configured(self) -> bool:
+        """Return whether this trainer has a complete checkpoint save contract."""
+        if self.checkpoint_dir is None:
+            return False
+        if self.checkpoint_policy is None:
+            return True
+        return self.checkpoint_save_policy is not None
 
     def inspect_checkpoint(self, path: Path) -> CheckpointInspection:
         """Inspect one checkpoint on rank zero and share the typed result."""

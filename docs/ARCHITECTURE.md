@@ -216,10 +216,10 @@ Mammoth's validation-metric early-stopping callback owns the generic best-value
 and consecutive-failure state machine and stops on the `patience`-th failed
 check. `TrainerState.stopped_early` is the sole persisted terminal decision;
 `fit()` returns without touching loaders, callbacks, or optimizer state when a
-restored state is already terminal. The callback exposes a transient
-`improved` signal so a project checkpoint policy can publish its own best-model
-format, while the project continues to choose the metric, mode, patience, and
-minimum delta.
+restored state is already terminal. The trainer reads the callback's transient
+`improved` signal after validation to select best-model publication, while the
+project continues to choose the metric, mode, patience, minimum delta, and
+serializer.
 
 `StepOutput` carries the optional loss, already-computed scalar metrics, and
 opaque updates for registered stateful metrics. Mammoth reduces configured
@@ -272,11 +272,11 @@ artifact mechanics.
 
 Mammoth's optional PyTorch layer provides two checkpoint paths. The generic
 trainer may use Mammoth's versioned registered-state payload and restore it
-directly. Projects with established checkpoint schemas instead submit ordered
-publication plans containing opaque serializer callbacks and exact retirement
-paths.
+directly. Projects with established checkpoint schemas instead capture one
+immutable snapshot and provide resumable and best-model serializers.
 
-A trainer checkpoint policy chooses when a completed epoch produces a plan and
+A trainer checkpoint policy captures project state when Mammoth's
+`CheckpointSavePolicy` selects resumable or best-model publication and
 translates its own format into Mammoth's typed restore contract. The trainer
 first calls the policy once on rank zero through `inspect_checkpoint()`, then
 shares its `CheckpointInspection`, including the immutable `RestoreOptions`
@@ -290,8 +290,7 @@ and metadata to agree across DDP ranks before training resumes. Projects may
 also request a synchronized manual publication. Rank zero publishes an
 interruption snapshot without entering collectives that could deadlock when a
 signal reaches only one process. The checkpoint context identifies the reason
-and exposes the prior restore report while the project still selects the
-artifact plan.
+and exposes the prior restore report to the project serializer.
 
 `Trainer.fit()` publishes that interruption plan automatically when
 `KeyboardInterrupt` escapes the loop, then preserves and re-raises the original
@@ -302,13 +301,21 @@ ordinary failure; rank zero can therefore publish while peers perform only
 local checkpoint shutdown.
 
 The trainer applies publisher backpressure before asking a project checkpoint
-policy to capture state or select retention paths. The publisher snapshots or
-receives caller-owned immutable state before background work, bounds pending
+policy to capture state. `CheckpointSavePolicy` selects `all` or `latest`
+resumable retention, periodic cadence, and optional best-model publication.
+Mammoth names zero-based `epoch_<N>.pt`, `latest_epoch_<N>.pt`, and
+`best.safetensors`; best publication follows `EarlyStopping.improved` on every
+validation epoch and is independent of resumable cadence. Manual and
+interrupted saves publish resumable state only. The publisher receives
+caller-owned immutable state before background work, bounds pending
 publications, prepares and syncs every artifact before the first commit,
-replaces destinations in declared order, and retires
-old artifacts only after every commit succeeds. Paths are confined to the
-declared checkpoint root. Mammoth does not choose filenames, serializers,
-payload fields, compatibility rules, best-model policy, or retention targets.
+replaces best before the resumable commit marker, and retires old latest files
+only after every commit succeeds. Paths are confined to the declared
+checkpoint root. Projects retain serializers, payload fields, compatibility
+rules, and restore policy.
+
+The lower-level ordered-plan API remains available for non-trainer artifact
+publication where callers need custom names and retirement targets.
 
 Atomic replacement applies to each file independently. An interruption between
 ordered replacements may expose a prefix of the plan, so the caller places its

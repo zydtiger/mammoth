@@ -191,6 +191,8 @@ Extend the optional PyTorch checkpoint layer for projects whose checkpoint
 meaning remains local but whose publication mechanics are reusable:
 
 - caller-owned opaque serializers and payloads;
+- trainer-owned all/latest retention, standard naming, and validation-driven
+  best-model selection;
 - preparation of every artifact before ordered atomic replacement;
 - exact post-commit retirement confined to the checkpoint root;
 - bounded asynchronous publication with explicit failure propagation; and

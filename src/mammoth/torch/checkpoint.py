@@ -31,6 +31,7 @@ from mammoth.core.artifacts import (
 
 CHECKPOINT_SCHEMA_VERSION = 1
 CheckpointReason = Literal["scheduled", "manual", "interrupted"]
+CheckpointMode = Literal["all", "latest"]
 CheckpointComponent = Literal[
     "model",
     "optimizer",
@@ -54,6 +55,27 @@ _CHECKPOINT_COMPONENTS = frozenset(
         "project",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointSavePolicy:
+    """Select generic resumable retention and metric-best publication."""
+
+    mode: CheckpointMode = "latest"
+    save_best: bool = True
+    every_epochs: int = 1
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"all", "latest"}:
+            raise ValueError("checkpoint mode must be 'all' or 'latest'")
+        if not isinstance(self.save_best, bool):
+            raise ValueError("checkpoint save_best must be a boolean")
+        if (
+            isinstance(self.every_epochs, bool)
+            or not isinstance(self.every_epochs, int)
+            or self.every_epochs < 1
+        ):
+            raise ValueError("checkpoint every_epochs must be a positive integer")
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +184,20 @@ class CheckpointArtifact:
 
 
 @dataclass(frozen=True)
+class TrainerCheckpointWriters:
+    """Project serializers closed over one immutable checkpoint snapshot."""
+
+    resumable: Callable[[Path], object]
+    best: Callable[[Path], object] | None = None
+
+    def __post_init__(self) -> None:
+        if not callable(self.resumable):
+            raise TypeError("resumable checkpoint writer must be callable")
+        if self.best is not None and not callable(self.best):
+            raise TypeError("best checkpoint writer must be callable or None")
+
+
+@dataclass(frozen=True)
 class CheckpointPlan:
     """Ordered local checkpoint publication with exact post-commit retirement."""
 
@@ -212,8 +248,8 @@ class TrainerCheckpointPolicy(Protocol):
         """Restore project objects and return generic trainer coordinates."""
         ...
 
-    def plan(self, context: TrainerCheckpointContext) -> CheckpointPlan | None:
-        """Return an immutable ordered publication plan or skip this epoch."""
+    def capture(self, context: TrainerCheckpointContext) -> TrainerCheckpointWriters:
+        """Capture immutable project state and return its two serializers."""
         ...
 
 
@@ -456,6 +492,75 @@ def validate_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPlan:
         artifacts=tuple(normalized_artifacts),
         retire_after_commit=tuple(normalized_retirements),
     )
+
+
+def build_trainer_checkpoint_plan(
+    checkpoint_root: Path,
+    *,
+    epoch: int,
+    save_policy: CheckpointSavePolicy,
+    writers: TrainerCheckpointWriters,
+    save_resumable: bool,
+    save_best: bool,
+) -> CheckpointPlan:
+    """Build Mammoth-selected names, ordering, and retirement for one capture."""
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < -1:
+        raise ValueError("checkpoint epoch must be an integer >= -1")
+    if not isinstance(save_policy, CheckpointSavePolicy):
+        raise TypeError("save_policy must be CheckpointSavePolicy")
+    if not isinstance(writers, TrainerCheckpointWriters):
+        raise TypeError("writers must be TrainerCheckpointWriters")
+    if not isinstance(save_resumable, bool) or not isinstance(save_best, bool):
+        raise TypeError("checkpoint selection flags must be booleans")
+    if not save_resumable and not save_best:
+        raise ValueError("checkpoint selection must include a resumable or best artifact")
+    if save_best and writers.best is None:
+        raise ValueError("save_best requires a project best-checkpoint writer")
+
+    root = Path(checkpoint_root)
+    artifacts: list[CheckpointArtifact] = []
+    if save_best:
+        assert writers.best is not None
+        artifacts.append(
+            CheckpointArtifact(
+                destination=root / "best.safetensors",
+                writer=writers.best,
+            )
+        )
+
+    retirements: tuple[Path, ...] = ()
+    if save_resumable:
+        prefix = "epoch_" if save_policy.mode == "all" else "latest_epoch_"
+        destination = root / f"{prefix}{epoch}.pt"
+        artifacts.append(
+            CheckpointArtifact(
+                destination=destination,
+                writer=writers.resumable,
+            )
+        )
+        if save_policy.mode == "latest":
+            retirements = tuple(
+                path
+                for path in sorted(root.glob("latest_epoch_*.pt"))
+                if path != destination and _latest_checkpoint_epoch(path) is not None
+            )
+
+    return CheckpointPlan(
+        checkpoint_root=root,
+        artifacts=tuple(artifacts),
+        retire_after_commit=retirements,
+    )
+
+
+def _latest_checkpoint_epoch(path: Path) -> int | None:
+    """Parse one Mammoth-owned latest-checkpoint filename."""
+    if path.suffix != ".pt" or not path.stem.startswith("latest_epoch_"):
+        return None
+    try:
+        epoch = int(path.stem.removeprefix("latest_epoch_"))
+    except ValueError:
+        return None
+    return epoch if epoch >= -1 else None
 
 
 def resolve_confined_path(root: Path, path: Path, *, role: str) -> Path:

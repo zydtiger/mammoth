@@ -38,6 +38,7 @@ from mammoth.torch import (
     CheckpointInspection,
     CheckpointPlan,
     CheckpointPublication,
+    CheckpointSavePolicy,
     EarlyStopping,
     MetricAccumulator,
     MetricRoute,
@@ -52,6 +53,7 @@ from mammoth.torch import (
     Trainer,
     TrainerCheckpointContext,
     TrainerCheckpointRestore,
+    TrainerCheckpointWriters,
     TrainerConfig,
     TrainerState,
     UniformAccumulationPolicy,
@@ -458,19 +460,16 @@ class RecordingCheckpointPolicy:
         del path, device, options
         return TrainerCheckpointRestore(epoch=2, global_step=7, optimizer_step=3)
 
-    def plan(self, context: TrainerCheckpointContext) -> CheckpointPlan:
+    def capture(self, context: TrainerCheckpointContext) -> TrainerCheckpointWriters:
         self.contexts.append(context)
-        destination = self.checkpoint_dir / "project.checkpoint"
-        return CheckpointPlan(
-            checkpoint_root=self.checkpoint_dir,
-            artifacts=(
-                CheckpointArtifact(
-                    destination=destination,
-                    writer=lambda path: path.write_text(
-                        f"epoch={context.epoch}\n",
-                        encoding="utf-8",
-                    ),
-                ),
+        return TrainerCheckpointWriters(
+            resumable=lambda path: path.write_text(
+                f"epoch={context.epoch}\n",
+                encoding="utf-8",
+            ),
+            best=lambda path: path.write_text(
+                f"best_epoch={context.epoch}\n",
+                encoding="utf-8",
             ),
         )
 
@@ -506,9 +505,9 @@ class InitialCheckpointPolicy(RecordingCheckpointPolicy):
 class SlowRecordingCheckpointPolicy(RecordingCheckpointPolicy):
     """Delay checkpoint planning long enough to exercise periodic heartbeats."""
 
-    def plan(self, context: TrainerCheckpointContext) -> CheckpointPlan:
+    def capture(self, context: TrainerCheckpointContext) -> TrainerCheckpointWriters:
         time.sleep(0.05)
-        return super().plan(context)
+        return super().capture(context)
 
 
 class RankFailingRestorePolicy(RecordingCheckpointPolicy):
@@ -878,7 +877,9 @@ def _distributed_interrupt_worker(
                     strategy="ddp",
                     checkpoint_every_epochs=None,
                 ),
+                checkpoint_dir=Path(checkpoint_dir),
                 checkpoint_policy=policy,
+                checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
                 runtime=runtime,
             ) as trainer:
                 try:
@@ -2112,7 +2113,9 @@ def test_checkpoint_heartbeat_does_not_reactivate_completed_epoch_task(
         train_loader=loader,
         train_step=regression_step,
         config=TrainerConfig(epochs=1, device="cpu"),
+        checkpoint_dir=tmp_path / "slow-checkpoint",
         checkpoint_policy=policy,
+        checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
         observer=observer,
     ) as trainer:
         trainer.fit()
@@ -2140,11 +2143,13 @@ def test_project_checkpoint_policy_uses_ordered_publication_and_restore(
         train_loader=loader,
         train_step=regression_step,
         config=TrainerConfig(epochs=1, device="cpu"),
+        checkpoint_dir=tmp_path / "project-checkpoints",
         checkpoint_policy=policy,
+        checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
     ) as trainer:
         trainer.fit()
 
-    assert (tmp_path / "project-checkpoints" / "project.checkpoint").read_text(
+    assert (tmp_path / "project-checkpoints" / "latest_epoch_0.pt").read_text(
         encoding="utf-8"
     ) == "epoch=0\n"
     assert len(policy.contexts) == 1
@@ -2167,6 +2172,220 @@ def test_project_checkpoint_policy_uses_ordered_publication_and_restore(
             "optimizer_step": 3,
             "stopped_early": False,
         }
+
+
+def test_checkpoint_save_policy_validates_configuration() -> None:
+    for mode in ("", "newest", 1):
+        with pytest.raises(ValueError, match="checkpoint mode"):
+            CheckpointSavePolicy(mode=cast(Any, mode))
+    for every_epochs in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="positive integer"):
+            CheckpointSavePolicy(every_epochs=cast(Any, every_epochs))
+    with pytest.raises(ValueError, match="boolean"):
+        CheckpointSavePolicy(save_best=cast(Any, 1))
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("all", {"epoch_0.pt", "epoch_1.pt"}),
+        ("latest", {"latest_epoch_1.pt"}),
+    ],
+)
+def test_checkpoint_save_policy_owns_resumable_retention(
+    tmp_path: Path,
+    mode: Literal["all", "latest"],
+    expected: set[str],
+) -> None:
+    policy = CheckpointSavePolicy(mode=mode, save_best=False)
+    for epoch in range(2):
+        writers = TrainerCheckpointWriters(
+            resumable=lambda path, epoch=epoch: path.write_text(
+                str(epoch), encoding="utf-8"
+            )
+        )
+        publish_checkpoint_plan(
+            checkpoint_module.build_trainer_checkpoint_plan(
+                tmp_path,
+                epoch=epoch,
+                save_policy=policy,
+                writers=writers,
+                save_resumable=True,
+                save_best=False,
+            )
+        )
+
+    assert {path.name for path in tmp_path.glob("*.pt")} == expected
+
+
+def test_failed_latest_write_preserves_previous_checkpoint(tmp_path: Path) -> None:
+    previous = tmp_path / "latest_epoch_0.pt"
+    previous.write_text("previous", encoding="utf-8")
+
+    def fail_writer(path: Path) -> None:
+        del path
+        raise RuntimeError("serialization failed")
+
+    plan = checkpoint_module.build_trainer_checkpoint_plan(
+        tmp_path,
+        epoch=1,
+        save_policy=CheckpointSavePolicy(save_best=False),
+        writers=TrainerCheckpointWriters(resumable=fail_writer),
+        save_resumable=True,
+        save_best=False,
+    )
+    with pytest.raises(RuntimeError, match="serialization failed"):
+        publish_checkpoint_plan(plan)
+
+    assert previous.read_text(encoding="utf-8") == "previous"
+    assert not (tmp_path / "latest_epoch_1.pt").exists()
+
+
+def test_best_checkpoint_follows_improvement_independent_of_cadence(
+    tmp_path: Path,
+) -> None:
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    values = (3.0, 2.0, 4.0)
+    policy = RecordingCheckpointPolicy(tmp_path)
+
+    def validation_step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del module, batch
+        return StepOutput(metrics={"score": values[context.epoch]})
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        validation_loader=loader,
+        validation_step=validation_step,
+        config=TrainerConfig(epochs=3, device="cpu"),
+        callbacks=(EarlyStopping("score", patience=3),),
+        checkpoint_dir=tmp_path,
+        checkpoint_policy=policy,
+        checkpoint_save_policy=CheckpointSavePolicy(every_epochs=3),
+    ) as trainer:
+        trainer.fit()
+
+    assert (tmp_path / "best.safetensors").read_text(encoding="utf-8") == (
+        "best_epoch=1\n"
+    )
+    assert (tmp_path / "latest_epoch_2.pt").read_text(encoding="utf-8") == (
+        "epoch=2\n"
+    )
+    assert [context.epoch for context in policy.contexts] == [0, 1, 2]
+
+
+def test_save_best_requires_one_early_stopping_callback(tmp_path: Path) -> None:
+    loader = DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+
+    def validation_step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del module, batch, context
+        return StepOutput(metrics={"score": 1.0})
+
+    with pytest.raises(ValueError, match="exactly one"):
+        Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=loader,
+            train_step=regression_step,
+            validation_loader=loader,
+            validation_step=validation_step,
+            config=TrainerConfig(epochs=1, device="cpu"),
+            checkpoint_dir=tmp_path,
+            checkpoint_policy=RecordingCheckpointPolicy(tmp_path),
+            checkpoint_save_policy=CheckpointSavePolicy(),
+        )
+
+    second_model = torch.nn.Linear(1, 1)
+    second_optimizer = torch.optim.SGD(second_model.parameters(), lr=0.0)
+    with pytest.raises(ValueError, match="exactly one"):
+        Trainer(
+            model=second_model,
+            optimizer=second_optimizer,
+            train_loader=loader,
+            train_step=regression_step,
+            validation_loader=loader,
+            validation_step=validation_step,
+            config=TrainerConfig(epochs=1, device="cpu"),
+            callbacks=(
+                EarlyStopping("score", patience=1),
+                EarlyStopping("score", patience=1),
+            ),
+            checkpoint_dir=tmp_path,
+            checkpoint_policy=RecordingCheckpointPolicy(tmp_path),
+            checkpoint_save_policy=CheckpointSavePolicy(),
+        )
+
+
+def test_save_best_can_be_disabled_without_validation_or_early_stopping(
+    tmp_path: Path,
+) -> None:
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(epochs=1, device="cpu"),
+        checkpoint_dir=tmp_path,
+        checkpoint_policy=RecordingCheckpointPolicy(tmp_path),
+        checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
+    ) as trainer:
+        trainer.fit()
+
+    assert (tmp_path / "latest_epoch_0.pt").is_file()
+    assert not (tmp_path / "best.safetensors").exists()
+
+
+def test_early_stopping_epoch_does_not_replace_best_checkpoint(tmp_path: Path) -> None:
+    loader = DataLoader(MappingDataset(), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    values = (1.0, 2.0)
+
+    def validation_step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del module, batch
+        return StepOutput(metrics={"score": values[context.epoch]})
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        validation_loader=loader,
+        validation_step=validation_step,
+        config=TrainerConfig(epochs=3, device="cpu"),
+        callbacks=(EarlyStopping("score", patience=1),),
+        checkpoint_dir=tmp_path,
+        checkpoint_policy=RecordingCheckpointPolicy(tmp_path),
+        checkpoint_save_policy=CheckpointSavePolicy(),
+    ) as trainer:
+        result = trainer.fit()
+
+    assert result.state.stopped_early
+    assert result.state.epoch == 1
+    assert (tmp_path / "best.safetensors").read_text(encoding="utf-8") == (
+        "best_epoch=0\n"
+    )
 
 
 def test_typed_checkpoint_inspection_selects_generic_restore_and_reset(
@@ -2400,19 +2619,25 @@ def test_forced_checkpoint_reports_interruption_reason(tmp_path: Path) -> None:
         train_loader=loader,
         train_step=regression_step,
         config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        checkpoint_dir=tmp_path / "project-checkpoints",
         checkpoint_policy=policy,
+        checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
     ) as trainer:
         trainer.publish_checkpoint_now(reason="interrupted")
 
     assert policy.contexts[-1].reason == "interrupted"
-    assert (tmp_path / "project-checkpoints" / "project.checkpoint").is_file()
+    assert (tmp_path / "project-checkpoints" / "latest_epoch_-1.pt").is_file()
 
 
 def test_fit_publishes_interrupted_checkpoint_before_reraising(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "interrupted-checkpoint"
+    checkpoint_dir.mkdir()
+    best_checkpoint = checkpoint_dir / "best.safetensors"
+    best_checkpoint.write_text("existing best", encoding="utf-8")
     loader = DataLoader(MappingDataset(), batch_size=2)
     model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
-    policy = RecordingCheckpointPolicy(tmp_path / "interrupted-checkpoint")
+    policy = RecordingCheckpointPolicy(checkpoint_dir)
 
     class InterruptingCallback(Callback):
         def on_train_start(self, state: TrainerState) -> None:
@@ -2425,7 +2650,9 @@ def test_fit_publishes_interrupted_checkpoint_before_reraising(tmp_path: Path) -
         train_loader=loader,
         train_step=regression_step,
         config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        checkpoint_dir=checkpoint_dir,
         checkpoint_policy=policy,
+        checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
         callbacks=(InterruptingCallback(),),
     ) as trainer, pytest.raises(KeyboardInterrupt, match="stop training"):
         trainer.all_gather_object = lambda value: pytest.fail(
@@ -2434,7 +2661,8 @@ def test_fit_publishes_interrupted_checkpoint_before_reraising(tmp_path: Path) -
         trainer.fit()
 
     assert [context.reason for context in policy.contexts] == ["interrupted"]
-    assert (tmp_path / "interrupted-checkpoint" / "project.checkpoint").is_file()
+    assert (checkpoint_dir / "latest_epoch_-1.pt").is_file()
+    assert best_checkpoint.read_text(encoding="utf-8") == "existing best"
 
 
 def test_ddp_interrupt_reaches_primary_checkpoint_policy(tmp_path: Path) -> None:
@@ -2446,7 +2674,7 @@ def test_ddp_interrupt_reaches_primary_checkpoint_policy(tmp_path: Path) -> None
     assert "stop distributed training" in results[1][2]
     assert results[0][3] == ["interrupted"]
     assert results[1][3] == []
-    assert (tmp_path / "interrupted-checkpoint" / "project.checkpoint").is_file()
+    assert (tmp_path / "interrupted-checkpoint" / "latest_epoch_-1.pt").is_file()
 
 
 def test_fit_can_disable_interrupted_checkpoint_publication(tmp_path: Path) -> None:
@@ -2474,7 +2702,9 @@ def test_fit_can_disable_interrupted_checkpoint_publication(tmp_path: Path) -> N
             checkpoint_every_epochs=None,
             checkpoint_on_interrupt=False,
         ),
+        checkpoint_dir=tmp_path / "disabled-interrupted-checkpoint",
         checkpoint_policy=policy,
+        checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
     ) as trainer, pytest.raises(KeyboardInterrupt, match="stop training"):
         trainer.fit()
 
@@ -2501,7 +2731,9 @@ def test_nonprimary_interruption_does_not_enter_checkpoint_collectives(
         train_loader=loader,
         train_step=regression_step,
         config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+        checkpoint_dir=tmp_path / "nonprimary-interrupted-checkpoint",
         checkpoint_policy=policy,
+        checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
         callbacks=(InterruptingCallback(),),
     ) as trainer, pytest.raises(KeyboardInterrupt, match="stop nonprimary training"):
         trainer.rank = 1
@@ -2590,9 +2822,8 @@ def test_project_checkpoint_policy_plans_after_publisher_backpressure(
     captures: list[int] = []
 
     class RetainingPolicy(RecordingCheckpointPolicy):
-        def plan(self, context: TrainerCheckpointContext) -> CheckpointPlan:
+        def capture(self, context: TrainerCheckpointContext) -> TrainerCheckpointWriters:
             captures.append(context.epoch)
-            destination = checkpoint_root / f"latest-{context.epoch}.pt"
 
             def writer(path: Path) -> None:
                 if context.epoch == 0:
@@ -2601,15 +2832,7 @@ def test_project_checkpoint_policy_plans_after_publisher_backpressure(
                         raise TimeoutError("test did not release checkpoint writer")
                 path.write_text(str(context.epoch), encoding="utf-8")
 
-            return CheckpointPlan(
-                checkpoint_root=checkpoint_root,
-                artifacts=(CheckpointArtifact(destination, writer),),
-                retire_after_commit=tuple(
-                    path
-                    for path in checkpoint_root.glob("latest-*.pt")
-                    if path != destination
-                ),
-            )
+            return TrainerCheckpointWriters(resumable=writer)
 
     loader = DataLoader(MappingDataset(), batch_size=2)
     model = torch.nn.Linear(1, 1)
@@ -2620,7 +2843,9 @@ def test_project_checkpoint_policy_plans_after_publisher_backpressure(
         train_loader=loader,
         train_step=regression_step,
         config=TrainerConfig(epochs=2, device="cpu"),
+        checkpoint_dir=checkpoint_root,
         checkpoint_policy=RetainingPolicy(checkpoint_root),
+        checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
     )
     errors: list[BaseException] = []
 
@@ -2643,7 +2868,9 @@ def test_project_checkpoint_policy_plans_after_publisher_backpressure(
     assert not worker.is_alive()
     assert errors == []
     assert captures == [0, 1]
-    assert [path.name for path in checkpoint_root.glob("latest-*.pt")] == ["latest-1.pt"]
+    assert [path.name for path in checkpoint_root.glob("latest_epoch_*.pt")] == [
+        "latest_epoch_1.pt"
+    ]
 
 
 def test_recursive_batch_transfer_preserves_common_container_structure() -> None:
