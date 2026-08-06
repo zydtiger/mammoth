@@ -23,6 +23,7 @@ import mammoth.torch.checkpoint as checkpoint_module
 import mammoth.torch.runtime as torch_runtime_module
 import mammoth.torch.trainer as trainer_module
 from mammoth.core import (
+    BoundedBackgroundPipeline,
     PreparedArtifact,
     claim_logical_run_lease,
     create_execution_context,
@@ -4876,6 +4877,7 @@ def test_execution_session_closes_owned_resources_before_runtime_in_reverse_orde
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     order: list[str] = []
+    release_pipeline = threading.Event()
     runtime, session = _create_test_execution_session(tmp_path, "owned-resource-order")
     sink = _RecordingSessionSink(order)
     original_logging_close = runtime.execution_logging.close
@@ -4887,6 +4889,7 @@ def test_execution_session_closes_owned_resources_before_runtime_in_reverse_orde
 
         def close(self) -> None:
             order.append("trainer-checkpoint-flush")
+            release_pipeline.set()
 
     def close_logging() -> None:
         order.append("execution-logging")
@@ -4902,6 +4905,17 @@ def test_execution_session_closes_owned_resources_before_runtime_in_reverse_orde
     monkeypatch.setattr(runtime, "close_process_group", lambda: order.append("process-group"))
 
     observer = session.create_observer((sink,))
+
+    def run_pipeline(value: str) -> str:
+        assert release_pipeline.wait(timeout=5.0)
+        order.append(value)
+        return value
+
+    pipeline = session.create_background_pipeline(
+        run_pipeline,
+        thread_name_prefix="test-session-pipeline",
+    )
+    pipeline.submit("background-pipeline")
     session.create_trainer(observer=observer)
     session.start_phase("train")
     session.complete_phase()
@@ -4909,6 +4923,7 @@ def test_execution_session_closes_owned_resources_before_runtime_in_reverse_orde
 
     assert order == [
         "trainer-checkpoint-flush",
+        "background-pipeline",
         "observer",
         "execution-logging",
         "lease",
@@ -4959,6 +4974,170 @@ def test_execution_session_close_is_idempotent_without_duplicate_terminal_events
     assert [event.event for event in events].count("phase_completed") == 1
     assert [event.event for event in events].count("process_completed") == 1
     assert runtime._closed is True
+
+
+def test_execution_session_recovers_interrupted_pipeline_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session cleanup finishes accepted work before propagating interruption."""
+    _, session = _create_test_execution_session(tmp_path, "interrupted-pipeline-cleanup")
+    pipeline = session.create_background_pipeline(lambda value: value + 1)
+    submission = pipeline.submit(4)
+    original_flush = pipeline.flush
+    calls = 0
+
+    def interrupt_once() -> tuple[Any, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KeyboardInterrupt("pipeline cleanup interrupted")
+        return original_flush()
+
+    monkeypatch.setattr(pipeline, "flush", interrupt_once)
+
+    with pytest.raises(KeyboardInterrupt, match="pipeline cleanup interrupted"):
+        session.close()
+
+    assert not pipeline.owns(submission)
+    assert pipeline.close() == ()
+    session.close()
+
+
+def test_execution_session_closes_pipeline_after_interrupted_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A constructed pipeline is closed if session ownership cannot register."""
+    _, session = _create_test_execution_session(tmp_path, "pipeline-registration")
+    created: list[BoundedBackgroundPipeline[Any, Any]] = []
+    real_pipeline_type = torch_runtime_module.BoundedBackgroundPipeline
+
+    def capture_pipeline(*args: Any, **kwargs: Any) -> BoundedBackgroundPipeline[Any, Any]:
+        pipeline = real_pipeline_type(*args, **kwargs)
+        created.append(pipeline)
+        return pipeline
+
+    def interrupt_registration(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise KeyboardInterrupt("registration interrupted")
+
+    monkeypatch.setattr(torch_runtime_module, "BoundedBackgroundPipeline", capture_pipeline)
+    monkeypatch.setattr(session, "_register_owned_resource", interrupt_registration)
+
+    with pytest.raises(KeyboardInterrupt, match="registration interrupted"):
+        session.create_background_pipeline(lambda value: value)
+
+    assert len(created) == 1
+    assert not created[0]._worker_thread.is_alive()
+    assert created[0].close() == ()
+    session.close()
+
+
+def test_execution_session_pipeline_factory_cannot_cross_concurrent_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session close either owns a constructed pipeline or makes its factory fail."""
+    _, session = _create_test_execution_session(tmp_path, "pipeline-close-race")
+    constructed = threading.Event()
+    allow_registration = threading.Event()
+    created: list[BoundedBackgroundPipeline[Any, Any]] = []
+    errors: list[BaseException] = []
+    real_pipeline_type = torch_runtime_module.BoundedBackgroundPipeline
+
+    def pause_after_construction(
+        *args: Any,
+        **kwargs: Any,
+    ) -> BoundedBackgroundPipeline[Any, Any]:
+        pipeline = real_pipeline_type(*args, **kwargs)
+        created.append(pipeline)
+        constructed.set()
+        assert allow_registration.wait(timeout=5.0)
+        return pipeline
+
+    def create_pipeline() -> None:
+        try:
+            session.create_background_pipeline(lambda value: value)
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(
+        torch_runtime_module,
+        "BoundedBackgroundPipeline",
+        pause_after_construction,
+    )
+    factory = threading.Thread(target=create_pipeline)
+    factory.start()
+    assert constructed.wait(timeout=5.0)
+    session.close()
+    allow_registration.set()
+    factory.join(timeout=5.0)
+
+    assert not factory.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert len(created) == 1
+    assert not created[0]._worker_thread.is_alive()
+    assert created[0].close() == ()
+
+
+def test_execution_session_preserves_every_pipeline_cleanup_failure(
+    tmp_path: Path,
+) -> None:
+    """An active workload error retains every attributed pipeline failure."""
+    _, session = _create_test_execution_session(tmp_path, "pipeline-cleanup-failures")
+    workload_error = RuntimeError("workload failed")
+
+    def fail(value: int) -> int:
+        raise OSError(f"publication {value} failed")
+
+    with pytest.raises(RuntimeError, match="workload failed") as raised, session:
+        pipeline = session.create_background_pipeline(fail, max_pending=2)
+        pipeline.submit(1)
+        pipeline.submit(2)
+        raise workload_error
+
+    assert raised.value is workload_error
+    notes = "\n".join(workload_error.__notes__)
+    assert "publication 1 failed" in notes
+    assert "publication 2 failed" in notes
+
+
+def test_execution_session_retries_interrupted_pipeline_acknowledgment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session fallback acknowledges outcomes before tearing down runtime state."""
+    _, session = _create_test_execution_session(tmp_path, "pipeline-acknowledgment")
+    workload_error = RuntimeError("workload failed")
+
+    def fail(_: int) -> int:
+        raise OSError("publication failed")
+
+    pipeline = session.create_background_pipeline(fail)
+    submission = pipeline.submit(1)
+    original_acknowledge = pipeline.acknowledge
+    calls = 0
+
+    def interrupt_once(value: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            original_acknowledge(value)
+            raise KeyboardInterrupt("acknowledgment interrupted")
+        original_acknowledge(value)
+
+    monkeypatch.setattr(pipeline, "acknowledge", interrupt_once)
+
+    with pytest.raises(RuntimeError, match="workload failed") as raised, session:
+        raise workload_error
+
+    assert raised.value is workload_error
+    notes = "\n".join(workload_error.__notes__)
+    assert "publication failed" in notes
+    assert "acknowledgment interrupted" in notes
+    assert not pipeline.owns(submission)
 
 
 def test_execution_session_closes_observer_after_trainer_construction_failure(

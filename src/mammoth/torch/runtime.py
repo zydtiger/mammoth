@@ -17,6 +17,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
+from threading import RLock
 from types import TracebackType
 from typing import Any, Literal, cast
 
@@ -24,6 +25,8 @@ import torch
 import torch.distributed as dist
 
 from mammoth.core import (
+    BackgroundPipelineError,
+    BoundedBackgroundPipeline,
     ExecutionContext,
     LogicalRunLease,
     claim_logical_run_lease,
@@ -634,10 +637,13 @@ class TorchExecutionSession:
         self._phase_started_at: float | None = None
         self._owned_resources = ExitStack()
         self._owned_observers = ExitStack()
+        self._owned_pipelines = ExitStack()
         self._owned_trainers = ExitStack()
         self._owned_resources.callback(self._owned_observers.close)
+        self._owned_resources.callback(self._owned_pipelines.close)
         self._owned_resources.callback(self._owned_trainers.close)
         self._owned_resource_errors: list[tuple[str, BaseException]] = []
+        self._resource_lock = RLock()
         self._closed = False
 
     @property
@@ -661,6 +667,74 @@ class TorchExecutionSession:
         trainer = Trainer(**kwargs)
         self._register_owned_resource(self._owned_trainers, "trainer", trainer.close)
         return trainer
+
+    def create_background_pipeline[InputT, ResultT](
+        self,
+        worker: Callable[[InputT], ResultT],
+        *,
+        max_pending: int = 1,
+        thread_name_prefix: str = "mammoth-background",
+    ) -> BoundedBackgroundPipeline[InputT, ResultT]:
+        """Create a pipeline that closes after trainers and before observers."""
+        self._require_open()
+        pipeline = BoundedBackgroundPipeline(
+            worker,
+            max_pending=max_pending,
+            thread_name_prefix=thread_name_prefix,
+        )
+
+        def close_pipeline() -> None:
+            cleanup_errors: list[BaseException] = []
+
+            def acknowledge_submission(submission: Any) -> None:
+                while pipeline.owns(submission):
+                    try:
+                        pipeline.acknowledge(submission)
+                    except BaseException as error:
+                        cleanup_errors.append(error)
+
+            while True:
+                try:
+                    completed = pipeline.close()
+                except BaseException as error:
+                    cleanup_errors.append(error)
+                    if isinstance(error, BackgroundPipelineError):
+                        acknowledge_submission(error.submission)
+                    continue
+                for result in completed:
+                    acknowledge_submission(result.submission)
+                break
+            if cleanup_errors:
+                first_error = cleanup_errors[0]
+                for later_error in cleanup_errors[1:]:
+                    first_error.add_note(
+                        "Later background pipeline cleanup failure: "
+                        f"{type(later_error).__name__}: {later_error}"
+                    )
+                raise first_error
+
+        try:
+            with self._resource_lock:
+                self._require_open()
+                self._register_owned_resource(
+                    self._owned_pipelines,
+                    "background pipeline",
+                    close_pipeline,
+                )
+        except BaseException as registration_error:
+            try:
+                close_pipeline()
+            except BaseException as cleanup_error:
+                registration_error.add_note(
+                    "Unregistered background pipeline cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+                for note in getattr(cleanup_error, "__notes__", ()):
+                    registration_error.add_note(
+                        f"Unregistered background pipeline cleanup detail: {note}"
+                    )
+            raise
+        return pipeline
 
     def start_phase(self, phase: str) -> None:
         """Start one phase and, on first use, this process lifecycle."""
@@ -741,9 +815,10 @@ class TorchExecutionSession:
         before_close: Callable[[], None] | None = None,
     ) -> None:
         """Close owned resources, lifecycle logging, leases, and owned runtime state."""
-        if self._closed:
-            return
-        self._closed = True
+        with self._resource_lock:
+            if self._closed:
+                return
+            self._closed = True
         cleanup_errors: list[tuple[str, BaseException]] = []
         self._owned_resource_errors = cleanup_errors
         self._owned_resources.close()
@@ -952,6 +1027,8 @@ def _attach_cleanup_errors(
     """Retain cleanup failures as notes without replacing the primary error."""
     for label, error in errors:
         primary_error.add_note(f"{label} cleanup also failed: {_error_text(error)}")
+        for note in getattr(error, "__notes__", ()):
+            primary_error.add_note(f"{label} cleanup detail: {note}")
 
 
 def _process_exit_code(

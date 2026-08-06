@@ -39,6 +39,16 @@ consuming project
 Textual, psutil, and PyTorch belong in optional dependency groups and must not
 be imported by the core package.
 
+Framework-neutral callers may submit typed inputs to one
+`BoundedBackgroundPipeline`. Its single worker preserves acceptance order,
+applies a caller-selected bound across queued and active work, and associates
+each result or failure with the accepted submission. Accepted work is never
+cancelled. Results and failures remain owned until explicit acknowledgment;
+interruption after queue acceptance is deferred for the submitter to
+propagate after recording the handoff. Later flushes or closes therefore retain
+unacknowledged outcomes, while cleanup remains idempotent and does not replace
+an active workload exception.
+
 ## Runtime model
 
 Mammoth uses six nested concepts:
@@ -166,11 +176,12 @@ on any rank is reported coherently before project work begins. TensorBoard's
 rank-aware sink and trainer checkpoints default to rank zero.
 
 `TorchExecutionSession` owns process and phase lifecycle events after logging
-starts. It is also the context-managed owner of observers and trainers created
-through its factories. Factory inputs such as models, optimizers, schedulers,
-loaders, policies, serializers, metrics, and directly supplied observers remain
-borrowed. Owned trainers close before owned observers in reverse construction
-order, which flushes checkpoint publication before metric sinks. Mammoth then
+starts. It is also the context-managed owner of observers, background
+pipelines, and trainers created through its factories. Factory inputs such as
+models, optimizers, schedulers, loaders, policies, serializers, metrics, and
+directly supplied observers remain borrowed. Owned trainers close before owned
+background pipelines, which close before owned observers regardless of
+construction order. This flushes artifact work before metric sinks. Mammoth then
 closes execution logging, releases leases, and destroys only a process group
 created by the runtime. Projects may attach presentation cleanup through the
 session close hook. Cleanup is idempotent, and cleanup failures are attached to

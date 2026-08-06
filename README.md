@@ -353,6 +353,35 @@ its path, role, epoch, byte size, and SHA-256. The hash and size describe the
 completed temporary artifact immediately before atomic publication, so projects
 can update manifests without reopening the checkpoint.
 
+Framework-independent callers can overlap ordered CPU or I/O work with their
+main workload through `BoundedBackgroundPipeline`. Submissions retain their
+typed input association, and the pending bound applies backpressure before more
+work is accepted:
+
+```python
+from mammoth.core import BoundedBackgroundPipeline
+
+with BoundedBackgroundPipeline(render_artifact, max_pending=1) as pipeline:
+    first = pipeline.submit(first_artifact)
+    pipeline.submit(second_artifact)
+    completed = pipeline.flush()
+    assert first.result() == completed[0].result
+    for item in completed:
+        pipeline.acknowledge(item.submission)
+
+```
+
+Results and attributed failures remain pipeline-owned until
+`acknowledge(submission)` is called, so interruption cannot erase an accepted
+outcome between internal state changes and caller bookkeeping. If interruption
+lands after queue acceptance, `submit()` completes the ownership transfer;
+call `take_deferred_interrupt()` after submission and propagate the returned
+`KeyboardInterrupt` or `SystemExit` once the caller has recorded that handoff.
+
+An active `TorchExecutionSession` can create and own the same pipeline through
+`session.create_background_pipeline(...)`, ensuring accepted work closes before
+observers and runtime resources.
+
 The lower-level bounded publisher remains available outside the trainer. A
 plan stages every artifact before committing its destinations in the declared
 order:
