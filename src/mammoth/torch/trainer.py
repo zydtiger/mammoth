@@ -571,10 +571,16 @@ class Trainer:
                                         window_index=window_offset,
                                     )
                                 metrics = output_metrics(output)
-                                accumulator.update(metrics, weight=output.weight)
+                                required_finite = {"loss": output.loss}
+                                accumulator.update(
+                                    metrics,
+                                    weight=output.weight,
+                                    required_finite=required_finite,
+                                )
                                 window_accumulator.update(
                                     metrics,
                                     weight=output.weight,
+                                    required_finite=required_finite,
                                 )
                                 update_stateful_metrics(
                                     self.train_stateful_metrics,
@@ -743,13 +749,23 @@ class Trainer:
                         ):
                             output = self.validation_step(self.execution_model, moved, context)
                         metrics = output_metrics(output)
-                        accumulator.update(metrics, weight=output.weight)
+                        required_finite = (
+                            {} if output.loss is None else {"loss": output.loss}
+                        )
+                        accumulator.update(
+                            metrics,
+                            weight=output.weight,
+                            required_finite=required_finite,
+                        )
                         update_stateful_metrics(
                             self.validation_stateful_metrics,
                             output.metric_updates,
                         )
                         routed = route_metrics(
-                            scalar_metrics(metrics),
+                            scalar_metrics(
+                                metrics,
+                                required_finite=required_finite,
+                            ),
                             self.validation_metric_routes,
                             "batch",
                         )

@@ -17,6 +17,7 @@ import torch.distributed
 Reduction = Literal["mean", "sum", "last"]
 MetricCadence = Literal["batch", "epoch"]
 MetricScalar = float | torch.Tensor
+MetricValidity = bool | torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +80,7 @@ class MetricValue:
     total: MetricScalar = 0.0
     weight: float = 0.0
     last: MetricScalar = 0.0
+    finite: MetricValidity = True
     seen: bool = False
 
 
@@ -100,15 +102,27 @@ class MetricAccumulator:
         metrics: Mapping[str, float | torch.Tensor],
         *,
         weight: float = 1.0,
+        required_finite: Mapping[str, float | torch.Tensor] | None = None,
     ) -> None:
         """Accumulate detached scalar metrics without forcing host materialization."""
         if not math.isfinite(weight) or weight <= 0:
             raise ValueError("metric weight must be positive and finite")
-        for name, value in prepared_scalar_metrics(metrics).items():
+        values = prepared_scalar_metrics(metrics)
+        required = prepared_scalar_metrics(required_finite or {})
+        if any(name not in values for name in required):
+            raise ValueError("required finite metrics must also be accumulated")
+        for name, value in values.items():
             state = self.values.setdefault(name, MetricValue())
             state.total = _add_metric_scalars(state.total, _scale_metric_scalar(value, weight))
             state.weight += weight
             state.last = value
+            finite = _metric_scalar_is_finite(value)
+            if name in required:
+                finite = _combine_metric_validity(
+                    finite,
+                    _metric_scalar_is_finite(required[name]),
+                )
+            state.finite = _combine_metric_validity(state.finite, finite)
             state.seen = True
 
     def compute(
@@ -119,6 +133,7 @@ class MetricAccumulator:
     ) -> dict[str, float]:
         """Return reduced metrics, optionally combining initialized DDP ranks."""
         results: dict[str, MetricScalar] = {}
+        validities: dict[str, MetricValidity] = {}
         use_distributed = distributed and torch.distributed.is_initialized()
         local_names = sorted(self.values)
         names = local_names
@@ -158,8 +173,12 @@ class MetricAccumulator:
             total = state.total
             reduced_weight: MetricScalar = state.weight
             last = state.last
+            finite = state.finite
             if use_distributed and spec.distributed:
                 reduction_device = device or torch.device("cpu")
+                finite_tensor = _distributed_validity_tensor(finite, reduction_device)
+                torch.distributed.all_reduce(finite_tensor, op=torch.distributed.ReduceOp.MIN)
+                finite = finite_tensor
                 if spec.reduction == "last":
                     if name not in gathered_names[0]:
                         raise ValueError(
@@ -190,7 +209,8 @@ class MetricAccumulator:
                 results[name] = total
             else:
                 results[name] = last
-        return scalar_metrics(results)
+            validities[name] = finite
+        return _materialize_scalar_metrics(results, validities=validities)
 
 
 def reset_stateful_metrics(metrics: Mapping[str, StatefulMetric]) -> None:
@@ -417,6 +437,8 @@ def prepared_scalar_metrics(
         if isinstance(raw_value, torch.Tensor):
             if raw_value.ndim != 0:
                 raise ValueError(f"metric {name!r} tensor must be scalar")
+            if raw_value.is_complex():
+                raise ValueError(f"metric {name!r} tensor must be real")
             value = raw_value.detach()
         elif isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
             raise TypeError(f"metric {name!r} must be a number or scalar tensor")
@@ -428,24 +450,71 @@ def prepared_scalar_metrics(
     return values
 
 
-def scalar_metrics(metrics: Mapping[str, float | torch.Tensor]) -> dict[str, float]:
-    """Materialize validated scalar metrics, batching transfers by device and dtype."""
+def scalar_metrics(
+    metrics: Mapping[str, float | torch.Tensor],
+    *,
+    required_finite: Mapping[str, float | torch.Tensor] | None = None,
+) -> dict[str, float]:
+    """Materialize metrics and required validity checks in shared transfer groups."""
+    required = prepared_scalar_metrics(required_finite or {})
+    return _materialize_scalar_metrics(
+        metrics,
+        validities={
+            name: _metric_scalar_is_finite(value) for name, value in required.items()
+        },
+    )
+
+
+def _materialize_scalar_metrics(
+    metrics: Mapping[str, float | torch.Tensor],
+    *,
+    validities: Mapping[str, MetricValidity],
+) -> dict[str, float]:
+    """Materialize values and sticky validity flags in common transfer groups."""
     values = prepared_scalar_metrics(metrics)
     materialized: dict[str, float] = {}
-    tensors: dict[tuple[torch.device, torch.dtype], list[tuple[str, torch.Tensor]]] = {}
+    materialized_validities: dict[str, bool] = {}
+    tensors: dict[
+        tuple[torch.device, torch.dtype],
+        list[tuple[str, bool, torch.Tensor]],
+    ] = {}
+    value_groups: dict[str, tuple[torch.device, torch.dtype]] = {}
     for name, value in values.items():
         if isinstance(value, torch.Tensor):
-            tensors.setdefault((value.device, value.dtype), []).append((name, value))
+            group = (value.device, value.dtype)
+            tensors.setdefault(group, []).append((name, False, value))
+            value_groups[name] = group
         else:
             materialized[name] = value
+    for name, valid in validities.items():
+        if isinstance(valid, bool):
+            materialized_validities[name] = valid
+            continue
+        validity_group = value_groups.get(name)
+        if validity_group is None or validity_group[0] != valid.device:
+            validity_group = next(
+                (candidate for candidate in tensors if candidate[0] == valid.device),
+                (valid.device, torch.float32),
+            )
+        tensors.setdefault(validity_group, []).append(
+            (name, True, valid.to(dtype=validity_group[1]))
+        )
     for grouped_values in tensors.values():
-        names, tensor_values = zip(*grouped_values, strict=True)
+        tensor_values = [value for _name, _validity, value in grouped_values]
         transferred = torch.stack(tensor_values).cpu().tolist()
-        for name, value in zip(names, transferred, strict=True):
-            materialized[name] = float(value)
+        for (name, validity, _tensor), value in zip(
+            grouped_values,
+            transferred,
+            strict=True,
+        ):
+            if validity:
+                materialized_validities[name] = bool(value)
+            else:
+                materialized[name] = float(value)
     for name, value in materialized.items():
         if not math.isfinite(value):
             raise ValueError(f"metric {name!r} must be finite")
+    _validate_materialized_metric_validities(materialized_validities)
     return {name: materialized[name] for name in values}
 
 
@@ -475,6 +544,44 @@ def _distributed_metric_tensor(value: MetricScalar, device: torch.device) -> tor
     if isinstance(value, torch.Tensor):
         return value.detach().to(device=device, dtype=torch.float64)
     return torch.tensor(value, dtype=torch.float64, device=device)
+
+
+def _metric_scalar_is_finite(value: MetricScalar) -> MetricValidity:
+    """Return deferred tensor finiteness without synchronizing its device."""
+    if isinstance(value, torch.Tensor):
+        return torch.isfinite(value)
+    return True
+
+
+def _combine_metric_validity(
+    left: MetricValidity,
+    right: MetricValidity,
+) -> MetricValidity:
+    """Combine sticky validity while preserving tensor device residency."""
+    if isinstance(left, bool):
+        return right if left else False
+    if isinstance(right, bool):
+        return left if right else False
+    return torch.logical_and(right.to(device=left.device), left)
+
+
+def _distributed_validity_tensor(
+    value: MetricValidity,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return one float64 validity flag on the collective device."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device=device, dtype=torch.float64)
+    return torch.tensor(float(value), dtype=torch.float64, device=device)
+
+
+def _validate_materialized_metric_validities(
+    validities: Mapping[str, bool],
+) -> None:
+    """Reject every materialized sticky validity flag that is false."""
+    for name, valid in validities.items():
+        if not valid:
+            raise ValueError(f"metric {name!r} must be finite")
 
 
 def validate_metric_name(name: object) -> None:

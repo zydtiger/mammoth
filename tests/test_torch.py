@@ -71,7 +71,7 @@ from mammoth.torch import (
     weighted_partition_counts,
     weighted_partition_indices,
 )
-from mammoth.torch.metrics import compute_stateful_metrics
+from mammoth.torch.metrics import compute_stateful_metrics, scalar_metrics
 
 
 def build_warmup_linear_stack(
@@ -1050,6 +1050,23 @@ def _uneven_accumulation_worker(
                 device=runtime.device,
                 distributed=True,
             )
+            sticky_last_accumulator = MetricAccumulator(
+                {"sticky": MetricSpec("last")}
+            )
+            if rank == 1:
+                sticky_last_accumulator.update(
+                    {"sticky": torch.tensor(float("nan"))}
+                )
+            sticky_last_accumulator.update({"sticky": torch.tensor(1.0)})
+            try:
+                sticky_last_accumulator.compute(
+                    device=runtime.device,
+                    distributed=True,
+                )
+            except ValueError as error:
+                sticky_last_error = str(error)
+            else:
+                sticky_last_error = None
             local_accumulator = MetricAccumulator(
                 {"local": MetricSpec("mean", distributed=False)}
             )
@@ -1391,6 +1408,7 @@ def _uneven_accumulation_worker(
                     metadata_value,
                     invalid_restore_error,
                     options_restore_error,
+                    sticky_last_error,
                     None,
                 )
             )
@@ -1398,6 +1416,7 @@ def _uneven_accumulation_worker(
         result_queue.put(
             (
                 rank,
+                None,
                 None,
                 None,
                 None,
@@ -1544,7 +1563,8 @@ def test_uneven_ddp_accumulation_reduces_each_logical_batch(tmp_path: Path) -> N
         "checkpoint restore request differs across ranks" in result[21]
         for result in results
     )
-    assert all(result[22] is None for result in results)
+    assert all("metric 'sticky' must be finite" in result[22] for result in results)
+    assert all(result[23] is None for result in results)
     assert len(list((tmp_path / "primary-checkpoints").glob("checkpoint-*.pt"))) == 1
 
 
@@ -3003,13 +3023,118 @@ def test_metric_accumulator_supports_mean_sum_and_last() -> None:
 def test_metric_accumulator_matches_host_precision_for_low_precision_tensors(
     dtype: torch.dtype,
 ) -> None:
-    value = torch.tensor(0.1, dtype=dtype)
+    value = torch.tensor(0.1, dtype=dtype, requires_grad=True)
     accumulator = MetricAccumulator({"metric": MetricSpec("sum")})
 
     for _ in range(100):
         accumulator.update({"metric": value})
 
-    assert accumulator.compute()["metric"] == pytest.approx(float(value) * 100)
+    assert accumulator.compute()["metric"] == pytest.approx(float(value.detach()) * 100)
+    assert isinstance(accumulator.values["metric"].total, torch.Tensor)
+    assert not accumulator.values["metric"].total.requires_grad
+    assert isinstance(accumulator.values["metric"].last, torch.Tensor)
+    assert not accumulator.values["metric"].last.requires_grad
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable"),
+        ),
+    ],
+)
+def test_metric_accumulator_preserves_weighted_tensor_and_numeric_reductions(
+    device: str,
+) -> None:
+    accumulator = MetricAccumulator(
+        {
+            "mean": MetricSpec("mean"),
+            "sum": MetricSpec("sum"),
+            "last": MetricSpec("last"),
+        }
+    )
+
+    accumulator.update(
+        {
+            "mean": torch.tensor(2.0, device=device),
+            "sum": torch.tensor(2.0, device=device),
+            "last": torch.tensor(2.0, device=device),
+        },
+        weight=1,
+    )
+    accumulator.update({"mean": 4.0, "sum": 4.0, "last": 4.0}, weight=3)
+
+    assert accumulator.compute() == pytest.approx(
+        {"mean": 3.5, "sum": 14.0, "last": 4.0}
+    )
+
+
+def test_metric_accumulator_rejects_sticky_non_finite_tensor_values() -> None:
+    accumulator = MetricAccumulator({"metric": MetricSpec("last")})
+    accumulator.update({"metric": torch.tensor(float("nan"))})
+    accumulator.update({"metric": torch.tensor(3.0)})
+
+    with pytest.raises(ValueError, match="metric 'metric' must be finite"):
+        accumulator.compute()
+
+
+def test_metric_accumulator_requires_finite_companion_values() -> None:
+    accumulator = MetricAccumulator({"loss": MetricSpec("last")})
+    accumulator.update(
+        {"loss": torch.tensor(2.0)},
+        required_finite={"loss": torch.tensor(float("inf"))},
+    )
+
+    with pytest.raises(ValueError, match="metric 'loss' must be finite"):
+        accumulator.compute()
+
+
+def test_output_metrics_rejects_non_scalar_tensor_values() -> None:
+    with pytest.raises(ValueError, match="metric 'score' tensor must be scalar"):
+        trainer_module.output_metrics(
+            StepOutput(
+                loss=torch.tensor(1.0),
+                metrics={"score": torch.ones(2)},
+            )
+        )
+
+
+def test_metric_accumulator_rejects_complex_tensors_before_reduction() -> None:
+    accumulator = MetricAccumulator({"metric": MetricSpec("sum")})
+
+    with pytest.raises(ValueError, match="metric 'metric' tensor must be real"):
+        accumulator.update({"metric": torch.tensor(1 + 2j)})
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_metric_values_and_required_validity_share_one_host_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cpu = torch.Tensor.cpu
+    tolist = torch.Tensor.tolist
+    extractions: list[str] = []
+
+    def count_cpu(value: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        extractions.append("cpu")
+        return cpu(value, *args, **kwargs)
+
+    def count_tolist(value: torch.Tensor) -> Any:
+        extractions.append("tolist")
+        return tolist(value)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", count_cpu)
+    monkeypatch.setattr(torch.Tensor, "tolist", count_tolist)
+    reported_loss = torch.tensor(1.0, device="cuda")
+    actual_loss = torch.tensor(2.0, device="cuda")
+
+    assert scalar_metrics(
+        {"loss": reported_loss, "score": torch.tensor(3.0, device="cuda")},
+        required_finite={"loss": actual_loss},
+    ) == {"loss": 1.0, "score": 3.0}
+    assert extractions == ["cpu", "tolist"]
 
 
 @pytest.mark.parametrize(
@@ -3071,13 +3196,22 @@ def test_training_reduces_scalar_metrics_only_at_observation_boundaries(
         reductions += 1
         return compute(accumulator, device=device, distributed=distributed)
 
+    def loss_only_step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del context
+        prediction = module(batch["features"])
+        return StepOutput(loss=torch.nn.functional.mse_loss(prediction, batch["targets"]))
+
     monkeypatch.setattr(MetricAccumulator, "compute", count_compute)
 
     with Trainer(
         model=model,
         optimizer=optimizer,
         train_loader=loader,
-        train_step=regression_step,
+        train_step=loss_only_step,
         observer=RunObserver((sink,)),
         config=TrainerConfig(
             epochs=1,
@@ -3092,6 +3226,164 @@ def test_training_reduces_scalar_metrics_only_at_observation_boundaries(
     progress = [observation for observation in sink.observations if observation.event == "progress"]
     assert len(progress) == 2
     assert reductions == 3
+
+
+def test_duplicate_loss_metric_does_not_hide_non_finite_training_loss() -> None:
+    loader = DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+
+    def non_finite_step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del context
+        loss = module(batch[0]).sum() * torch.tensor(float("nan"))
+        return StepOutput(loss=loss, metrics={"loss": torch.tensor(1.0)})
+
+    with (
+        pytest.raises(ValueError, match="metric 'loss' must be finite"),
+        Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=loader,
+            train_step=non_finite_step,
+            config=TrainerConfig(
+                epochs=1,
+                device="cpu",
+                checkpoint_every_epochs=None,
+            ),
+        ) as trainer,
+    ):
+        trainer.fit()
+
+
+def test_duplicate_loss_metric_fails_before_validation_progress() -> None:
+    loader = DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = RecordingSink()
+
+    def finite_training_step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del context
+        return StepOutput(loss=module(batch[0]).sum() * 0)
+
+    def non_finite_validation_step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del context
+        loss = module(batch[0]).sum() * torch.tensor(float("nan"))
+        return StepOutput(loss=loss, metrics={"loss": torch.tensor(1.0)})
+
+    with (
+        pytest.raises(ValueError, match="metric 'loss' must be finite"),
+        Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=loader,
+            train_step=finite_training_step,
+            validation_loader=loader,
+            validation_step=non_finite_validation_step,
+            observer=RunObserver((sink,)),
+            config=TrainerConfig(
+                epochs=1,
+                device="cpu",
+                checkpoint_every_epochs=None,
+            ),
+        ) as trainer,
+    ):
+        trainer.fit()
+
+    validation_progress = [
+        observation
+        for observation in sink.observations
+        if observation.event == "progress"
+        and observation.fields.get("phase") == "validation"
+    ]
+    assert validation_progress == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_metric_transfers_occur_only_at_observation_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = DataLoader(MappingDataset(), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    cpu = torch.Tensor.cpu
+    item = torch.Tensor.item
+    tolist = torch.Tensor.tolist
+    compute = MetricAccumulator.compute
+    boundary_count = 0
+    active_boundary = 0
+    extractions: list[tuple[str, int]] = []
+
+    def count_cpu(value: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        extractions.append(("cpu", active_boundary))
+        return cpu(value, *args, **kwargs)
+
+    def count_item(value: torch.Tensor) -> Any:
+        extractions.append(("item", active_boundary))
+        return item(value)
+
+    def count_tolist(value: torch.Tensor) -> Any:
+        extractions.append(("tolist", active_boundary))
+        return tolist(value)
+
+    def mark_materialization_boundary(
+        accumulator: MetricAccumulator,
+        *,
+        device: torch.device | None = None,
+        distributed: bool = False,
+    ) -> dict[str, float]:
+        nonlocal active_boundary, boundary_count
+        boundary_count += 1
+        active_boundary = boundary_count
+        try:
+            return compute(accumulator, device=device, distributed=distributed)
+        finally:
+            active_boundary = 0
+
+    monkeypatch.setattr(torch.Tensor, "cpu", count_cpu)
+    monkeypatch.setattr(torch.Tensor, "item", count_item)
+    monkeypatch.setattr(torch.Tensor, "tolist", count_tolist)
+    monkeypatch.setattr(MetricAccumulator, "compute", mark_materialization_boundary)
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        config=TrainerConfig(
+            epochs=1,
+            device="cuda",
+            gradient_accumulation_steps=2,
+            log_every_batches=2,
+            checkpoint_every_epochs=None,
+        ),
+    ) as trainer:
+        trainer.fit()
+
+    outside_metric_boundaries = [
+        extraction for extraction in extractions if extraction[1] == 0
+    ]
+    assert outside_metric_boundaries == [("item", 0)]  # DataLoader iterator seed.
+    metric_extractions = [
+        extraction for extraction in extractions if extraction[1] != 0
+    ]
+    assert {observed_boundary for _kind, observed_boundary in metric_extractions} == {
+        1,
+        2,
+        3,
+    }
+    assert all(kind in {"cpu", "tolist"} for kind, _boundary in metric_extractions)
 
 
 @pytest.mark.parametrize("value", [0, False, "2"])
