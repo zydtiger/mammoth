@@ -1469,6 +1469,190 @@ def run_uneven_accumulation(tmp_path: Path) -> list[tuple[Any, ...]]:
     return sorted(result_queue.get(timeout=5) for _ in processes)
 
 
+def _validation_epoch_metric_worker(
+    rank: int,
+    rendezvous: str,
+    result_queue: Any,
+) -> None:
+    """Reduce one validation epoch with unequal rank-local DataLoader lengths."""
+    try:
+        with initialize_torch_runtime(
+            TorchRuntimeConfig(
+                strategy="ddp",
+                device="cpu",
+                backend="gloo",
+                init_method=rendezvous,
+                timeout_seconds=30,
+                rank=rank,
+                local_rank=rank,
+                world_size=2,
+            )
+        ) as runtime:
+            local_count = 3 if rank == 0 else 1
+            local_value = 1.0 if rank == 0 else 3.0
+            loader = DataLoader(
+                TensorDataset(torch.full((local_count, 1), local_value)),
+                batch_size=1,
+            )
+            model = torch.nn.Linear(1, 1, bias=False)
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+            sink = RecordingSink()
+
+            def validation_step(
+                module: torch.nn.Module,
+                batch: Any,
+                context: StepContext,
+            ) -> StepOutput:
+                del module, context
+                value = batch[0].mean()
+                return StepOutput(
+                    metrics={"mean": value, "sum": value, "last": value},
+                    metric_updates={"count": len(batch[0])},
+                    weight=len(batch[0]),
+                )
+
+            with Trainer(
+                model=model,
+                optimizer=optimizer,
+                train_loader=loader,
+                train_step=validation_step,
+                validation_loader=loader,
+                validation_step=validation_step,
+                metric_specs={
+                    "mean": MetricSpec("mean"),
+                    "sum": MetricSpec("sum"),
+                    "last": MetricSpec("last"),
+                },
+                validation_stateful_metrics={"count": AdditiveCountMetric()},
+                validation_metric_routes={
+                    "count": MetricRoute(
+                        batch_name=None,
+                        epoch_name="validation/count",
+                    )
+                },
+                observer=RunObserver((sink,)),
+                config=TrainerConfig(
+                    epochs=1,
+                    device="cpu",
+                    strategy="ddp",
+                    checkpoint_every_epochs=None,
+                ),
+                runtime=runtime,
+            ) as trainer:
+                summary = trainer.validate_epoch(0)
+            progress = [
+                observation
+                for observation in sink.observations
+                if observation.event == "progress"
+            ]
+            completed = [
+                observation
+                for observation in sink.observations
+                if observation.event == "task_completed"
+            ]
+
+            invalid_loader = DataLoader(
+                TensorDataset(torch.ones(1, 1)),
+                batch_size=1,
+            )
+            invalid_model = torch.nn.Linear(1, 1, bias=False)
+            invalid_optimizer = torch.optim.SGD(
+                invalid_model.parameters(),
+                lr=0.0,
+            )
+
+            def invalid_validation_step(
+                module: torch.nn.Module,
+                batch: Any,
+                context: StepContext,
+            ) -> StepOutput:
+                del module, batch, context
+                value = float("nan") if rank == 1 else 1.0
+                return StepOutput(
+                    metrics={"local": torch.tensor(value)},
+                    metric_updates={"count": 1},
+                )
+
+            try:
+                with Trainer(
+                    model=invalid_model,
+                    optimizer=invalid_optimizer,
+                    train_loader=invalid_loader,
+                    train_step=invalid_validation_step,
+                    validation_loader=invalid_loader,
+                    validation_step=invalid_validation_step,
+                    metric_specs={
+                        "local": MetricSpec("mean", distributed=False),
+                    },
+                    validation_stateful_metrics={"count": AdditiveCountMetric()},
+                    config=TrainerConfig(
+                        epochs=1,
+                        device="cpu",
+                        strategy="ddp",
+                        checkpoint_every_epochs=None,
+                    ),
+                    runtime=runtime,
+                ) as invalid_trainer:
+                    invalid_trainer.validate_epoch(0)
+            except ValueError as error:
+                invalid_error = str(error)
+            except RuntimeError as error:
+                invalid_error = str(error)
+            else:
+                invalid_error = None
+
+            result_queue.put(
+                (
+                    rank,
+                    dict(summary),
+                    [dict(observation.metrics) for observation in progress],
+                    dict(completed[-1].metrics),
+                    invalid_error,
+                    None,
+                )
+            )
+    except BaseException as error:
+        result_queue.put((rank, None, None, None, None, str(error)))
+
+
+def test_uneven_ddp_validation_materializes_only_epoch_summary(tmp_path: Path) -> None:
+    process_context = multiprocessing.get_context("spawn")
+    result_queue = process_context.Queue()
+    rendezvous = f"file://{tmp_path / 'validation-rendezvous'}"
+    processes = [
+        process_context.Process(
+            target=_validation_epoch_metric_worker,
+            args=(rank, rendezvous, result_queue),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=40)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            pytest.fail("Validation metric worker did not shut down coherently")
+        assert process.exitcode == 0
+    results = sorted(result_queue.get(timeout=5) for _ in processes)
+
+    assert [result[0] for result in results] == [0, 1]
+    assert all(
+        result[1]
+        == pytest.approx(
+            {"count": 4.0, "last": 1.0, "mean": 1.5, "sum": 6.0}
+        )
+        for result in results
+    )
+    assert [len(result[2]) for result in results] == [3, 1]
+    assert all(all(metrics == {} for metrics in result[2]) for result in results)
+    assert all(result[3] == {"validation/count": 4.0} for result in results)
+    assert all("metric 'local' must be finite" in result[4] for result in results)
+    assert all("connection closed" not in result[4].lower() for result in results)
+    assert all(result[5] is None for result in results)
+
+
 def test_same_trainer_handles_classification_and_mapping_regression(tmp_path: Path) -> None:
     torch.manual_seed(7)
     features = torch.randn(16, 2)
@@ -1858,7 +2042,7 @@ def test_stateful_metrics_and_routes_remain_project_named() -> None:
     assert completed[-1].metrics == {"project/count": 4.0}
 
 
-def test_validation_progress_preserves_routed_dense_metrics() -> None:
+def test_validation_progress_omits_metrics_and_preserves_epoch_route() -> None:
     features = torch.ones(2, 1)
     loader = DataLoader(TensorDataset(features), batch_size=1)
     model = torch.nn.Linear(1, 1)
@@ -1896,7 +2080,7 @@ def test_validation_progress_preserves_routed_dense_metrics() -> None:
         ),
         validation_metric_routes={
             "score": MetricRoute(
-                batch_name="validation/score",
+                batch_name=None,
                 epoch_name="validation/score_epoch",
             )
         },
@@ -1910,14 +2094,111 @@ def test_validation_progress_preserves_routed_dense_metrics() -> None:
         if observation.event == "progress"
         and observation.fields.get("phase") == "validation"
     ]
-    assert [observation.metrics for observation in progress] == [
-        {"validation/score": 2.0},
-        {"validation/score": 2.0},
+    assert [observation.metrics for observation in progress] == [{}, {}]
+    assert [observation.display_metrics for observation in progress] == [{}, {}]
+    validation_completed = [
+        observation
+        for observation in sink.observations
+        if observation.event == "task_completed"
+        and observation.fields.get("phase") == "validation"
     ]
-    assert [observation.display_metrics for observation in progress] == [
-        {"validation/score": 2.0},
-        {"validation/score": 2.0},
-    ]
+    assert validation_completed[-1].metrics == {"validation/score_epoch": 2.0}
+
+
+def test_validation_metric_routes_reject_batch_names() -> None:
+    loader = DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+
+    def step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del context
+        return StepOutput(loss=module(batch[0]).sum() * 0)
+
+    with pytest.raises(
+        ValueError,
+        match="validation metric routes do not support batch_name",
+    ):
+        Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=loader,
+            train_step=step,
+            validation_loader=loader,
+            validation_step=step,
+            validation_metric_routes={
+                "loss": MetricRoute(
+                    batch_name="validation/loss",
+                    epoch_name="validation/loss_epoch",
+                )
+            },
+            config=TrainerConfig(
+                epochs=1,
+                device="cpu",
+                checkpoint_every_epochs=None,
+            ),
+        )
+
+
+def test_validation_epoch_summary_honors_sample_weights() -> None:
+    class RecordingValidationScheduler(CountingScheduler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.values: list[float | None] = []
+
+        def step(self, value: float | None = None) -> None:
+            super().step(value)
+            self.values.append(value)
+
+    values = torch.tensor([[1.0], [1.0], [3.0]])
+    loader = DataLoader(TensorDataset(values), batch_size=2)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    scheduler = RecordingValidationScheduler()
+
+    def train_step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del context
+        return StepOutput(loss=module(batch[0]).sum() * 0)
+
+    def validation_step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        del module, context
+        batch_values = batch[0]
+        return StepOutput(
+            metrics={"score": batch_values.mean()},
+            weight=len(batch_values),
+        )
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=train_step,
+        validation_loader=loader,
+        validation_step=validation_step,
+        scheduler=scheduler,
+        config=TrainerConfig(
+            epochs=1,
+            device="cpu",
+            scheduler_interval="validation",
+            scheduler_monitor="score",
+            checkpoint_every_epochs=None,
+        ),
+    ) as trainer:
+        result = trainer.fit()
+
+    assert result.validation_history[0]["score"] == pytest.approx(5 / 3)
+    assert scheduler.values == pytest.approx([5 / 3])
 
 
 def test_empty_training_loader_remains_a_completed_noop_epoch() -> None:
@@ -3229,6 +3510,55 @@ def test_training_reduces_scalar_metrics_only_at_observation_boundaries(
     assert reductions == 3
 
 
+def test_validation_reduces_scalar_metrics_only_at_epoch_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = DataLoader(MappingDataset(), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = RecordingSink()
+    compute = MetricAccumulator.compute
+    reductions = 0
+
+    def count_compute(
+        accumulator: MetricAccumulator,
+        *,
+        device: torch.device | None = None,
+        distributed: bool = False,
+    ) -> dict[str, float]:
+        nonlocal reductions
+        reductions += 1
+        return compute(accumulator, device=device, distributed=distributed)
+
+    monkeypatch.setattr(MetricAccumulator, "compute", count_compute)
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        validation_loader=loader,
+        validation_step=regression_step,
+        observer=RunObserver((sink,)),
+        config=TrainerConfig(
+            epochs=1,
+            device="cpu",
+            checkpoint_every_epochs=None,
+        ),
+    ) as trainer:
+        summary = trainer.validate_epoch(0)
+
+    progress = [
+        observation
+        for observation in sink.observations
+        if observation.event == "progress"
+    ]
+    assert summary.keys() == {"loss", "mae"}
+    assert len(progress) == len(loader)
+    assert all(observation.metrics == {} for observation in progress)
+    assert reductions == 1
+
+
 def test_duplicate_loss_metric_does_not_hide_non_finite_training_loss() -> None:
     loader = DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1)
     model = torch.nn.Linear(1, 1)
@@ -3260,7 +3590,7 @@ def test_duplicate_loss_metric_does_not_hide_non_finite_training_loss() -> None:
         trainer.fit()
 
 
-def test_duplicate_loss_metric_fails_before_validation_progress() -> None:
+def test_duplicate_loss_metric_fails_at_validation_epoch_boundary() -> None:
     loader = DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1)
     model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
@@ -3308,7 +3638,16 @@ def test_duplicate_loss_metric_fails_before_validation_progress() -> None:
         if observation.event == "progress"
         and observation.fields.get("phase") == "validation"
     ]
-    assert validation_progress == []
+    assert len(validation_progress) == 1
+    assert validation_progress[0].metrics == {}
+    assert validation_progress[0].display_metrics == {}
+    validation_completions = [
+        observation
+        for observation in sink.observations
+        if observation.event == "task_completed"
+        and observation.fields.get("phase") == "validation"
+    ]
+    assert validation_completions == []
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
@@ -3385,6 +3724,139 @@ def test_cuda_metric_transfers_occur_only_at_observation_boundaries(
         3,
     }
     assert all(kind in {"cpu", "tolist"} for kind, _boundary in metric_extractions)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_validation_metric_transfers_occur_only_at_epoch_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CudaCountMetric:
+        def __init__(self) -> None:
+            self.count = torch.zeros((), device="cuda")
+
+        def reset(self) -> None:
+            self.count.zero_()
+
+        def update(self, value: Any) -> None:
+            self.count.add_(value)
+
+        def state_tensors(self) -> Mapping[str, torch.Tensor]:
+            return {"count": self.count}
+
+        def compute(
+            self,
+            state: Mapping[str, torch.Tensor],
+        ) -> Mapping[str, float | torch.Tensor]:
+            return {"count": state["count"]}
+
+    loader = DataLoader(MappingDataset(), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    cpu = torch.Tensor.cpu
+    item = torch.Tensor.item
+    tolist = torch.Tensor.tolist
+    compute = MetricAccumulator.compute
+    compute_stateful = trainer_module.compute_stateful_metrics
+    active_boundary = False
+    boundaries: list[str] = []
+    extractions: list[tuple[str, bool]] = []
+
+    def count_cpu(value: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        extractions.append(("cpu", active_boundary))
+        return cpu(value, *args, **kwargs)
+
+    def count_item(value: torch.Tensor) -> Any:
+        extractions.append(("item", active_boundary))
+        return item(value)
+
+    def count_tolist(value: torch.Tensor) -> Any:
+        extractions.append(("tolist", active_boundary))
+        return tolist(value)
+
+    def mark_epoch_boundary(
+        accumulator: MetricAccumulator,
+        *,
+        device: torch.device | None = None,
+        distributed: bool = False,
+    ) -> dict[str, float]:
+        nonlocal active_boundary
+        boundaries.append("scalar")
+        active_boundary = True
+        try:
+            return compute(accumulator, device=device, distributed=distributed)
+        finally:
+            active_boundary = False
+
+    def mark_stateful_epoch_boundary(
+        metrics: Mapping[str, Any],
+        *,
+        device: torch.device,
+        distributed: bool,
+        baseline: Mapping[str, Mapping[str, torch.Tensor]] | None = None,
+    ) -> dict[str, float]:
+        nonlocal active_boundary
+        boundaries.append("stateful")
+        active_boundary = True
+        try:
+            return compute_stateful(
+                metrics,
+                device=device,
+                distributed=distributed,
+                baseline=baseline,
+            )
+        finally:
+            active_boundary = False
+
+    def validation_step(
+        module: torch.nn.Module,
+        batch: Any,
+        context: StepContext,
+    ) -> StepOutput:
+        output = regression_step(module, batch, context)
+        assert output.loss is not None
+        return StepOutput(
+            loss=output.loss,
+            metrics=output.metrics,
+            metric_updates={"count": torch.ones((), device=output.loss.device)},
+        )
+
+    monkeypatch.setattr(torch.Tensor, "cpu", count_cpu)
+    monkeypatch.setattr(torch.Tensor, "item", count_item)
+    monkeypatch.setattr(torch.Tensor, "tolist", count_tolist)
+    monkeypatch.setattr(MetricAccumulator, "compute", mark_epoch_boundary)
+    monkeypatch.setattr(
+        trainer_module,
+        "compute_stateful_metrics",
+        mark_stateful_epoch_boundary,
+    )
+
+    with Trainer(
+        model=model,
+        optimizer=optimizer,
+        train_loader=loader,
+        train_step=regression_step,
+        validation_loader=loader,
+        validation_step=validation_step,
+        validation_stateful_metrics={"count": CudaCountMetric()},
+        config=TrainerConfig(
+            epochs=1,
+            device="cuda",
+            checkpoint_every_epochs=None,
+        ),
+    ) as trainer:
+        trainer.validate_epoch(0)
+
+    assert boundaries == ["scalar", "stateful"]
+    outside_boundary = [
+        extraction for extraction in extractions if not extraction[1]
+    ]
+    assert outside_boundary == [("item", False)]  # DataLoader iterator seed.
+    assert all(
+        at_boundary
+        for kind, at_boundary in extractions
+        if kind in {"cpu", "tolist"}
+    )
+    assert all(kind in {"cpu", "tolist"} for kind, at_boundary in extractions if at_boundary)
 
 
 @pytest.mark.parametrize("value", [0, False, "2"])
