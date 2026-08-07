@@ -159,17 +159,17 @@ import os
 from pathlib import Path
 
 from mammoth.torch import (
-    TorchExecutionRequest,
-    TorchRuntimeConfig,
-    initialize_torch_runtime,
+    ExecutionRequest,
+    RuntimeConfig,
+    initialize_runtime,
 )
 
 phase = os.environ["MAMMOTH_PHASE"]
-with initialize_torch_runtime(
-    TorchRuntimeConfig(strategy="ddp", device="cpu", backend="gloo")
+with initialize_runtime(
+    RuntimeConfig(strategy="ddp", device="cpu", backend="gloo")
 ) as runtime:
     bundle = runtime.start_execution(
-        TorchExecutionRequest(
+        ExecutionRequest(
             run_dir=Path(os.environ["RUN_DIR"]),
             run_name=os.environ["MAMMOTH_RUN_NAME"],
             invocation_kind="workflow-child",
