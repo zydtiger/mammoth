@@ -17,6 +17,7 @@ src/mammoth/
 │   └── pipeline.py
 ├── logging/
 │   ├── __init__.py
+│   ├── dispatch.py
 │   ├── execution.py
 │   ├── jsonl.py
 │   ├── model.py
