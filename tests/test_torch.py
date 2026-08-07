@@ -42,17 +42,17 @@ from mammoth.torch import (
     CheckpointPublication,
     CheckpointSavePolicy,
     EarlyStopping,
+    ExecutionRequest,
     MetricAccumulator,
     MetricRoute,
     MetricSpec,
     PublishedCheckpoint,
     RestoreOptions,
+    RuntimeConfig,
     StateRegistry,
     StepContext,
     StepOutput,
     TorchCompileConfig,
-    TorchExecutionRequest,
-    TorchRuntimeConfig,
     Trainer,
     TrainerCheckpointContext,
     TrainerCheckpointRestore,
@@ -65,7 +65,7 @@ from mammoth.torch import (
     WeightedDistributedBatchSampler,
     allocate_weighted_tasks,
     checkpoint_payload,
-    initialize_torch_runtime,
+    initialize_runtime,
     move_batch_to_device,
     publish_checkpoint_plan,
     restore_checkpoint,
@@ -737,7 +737,7 @@ def _torch_runtime_worker(
 ) -> None:
     """Exercise a real two-process Gloo runtime and report bounded results."""
     try:
-        config = TorchRuntimeConfig(
+        config = RuntimeConfig(
             strategy="ddp",
             device="cpu",
             backend="gloo",
@@ -747,7 +747,7 @@ def _torch_runtime_worker(
             local_rank=rank,
             world_size=2,
         )
-        with initialize_torch_runtime(config) as runtime:
+        with initialize_runtime(config) as runtime:
             if fail_logging_rank == rank:
 
                 def fail_logging(*args: Any, **kwargs: Any) -> Any:
@@ -755,7 +755,7 @@ def _torch_runtime_worker(
 
                 torch_runtime_module.create_execution_logging = fail_logging
             bundle = runtime.start_execution(
-                TorchExecutionRequest(
+                ExecutionRequest(
                     run_dir=Path(run_dir),
                     run_name="ddp-run",
                     invocation_kind="test",
@@ -842,8 +842,8 @@ def _distributed_interrupt_worker(
 ) -> None:
     """Report whether rank-wide interrupt consensus reaches checkpoint policy."""
     try:
-        with initialize_torch_runtime(
-            TorchRuntimeConfig(
+        with initialize_runtime(
+            RuntimeConfig(
                 strategy="ddp",
                 device="cpu",
                 backend="gloo",
@@ -936,8 +936,8 @@ def _uneven_accumulation_worker(
 ) -> None:
     """Exercise unequal rank-local windows with global logical-batch metrics."""
     try:
-        with initialize_torch_runtime(
-            TorchRuntimeConfig(
+        with initialize_runtime(
+            RuntimeConfig(
                 strategy="ddp",
                 device="cpu",
                 backend="gloo",
@@ -1477,8 +1477,8 @@ def _validation_epoch_metric_worker(
 ) -> None:
     """Reduce one validation epoch with unequal rank-local DataLoader lengths."""
     try:
-        with initialize_torch_runtime(
-            TorchRuntimeConfig(
+        with initialize_runtime(
+            RuntimeConfig(
                 strategy="ddp",
                 device="cpu",
                 backend="gloo",
@@ -6469,9 +6469,9 @@ def test_single_runtime_establishes_execution_and_supplies_trainer_observer(
     loader = DataLoader(MappingDataset(), batch_size=2)
     model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    with initialize_torch_runtime(TorchRuntimeConfig(device="cpu")) as runtime:
+    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
         bundle = runtime.start_execution(
-            TorchExecutionRequest(
+            ExecutionRequest(
                 run_dir=run_dir,
                 run_name="single-run",
                 invocation_kind="test",
@@ -6521,9 +6521,9 @@ def test_single_runtime_establishes_execution_and_supplies_trainer_observer(
 def test_runtime_preserves_caller_supplied_parent_execution_id(tmp_path: Path) -> None:
     """The PyTorch request forwards explicit lineage without inspecting artifacts."""
     run_dir = tmp_path / "explicit-parent"
-    with initialize_torch_runtime(TorchRuntimeConfig(device="cpu")) as runtime:
+    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
         context = runtime.establish_execution(
-            TorchExecutionRequest(
+            ExecutionRequest(
                 run_dir=run_dir,
                 run_name="explicit-parent",
                 invocation_kind="train",
@@ -6543,11 +6543,11 @@ def test_single_runtime_owns_weighted_helpers_and_execution_lifecycle(
     tmp_path: Path,
 ) -> None:
     run_dir = tmp_path / "runtime-session"
-    runtime = initialize_torch_runtime(
-        TorchRuntimeConfig(device="cpu", workload_weights=(2,))
+    runtime = initialize_runtime(
+        RuntimeConfig(device="cpu", workload_weights=(2,))
     )
     runtime.start_execution(
-        TorchExecutionRequest(
+        ExecutionRequest(
             run_dir=run_dir,
             run_name="runtime-session",
             invocation_kind="test",
@@ -6604,9 +6604,9 @@ def _create_test_execution_session(
     name: str,
 ) -> tuple[Any, Any]:
     """Create one started single-process runtime/session test fixture."""
-    runtime = initialize_torch_runtime(TorchRuntimeConfig(device="cpu"))
+    runtime = initialize_runtime(RuntimeConfig(device="cpu"))
     runtime.start_execution(
-        TorchExecutionRequest(
+        ExecutionRequest(
             run_dir=tmp_path / name,
             run_name=name,
             invocation_kind="test",
@@ -6997,9 +6997,9 @@ def test_execution_session_scope_derives_terminal_process_state(
     expected_status: str,
 ) -> None:
     run_dir = tmp_path / f"session-{type(error).__name__}"
-    runtime = initialize_torch_runtime(TorchRuntimeConfig(device="cpu"))
+    runtime = initialize_runtime(RuntimeConfig(device="cpu"))
     runtime.start_execution(
-        TorchExecutionRequest(
+        ExecutionRequest(
             run_dir=run_dir,
             run_name="runtime-session",
             invocation_kind="test",
@@ -7034,9 +7034,9 @@ def test_execution_session_scope_derives_terminal_process_state(
 
 def test_execution_session_cannot_report_failed_phase_as_success(tmp_path: Path) -> None:
     run_dir = tmp_path / "failed-session"
-    runtime = initialize_torch_runtime(TorchRuntimeConfig(device="cpu"))
+    runtime = initialize_runtime(RuntimeConfig(device="cpu"))
     runtime.start_execution(
-        TorchExecutionRequest(
+        ExecutionRequest(
             run_dir=run_dir,
             run_name="failed-session",
             invocation_kind="test",
@@ -7061,9 +7061,9 @@ def test_execution_session_reraises_late_runtime_cleanup_failure(
     tmp_path: Path,
 ) -> None:
     run_dir = tmp_path / "cleanup-failed-session"
-    runtime = initialize_torch_runtime(TorchRuntimeConfig(device="cpu"))
+    runtime = initialize_runtime(RuntimeConfig(device="cpu"))
     runtime.start_execution(
-        TorchExecutionRequest(
+        ExecutionRequest(
             run_dir=run_dir,
             run_name="cleanup-failed-session",
             invocation_kind="test",
@@ -7098,9 +7098,9 @@ def test_execution_session_derives_interrupt_from_presentation_cleanup(
     tmp_path: Path,
 ) -> None:
     run_dir = tmp_path / "cleanup-interrupted-session"
-    runtime = initialize_torch_runtime(TorchRuntimeConfig(device="cpu"))
+    runtime = initialize_runtime(RuntimeConfig(device="cpu"))
     runtime.start_execution(
-        TorchExecutionRequest(
+        ExecutionRequest(
             run_dir=run_dir,
             run_name="cleanup-interrupted-session",
             invocation_kind="test",
@@ -7137,13 +7137,13 @@ def test_runtime_validates_launch_and_weight_topology(
 ) -> None:
     monkeypatch.setenv("WORLD_SIZE", "2")
     with pytest.raises(RuntimeError, match="multi-process launch"):
-        initialize_torch_runtime(
-            TorchRuntimeConfig(device="cpu", strict_launch_environment=True)
+        initialize_runtime(
+            RuntimeConfig(device="cpu", strict_launch_environment=True)
         )
 
     with pytest.raises(RuntimeError, match="one value per rank"):
-        initialize_torch_runtime(
-            TorchRuntimeConfig(
+        initialize_runtime(
+            RuntimeConfig(
                 strategy="ddp",
                 device="cpu",
                 rank=0,
@@ -7154,8 +7154,8 @@ def test_runtime_validates_launch_and_weight_topology(
         )
 
     with pytest.raises(RuntimeError, match="global rank and local rank"):
-        initialize_torch_runtime(
-            TorchRuntimeConfig(
+        initialize_runtime(
+            RuntimeConfig(
                 strategy="ddp",
                 device="cpu",
                 rank=1,
@@ -7183,9 +7183,9 @@ def test_single_runtime_joins_runner_execution_from_environment(
     )
     monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
 
-    with initialize_torch_runtime(TorchRuntimeConfig(device="cpu")) as runtime:
+    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
         bundle = runtime.start_execution(
-            TorchExecutionRequest(
+            ExecutionRequest(
                 run_dir=run_dir,
                 run_name="joined-run",
                 invocation_kind="train",
@@ -7215,9 +7215,9 @@ def test_single_runtime_joins_execution_from_request_owned_alias(
     )
     monkeypatch.setenv("CALLER_EXECUTION_ID", "runner-attempt")
 
-    with initialize_torch_runtime(TorchRuntimeConfig(device="cpu")) as runtime:
+    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
         runtime.start_execution(
-            TorchExecutionRequest(
+            ExecutionRequest(
                 run_dir=run_dir,
                 run_name="joined-run",
                 invocation_kind="train",
@@ -7232,7 +7232,7 @@ def test_single_runtime_joins_execution_from_request_owned_alias(
 
 def test_execution_request_rejects_invalid_alias_declarations(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="not a string"):
-        TorchExecutionRequest(
+        ExecutionRequest(
             run_dir=tmp_path,
             run_name="alias-validation",
             invocation_kind="test",
@@ -7244,9 +7244,9 @@ def test_execution_request_rejects_invalid_alias_declarations(tmp_path: Path) ->
 
 def test_execution_establishment_can_be_used_without_mammoth_logging(tmp_path: Path) -> None:
     run_dir = tmp_path / "adapter-run"
-    runtime = initialize_torch_runtime(TorchRuntimeConfig(device="cpu"))
+    runtime = initialize_runtime(RuntimeConfig(device="cpu"))
     context = runtime.establish_execution(
-        TorchExecutionRequest(
+        ExecutionRequest(
             run_dir=run_dir,
             run_name="adapter-run",
             invocation_kind="test",

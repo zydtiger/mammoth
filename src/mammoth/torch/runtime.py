@@ -49,7 +49,7 @@ Strategy = Literal["single", "ddp"]
 
 
 @dataclass(frozen=True, slots=True)
-class TorchRuntimeConfig:
+class RuntimeConfig:
     """Framework-level process-group and device policy."""
 
     strategy: Strategy = "single"
@@ -114,7 +114,7 @@ class TorchRuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class TorchExecutionRequest:
+class ExecutionRequest:
     """Project-neutral facts needed to establish one immutable execution.
 
     Consumers may declare temporary execution-ID environment aliases here; the
@@ -166,17 +166,17 @@ class _StartupStatus:
     error: str | None
 
 
-class TorchExecutionRuntime:
+class Runtime:
     """Own one process's generic PyTorch identity, collectives, and execution IO."""
 
-    def __init__(self, config: TorchRuntimeConfig | None = None) -> None:
-        self.config = config or TorchRuntimeConfig()
+    def __init__(self, config: RuntimeConfig | None = None) -> None:
+        self.config = config or RuntimeConfig()
         self.strategy = self.config.strategy
         self._owns_process_group = False
         self._logical_run_lease: LogicalRunLease | None = None
         self.execution_logging: ExecutionLogging | None = None
         self.execution_context: ExecutionContext | None = None
-        self._execution_session: TorchExecutionSession | None = None
+        self._execution_session: ExecutionSession | None = None
         self._closed = False
 
         if self.strategy == "single":
@@ -373,7 +373,7 @@ class TorchExecutionRuntime:
 
     def start_execution(
         self,
-        request: TorchExecutionRequest,
+        request: ExecutionRequest,
         *,
         additional_sinks: Sequence[ObservationSink] = (),
         text_level: int = logging.INFO,
@@ -425,17 +425,17 @@ class TorchExecutionRuntime:
         self.execution_logging = logging_bundle
         return logging_bundle
 
-    def create_execution_session(self) -> TorchExecutionSession:
+    def create_execution_session(self) -> ExecutionSession:
         """Create the generic process/phase lifecycle owner for this runtime."""
         if self._execution_session is not None:
             raise RuntimeError("This torch runtime already has an execution session")
         if self.execution_logging is None:
             raise RuntimeError("Start execution logging before creating a session")
-        session = TorchExecutionSession(self)
+        session = ExecutionSession(self)
         self._execution_session = session
         return session
 
-    def establish_execution(self, request: TorchExecutionRequest) -> ExecutionContext:
+    def establish_execution(self, request: ExecutionRequest) -> ExecutionContext:
         """Create or join and validate one immutable execution across all ranks."""
         if self.execution_context is not None:
             raise RuntimeError("This torch runtime has already established an execution")
@@ -477,13 +477,13 @@ class TorchExecutionRuntime:
         if first_error is not None:
             raise first_error
 
-    def __enter__(self) -> TorchExecutionRuntime:
+    def __enter__(self) -> Runtime:
         return self
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         self.close()
 
-    def _establish_execution(self, request: TorchExecutionRequest) -> ExecutionContext:
+    def _establish_execution(self, request: ExecutionRequest) -> ExecutionContext:
         """Publish on rank zero, then make every rank join and validate one attempt."""
         primary_result: _PrimaryResult | None = None
         if self.is_primary:
@@ -562,7 +562,7 @@ class TorchExecutionRuntime:
     def _validate_context(
         self,
         context: ExecutionContext,
-        request: TorchExecutionRequest,
+        request: ExecutionRequest,
     ) -> None:
         metadata = context.metadata
         expected_mode = "distributed" if self.enabled else "single"
@@ -631,10 +631,10 @@ class TorchExecutionRuntime:
         }
 
 
-class TorchExecutionSession:
+class ExecutionSession:
     """Own process/phase lifecycle plus resources created through this session."""
 
-    def __init__(self, runtime: TorchExecutionRuntime) -> None:
+    def __init__(self, runtime: Runtime) -> None:
         logging_bundle = runtime.execution_logging
         if logging_bundle is None:
             raise RuntimeError("Execution logging is required for an execution session")
@@ -768,7 +768,7 @@ class TorchExecutionSession:
         self.observer.emit("phase_started", phase=phase)
 
     @contextmanager
-    def phase_scope(self, phase: str) -> Iterator[TorchExecutionSession]:
+    def phase_scope(self, phase: str) -> Iterator[ExecutionSession]:
         """Own one phase's success, failure, and interruption transition."""
         self.start_phase(phase)
         try:
@@ -896,7 +896,7 @@ class TorchExecutionSession:
             first_error.add_note(f"Cleanup stage: {first_label}")
             raise first_error
 
-    def __enter__(self) -> TorchExecutionSession:
+    def __enter__(self) -> ExecutionSession:
         """Return this open execution session."""
         self._require_open()
         return self
@@ -949,14 +949,14 @@ class TorchExecutionSession:
         return max(0.0, time.monotonic() - self._process_started_at)
 
 
-def initialize_torch_runtime(
-    config: TorchRuntimeConfig | None = None,
-) -> TorchExecutionRuntime:
+def initialize_runtime(
+    config: RuntimeConfig | None = None,
+) -> Runtime:
     """Initialize and return one generic PyTorch execution runtime."""
-    return TorchExecutionRuntime(config)
+    return Runtime(config)
 
 
-def _distributed_identity(config: TorchRuntimeConfig) -> tuple[int, int, int]:
+def _distributed_identity(config: RuntimeConfig) -> tuple[int, int, int]:
     if config.rank is not None and config.world_size is not None:
         rank = config.rank
         world_size = config.world_size
