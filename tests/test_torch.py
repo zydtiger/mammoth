@@ -3042,6 +3042,11 @@ def test_batch_prefetch_iterator_preserves_sync_order_when_cuda_is_ineligible() 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_cuda_prefetch_iterator_stages_one_pinned_batch_on_a_copy_stream() -> None:
     device = torch.device("cuda")
+    copy_gate = torch.cuda.Event()
+    blocker = torch.cuda.Stream(device)
+    with torch.cuda.stream(blocker):
+        torch.cuda._sleep(1_000_000_000)
+        copy_gate.record()
     sync_moves: list[int] = []
     prefetch_moves: list[int] = []
 
@@ -3051,6 +3056,7 @@ def test_cuda_prefetch_iterator_stages_one_pinned_batch_on_a_copy_stream() -> No
 
     def prefetch_mover(batch: torch.Tensor, target: torch.device) -> torch.Tensor:
         prefetch_moves.append(int(batch.item()))
+        torch.cuda.current_stream(target).wait_event(copy_gate)
         return batch.to(target, non_blocking=True)
 
     iterator = CudaPrefetchingBatchIterator(
@@ -3068,6 +3074,10 @@ def test_cuda_prefetch_iterator_stages_one_pinned_batch_on_a_copy_stream() -> No
     assert sync_moves == [1]
     assert prefetch_moves == [2]
     assert iterator._prefetched.device.type == "cuda"
+    compute_complete = torch.cuda.Event()
+    compute_complete.record(torch.cuda.current_stream(device))
+    compute_complete.synchronize()
+    assert not copy_gate.query()
     second = next(iterator)
     assert second.item() == 2
     assert prefetch_moves == [2]
