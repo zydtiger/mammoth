@@ -403,6 +403,18 @@ def test_plain_snapshot_marks_missing_throughput_unavailable(tmp_path: Path) -> 
 
     assert "rank-0/opaque/task: running 1/2 rate=--" in rendered
 
+    console = Console(width=80, record=True, color_system=None)
+    console.print(
+        dashboard_layout(
+            RunMonitor(layout).poll(),
+            host=None,
+            detail=False,
+            compact=True,
+        )
+    )
+
+    assert "overall: 1/2 · --" in console.export_text()
+
 
 def test_dashboard_omits_secondary_metrics_without_loss_or_learning_rate(
     tmp_path: Path,

@@ -1041,7 +1041,7 @@ def _progress_text(progress: _ProgressView) -> str:
     rate = (
         f" · {progress.throughput:.1f} b/s"
         if progress.throughput is not None
-        else ""
+        else " · --"
     )
     eta = format_duration(progress.eta_seconds)
     eta_text = f" · ETA {eta}" if eta is not None else ""
