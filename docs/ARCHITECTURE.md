@@ -190,7 +190,7 @@ producers, or controls an execution.
 
 ## PyTorch execution runtime
 
-`TorchExecutionRuntime` owns framework-level single-process or standard DDP
+`Runtime` owns framework-level single-process or standard DDP
 state. It resolves rank, local rank, world size, and device; initializes an
 uninitialized default process group; exposes common object and tensor
 collectives; validates optional caller-selected launch constraints; applies
@@ -203,14 +203,14 @@ not encode GPU models, concrete workload weights, or project topology rules.
 Rank zero creates a direct execution and holds its logical-run lease, or joins
 an execution identified by `MAMMOTH_EXECUTION_ID`. A consuming project may
 explicitly pass temporary compatibility alias names through
-`TorchExecutionRequest`; Mammoth validates those names and their values with
+`ExecutionRequest`; Mammoth validates those names and their values with
 the canonical variable, but does not define, publish, or persist any
 consumer-specific alias. Every rank validates the same immutable context, opens
 its own JSONL and text streams, and reaches startup consensus. A failure on any
 rank is reported coherently before project work begins. TensorBoard's rank-aware
 sink and trainer checkpoints default to rank zero.
 
-`TorchExecutionSession` owns process and phase lifecycle events after logging
+`ExecutionSession` owns process and phase lifecycle events after logging
 starts. It is also the context-managed owner of observers, background
 pipelines, and trainers created through its factories. Factory inputs such as
 models, optimizers, schedulers, loaders, policies, serializers, metrics, and
@@ -245,7 +245,7 @@ serializer.
 Mammoth may own the ordinary loop mechanics: mode switching, device transfer,
 precision, backward, accumulation, clipping, optimizer/scheduler steps,
 standard DDP, callbacks, logging, interruption handling, and registered-state
-checkpoint publication. A trainer may consume a `TorchExecutionRuntime` for
+checkpoint publication. A trainer may consume a `Runtime` for
 device/rank identity and its active execution observer; constructing the
 trainer without a runtime remains supported for callers that already own their
 process group.

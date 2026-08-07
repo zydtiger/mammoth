@@ -336,17 +336,17 @@ trusted producer provenance; the stored parent remains `None`.
 from pathlib import Path
 
 from mammoth.torch import (
-    TorchExecutionRequest,
-    TorchRuntimeConfig,
+    ExecutionRequest,
+    RuntimeConfig,
     Trainer,
     TrainerConfig,
-    initialize_torch_runtime,
+    initialize_runtime,
 )
 
-runtime_config = TorchRuntimeConfig(strategy="ddp", device="auto")
-with initialize_torch_runtime(runtime_config) as runtime:
+runtime_config = RuntimeConfig(strategy="ddp", device="auto")
+with initialize_runtime(runtime_config) as runtime:
     runtime.start_execution(
-        TorchExecutionRequest(
+        ExecutionRequest(
             run_dir=Path("runs/example"),
             run_name="example",
             invocation_kind="train",
@@ -411,7 +411,7 @@ Callers resolving an interrupt at the return boundary may use
 acknowledgment removal is likewise deferred so the observed outcome is not
 lost.
 
-An active `TorchExecutionSession` can create and own the same pipeline through
+An active `ExecutionSession` can create and own the same pipeline through
 `session.create_background_pipeline(...)`, ensuring accepted work closes before
 observers and runtime resources.
 

@@ -63,7 +63,7 @@ from mammoth.torch.scheduling import AccumulationPolicy, UniformAccumulationPoli
 from mammoth.torch.state import TrainerState
 
 if TYPE_CHECKING:
-    from mammoth.torch.runtime import TorchExecutionRuntime
+    from mammoth.torch.runtime import Runtime
 
 Precision = Literal["fp32", "bf16", "fp16"]
 Strategy = Literal["single", "ddp"]
@@ -261,7 +261,7 @@ class Trainer:
         checkpoint_save_policy: CheckpointSavePolicy | None = None,
         extra_state: Mapping[str, Stateful] | None = None,
         batch_mover: BatchMover | None = None,
-        runtime: TorchExecutionRuntime | None = None,
+        runtime: Runtime | None = None,
     ) -> None:
         if (validation_loader is None) != (validation_step is None):
             raise ValueError("validation_loader and validation_step must be provided together")
