@@ -238,6 +238,25 @@ Chrome traces remain operational evidence.
 Projects can replace the generic nested-tensor output summary when they need a
 semantic comparison such as predicted classes or generated-token checks.
 
+## Profile dependent named regions
+
+For a compound workflow, callers can retain values between measured regions
+while Mammoth aggregates only the samples they elect to report:
+
+```python
+from mammoth.torch import NamedPhaseProfiler
+
+phases = NamedPhaseProfiler("cuda:0")
+features = phases.measure("encode", lambda: model.encoder(images), record=False)
+scores = phases.measure("decode", lambda: model.decoder(features))
+phase_summaries = phases.summaries()
+```
+
+The phase names and their ordering remain caller-owned. `NamedPhaseProfiler`
+records generic `torch.profiler` ranges when used inside a caller-owned profiler
+context; `normalize_operation_profiles()` turns that context's operation rows
+into Mammoth's stable value objects.
+
 ## Use the PyTorch trainer
 
 The optional trainer fits into a project that already constructs its model,
