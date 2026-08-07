@@ -17,6 +17,19 @@ direction, runtime concepts, artifact layout, logging roles, trainer scope, and
 compatibility policy. Do not restate those contracts in another document or
 implement behavior that contradicts them.
 
+## Batch Terminology
+
+In agent conversations and status reports, always qualify whether training work
+means a `microbatch` or a `logical batch`. A microbatch is one local loader batch
+processed inside an accumulation window. A logical batch is the complete
+accumulation window that produces one optimizer step.
+
+When a user says `batch` without qualification, infer `logical batch` and state
+that inference in the response. Interpret the term as `microbatch` only when the
+user says so explicitly. When discussing validation, where optimizer-step
+accumulation does not define a logical batch, use `validation DataLoader batch`
+explicitly.
+
 ## File Ownership
 
 Every current repository file has one primary purpose. Update the owning file
