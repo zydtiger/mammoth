@@ -52,6 +52,7 @@ from mammoth.torch.metrics import (
     MetricSpec,
     StatefulMetric,
     compute_stateful_metrics,
+    prepared_scalar_metrics,
     reset_stateful_metrics,
     route_metrics,
     scalar_metrics,
@@ -570,10 +571,16 @@ class Trainer:
                                         window_index=window_offset,
                                     )
                                 metrics = output_metrics(output)
-                                accumulator.update(metrics, weight=output.weight)
+                                required_finite = {"loss": output.loss}
+                                accumulator.update(
+                                    metrics,
+                                    weight=output.weight,
+                                    required_finite=required_finite,
+                                )
                                 window_accumulator.update(
                                     metrics,
                                     weight=output.weight,
+                                    required_finite=required_finite,
                                 )
                                 update_stateful_metrics(
                                     self.train_stateful_metrics,
@@ -603,19 +610,26 @@ class Trainer:
                         accumulator.update(optimizer_metrics)
                         window_accumulator.update(optimizer_metrics)
 
-                    window_metrics, window_stateful_baseline = self.coordinate(
-                        "training metric reduction",
-                        partial(
-                            self.compute_training_window,
-                            window_accumulator,
-                            window_stateful_baseline,
-                        ),
-                    )
-                    window_accumulator = MetricAccumulator(self.metric_specs)
-                    if (
+                    should_observe = (
                         window_index % self.config.log_every_batches == 0
                         or window_index == len(window_sizes)
-                    ):
+                    )
+                    if should_observe:
+                        window_metrics, window_stateful_baseline = self.coordinate(
+                            "training metric reduction",
+                            partial(
+                                self.compute_training_window,
+                                window_accumulator,
+                                window_stateful_baseline,
+                            ),
+                        )
+                    else:
+                        window_stateful_baseline = self.coordinate(
+                            "training metric baseline",
+                            partial(snapshot_stateful_metrics, self.train_stateful_metrics),
+                        )
+                    window_accumulator = MetricAccumulator(self.metric_specs)
+                    if should_observe:
                         routed = self.coordinate(
                             "training metric routing",
                             partial(
@@ -735,13 +749,23 @@ class Trainer:
                         ):
                             output = self.validation_step(self.execution_model, moved, context)
                         metrics = output_metrics(output)
-                        accumulator.update(metrics, weight=output.weight)
+                        required_finite = (
+                            {} if output.loss is None else {"loss": output.loss}
+                        )
+                        accumulator.update(
+                            metrics,
+                            weight=output.weight,
+                            required_finite=required_finite,
+                        )
                         update_stateful_metrics(
                             self.validation_stateful_metrics,
                             output.metric_updates,
                         )
                         routed = route_metrics(
-                            metrics,
+                            scalar_metrics(
+                                metrics,
+                                required_finite=required_finite,
+                            ),
                             self.validation_metric_routes,
                             "batch",
                         )
@@ -836,9 +860,9 @@ class Trainer:
     def compute_optimizer_step_metrics(
         self,
         provider: OptimizerStepMetrics,
-    ) -> dict[str, float]:
+    ) -> dict[str, float | torch.Tensor]:
         """Validate consumer metrics after one optimizer/scheduler boundary."""
-        return scalar_metrics(provider(self.state))
+        return prepared_scalar_metrics(provider(self.state))
 
     def optimizer_step_logical_step(self) -> int:
         """Return the configured sink clock without changing completed-step state."""
@@ -1699,11 +1723,11 @@ class Trainer:
         )
 
 
-def output_metrics(output: StepOutput) -> dict[str, float]:
-    """Convert scalar tensors to detached finite floats and include loss."""
-    metrics = scalar_metrics(output.metrics)
+def output_metrics(output: StepOutput) -> dict[str, float | torch.Tensor]:
+    """Validate and detach scalar tensors without forcing host materialization."""
+    metrics = prepared_scalar_metrics(output.metrics)
     if output.loss is not None:
-        loss = scalar_metrics({"loss": output.loss})["loss"]
+        loss = prepared_scalar_metrics({"loss": output.loss})["loss"]
         metrics.setdefault("loss", loss)
     return metrics
 
