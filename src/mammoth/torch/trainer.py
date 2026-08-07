@@ -541,10 +541,12 @@ class Trainer:
                     window_index = window_offset + 1
                     window_global_step = self.state.global_step
                     window_error: BaseException | None = None
+                    final_backward_loss: torch.Tensor | None = None
                     last_batch_index = batch_index
                     for local_window_offset in range(window_size):
                         if window_error is not None:
                             break
+                        synchronizes_gradients = local_window_offset + 1 == window_size
                         try:
                             batch = next(loader_iterator)
                             moved = self.batch_mover(batch, self.device)
@@ -559,7 +561,9 @@ class Trainer:
                                 ),
                                 optimizer_step=self.state.optimizer_step,
                             )
-                            with self.gradient_accumulation_context():
+                            with self.gradient_accumulation_context(
+                                synchronizes_gradients=synchronizes_gradients
+                            ):
                                 with self.autocast_context():
                                     output = self.train_step(self.execution_model, moved, context)
                                     if output.loss is None:
@@ -588,14 +592,19 @@ class Trainer:
                                 )
                                 backward_loss = self.scaler.scale(scaled)
                                 assert isinstance(backward_loss, torch.Tensor)
-                                backward_loss.backward()  # type: ignore[no-untyped-call]
+                                if synchronizes_gradients and self._ddp_model is not None:
+                                    final_backward_loss = backward_loss
+                                else:
+                                    backward_loss.backward()  # type: ignore[no-untyped-call]
                         except BaseException as error:
                             window_error = error
                         else:
                             last_batch_index = batch_index
                             batch_index += 1
                     self.raise_distributed_failure("train step", window_error)
-                    self.synchronize_gradients()
+                    if self._ddp_model is not None:
+                        assert final_backward_loss is not None
+                        final_backward_loss.backward()  # type: ignore[no-untyped-call]
                     self.coordinate("optimizer step", self.optimizer_step)
                     self.state.global_step += global_window_sizes[window_offset]
                     optimizer_step_metrics = self.optimizer_step_metrics
@@ -934,44 +943,11 @@ class Trainer:
         for callback in self.callbacks:
             callback.on_checkpoint_published(self.state, publication)
 
-    def gradient_accumulation_context(self) -> Any:
-        """Suppress automatic DDP reduction until the shared logical-step boundary."""
-        if self._ddp_model is not None:
+    def gradient_accumulation_context(self, *, synchronizes_gradients: bool = False) -> Any:
+        """Suppress DDP reduction only before a native window's final backward."""
+        if self._ddp_model is not None and not synchronizes_gradients:
             return self._ddp_model.no_sync()
         return nullcontext()
-
-    def synchronize_gradients(self) -> None:
-        """Average accumulated gradients after rank-wide metadata consensus."""
-        if self.config.strategy == "single":
-            return
-        parameters = tuple(self.base_model.named_parameters())
-        local_metadata = tuple(
-            (
-                name,
-                parameter.grad is not None,
-                None if parameter.grad is None else tuple(parameter.grad.shape),
-                None if parameter.grad is None else str(parameter.grad.dtype),
-                None if parameter.grad is None else str(parameter.grad.layout),
-            )
-            for name, parameter in parameters
-        )
-        gathered_metadata = self.all_gather_object(local_metadata)
-        if any(metadata != local_metadata for metadata in gathered_metadata):
-            raise RuntimeError("gradient presence or tensor metadata differs across ranks")
-        for _, parameter in parameters:
-            gradient = parameter.grad
-            if gradient is None:
-                continue
-            if gradient.layout != torch.strided:
-                raise ValueError("distributed accumulated gradients must use strided layout")
-            if self.runtime is not None:
-                self.runtime.all_reduce_sum(gradient)
-            else:
-                torch.distributed.all_reduce(
-                    gradient,
-                    op=torch.distributed.ReduceOp.SUM,
-                )
-            gradient.div_(self.world_size)
 
     def autocast_context(self) -> Any:
         """Return configured device autocast without affecting fp32 execution."""
@@ -1582,20 +1558,6 @@ class Trainer:
             if local_error is not None:
                 raise local_error
             return
-        failure_flag = torch.tensor(
-            1 if local_error is not None else 0,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        if self.runtime is not None:
-            self.runtime.all_reduce_max(failure_flag)
-        else:
-            torch.distributed.all_reduce(
-                failure_flag,
-                op=torch.distributed.ReduceOp.MAX,
-            )
-        if not bool(failure_flag.item()):
-            return
         local_status = (
             None
             if local_error is None
@@ -1605,6 +1567,8 @@ class Trainer:
             )
         )
         statuses = self.all_gather_object(local_status)
+        if all(status is None for status in statuses):
+            return
         interruption = next(
             (
                 status
