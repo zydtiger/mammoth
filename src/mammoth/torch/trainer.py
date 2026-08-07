@@ -56,7 +56,6 @@ from mammoth.torch.metrics import (
     prepared_scalar_metrics,
     reset_stateful_metrics,
     route_metrics,
-    scalar_metrics,
     snapshot_stateful_metrics,
     update_stateful_metrics,
 )
@@ -340,6 +339,16 @@ class Trainer:
         self.metric_specs = dict(metric_specs or {})
         self.train_metric_routes = dict(train_metric_routes or {})
         self.validation_metric_routes = dict(validation_metric_routes or {})
+        validation_batch_routes = sorted(
+            name
+            for name, route in self.validation_metric_routes.items()
+            if route.batch_name is not None
+        )
+        if validation_batch_routes:
+            raise ValueError(
+                "validation metric routes do not support batch_name; validation "
+                "metrics are emitted at epoch boundaries only"
+            )
         self.train_stateful_metrics = dict(train_stateful_metrics or {})
         self.validation_stateful_metrics = dict(validation_stateful_metrics or {})
         self.accumulation_policy = accumulation_policy or UniformAccumulationPolicy(
@@ -791,14 +800,6 @@ class Trainer:
                             self.validation_stateful_metrics,
                             output.metric_updates,
                         )
-                        routed = route_metrics(
-                            scalar_metrics(
-                                metrics,
-                                required_finite=required_finite,
-                            ),
-                            self.validation_metric_routes,
-                            "batch",
-                        )
                     except BaseException as error:
                         validation_error = error
                         break
@@ -807,11 +808,8 @@ class Trainer:
                         task_id=task_id,
                         completed=batch_index + 1,
                         total=total_batches,
-                        metrics=routed,
-                        display_metrics=display_metrics(
-                            routed,
-                            self.config.display_metric_names,
-                        ),
+                        metrics={},
+                        display_metrics={},
                         coordinates={"epoch": epoch, "batch": batch_index},
                         final=batch_index + 1 == total_batches,
                     )
@@ -819,19 +817,25 @@ class Trainer:
                     "validation step",
                     validation_error,
                 )
-            def compute_validation_summary() -> tuple[
-                dict[str, float],
-                dict[str, float],
-            ]:
-                scalar_summary = accumulator.compute(
+            scalar_summary = self.coordinate(
+                "validation scalar metric summary",
+                partial(
+                    accumulator.compute,
                     device=self.device,
                     distributed=self.config.strategy == "ddp",
-                )
-                stateful_summary = compute_stateful_metrics(
+                ),
+            )
+            stateful_summary = self.coordinate(
+                "validation stateful metric summary",
+                partial(
+                    compute_stateful_metrics,
                     self.validation_stateful_metrics,
                     device=self.device,
                     distributed=self.config.strategy == "ddp",
-                )
+                ),
+            )
+
+            def route_validation_summary() -> tuple[dict[str, float], dict[str, float]]:
                 summary = merge_metrics(scalar_summary, stateful_summary)
                 return (
                     summary,
@@ -843,8 +847,8 @@ class Trainer:
                 )
 
             summary, routed_summary = self.coordinate(
-                "validation metric summary",
-                compute_validation_summary,
+                "validation metric routing",
+                route_validation_summary,
             )
         except BaseException as error:
             self.observer.emit(

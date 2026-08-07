@@ -296,11 +296,18 @@ serializer.
 
 `StepOutput` carries the optional loss, already-computed scalar metrics, and
 opaque updates for registered stateful metrics. Mammoth reduces configured
-distributed training-window summaries and train/validation epoch summaries,
-then applies separate batch and epoch routes. Validation batch routes and
-metrics configured with `distributed=False` remain rank-local. The trainer
-emits generic phase, task, progress, heartbeat, completion, and failure
-observations; projects select phase names, metric names, and display fields.
+distributed training-window summaries and train/validation epoch summaries.
+Training applies batch routes at its configured logical-batch observation
+cadence and epoch routes at epoch end. Validation DataLoader batches update
+device-resident scalar accumulators and stateful metrics while their progress
+observations omit metric values; validation reduces, materializes, and applies
+epoch routes only at the validation epoch boundary. Validation routes therefore
+support `epoch_name` only. Metrics configured with `distributed=False` remain
+rank-local. `StepOutput.weight` controls weighted scalar means, with the default
+weight of one treating each DataLoader batch equally; callers supply a batch
+size when sample-weighted means are required. The trainer emits generic phase,
+task, progress, heartbeat, completion, and failure observations; projects
+select phase names, metric names, and display fields.
 When a surrounding command already owns the outer training phase, it disables
 the trainer's fit-level phase records while retaining Mammoth's nested task,
 progress, validation-phase, heartbeat, and metric observations.
