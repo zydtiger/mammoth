@@ -23,6 +23,7 @@ import mammoth.torch.checkpoint as checkpoint_module
 import mammoth.torch.runtime as torch_runtime_module
 import mammoth.torch.trainer as trainer_module
 from mammoth.core import (
+    BoundedBackgroundPipeline,
     PreparedArtifact,
     claim_logical_run_lease,
     create_execution_context,
@@ -3792,6 +3793,7 @@ def test_generic_receipt_publication_replaces_destination_symlink(
             epoch=0,
         )
         publisher.flush()
+        assert future.done()
 
     receipt = future.result().published[0]
     assert outside.read_bytes() == b"sentinel"
@@ -3888,6 +3890,382 @@ def test_generic_receipt_publication_applies_backpressure_before_snapshot(
 
     assert errors == []
     assert snapshots == [1, 2]
+
+
+def test_checkpoint_failure_during_snapshot_preserves_admitted_submission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slot admitted before snapshot remains usable if prior work then fails."""
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_snapshot_started = threading.Event()
+    allow_second_snapshot = threading.Event()
+    real_snapshot = checkpoint_module.snapshot_to_cpu
+
+    def fail_first(temporary: Path) -> None:
+        first_started.set()
+        assert release_first.wait(timeout=5.0)
+        temporary.write_bytes(b"partial")
+        raise OSError("first publication failed")
+
+    def snapshot(payload: Any) -> Any:
+        if isinstance(payload, Mapping) and payload.get("sequence") == 2:
+            second_snapshot_started.set()
+            assert allow_second_snapshot.wait(timeout=5.0)
+        return real_snapshot(payload)
+
+    monkeypatch.setattr(checkpoint_module, "snapshot_to_cpu", snapshot)
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    publisher = AsyncCheckpointPublisher(max_pending=2)
+    first_future = publisher.submit(
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(checkpoint_root / "first.pt", fail_first),),
+        )
+    )
+    assert first_started.wait(timeout=5.0)
+    first_completed = threading.Event()
+    first_future.add_done_callback(lambda _: first_completed.set())
+    submitted: list[Future[Path]] = []
+    errors: list[BaseException] = []
+
+    def submit_second() -> None:
+        try:
+            submitted.append(
+                publisher.publish(
+                    checkpoint_root / "second.pt",
+                    {"sequence": 2},
+                )
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    submitter = threading.Thread(target=submit_second)
+    submitter.start()
+    assert second_snapshot_started.wait(timeout=5.0)
+    release_first.set()
+    assert first_completed.wait(timeout=5.0)
+    allow_second_snapshot.set()
+    submitter.join(timeout=5.0)
+
+    assert not submitter.is_alive()
+    assert errors == []
+    assert len(submitted) == 1
+    assert submitted[0].result(timeout=5.0) == checkpoint_root / "second.pt"
+    with pytest.raises(OSError, match="first publication failed"):
+        publisher.flush()
+    publisher.close()
+
+
+def test_checkpoint_failure_survives_interrupted_adapter_acknowledgment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adapter ownership preserves a raw failure before generic acknowledgment."""
+    first_started = threading.Event()
+    release_first = threading.Event()
+    second_snapshot_started = threading.Event()
+    allow_second_snapshot = threading.Event()
+    real_snapshot = checkpoint_module.snapshot_to_cpu
+
+    def fail_first(temporary: Path) -> None:
+        first_started.set()
+        assert release_first.wait(timeout=5.0)
+        temporary.write_bytes(b"partial")
+        raise OSError("preserved publication failure")
+
+    def snapshot(payload: Any) -> Any:
+        if isinstance(payload, Mapping) and payload.get("sequence") == 2:
+            second_snapshot_started.set()
+            assert allow_second_snapshot.wait(timeout=5.0)
+        return real_snapshot(payload)
+
+    monkeypatch.setattr(checkpoint_module, "snapshot_to_cpu", snapshot)
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    publisher = AsyncCheckpointPublisher(max_pending=2)
+    first_future = publisher.submit(
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(checkpoint_root / "first.pt", fail_first),),
+        )
+    )
+    assert first_started.wait(timeout=5.0)
+    first_completed = threading.Event()
+    first_future.add_done_callback(lambda _: first_completed.set())
+    real_acknowledge = publisher._acknowledge
+    acknowledgment_calls = 0
+
+    def interrupt_after_acknowledgment(submission: Any) -> None:
+        nonlocal acknowledgment_calls
+        acknowledgment_calls += 1
+        real_acknowledge(submission)
+        if acknowledgment_calls == 1:
+            raise KeyboardInterrupt("adapter acknowledgment interrupted")
+
+    monkeypatch.setattr(publisher, "_acknowledge", interrupt_after_acknowledgment)
+    errors: list[BaseException] = []
+
+    def submit_second() -> None:
+        try:
+            publisher.publish(
+                checkpoint_root / "second.pt",
+                {"sequence": 2},
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    submitter = threading.Thread(target=submit_second)
+    submitter.start()
+    assert second_snapshot_started.wait(timeout=5.0)
+    release_first.set()
+    assert first_completed.wait(timeout=5.0)
+    allow_second_snapshot.set()
+    submitter.join(timeout=5.0)
+
+    assert not submitter.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], KeyboardInterrupt)
+    with pytest.raises(OSError, match="preserved publication failure"):
+        publisher.flush()
+    publisher.close()
+
+
+def test_checkpoint_future_callbacks_observe_final_pipeline_state(
+    tmp_path: Path,
+) -> None:
+    """Re-entrant and process-exception callbacks cannot corrupt publication."""
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    started = threading.Event()
+    release = threading.Event()
+    callback_completed = threading.Event()
+
+    def write(temporary: Path) -> None:
+        started.set()
+        assert release.wait(timeout=5.0)
+        temporary.write_bytes(b"complete")
+
+    def write_second(temporary: Path) -> None:
+        temporary.write_bytes(b"second")
+
+    publisher = AsyncCheckpointPublisher(max_pending=2)
+    future = publisher.submit(
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(checkpoint_root / "complete.pt", write),),
+        )
+    )
+    assert started.wait(timeout=5.0)
+    second_future = publisher.submit(
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(checkpoint_root / "second.pt", write_second),),
+        )
+    )
+
+    def flush_from_callback(_: Future[CheckpointPublication]) -> None:
+        publisher.flush()
+        callback_completed.set()
+        raise KeyboardInterrupt("callback interrupted")
+
+    future.add_done_callback(flush_from_callback)
+    release.set()
+
+    publisher.close()
+    publication = future.result(timeout=5.0)
+    assert callback_completed.wait(timeout=5.0)
+    assert publication.published[0].path == checkpoint_root / "complete.pt"
+    assert second_future.result(timeout=5.0).published[0].path == (
+        checkpoint_root / "second.pt"
+    )
+
+
+def test_checkpoint_close_retains_handoff_interrupt_across_cleanup_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Close retry surfaces acceptance interruption after cleanup can finish."""
+    publisher = AsyncCheckpointPublisher()
+    handoff_interrupt = KeyboardInterrupt("accepted handoff interrupted")
+
+    def interrupt_handoff(submission: Any) -> Any:
+        del submission
+        raise handoff_interrupt
+
+    monkeypatch.setattr(
+        publisher._pipeline,
+        "_complete_submission_handoff",
+        interrupt_handoff,
+    )
+    future = publisher.publish(tmp_path / "checkpoint.pt", {"value": 1})
+    assert future.result(timeout=5.0) == tmp_path / "checkpoint.pt"
+    real_flush_pipeline = publisher._flush_pipeline
+    cleanup_calls = 0
+
+    def interrupt_cleanup(*, close: bool, raise_error: bool = True) -> BaseException | None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            raise SystemExit("cleanup interrupted")
+        return real_flush_pipeline(close=close, raise_error=raise_error)
+
+    monkeypatch.setattr(publisher, "_flush_pipeline", interrupt_cleanup)
+
+    with pytest.raises(SystemExit, match="cleanup interrupted"):
+        publisher.close()
+    with pytest.raises(KeyboardInterrupt, match="accepted handoff interrupted") as raised:
+        publisher.close()
+
+    assert raised.value is handoff_interrupt
+    publisher.close()
+
+
+def test_checkpoint_future_callback_cannot_replace_worker_failure(
+    tmp_path: Path,
+) -> None:
+    """A callback process exception cannot corrupt serializer attribution."""
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    release = threading.Event()
+
+    def fail(temporary: Path) -> None:
+        assert release.wait(timeout=5.0)
+        temporary.write_bytes(b"partial")
+        raise OSError("serializer failed")
+
+    publisher = AsyncCheckpointPublisher()
+    future = publisher.submit(
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(checkpoint_root / "failed.pt", fail),),
+        )
+    )
+
+    def interrupt_callback(_: Future[CheckpointPublication]) -> None:
+        raise KeyboardInterrupt("callback interrupted")
+
+    future.add_done_callback(interrupt_callback)
+    release.set()
+
+    with pytest.raises(OSError, match="serializer failed"):
+        future.result(timeout=5.0)
+    with pytest.raises(OSError, match="serializer failed"):
+        publisher.flush()
+    publisher.close()
+
+
+def test_checkpoint_future_callback_can_submit_and_wait_for_more_work(
+    tmp_path: Path,
+) -> None:
+    """User callbacks do not block internal completion of nested publications."""
+    release = threading.Event()
+    callback_finished = threading.Event()
+    nested_results: list[Path] = []
+
+    def write_first(temporary: Path) -> None:
+        assert release.wait(timeout=5.0)
+        temporary.write_bytes(b"first")
+
+    publisher = AsyncCheckpointPublisher()
+    first = publisher.submit(
+        CheckpointPlan(
+            tmp_path,
+            (CheckpointArtifact(tmp_path / "first.pt", write_first),),
+        )
+    )
+
+    def publish_nested(_: Future[CheckpointPublication]) -> None:
+        nested = publisher.publish(tmp_path / "nested.pt", {"value": 2})
+        nested_results.append(nested.result(timeout=5.0))
+        callback_finished.set()
+
+    first.add_done_callback(publish_nested)
+    release.set()
+
+    assert first.result(timeout=5.0).published[0].path == tmp_path / "first.pt"
+    assert callback_finished.wait(timeout=5.0)
+    assert nested_results == [tmp_path / "nested.pt"]
+    publisher.close()
+
+
+def test_checkpoint_completed_future_callback_is_immediate_during_other_work(
+    tmp_path: Path,
+) -> None:
+    """Post-completion callback registration remains synchronous."""
+    publisher = AsyncCheckpointPublisher(max_pending=2)
+    completed = publisher.publish(tmp_path / "complete.pt", {"value": 1})
+    assert completed.result(timeout=5.0) == tmp_path / "complete.pt"
+    release = threading.Event()
+
+    def block(temporary: Path) -> None:
+        assert release.wait(timeout=5.0)
+        temporary.write_bytes(b"blocked")
+
+    publisher.submit(
+        CheckpointPlan(
+            tmp_path,
+            (CheckpointArtifact(tmp_path / "blocked.pt", block),),
+        )
+    )
+    callbacks: list[Future[Path]] = []
+    completed.add_done_callback(callbacks.append)
+
+    assert callbacks == [completed]
+    release.set()
+    publisher.close()
+
+
+def test_concurrent_checkpoint_flush_and_close_wait_for_shutdown(
+    tmp_path: Path,
+) -> None:
+    """Concurrent terminal calls serialize behind the active close."""
+    started = threading.Event()
+    release = threading.Event()
+    first_close_done = threading.Event()
+    flush_done = threading.Event()
+    second_close_done = threading.Event()
+
+    def block(temporary: Path) -> None:
+        started.set()
+        assert release.wait(timeout=5.0)
+        temporary.write_bytes(b"complete")
+
+    publisher = AsyncCheckpointPublisher()
+    publisher.submit(
+        CheckpointPlan(
+            tmp_path,
+            (CheckpointArtifact(tmp_path / "checkpoint.pt", block),),
+        )
+    )
+    assert started.wait(timeout=5.0)
+    first_closer = threading.Thread(
+        target=lambda: (publisher.close(), first_close_done.set())
+    )
+    first_closer.start()
+    with publisher._lifecycle_condition:
+        assert publisher._lifecycle_condition.wait_for(
+            lambda: publisher._closing,
+            timeout=5.0,
+        )
+    flusher = threading.Thread(target=lambda: (publisher.flush(), flush_done.set()))
+    second_closer = threading.Thread(
+        target=lambda: (publisher.close(), second_close_done.set())
+    )
+    flusher.start()
+    second_closer.start()
+
+    assert not flush_done.wait(timeout=0.1)
+    assert not second_close_done.wait(timeout=0.1)
+    release.set()
+    for thread in (first_closer, flusher, second_closer):
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+    assert first_close_done.is_set()
+    assert flush_done.is_set()
+    assert second_close_done.is_set()
 
 
 def test_async_checkpoint_plan_submission_applies_bounded_backpressure(
@@ -4006,7 +4384,7 @@ def test_concurrent_checkpoint_submissions_preserve_pending_bound(
     assert worker_started.wait(timeout=5)
     assert one_returned.wait(timeout=5)
     assert not all_returned.wait(timeout=0.1)
-    assert len(publisher._pending) == 1
+    assert publisher._pipeline.pending_count == 1
 
     release_worker.set()
     for submitter in submitters:
@@ -4502,6 +4880,93 @@ def test_async_checkpoint_flush_waits_for_later_work_before_raising(
     assert (checkpoint_root / "second.pt").read_bytes() == b"second"
 
 
+def test_async_checkpoint_flush_preserves_process_exception_priority(
+    tmp_path: Path,
+) -> None:
+    """A later worker signal remains primary without losing an earlier failure."""
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+
+    def fail(temporary: Path) -> None:
+        temporary.write_bytes(b"partial")
+        raise OSError("ordinary failure")
+
+    def interrupt(temporary: Path) -> None:
+        temporary.write_bytes(b"partial")
+        raise KeyboardInterrupt("worker interrupted")
+
+    publisher = AsyncCheckpointPublisher(max_pending=2)
+    publisher.submit(
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(checkpoint_root / "failed.pt", fail),),
+        )
+    )
+    publisher.submit(
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(checkpoint_root / "interrupted.pt", interrupt),),
+        )
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="worker interrupted") as raised:
+        publisher.flush()
+
+    assert "ordinary failure" in "\n".join(raised.value.__notes__)
+    publisher.close()
+
+
+def test_async_checkpoint_flush_retains_failures_if_aggregation_is_interrupted(
+    tmp_path: Path,
+) -> None:
+    """An interrupted diagnostic note cannot consume acknowledged failures."""
+
+    class InterruptingFailure(OSError):
+        def __init__(self, message: str) -> None:
+            super().__init__(message)
+            self._interrupt_note_once = True
+
+        def add_note(self, note: str) -> None:
+            if self._interrupt_note_once:
+                self._interrupt_note_once = False
+                raise KeyboardInterrupt("failure aggregation interrupted")
+            super().add_note(note)
+
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    first_error = InterruptingFailure("first publication failed")
+
+    def fail_first(temporary: Path) -> None:
+        temporary.write_bytes(b"partial")
+        raise first_error
+
+    def fail_second(temporary: Path) -> None:
+        temporary.write_bytes(b"partial")
+        raise OSError("second publication failed")
+
+    publisher = AsyncCheckpointPublisher(max_pending=2)
+    publisher.submit(
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(checkpoint_root / "first.pt", fail_first),),
+        )
+    )
+    publisher.submit(
+        CheckpointPlan(
+            checkpoint_root,
+            (CheckpointArtifact(checkpoint_root / "second.pt", fail_second),),
+        )
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="failure aggregation interrupted"):
+        publisher.flush()
+    with pytest.raises(InterruptingFailure, match="first publication failed") as raised:
+        publisher.flush()
+
+    assert "second publication failed" in "\n".join(raised.value.__notes__)
+    publisher.close()
+
+
 def test_precision_and_ddp_configuration_guards(tmp_path: Path) -> None:
     loader = DataLoader(TensorDataset(torch.ones(2, 1), torch.zeros(2, 1)), batch_size=1)
     model = torch.nn.Linear(1, 1)
@@ -4876,6 +5341,7 @@ def test_execution_session_closes_owned_resources_before_runtime_in_reverse_orde
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     order: list[str] = []
+    release_pipeline = threading.Event()
     runtime, session = _create_test_execution_session(tmp_path, "owned-resource-order")
     sink = _RecordingSessionSink(order)
     original_logging_close = runtime.execution_logging.close
@@ -4887,6 +5353,7 @@ def test_execution_session_closes_owned_resources_before_runtime_in_reverse_orde
 
         def close(self) -> None:
             order.append("trainer-checkpoint-flush")
+            release_pipeline.set()
 
     def close_logging() -> None:
         order.append("execution-logging")
@@ -4902,6 +5369,17 @@ def test_execution_session_closes_owned_resources_before_runtime_in_reverse_orde
     monkeypatch.setattr(runtime, "close_process_group", lambda: order.append("process-group"))
 
     observer = session.create_observer((sink,))
+
+    def run_pipeline(value: str) -> str:
+        assert release_pipeline.wait(timeout=5.0)
+        order.append(value)
+        return value
+
+    pipeline = session.create_background_pipeline(
+        run_pipeline,
+        thread_name_prefix="test-session-pipeline",
+    )
+    pipeline.submit("background-pipeline")
     session.create_trainer(observer=observer)
     session.start_phase("train")
     session.complete_phase()
@@ -4909,6 +5387,7 @@ def test_execution_session_closes_owned_resources_before_runtime_in_reverse_orde
 
     assert order == [
         "trainer-checkpoint-flush",
+        "background-pipeline",
         "observer",
         "execution-logging",
         "lease",
@@ -4959,6 +5438,170 @@ def test_execution_session_close_is_idempotent_without_duplicate_terminal_events
     assert [event.event for event in events].count("phase_completed") == 1
     assert [event.event for event in events].count("process_completed") == 1
     assert runtime._closed is True
+
+
+def test_execution_session_recovers_interrupted_pipeline_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session cleanup finishes accepted work before propagating interruption."""
+    _, session = _create_test_execution_session(tmp_path, "interrupted-pipeline-cleanup")
+    pipeline = session.create_background_pipeline(lambda value: value + 1)
+    submission = pipeline.submit(4)
+    original_flush = pipeline.flush
+    calls = 0
+
+    def interrupt_once() -> tuple[Any, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise KeyboardInterrupt("pipeline cleanup interrupted")
+        return original_flush()
+
+    monkeypatch.setattr(pipeline, "flush", interrupt_once)
+
+    with pytest.raises(KeyboardInterrupt, match="pipeline cleanup interrupted"):
+        session.close()
+
+    assert not pipeline.owns(submission)
+    assert pipeline.close() == ()
+    session.close()
+
+
+def test_execution_session_closes_pipeline_after_interrupted_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A constructed pipeline is closed if session ownership cannot register."""
+    _, session = _create_test_execution_session(tmp_path, "pipeline-registration")
+    created: list[BoundedBackgroundPipeline[Any, Any]] = []
+    real_pipeline_type = torch_runtime_module.BoundedBackgroundPipeline
+
+    def capture_pipeline(*args: Any, **kwargs: Any) -> BoundedBackgroundPipeline[Any, Any]:
+        pipeline = real_pipeline_type(*args, **kwargs)
+        created.append(pipeline)
+        return pipeline
+
+    def interrupt_registration(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise KeyboardInterrupt("registration interrupted")
+
+    monkeypatch.setattr(torch_runtime_module, "BoundedBackgroundPipeline", capture_pipeline)
+    monkeypatch.setattr(session, "_register_owned_resource", interrupt_registration)
+
+    with pytest.raises(KeyboardInterrupt, match="registration interrupted"):
+        session.create_background_pipeline(lambda value: value)
+
+    assert len(created) == 1
+    assert not created[0]._worker_thread.is_alive()
+    assert created[0].close() == ()
+    session.close()
+
+
+def test_execution_session_pipeline_factory_cannot_cross_concurrent_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session close either owns a constructed pipeline or makes its factory fail."""
+    _, session = _create_test_execution_session(tmp_path, "pipeline-close-race")
+    constructed = threading.Event()
+    allow_registration = threading.Event()
+    created: list[BoundedBackgroundPipeline[Any, Any]] = []
+    errors: list[BaseException] = []
+    real_pipeline_type = torch_runtime_module.BoundedBackgroundPipeline
+
+    def pause_after_construction(
+        *args: Any,
+        **kwargs: Any,
+    ) -> BoundedBackgroundPipeline[Any, Any]:
+        pipeline = real_pipeline_type(*args, **kwargs)
+        created.append(pipeline)
+        constructed.set()
+        assert allow_registration.wait(timeout=5.0)
+        return pipeline
+
+    def create_pipeline() -> None:
+        try:
+            session.create_background_pipeline(lambda value: value)
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(
+        torch_runtime_module,
+        "BoundedBackgroundPipeline",
+        pause_after_construction,
+    )
+    factory = threading.Thread(target=create_pipeline)
+    factory.start()
+    assert constructed.wait(timeout=5.0)
+    session.close()
+    allow_registration.set()
+    factory.join(timeout=5.0)
+
+    assert not factory.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert len(created) == 1
+    assert not created[0]._worker_thread.is_alive()
+    assert created[0].close() == ()
+
+
+def test_execution_session_preserves_every_pipeline_cleanup_failure(
+    tmp_path: Path,
+) -> None:
+    """An active workload error retains every attributed pipeline failure."""
+    _, session = _create_test_execution_session(tmp_path, "pipeline-cleanup-failures")
+    workload_error = RuntimeError("workload failed")
+
+    def fail(value: int) -> int:
+        raise OSError(f"publication {value} failed")
+
+    with pytest.raises(RuntimeError, match="workload failed") as raised, session:
+        pipeline = session.create_background_pipeline(fail, max_pending=2)
+        pipeline.submit(1)
+        pipeline.submit(2)
+        raise workload_error
+
+    assert raised.value is workload_error
+    notes = "\n".join(workload_error.__notes__)
+    assert "publication 1 failed" in notes
+    assert "publication 2 failed" in notes
+
+
+def test_execution_session_retries_interrupted_pipeline_acknowledgment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session fallback acknowledges outcomes before tearing down runtime state."""
+    _, session = _create_test_execution_session(tmp_path, "pipeline-acknowledgment")
+    workload_error = RuntimeError("workload failed")
+
+    def fail(_: int) -> int:
+        raise OSError("publication failed")
+
+    pipeline = session.create_background_pipeline(fail)
+    submission = pipeline.submit(1)
+    original_acknowledge = pipeline.acknowledge
+    calls = 0
+
+    def interrupt_once(value: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            original_acknowledge(value)
+            raise KeyboardInterrupt("acknowledgment interrupted")
+        original_acknowledge(value)
+
+    monkeypatch.setattr(pipeline, "acknowledge", interrupt_once)
+
+    with pytest.raises(RuntimeError, match="workload failed") as raised, session:
+        raise workload_error
+
+    assert raised.value is workload_error
+    notes = "\n".join(workload_error.__notes__)
+    assert "publication failed" in notes
+    assert "acknowledgment interrupted" in notes
+    assert not pipeline.owns(submission)
 
 
 def test_execution_session_closes_observer_after_trainer_construction_failure(
