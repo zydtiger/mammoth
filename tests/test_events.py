@@ -53,6 +53,7 @@ def test_process_writer_round_trips_lifecycle_progress_and_coordinates(tmp_path:
     progress = events[3]
     assert progress.coordinates == {"epoch": 0, "split": "train"}
     assert progress.display_metrics == {"loss": 0.5}
+    assert "unit" not in progress.to_dict()
     assert events[-1].is_terminal
 
 
@@ -80,7 +81,27 @@ def test_progress_is_replaceable_and_terminal_event_flushes_latest(tmp_path: Pat
     ]
 
 
-def test_legacy_project_fields_are_preserved_as_opaque_extensions() -> None:
+def test_new_progress_writers_reject_retired_unit_keyword(tmp_path: Path) -> None:
+    context = execution_context(tmp_path)
+    with ExecutionEventWriter.for_process(context, rank=0) as writer:
+        with pytest.raises(TypeError, match="unit is no longer supported"):
+            writer.emit_progress(
+                phase="work",
+                task_id="item",
+                completed=1,
+                unit="items",
+            )
+        with pytest.raises(TypeError, match="unit is no longer supported"):
+            writer.emit(
+                "progress",
+                phase="work",
+                task_id="item",
+                completed=1,
+                unit="items",
+            )
+
+
+def test_legacy_progress_unit_is_readable_but_not_reserialized() -> None:
     payload = {
         "schema_version": 1,
         "sequence": 1,
@@ -95,6 +116,7 @@ def test_legacy_project_fields_are_preserved_as_opaque_extensions() -> None:
         "task_id": "slide",
         "completed": 1,
         "total": 2,
+        "unit": "patches",
         "epoch": 4,
         "slide_id": "case-1",
         "scheduling_mode": "dynamic",
@@ -104,7 +126,9 @@ def test_legacy_project_fields_are_preserved_as_opaque_extensions() -> None:
 
     assert event.extensions["epoch"] == 4
     assert event.extensions["slide_id"] == "case-1"
-    assert event.to_dict()["scheduling_mode"] == "dynamic"
+    serialized = event.to_dict()
+    assert serialized["scheduling_mode"] == "dynamic"
+    assert "unit" not in serialized
 
 
 def test_tail_reader_holds_partial_record_and_detects_prefix_mutation(tmp_path: Path) -> None:

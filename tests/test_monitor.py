@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from datetime import UTC, datetime
 from itertools import count
@@ -177,7 +178,7 @@ def test_monitor_folds_generic_tasks_metrics_throughput_and_eta(tmp_path: Path) 
         now=datetime(2026, 1, 1, tzinfo=UTC),
         stale_after_seconds=10**9,
     )
-    assert "rank-0/opaque/unit-1: running 4/10 eta=3s" in rendered
+    assert "rank-0/opaque/unit-1: running 4/10 rate=2.0 b/s eta=3s" in rendered
     assert "arbitrary/score: 0.75 (1 points)" in rendered
     assert "\x1b[" not in rendered
 
@@ -308,48 +309,29 @@ def test_braille_chart_restores_multi_row_terminal_geometry() -> None:
     assert any(0x2800 <= ord(character) <= 0x28FF for character in wide)
 
 
-def test_dashboard_shortens_batch_and_microbatch_throughput_units(tmp_path: Path) -> None:
-    for unit in ("batch", "microbatch"):
-        layout = RunLayout(tmp_path / unit, "run").prepare()
-        context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
-        with ExecutionEventWriter.for_process(context, rank=0) as writer:
+def test_dashboard_ignores_legacy_units_when_reconciling_progress(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z", world_size=2)
+    for rank, unit in enumerate(("patches", "unrelated-items")):
+        with ExecutionEventWriter.for_process(context, rank=rank) as writer:
             writer.emit_progress(
-                phase="train",
-                task_id="train",
-                completed=1,
-                total=2,
-                unit=unit,
+                phase="arbitrary-phase",
+                task_id="unrelated-task",
+                completed=rank + 1,
+                total=3,
                 throughput=2.0,
             )
-        console = Console(width=120, record=True, color_system=None)
-
-        console.print(
-            dashboard_layout(
-                RunMonitor(layout).poll(),
-                host=None,
-                detail=False,
-                compact=False,
-            )
-        )
-        rendered = console.export_text()
-
-        assert "2.0 b/s" in rendered
-        assert f"{unit}/s" not in rendered
-
-
-def test_dashboard_shows_segmentation_test_patch_rate_as_batches(tmp_path: Path) -> None:
-    layout = RunLayout(tmp_path, "run").prepare()
-    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
-    with ExecutionEventWriter.for_process(context, rank=0) as writer:
-        writer.emit_progress(
-            phase="test/segmentation",
-            task_id="segment",
-            completed=1,
-            total=2,
-            unit="patches",
-            throughput=2.0,
-        )
+        path = context.execution_dir / f"rank-{rank}.jsonl"
+        payload = json.loads(path.read_text())
+        payload["unit"] = unit
+        path.write_text(json.dumps(payload) + "\n")
     snapshot = RunMonitor(layout).poll()
+    task = snapshot.selected.current_task
+
+    assert task is not None
+    assert task.eta_seconds == 0.5
+    assert "patches" not in render_snapshot(snapshot.selected)
+    assert "unrelated-items" not in render_snapshot(snapshot.selected)
 
     for compact, width in ((False, 120), (True, 80)):
         console = Console(width=width, record=True, color_system=None)
@@ -364,7 +346,20 @@ def test_dashboard_shows_segmentation_test_patch_rate_as_batches(tmp_path: Path)
         rendered = console.export_text()
 
         assert "2.0 b/s" in rendered
-        assert "patches/s" not in rendered
+        assert "3/6" in rendered
+        assert "patches" not in rendered
+        assert "unrelated-items" not in rendered
+
+
+def test_plain_snapshot_marks_missing_throughput_unavailable(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    with ExecutionEventWriter.for_process(context, rank=0) as writer:
+        writer.emit_progress(phase="opaque", task_id="task", completed=1, total=2)
+
+    rendered = render_snapshot(ExecutionMonitor(layout, "attempt").poll())
+
+    assert "rank-0/opaque/task: running 1/2 rate=--" in rendered
 
 
 def test_dashboard_omits_secondary_metrics_without_loss_or_learning_rate(
@@ -429,7 +424,6 @@ def test_dashboard_restores_legacy_wide_and_compact_information_hierarchy(
                     task_id="train-epoch-3",
                     completed=index + 1,
                     total=2000,
-                    unit="microbatch",
                     throughput=6.5,
                     epoch=3,
                     epoch_total=10,
@@ -525,7 +519,7 @@ def test_dashboard_restores_legacy_wide_and_compact_information_hierarchy(
 
     assert "SELECTED ATTEMPT · bbbbbbbb" in compact
     assert second_id not in compact
-    assert "overall: 16/2,000 microbatch · 6.5 b/s" in compact
+    assert "overall: 16/2,000 · 6.5 b/s" in compact
     assert "Overall ━" not in compact
     assert max(len(line) for line in compact.splitlines()) <= 80
 
@@ -553,7 +547,6 @@ def test_dashboard_keeps_parent_overview_and_active_leaf_rank_progress(
                 task_id="pipeline",
                 completed=5,
                 total=41,
-                unit="items",
             )
             writer.emit(
                 "task_started",
@@ -568,7 +561,6 @@ def test_dashboard_keeps_parent_overview_and_active_leaf_rank_progress(
                 parent_task_id="pipeline",
                 completed=child_completed,
                 total=child_total,
-                unit="parts",
             )
             writer.emit("heartbeat", phase="work", task_id="pipeline")
 

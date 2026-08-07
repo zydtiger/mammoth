@@ -113,9 +113,13 @@ meaning to entry names.
 
 JSONL is the live operational source of truth. Each producer exclusively owns
 one append-only file. Records contain stable identity and lifecycle fields plus
-opaque project coordinates and metrics. Progress may be throttled and replaced;
-lifecycle and terminal records flush immediately. A writer failure disables
-only that writer and must not terminate the workload.
+opaque project coordinates and metrics. Progress values are unitless
+producer-owned numbers: within one task, `completed`, `total`, and any
+`throughput` must describe the same logical work quantity, while a producer
+that cannot provide that relationship omits throughput. Mammoth neither
+validates nor converts that domain meaning. Progress may be throttled and
+replaced; lifecycle and terminal records flush immediately. A writer failure
+disables only that writer and must not terminate the workload.
 
 ### TensorBoard
 
@@ -146,9 +150,11 @@ message policy.
 
 The generic monitor reconstructs executions, producer liveness, task trees,
 progress, throughput, arbitrary metrics, failures, and lineage. Generic ETA
-uses only completed work, total work, and observed time. A run-level monitor
-keeps every valid immutable execution available for navigation while selected
-resume-lineage histories provide continuous project-neutral metric state.
+uses only producer-reported completed work, total work, and throughput or
+observed time. A run-level monitor keeps every valid immutable execution
+available for navigation while selected resume-lineage histories provide
+continuous project-neutral metric state. Historical schema-version-1 `unit`
+fields remain readable but do not affect reconstructed state or presentation.
 
 An interactive terminal launches the optional Textual dashboard by default.
 Textual owns refresh workers, keyboard navigation, scrolling, and responsive

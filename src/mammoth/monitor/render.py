@@ -53,12 +53,16 @@ def render_snapshot(
             progress = str(task.completed)
             if task.total is not None:
                 progress = f"{progress}/{task.total}"
-            unit = f" {task.unit}" if task.unit else ""
+            rate = (
+                f" rate={task.throughput:.1f} b/s"
+                if task.throughput is not None
+                else " rate=--"
+            )
             eta = format_duration(task.eta_seconds)
             eta_text = f" eta={eta}" if eta is not None else ""
             lines.append(
                 f"  {task.producer.label}/{task.phase}/{task.task_id}: "
-                f"{task.status} {progress}{unit}{eta_text}"
+                f"{task.status} {progress}{rate}{eta_text}"
             )
     else:
         lines.append("  (none observed)")
