@@ -138,6 +138,7 @@ _KNOWN_FIELDS = frozenset(
         "signal",
         "completed",
         "total",
+        # Schema-v1 readers recognize this legacy producer field but discard it.
         "unit",
         "final",
         "message",
@@ -182,7 +183,6 @@ class ExecutionEvent:
     signal: int | str | None = None
     completed: int | None = None
     total: int | None = None
-    unit: str | None = None
     final: bool | None = None
     message: str | None = None
     display_metrics: Mapping[str, float] = field(default_factory=dict)
@@ -226,7 +226,6 @@ class ExecutionEvent:
             "signal": self.signal,
             "completed": self.completed,
             "total": self.total,
-            "unit": self.unit,
             "final": self.final,
             "message": self.message,
         }
@@ -259,6 +258,9 @@ class ExecutionEvent:
         if any(not isinstance(key, str) or not key for key in payload):
             raise ValueError("execution event field names must be non-empty strings.")
         extensions = {key: value for key, value in payload.items() if key not in _KNOWN_FIELDS}
+        # Unit was a schema-v1 producer field. Preserve artifact readability
+        # without retaining the domain label in reconstructed event state.
+        _optional_string(payload, "unit")
         return cls(
             schema_version=_required_int(payload, "schema_version", minimum=1),
             sequence=_required_int(payload, "sequence", minimum=1),
@@ -279,7 +281,6 @@ class ExecutionEvent:
             signal=_optional_signal(payload),
             completed=_optional_int(payload, "completed", minimum=0),
             total=_optional_int(payload, "total", minimum=0),
-            unit=_optional_string(payload, "unit"),
             final=_optional_bool(payload, "final"),
             message=_optional_string(payload, "message"),
             display_metrics=_optional_mapping(payload, "display_metrics"),
@@ -338,7 +339,7 @@ class ExecutionEvent:
                 raise ValueError("parent_task_id must differ from task_id.")
         if self.event in _PROCESS_EVENTS and self.source != "process":
             raise ValueError(f"{self.event} requires source='process'.")
-        progress_values = (self.completed, self.total, self.unit, self.final)
+        progress_values = (self.completed, self.total, self.final)
         if self.event == "progress":
             _validate_int("completed", self.completed, minimum=0)
             if self.total is not None:
@@ -355,7 +356,7 @@ class ExecutionEvent:
             raise ValueError(f"{self.event} must omit progress-only fields.")
 
     def _validate_optional_data(self) -> None:
-        for name in ("unit", "message"):
+        for name in ("message",):
             text_value = cast(str | None, getattr(self, name))
             if text_value is not None:
                 _validate_nonempty_string(name, text_value)
@@ -510,6 +511,7 @@ class ExecutionEventWriter:
     def emit(self, event: EventName, **fields: Any) -> ExecutionEvent | None:
         """Validate and immediately flush a lifecycle or heartbeat event."""
         with self._lock:
+            _reject_legacy_unit(fields)
             if event == "progress":
                 return self.emit_progress(**fields)
             if event == "heartbeat":
@@ -544,6 +546,7 @@ class ExecutionEventWriter:
     ) -> ExecutionEvent | None:
         """Emit, replace, or immediately finalize one throttled progress update."""
         with self._lock:
+            _reject_legacy_unit(fields)
             if not self.enabled:
                 return None
             if not isinstance(final, bool):
@@ -1025,6 +1028,12 @@ def _with_sequence(
     if final is not None:
         changes["final"] = final
     return replace(event, **changes)
+
+
+def _reject_legacy_unit(fields: Mapping[str, Any]) -> None:
+    """Reject the retired producer-facing progress-unit keyword."""
+    if "unit" in fields:
+        raise TypeError("unit is no longer supported; progress values are unitless.")
 
 
 def _validate_interval(name: str, value: Any) -> float:
