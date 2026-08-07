@@ -5899,6 +5899,27 @@ def test_single_runtime_establishes_execution_and_supplies_trainer_observer(
     assert (run_dir / "checkpoints" / "checkpoint-0000.pt").is_file()
 
 
+def test_runtime_preserves_caller_supplied_parent_execution_id(tmp_path: Path) -> None:
+    """The PyTorch request forwards explicit lineage without inspecting artifacts."""
+    run_dir = tmp_path / "explicit-parent"
+    with initialize_torch_runtime(TorchRuntimeConfig(device="cpu")) as runtime:
+        context = runtime.establish_execution(
+            TorchExecutionRequest(
+                run_dir=run_dir,
+                run_name="explicit-parent",
+                invocation_kind="train",
+                intended_phases=("train",),
+                command=("python", "train.py"),
+                execution_id="child",
+                resume_checkpoint=run_dir / "checkpoint-copy.pt",
+                parent_execution_id="producer",
+            )
+        )
+
+    assert context.metadata.resume_checkpoint == str(run_dir / "checkpoint-copy.pt")
+    assert context.metadata.parent_execution_id == "producer"
+
+
 def test_single_runtime_owns_weighted_helpers_and_execution_lifecycle(
     tmp_path: Path,
 ) -> None:
