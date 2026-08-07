@@ -39,6 +39,13 @@ consuming project
 Textual, psutil, and PyTorch belong in optional dependency groups and must not
 be imported by the core package.
 
+The workflow layer owns project-neutral local process supervision. Its ordinary
+workflow launcher inherits the parent terminal streams; callers that explicitly
+need captured output use `run_captured_process()` for separately drained text
+stdout and stderr, timeout facts, and the same bounded launcher/descendant
+cleanup. Mammoth does not assign outcome policy, persist captured output, or
+inspect commands beyond executing their already-tokenized argument arrays.
+
 Framework-neutral callers may submit typed inputs to one
 `BoundedBackgroundPipeline`. Its single worker preserves acceptance order,
 applies a caller-selected bound across queued and active work, and associates
