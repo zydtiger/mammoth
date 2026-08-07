@@ -83,7 +83,6 @@ def create_execution_logging(
     text_level: int = logging.INFO,
     progress_interval_seconds: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
     heartbeat_interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
-    asynchronous: bool = False,
     max_pending_observations: int = 64,
 ) -> ExecutionLogging:
     """Create JSONL-first observation fan-out plus one exclusive text handler."""
@@ -94,7 +93,6 @@ def create_execution_logging(
         additional_sinks=additional_sinks,
         progress_interval_seconds=progress_interval_seconds,
         heartbeat_interval_seconds=heartbeat_interval_seconds,
-        asynchronous=asynchronous,
         max_pending_observations=max_pending_observations,
     )
     try:
@@ -124,7 +122,6 @@ def create_execution_observability(
     additional_sinks: Sequence[ObservationSink] = (),
     progress_interval_seconds: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
     heartbeat_interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
-    asynchronous: bool = False,
     max_pending_observations: int = 64,
 ) -> ExecutionObservability:
     """Create one rank's JSONL-first observer without claiming its text log."""
@@ -138,7 +135,6 @@ def create_execution_observability(
     observer = RunObserver(
         (JsonlEventSink(writer), *additional_sinks),
         heartbeat_interval_seconds=heartbeat_interval_seconds,
-        asynchronous=asynchronous,
         max_pending_observations=max_pending_observations,
     )
     return ExecutionObservability(

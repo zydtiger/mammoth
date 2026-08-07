@@ -44,30 +44,22 @@ class RunObserver:
         *,
         heartbeat_interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
         monotonic_clock: Callable[[], float] = time.monotonic,
-        asynchronous: bool = False,
         max_pending_observations: int = 64,
     ) -> None:
-        if not isinstance(asynchronous, bool):
-            raise TypeError("asynchronous must be a boolean")
         if (
             isinstance(max_pending_observations, bool)
             or not isinstance(max_pending_observations, int)
             or max_pending_observations < 1
         ):
             raise ValueError("max_pending_observations must be a positive integer")
-        self._sinks: tuple[ObservationSink, ...] = (
-            tuple(
-                AsyncObservationSink(
-                    sink,
-                    max_pending=max_pending_observations,
-                    coalesce_progress=isinstance(sink, JsonlEventSink),
-                )
-                for sink in sinks
+        self._sinks: tuple[ObservationSink, ...] = tuple(
+            AsyncObservationSink(
+                sink,
+                max_pending=max_pending_observations,
+                coalesce_progress=isinstance(sink, JsonlEventSink),
             )
-            if asynchronous
-            else tuple(sinks)
+            for sink in sinks
         )
-        self.asynchronous = asynchronous
         self._disabled: set[int] = set()
         self._closed = False
         self._heartbeat_interval_seconds = _validate_heartbeat_interval(
@@ -104,7 +96,7 @@ class RunObserver:
                 self._last_activity = self._monotonic_clock()
             dense_metrics = {} if metrics is None else metrics
             displayed = dense_metrics if display_metrics is None else display_metrics
-            if self.asynchronous and media:
+            if media:
                 raise ValueError("asynchronous observation dispatch does not support media")
             observation = Observation(
                 event=event,
@@ -114,9 +106,7 @@ class RunObserver:
                 media={} if media is None else media,
                 logical_step=logical_step,
             )
-            dispatched = (
-                _snapshot_async_observation(observation) if self.asynchronous else observation
-            )
+            dispatched = _snapshot_async_observation(observation)
             for sink in self._sinks:
                 identifier = id(sink)
                 if identifier in self._disabled:

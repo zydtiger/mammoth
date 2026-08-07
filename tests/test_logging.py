@@ -207,7 +207,7 @@ def test_observer_isolates_failed_sink_and_keeps_healthy_sinks() -> None:
 def test_async_observer_uses_independent_per_sink_workers() -> None:
     blocked = BlockingSink()
     healthy = RecordingSink()
-    observer = RunObserver((blocked, healthy), asynchronous=True, max_pending_observations=1)
+    observer = RunObserver((blocked, healthy), max_pending_observations=1)
 
     observer.progress(phase="phase", task_id="task", completed=1)
 
@@ -226,7 +226,6 @@ def test_async_jsonl_coalesces_only_latest_pending_progress() -> None:
     writer = BlockingEventWriter()
     observer = RunObserver(
         (JsonlEventSink(writer),),  # type: ignore[arg-type]
-        asynchronous=True,
         max_pending_observations=1,
     )
 
@@ -248,7 +247,6 @@ def test_async_jsonl_final_progress_drains_pending_scope_before_terminal_record(
     writer = BlockingEventWriter()
     observer = RunObserver(
         (JsonlEventSink(writer),),  # type: ignore[arg-type]
-        asynchronous=True,
         max_pending_observations=1,
     )
     final_done = threading.Event()
@@ -277,7 +275,6 @@ def test_async_tensorboard_preserves_dense_scalar_history(tmp_path: Path) -> Non
     writer = FakeSummaryWriter()
     observer = RunObserver(
         (TensorBoardSink(tmp_path, writer=writer),),
-        asynchronous=True,
         max_pending_observations=1,
     )
 
@@ -298,7 +295,7 @@ def test_async_tensorboard_preserves_dense_scalar_history(tmp_path: Path) -> Non
 def test_async_observer_disables_only_failed_worker_sink() -> None:
     failing = SignalFailingSink()
     healthy = RecordingSink()
-    observer = RunObserver((failing, healthy), asynchronous=True)
+    observer = RunObserver((failing, healthy))
 
     observer.progress(phase="phase", task_id="task", completed=1)
     assert failing.failed.wait(timeout=1.0)
@@ -312,7 +309,7 @@ def test_async_observer_disables_only_failed_worker_sink() -> None:
 
 
 def test_async_observer_rejects_media_without_a_cpu_snapshot_policy() -> None:
-    observer = RunObserver((RecordingSink(),), asynchronous=True)
+    observer = RunObserver((RecordingSink(),))
 
     with pytest.raises(ValueError, match="does not support media"):
         observer.progress(
@@ -327,7 +324,7 @@ def test_async_observer_rejects_media_without_a_cpu_snapshot_policy() -> None:
 
 def test_async_observer_snapshots_nested_fields_before_worker_dispatch() -> None:
     blocked = BlockingSink()
-    observer = RunObserver((blocked,), asynchronous=True, max_pending_observations=1)
+    observer = RunObserver((blocked,), max_pending_observations=1)
     coordinates = {"nested": {"step": 1}}
 
     observer.progress(phase="phase", task_id="task", completed=1, coordinates=coordinates)
@@ -342,7 +339,7 @@ def test_async_observer_snapshots_nested_fields_before_worker_dispatch() -> None
 
 def test_async_observer_uses_private_snapshot_not_returned_observation_alias() -> None:
     blocked = BlockingSink()
-    observer = RunObserver((blocked,), asynchronous=True, max_pending_observations=1)
+    observer = RunObserver((blocked,), max_pending_observations=1)
 
     observation = observer.progress(
         phase="phase",
@@ -361,7 +358,7 @@ def test_async_observer_uses_private_snapshot_not_returned_observation_alias() -
 
 def test_async_observer_close_releases_worker_after_flush_failure() -> None:
     sink = FlushFailingSink()
-    observer = RunObserver((sink,), asynchronous=True)
+    observer = RunObserver((sink,))
     dispatcher = observer._sinks[0]  # type: ignore[attr-defined]
 
     observer.progress(phase="phase", task_id="task", completed=1)
@@ -560,7 +557,6 @@ def test_execution_observability_does_not_claim_text_log(tmp_path: Path) -> None
         context,
         rank=0,
         additional_sinks=(recording,),
-        asynchronous=True,
         max_pending_observations=1,
     ) as observability:
         observability.observer.emit("process_started", phase="phase")
