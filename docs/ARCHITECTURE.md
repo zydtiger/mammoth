@@ -183,11 +183,14 @@ and attach presentation sinks without recreating the runtime. The runtime does
 not encode GPU models, concrete workload weights, or project topology rules.
 
 Rank zero creates a direct execution and holds its logical-run lease, or joins
-an execution already identified by `MAMMOTH_EXECUTION_ID` or the compatible
-`TISAM_EXECUTION_ID` hook. Every rank validates the same immutable context,
-opens its own JSONL and text streams, and reaches startup consensus. A failure
-on any rank is reported coherently before project work begins. TensorBoard's
-rank-aware sink and trainer checkpoints default to rank zero.
+an execution identified by `MAMMOTH_EXECUTION_ID`. A consuming project may
+explicitly pass temporary compatibility alias names through
+`TorchExecutionRequest`; Mammoth validates those names and their values with
+the canonical variable, but does not define, publish, or persist any
+consumer-specific alias. Every rank validates the same immutable context, opens
+its own JSONL and text streams, and reaches startup consensus. A failure on any
+rank is reported coherently before project work begins. TensorBoard's rank-aware
+sink and trainer checkpoints default to rank zero.
 
 `TorchExecutionSession` owns process and phase lifecycle events after logging
 starts. It is also the context-managed owner of observers, background
