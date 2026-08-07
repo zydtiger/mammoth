@@ -8,15 +8,22 @@ from typing import Any
 
 import pytest
 import torch
+from torch.profiler import ProfilerActivity, profile
 
 import mammoth.torch.profiling as profiling_module
 from mammoth.torch import (
+    NamedPhaseProfiler,
     ProfileConfig,
+    ProfileTiming,
     TorchRuntimeOptions,
+    collect_cuda_memory_stats,
     current_torch_runtime_state,
+    normalize_operation_profiles,
     profile_callable,
+    reset_cuda_peak_memory_stats,
     summarize_latency,
     summarize_output_value,
+    synchronize_device,
     write_profile_report,
 )
 
@@ -30,6 +37,69 @@ class KeywordModel(torch.nn.Module):
 
     def forward(self, features: torch.Tensor, *, bias: torch.Tensor) -> torch.Tensor:
         return self.projection(features) + bias
+
+
+def test_named_phase_profiler_measures_dependent_cpu_regions_and_profiler_ranges() -> None:
+    phases = NamedPhaseProfiler("cpu")
+
+    with profile(activities=[ProfilerActivity.CPU]) as operation_profiler:
+        prepared = phases.measure("prepare inputs", lambda: torch.arange(4, dtype=torch.float32))
+        result = phases.measure("consume inputs", lambda: prepared.square().sum())
+
+    summaries = phases.summaries()
+    assert result.item() == 14.0
+    assert list(summaries) == ["prepare inputs", "consume inputs"]
+    assert summaries["prepare inputs"].wall_latency.mean_ms >= 0.0
+    assert summaries["prepare inputs"].device_latency is None
+    with pytest.raises(TypeError):
+        summaries["new"] = summaries["prepare inputs"]  # type: ignore[index]
+    operation_rows = normalize_operation_profiles(operation_profiler, device="cpu")
+    operation_keys = {row.key for row in operation_rows}
+    assert {"prepare inputs", "consume inputs"} <= operation_keys
+
+
+def test_named_phase_profiler_aggregates_completed_samples_and_excludes_warmup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = iter(
+        [
+            ("warmup", ProfileTiming(wall_ms=99.0, device_ms=None)),
+            ("first", ProfileTiming(wall_ms=1.0, device_ms=None)),
+            ("second", ProfileTiming(wall_ms=3.0, device_ms=None)),
+        ]
+    )
+    monkeypatch.setattr(
+        profiling_module,
+        "_measure_invocation",
+        lambda _device, _workload: next(values),
+    )
+    phases = NamedPhaseProfiler("cpu")
+
+    assert phases.measure("forward", lambda: "unused", record=False) == "warmup"
+    assert phases.measure("forward", lambda: "unused") == "first"
+    assert phases.measure("forward", lambda: "unused") == "second"
+
+    summary = phases.summaries()["forward"].wall_latency
+    assert summary.mean_ms == 2.0
+    assert summary.median_ms == 2.0
+    assert summary.p95_ms == pytest.approx(2.9)
+    assert summary.min_ms == 1.0
+    assert summary.max_ms == 3.0
+
+
+def test_named_phase_profiler_rejects_invalid_names_and_discards_failed_measurements() -> None:
+    phases = NamedPhaseProfiler("cpu")
+    with pytest.raises(ValueError, match="phase"):
+        phases.measure("  ", lambda: None)
+    with pytest.raises(RuntimeError, match="failed phase"):
+        phases.measure("forward", lambda: (_ for _ in ()).throw(RuntimeError("failed phase")))
+    assert phases.summaries() == {}
+
+
+def test_public_cpu_allocator_helpers_do_not_require_cuda() -> None:
+    synchronize_device("cpu")
+    reset_cuda_peak_memory_stats("cpu")
+    assert collect_cuda_memory_stats("cpu") is None
 
 
 def test_profile_callable_accepts_project_owned_call_and_components() -> None:
@@ -315,9 +385,9 @@ def test_legacy_cuda_time_field_is_used_for_operation_sorting() -> None:
         def key_averages(self) -> list[Row]:
             return [Row("slow", 20.0), Row("fast", 2.0)]
 
-    rows = profiling_module._top_operations(  # type: ignore[attr-defined]
-        Profiler(),  # type: ignore[arg-type]
-        device=torch.device("cuda"),
+    rows = normalize_operation_profiles(
+        Profiler(),
+        device="cuda",
         row_limit=2,
         sort_by=None,
     )
@@ -335,9 +405,9 @@ def test_current_cuda_time_field_is_used_for_legacy_requested_sort() -> None:
         def key_averages(self) -> list[Row]:
             return [Row("slow", 20.0), Row("fast", 2.0)]
 
-    rows = profiling_module._top_operations(  # type: ignore[attr-defined]
-        Profiler(),  # type: ignore[arg-type]
-        device=torch.device("cuda"),
+    rows = normalize_operation_profiles(
+        Profiler(),
+        device="cuda",
         row_limit=2,
         sort_by="cuda_time_total",
     )
@@ -412,3 +482,19 @@ def test_profile_callable_collects_cuda_timing_and_memory() -> None:
     assert report.device_latency is not None
     assert report.memory is not None
     assert report.memory.max_allocated_bytes > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_named_phase_profiler_and_public_cuda_allocator_helpers() -> None:
+    phases = NamedPhaseProfiler("cuda")
+    tensor = torch.ones(8, 8, device="cuda")
+
+    reset_cuda_peak_memory_stats("cuda")
+    result = phases.measure("matrix product", lambda: tensor @ tensor)
+    synchronize_device("cuda")
+    memory = collect_cuda_memory_stats("cuda")
+
+    assert result.device.type == "cuda"
+    assert phases.summaries()["matrix product"].device_latency is not None
+    assert memory is not None
+    assert memory.max_allocated_bytes > 0
