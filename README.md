@@ -262,6 +262,15 @@ gradient accumulation, validation, callbacks, scheduling, and checkpoints. It
 does not choose your architecture, dataset, batch format, loss, or metric
 meaning.
 
+For the default batch mover, `TrainerConfig.cuda_prefetch` defaults to `True`.
+On CUDA it uses one dedicated copy stream to transfer one following batch while
+the current batch runs on the compute stream. This path activates only when all
+CPU tensor leaves of that batch are pinned; pageable or unsupported batches,
+CPU devices, and caller-supplied `batch_mover` functions retain their existing
+synchronous movement. Set `cuda_prefetch=False` to disable the pipeline
+deterministically. Mammoth does not change DataLoader pin-memory, worker,
+sampling, or collation policy.
+
 `WarmupLinearLR` supplies a reusable optimizer-step schedule with linear
 warmup and decay. Projects choose its warmup ratio and total-step horizon; an
 extended resume rebases optimizer learning rates, while a shortened horizon is
