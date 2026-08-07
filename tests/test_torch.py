@@ -9,7 +9,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
-from contextlib import nullcontext, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from pathlib import Path
 from queue import Empty
 from typing import Any, Literal, cast
@@ -5586,6 +5586,86 @@ def test_world_size_one_cpu_ddp_uses_same_project_step_contract(tmp_path: Path) 
         assert result.state.global_step == len(loader)
     finally:
         torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    ("ddp_gradient_sync", "expected_no_sync_calls"),
+    [("native", 2), ("manual", 5)],
+)
+def test_ddp_gradient_sync_uses_native_reducer_only_for_window_finals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ddp_gradient_sync: Literal["native", "manual"],
+    expected_no_sync_calls: int,
+) -> None:
+    """Native DDP leaves each final backward available to its bucket reducer."""
+    rendezvous = tmp_path / "rendezvous"
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=0,
+        world_size=1,
+    )
+    no_sync_calls = 0
+    original_no_sync = trainer_module.DistributedDataParallel.no_sync
+
+    @contextmanager
+    def recording_no_sync(module: torch.nn.Module) -> Any:
+        nonlocal no_sync_calls
+        no_sync_calls += 1
+        with original_no_sync(module):
+            yield
+
+    monkeypatch.setattr(
+        trainer_module.DistributedDataParallel,
+        "no_sync",
+        recording_no_sync,
+    )
+    try:
+        loader = DataLoader(
+            TensorDataset(torch.ones(5, 1), torch.zeros(5, 1)),
+            batch_size=1,
+        )
+        model = torch.nn.Linear(1, 1)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+        with Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=loader,
+            train_step=distributed_regression_step,
+            config=TrainerConfig(
+                epochs=1,
+                device="cpu",
+                strategy="ddp",
+                gradient_accumulation_steps=2,
+                checkpoint_every_epochs=None,
+                ddp_gradient_sync=ddp_gradient_sync,
+            ),
+        ) as trainer:
+            if ddp_gradient_sync == "native":
+                trainer.synchronize_gradients = lambda: pytest.fail(
+                    "native DDP must not manually synchronize parameter gradients"
+                )
+            trainer.fit()
+        assert no_sync_calls == expected_no_sync_calls
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_ddp_failure_consensus_does_not_construct_a_device_failure_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Successful DDP coordination uses Python statuses instead of CUDA scalar reads."""
+    trainer = Trainer.__new__(Trainer)
+    trainer.config = TrainerConfig(epochs=1, device="cpu", strategy="ddp")
+    trainer.all_gather_object = lambda value: (value,)
+    monkeypatch.setattr(
+        torch,
+        "tensor",
+        lambda *args, **kwargs: pytest.fail("failure coordination built a tensor flag"),
+    )
+
+    trainer.raise_distributed_failure("test operation", None)
 
 
 def test_single_runtime_establishes_execution_and_supplies_trainer_observer(

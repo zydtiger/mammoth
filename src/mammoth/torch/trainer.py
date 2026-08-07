@@ -69,6 +69,7 @@ Precision = Literal["fp32", "bf16", "fp16"]
 Strategy = Literal["single", "ddp"]
 SchedulerInterval = Literal["optimizer", "epoch", "validation"]
 OptimizerStepLogicalClock = Literal["completed", "zero_based"]
+DdpGradientSync = Literal["native", "manual"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +167,7 @@ class TrainerConfig:
     display_metric_names: tuple[str, ...] = ("loss",)
     emit_fit_phase_events: bool = True
     optimizer_step_logical_clock: OptimizerStepLogicalClock = "completed"
+    ddp_gradient_sync: DdpGradientSync = "native"
     compile_config: TorchCompileConfig | None = None
 
     def __post_init__(self) -> None:
@@ -186,6 +188,8 @@ class TrainerConfig:
             raise ValueError(
                 "optimizer_step_logical_clock must be 'completed' or 'zero_based'"
             )
+        if self.ddp_gradient_sync not in {"native", "manual"}:
+            raise ValueError("ddp_gradient_sync must be 'native' or 'manual'")
         if self.max_gradient_norm is not None and (
             isinstance(self.max_gradient_norm, bool)
             or not math.isfinite(self.max_gradient_norm)
@@ -541,10 +545,12 @@ class Trainer:
                     window_index = window_offset + 1
                     window_global_step = self.state.global_step
                     window_error: BaseException | None = None
+                    final_backward_loss: torch.Tensor | None = None
                     last_batch_index = batch_index
                     for local_window_offset in range(window_size):
                         if window_error is not None:
                             break
+                        synchronizes_gradients = local_window_offset + 1 == window_size
                         try:
                             batch = next(loader_iterator)
                             moved = self.batch_mover(batch, self.device)
@@ -559,7 +565,9 @@ class Trainer:
                                 ),
                                 optimizer_step=self.state.optimizer_step,
                             )
-                            with self.gradient_accumulation_context():
+                            with self.gradient_accumulation_context(
+                                synchronizes_gradients=synchronizes_gradients
+                            ):
                                 with self.autocast_context():
                                     output = self.train_step(self.execution_model, moved, context)
                                     if output.loss is None:
@@ -588,14 +596,24 @@ class Trainer:
                                 )
                                 backward_loss = self.scaler.scale(scaled)
                                 assert isinstance(backward_loss, torch.Tensor)
-                                backward_loss.backward()  # type: ignore[no-untyped-call]
+                                if (
+                                    synchronizes_gradients
+                                    and self.uses_native_ddp_gradient_sync
+                                ):
+                                    final_backward_loss = backward_loss
+                                else:
+                                    backward_loss.backward()  # type: ignore[no-untyped-call]
                         except BaseException as error:
                             window_error = error
                         else:
                             last_batch_index = batch_index
                             batch_index += 1
                     self.raise_distributed_failure("train step", window_error)
-                    self.synchronize_gradients()
+                    if self.uses_native_ddp_gradient_sync:
+                        assert final_backward_loss is not None
+                        final_backward_loss.backward()  # type: ignore[no-untyped-call]
+                    else:
+                        self.synchronize_gradients()
                     self.coordinate("optimizer step", self.optimizer_step)
                     self.state.global_step += global_window_sizes[window_offset]
                     optimizer_step_metrics = self.optimizer_step_metrics
@@ -934,9 +952,16 @@ class Trainer:
         for callback in self.callbacks:
             callback.on_checkpoint_published(self.state, publication)
 
-    def gradient_accumulation_context(self) -> Any:
-        """Suppress automatic DDP reduction until the shared logical-step boundary."""
-        if self._ddp_model is not None:
+    @property
+    def uses_native_ddp_gradient_sync(self) -> bool:
+        """Return whether DDP final backwards use PyTorch's bucket reducer."""
+        return self._ddp_model is not None and self.config.ddp_gradient_sync == "native"
+
+    def gradient_accumulation_context(self, *, synchronizes_gradients: bool = False) -> Any:
+        """Suppress DDP reduction only before a native window's final backward."""
+        if self._ddp_model is not None and (
+            not self.uses_native_ddp_gradient_sync or not synchronizes_gradients
+        ):
             return self._ddp_model.no_sync()
         return nullcontext()
 
@@ -1582,20 +1607,6 @@ class Trainer:
             if local_error is not None:
                 raise local_error
             return
-        failure_flag = torch.tensor(
-            1 if local_error is not None else 0,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        if self.runtime is not None:
-            self.runtime.all_reduce_max(failure_flag)
-        else:
-            torch.distributed.all_reduce(
-                failure_flag,
-                op=torch.distributed.ReduceOp.MAX,
-            )
-        if not bool(failure_flag.item()):
-            return
         local_status = (
             None
             if local_error is None
@@ -1605,6 +1616,8 @@ class Trainer:
             )
         )
         statuses = self.all_gather_object(local_status)
+        if all(status is None for status in statuses):
+            return
         interruption = next(
             (
                 status
