@@ -28,7 +28,6 @@ from mammoth.core.identity import validate_execution_id, validate_run_name
 
 EXECUTION_SCHEMA_VERSION = 1
 EXECUTION_ID_ENV = "MAMMOTH_EXECUTION_ID"
-LEGACY_EXECUTION_ID_ENV = "TISAM_EXECUTION_ID"
 RUN_NAME_ENV = "MAMMOTH_RUN_NAME"
 INVOCATION_KIND_ENV = "MAMMOTH_INVOCATION_KIND"
 PHASE_ENV = "MAMMOTH_PHASE"
@@ -353,21 +352,45 @@ def generate_execution_id() -> str:
 
 def execution_id_from_environment(
     environ: Mapping[str, str] | None = None,
+    *,
+    aliases: Sequence[str] = (),
 ) -> str | None:
-    """Read the documented runner/direct-rank join hook without copying the environment."""
+    """Resolve the canonical execution ID and explicit caller-owned aliases.
+
+    Callers may supply aliases only for their own compatibility policy. Aliases
+    must be distinct, non-empty POSIX environment-variable names other than
+    :data:`EXECUTION_ID_ENV`; malformed declarations fail deterministically.
+    Every populated configured name must carry the same valid execution ID.
+    """
     source = os.environ if environ is None else environ
-    execution_id = source.get(EXECUTION_ID_ENV)
-    legacy_execution_id = source.get(LEGACY_EXECUTION_ID_ENV)
-    if (
-        execution_id is not None
-        and legacy_execution_id is not None
-        and execution_id != legacy_execution_id
-    ):
-        raise ValueError(f"{EXECUTION_ID_ENV} and {LEGACY_EXECUTION_ID_ENV} disagree.")
-    selected = execution_id or legacy_execution_id
-    if selected is None:
+    alias_names = normalize_execution_id_environment_aliases(aliases)
+    configured_names = (EXECUTION_ID_ENV, *alias_names)
+    values = tuple(
+        (name, validate_execution_id(value))
+        for name in configured_names
+        if (value := source.get(name)) is not None
+    )
+    if not values:
         return None
-    return validate_execution_id(selected)
+    if len({value for _, value in values}) != 1:
+        names = ", ".join(name for name, _ in values)
+        raise ValueError(f"Configured execution ID environment variables disagree: {names}.")
+    return values[0][1]
+
+
+def normalize_execution_id_environment_aliases(aliases: Sequence[str]) -> tuple[str, ...]:
+    """Validate and freeze caller-owned execution-ID alias declarations."""
+    if not isinstance(aliases, Sequence) or isinstance(aliases, str):
+        raise ValueError("aliases must be a sequence of environment variable names, not a string.")
+    alias_names = tuple(aliases)
+    for alias in alias_names:
+        if not isinstance(alias, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", alias):
+            raise ValueError(f"Invalid execution ID environment alias: {alias!r}.")
+        if alias == EXECUTION_ID_ENV:
+            raise ValueError(f"aliases must not repeat canonical name {EXECUTION_ID_ENV}.")
+    if len(set(alias_names)) != len(alias_names):
+        raise ValueError("aliases must not contain duplicate environment variable names.")
+    return alias_names
 
 
 def sanitize_reference(reference: str | os.PathLike[str]) -> str:
@@ -606,32 +629,6 @@ def latest_execution_id(run_dir: Path) -> str | None:
         return None
     latest = max(
         records,
-        key=lambda item: (_parse_created_at(item.created_at), item.execution_id),
-    )
-    return latest.execution_id
-
-
-def parent_execution_id_for_checkpoint(run_dir: Path, checkpoint_path: Path) -> str | None:
-    """Find the latest training attempt established before a checkpoint write."""
-    try:
-        checkpoint_time = datetime.fromtimestamp(checkpoint_path.stat().st_mtime, UTC)
-        resolved_checkpoint = checkpoint_path.resolve(strict=True)
-        resolved_checkpoint_dir = (run_dir / "checkpoints").resolve(strict=True)
-    except OSError:
-        return None
-    if not resolved_checkpoint.is_relative_to(resolved_checkpoint_dir):
-        return None
-
-    candidates = [
-        metadata
-        for metadata in _valid_execution_records(run_dir)
-        if "train" in metadata.intended_phases
-        and _parse_created_at(metadata.created_at) <= checkpoint_time
-    ]
-    if not candidates:
-        return None
-    latest = max(
-        candidates,
         key=lambda item: (_parse_created_at(item.created_at), item.execution_id),
     )
     return latest.execution_id

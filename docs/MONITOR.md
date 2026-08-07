@@ -30,8 +30,10 @@ small presentation conventions stated below.
 - Overview identity uses the final eight characters of an execution ID.
   Exact detail is the only dashboard view that prints the complete immutable
   ID and full lineage/provenance fields.
-- `parent_execution_id` defines resume continuity. `previous_execution_id`
-  records adjacency but does not make metrics or coordinates continuous.
+- A caller-supplied `parent_execution_id` defines resume continuity.
+  `resume_checkpoint` remains an independent artifact reference and never
+  infers a parent. `previous_execution_id` records adjacency but does not make
+  metrics or coordinates continuous.
 - Logical run coordinates are folded chronologically across the resolved
   parent lineage. Parent metric samples at or beyond a child's declared
   starting global step, or starting epoch when no global-step coordinate is

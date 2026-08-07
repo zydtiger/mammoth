@@ -121,6 +121,15 @@ validates nor converts that domain meaning. Progress may be throttled and
 replaced; lifecycle and terminal records flush immediately. A writer failure
 disables only that writer and must not terminate the workload.
 
+`RunObserver` asynchronously dispatches CPU-owned scalar observations. It owns
+one bounded ordered worker per sink, so a slow TensorBoard writer cannot stall
+JSONL dispatch. JSONL may coalesce unprocessed
+non-final task progress; TensorBoard retains dense scalar history and applies
+backpressure instead. Lifecycle, terminal, explicit flush, and shutdown
+operations are per-sink barriers. Asynchronous mode currently rejects media
+until it has an explicit immutable CPU snapshot contract. Its per-sink pending
+bound also limits the number of retained JSONL progress scopes.
+
 ### TensorBoard
 
 TensorBoard stores dense numerical and media history. Mammoth manages writer
@@ -155,6 +164,9 @@ observed time. A run-level monitor keeps every valid immutable execution
 available for navigation while selected resume-lineage histories provide
 continuous project-neutral metric state. Historical schema-version-1 `unit`
 fields remain readable but do not affect reconstructed state or presentation.
+Callers record that continuity explicitly with `parent_execution_id`; a
+`resume_checkpoint` is an independent sanitized artifact reference and never
+causes Mammoth to infer a parent from its location, name, phase, or timestamp.
 
 An interactive terminal launches the optional Textual dashboard by default.
 Textual owns refresh workers, keyboard navigation, scrolling, and responsive
@@ -189,11 +201,14 @@ and attach presentation sinks without recreating the runtime. The runtime does
 not encode GPU models, concrete workload weights, or project topology rules.
 
 Rank zero creates a direct execution and holds its logical-run lease, or joins
-an execution already identified by `MAMMOTH_EXECUTION_ID` or the compatible
-`TISAM_EXECUTION_ID` hook. Every rank validates the same immutable context,
-opens its own JSONL and text streams, and reaches startup consensus. A failure
-on any rank is reported coherently before project work begins. TensorBoard's
-rank-aware sink and trainer checkpoints default to rank zero.
+an execution identified by `MAMMOTH_EXECUTION_ID`. A consuming project may
+explicitly pass temporary compatibility alias names through
+`TorchExecutionRequest`; Mammoth validates those names and their values with
+the canonical variable, but does not define, publish, or persist any
+consumer-specific alias. Every rank validates the same immutable context, opens
+its own JSONL and text streams, and reaches startup consensus. A failure on any
+rank is reported coherently before project work begins. TensorBoard's rank-aware
+sink and trainer checkpoints default to rank zero.
 
 `TorchExecutionSession` owns process and phase lifecycle events after logging
 starts. It is also the context-managed owner of observers, background
@@ -234,6 +249,14 @@ checkpoint publication. A trainer may consume a `TorchExecutionRuntime` for
 device/rank identity and its active execution observer; constructing the
 trainer without a runtime remains supported for callers that already own their
 process group.
+
+For the built-in batch mover, a CUDA trainer may prefetch one fully pinned CPU
+batch on a dedicated copy stream while the current compute stream consumes the
+previous batch. The compute stream waits only for that batch's copy-stream
+transfer before invoking the project step and records the stream against its
+CUDA tensor storage. The pipeline never changes DataLoader policy or runs a
+project-supplied batch mover on a Mammoth-owned stream; ineligible batches use
+the ordinary mover.
 
 For DDP, Mammoth suppresses reducer communication only for non-final
 microbatches in an accumulation window. Every rank reaches a Python-status
