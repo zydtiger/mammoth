@@ -305,6 +305,13 @@ runtime before the trainer. Rank zero creates the immutable execution, every
 rank joins it and receives its own JSONL and text stream, and the trainer uses
 the runtime's device and rank identity:
 
+When resuming, the caller must resolve artifact provenance before constructing
+the request and provide the producing attempt as `parent_execution_id`.
+`resume_checkpoint` is only a sanitized artifact reference: it never causes
+Mammoth to infer a parent from a path, filename, phase, or timestamp. Omit
+`parent_execution_id` for legacy or externally supplied artifacts without
+trusted producer provenance; the stored parent remains `None`.
+
 ```python
 from pathlib import Path
 
@@ -325,6 +332,8 @@ with initialize_torch_runtime(runtime_config) as runtime:
             invocation_kind="train",
             intended_phases=("train",),
             command=("python", "train.py"),
+            resume_checkpoint=Path("runs/example/checkpoints/latest.pt"),
+            parent_execution_id="producer-attempt",
         )
     )
     with Trainer(
