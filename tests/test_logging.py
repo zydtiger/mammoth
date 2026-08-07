@@ -78,6 +78,64 @@ class BlockingSerialSink(RecordingSink):
             self._active.release()
 
 
+class BlockingSink(RecordingSink):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self._block_once = True
+
+    def observe(self, observation: Observation) -> None:
+        super().observe(observation)
+        if self._block_once:
+            self._block_once = False
+            self.entered.set()
+            assert self.release.wait(timeout=1.0)
+
+
+class BlockingEventWriter:
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.delivered_second = threading.Event()
+        self.flushes = 0
+        self.closed = 0
+        self._block_once = True
+
+    def emit(self, event: str, **fields: Any) -> None:
+        if self._block_once:
+            self._block_once = False
+            self.entered.set()
+            assert self.release.wait(timeout=1.0)
+        self.events.append({"event": event, **fields})
+        if len(self.events) >= 2:
+            self.delivered_second.set()
+
+    def flush_progress(self, *, final: bool = True) -> None:
+        del final
+        self.flushes += 1
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class SignalFailingSink(RecordingSink):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed = threading.Event()
+
+    def observe(self, observation: Observation) -> None:
+        del observation
+        self.failed.set()
+        raise OSError("backend unavailable")
+
+
+class FlushFailingSink(RecordingSink):
+    def flush(self) -> None:
+        raise OSError("flush failed")
+
+
 class FakeSummaryWriter:
     def __init__(self) -> None:
         self.scalars: list[tuple[str, float, int]] = []
@@ -144,6 +202,172 @@ def test_observer_isolates_failed_sink_and_keeps_healthy_sinks() -> None:
         "execution_completed",
     ]
     assert failing.closed == 1
+
+
+def test_async_observer_uses_independent_per_sink_workers() -> None:
+    blocked = BlockingSink()
+    healthy = RecordingSink()
+    observer = RunObserver((blocked, healthy), asynchronous=True, max_pending_observations=1)
+
+    observer.progress(phase="phase", task_id="task", completed=1)
+
+    assert blocked.entered.wait(timeout=1.0)
+    assert healthy.observed.wait(timeout=1.0)
+    blocked.release.set()
+    observer.flush()
+    observer.close()
+
+    assert [item.event for item in healthy.observations] == ["progress"]
+    assert blocked.flushed == 2
+    assert healthy.flushed == 2
+
+
+def test_async_jsonl_coalesces_only_latest_pending_progress() -> None:
+    writer = BlockingEventWriter()
+    observer = RunObserver(
+        (JsonlEventSink(writer),),  # type: ignore[arg-type]
+        asynchronous=True,
+        max_pending_observations=1,
+    )
+
+    observer.progress(phase="phase", task_id="task", completed=1)
+    assert writer.entered.wait(timeout=1.0)
+    observer.progress(phase="phase", task_id="task", completed=2)
+    observer.progress(phase="phase", task_id="task", completed=3)
+    writer.release.set()
+    assert writer.delivered_second.wait(timeout=1.0)
+    observer.flush()
+    observer.close()
+
+    assert [event["completed"] for event in writer.events] == [1, 3]
+    assert writer.flushes >= 2
+    assert writer.closed == 1
+
+
+def test_async_jsonl_final_progress_drains_pending_scope_before_terminal_record() -> None:
+    writer = BlockingEventWriter()
+    observer = RunObserver(
+        (JsonlEventSink(writer),),  # type: ignore[arg-type]
+        asynchronous=True,
+        max_pending_observations=1,
+    )
+    final_done = threading.Event()
+
+    observer.progress(phase="phase", task_id="task", completed=1)
+    assert writer.entered.wait(timeout=1.0)
+    observer.progress(phase="phase", task_id="task", completed=2)
+
+    def emit_final() -> None:
+        observer.progress(phase="phase", task_id="task", completed=3, final=True)
+        final_done.set()
+
+    final_thread = threading.Thread(target=emit_final)
+    final_thread.start()
+    assert not final_done.wait(timeout=0.05)
+    writer.release.set()
+    assert final_done.wait(timeout=1.0)
+    final_thread.join()
+    observer.close()
+
+    assert [event["completed"] for event in writer.events] == [1, 2, 3]
+    assert writer.events[-1]["final"] is True
+
+
+def test_async_tensorboard_preserves_dense_scalar_history(tmp_path: Path) -> None:
+    writer = FakeSummaryWriter()
+    observer = RunObserver(
+        (TensorBoardSink(tmp_path, writer=writer),),
+        asynchronous=True,
+        max_pending_observations=1,
+    )
+
+    for step in range(3):
+        observer.progress(
+            phase="phase",
+            task_id="task",
+            completed=step + 1,
+            metrics={"loss": float(step)},
+            logical_step=step,
+        )
+    observer.flush()
+    observer.close()
+
+    assert writer.scalars == [("loss", 0.0, 0), ("loss", 1.0, 1), ("loss", 2.0, 2)]
+
+
+def test_async_observer_disables_only_failed_worker_sink() -> None:
+    failing = SignalFailingSink()
+    healthy = RecordingSink()
+    observer = RunObserver((failing, healthy), asynchronous=True)
+
+    observer.progress(phase="phase", task_id="task", completed=1)
+    assert failing.failed.wait(timeout=1.0)
+    observer.progress(phase="phase", task_id="task", completed=2)
+    observer.flush()
+    observer.close()
+
+    assert observer.disabled_sink_count == 1
+    assert failing.closed == 1
+    assert [item.fields["completed"] for item in healthy.observations] == [1, 2]
+
+
+def test_async_observer_rejects_media_without_a_cpu_snapshot_policy() -> None:
+    observer = RunObserver((RecordingSink(),), asynchronous=True)
+
+    with pytest.raises(ValueError, match="does not support media"):
+        observer.progress(
+            phase="phase",
+            task_id="task",
+            completed=1,
+            media={"sample": Media("image", [[1]])},
+        )
+
+    observer.close()
+
+
+def test_async_observer_snapshots_nested_fields_before_worker_dispatch() -> None:
+    blocked = BlockingSink()
+    observer = RunObserver((blocked,), asynchronous=True, max_pending_observations=1)
+    coordinates = {"nested": {"step": 1}}
+
+    observer.progress(phase="phase", task_id="task", completed=1, coordinates=coordinates)
+    assert blocked.entered.wait(timeout=1.0)
+    coordinates["nested"]["step"] = 2
+    blocked.release.set()
+    observer.flush()
+    observer.close()
+
+    assert blocked.observations[0].fields["coordinates"] == {"nested": {"step": 1}}
+
+
+def test_async_observer_uses_private_snapshot_not_returned_observation_alias() -> None:
+    blocked = BlockingSink()
+    observer = RunObserver((blocked,), asynchronous=True, max_pending_observations=1)
+
+    observation = observer.progress(
+        phase="phase",
+        task_id="task",
+        completed=1,
+        coordinates={"nested": {"step": 1}},
+    )
+    assert blocked.entered.wait(timeout=1.0)
+    observation.fields["coordinates"]["nested"]["step"] = 2
+    blocked.release.set()
+    observer.flush()
+    observer.close()
+
+    assert blocked.observations[0].fields["coordinates"] == {"nested": {"step": 1}}
+
+
+def test_async_observer_close_releases_worker_after_flush_failure() -> None:
+    sink = FlushFailingSink()
+    observer = RunObserver((sink,), asynchronous=True)
+    dispatcher = observer._sinks[0]  # type: ignore[attr-defined]
+
+    observer.progress(phase="phase", task_id="task", completed=1)
+    observer.close()
+
+    assert dispatcher._pipeline._closed  # type: ignore[attr-defined]
 
 
 def test_phase_and_task_contexts_emit_balanced_terminal_records() -> None:
@@ -336,6 +560,8 @@ def test_execution_observability_does_not_claim_text_log(tmp_path: Path) -> None
         context,
         rank=0,
         additional_sinks=(recording,),
+        asynchronous=True,
+        max_pending_observations=1,
     ) as observability:
         observability.observer.emit("process_started", phase="phase")
         assert not context.rank_log_path(0).exists()
