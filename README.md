@@ -92,6 +92,12 @@ uv run mammoth monitor demo
 The monitor reads from `./runs` by default. Use `--entry <path>` to inspect a
 different artifact root.
 
+Progress counters are unitless producer-owned numbers. Within each task,
+`completed`, `total`, and any reported throughput must describe the same
+logical work quantity; producers omit throughput when they cannot keep that
+relationship. The monitor renders every present throughput as `b/s` without
+defining or converting the underlying work batch.
+
 On an interactive terminal, this opens the Textual dashboard with continuous
 two-second polling and explicitly viewer-host telemetry enabled. The dashboard
 includes compact attempt IDs, resume-aware run progress, integrated progress

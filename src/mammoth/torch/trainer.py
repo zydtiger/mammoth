@@ -693,7 +693,6 @@ class Trainer:
                             },
                             logical_step=self.optimizer_step_logical_step(),
                             final=window_index == len(window_sizes),
-                            unit="optimizer step",
                         )
                         self.observer.flush()
             def compute_summary() -> tuple[dict[str, float], dict[str, float]]:
@@ -813,7 +812,6 @@ class Trainer:
                         display_metrics={},
                         coordinates={"epoch": epoch, "batch": batch_index},
                         final=batch_index + 1 == total_batches,
-                        unit="batch",
                     )
                 self.raise_distributed_failure(
                     "validation step",

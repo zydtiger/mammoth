@@ -90,6 +90,8 @@ class RunObserver:
     ) -> Observation:
         """Validate and dispatch one observation without propagating sink I/O errors."""
         with self._dispatch_lock:
+            if "unit" in fields:
+                raise TypeError("unit is no longer supported; progress values are unitless.")
             with self._state_lock:
                 if self._closed:
                     raise RuntimeError("RunObserver is closed")
@@ -134,7 +136,6 @@ class RunObserver:
         display_metrics: Mapping[str, float] | None = None,
         coordinates: Mapping[str, int | float | str] | None = None,
         final: bool = False,
-        unit: str | None = None,
         message: str | None = None,
         media: Mapping[str, Media] | None = None,
         logical_step: int | None = None,
@@ -150,8 +151,6 @@ class RunObserver:
             fields["total"] = total
         if coordinates:
             fields["coordinates"] = coordinates
-        if unit is not None:
-            fields["unit"] = unit
         if message is not None:
             fields["message"] = message
         return self.emit(

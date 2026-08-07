@@ -57,10 +57,11 @@ small presentation conventions stated below.
   Identical counters are treated as replicated global progress and shown once.
   Distinct compatible counters are summed. Missing expected ranks produce an
   aggregation-pending state instead of a partial total.
-- Count units are preserved exactly. Throughput abbreviates both `batch/s` and
-  `microbatch/s` as `b/s`. The `test/segmentation` phase also presents producer
-  `patch/s` or `patches/s` throughput as `b/s`; one displayed batch represents
-  one model forward pass.
+- Progress counts are unitless producer-owned numbers and render without a
+  suffix. Within a task, producers must use one logical work quantity for
+  `completed` and `total`, and report `throughput` for that same quantity per
+  second or omit it. Every present throughput renders as `b/s`; this compact
+  label does not define or convert the producer's work batch.
 
 ## Dashboard Information Hierarchy
 

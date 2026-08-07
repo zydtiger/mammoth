@@ -87,7 +87,6 @@ class TaskState:
     status: ScopeStatus = "pending"
     completed: int = 0
     total: int | None = None
-    unit: str | None = None
     throughput: float | None = None
     message: str | None = None
     started_at: datetime | None = None
@@ -440,7 +439,6 @@ def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
             )
             task.completed = event.completed or 0
             task.total = event.total
-            task.unit = event.unit
         if event.throughput is not None:
             task.throughput = event.throughput
         if event.message is not None:
