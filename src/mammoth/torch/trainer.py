@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import pickle
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
@@ -24,7 +24,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
 from mammoth.logging import RunObserver
-from mammoth.torch.batch import move_batch_to_device
+from mammoth.torch.batch import CudaPrefetchingBatchIterator, move_batch_to_device
 from mammoth.torch.callbacks import Callback, EarlyStopping
 from mammoth.torch.checkpoint import (
     AsyncCheckpointPublisher,
@@ -164,6 +164,7 @@ class TrainerConfig:
     checkpoint_cuda_headroom_bytes: int = 0
     checkpoint_on_interrupt: bool = True
     non_blocking_transfer: bool = False
+    cuda_prefetch: bool = True
     train_phase: str = "train"
     validation_phase: str = "validation"
     display_metric_names: tuple[str, ...] = ("loss",)
@@ -207,6 +208,8 @@ class TrainerConfig:
             raise ValueError("emit_fit_phase_events must be a boolean")
         if not isinstance(self.checkpoint_on_interrupt, bool):
             raise ValueError("checkpoint_on_interrupt must be a boolean")
+        if not isinstance(self.cuda_prefetch, bool):
+            raise ValueError("cuda_prefetch must be a boolean")
         if self.compile_config is not None and not isinstance(
             self.compile_config, TorchCompileConfig
         ):
@@ -345,6 +348,7 @@ class Trainer:
         self.checkpoint_dir = None if checkpoint_dir is None else Path(checkpoint_dir)
         self.checkpoint_policy = checkpoint_policy
         self.checkpoint_save_policy = checkpoint_save_policy
+        self._uses_default_batch_mover = batch_mover is None
         self.batch_mover = batch_mover or self._default_batch_mover
         self.state = TrainerState()
         self.scaler = torch.GradScaler("cuda", enabled=config.precision == "fp16")
@@ -528,6 +532,7 @@ class Trainer:
             epoch=epoch,
             epoch_total=self.config.epochs,
         )
+        batch_iterator: CudaPrefetchingBatchIterator | None = None
         try:
             window_stateful_baseline = self.coordinate(
                 "training metric setup",
@@ -548,6 +553,7 @@ class Trainer:
                     "training loader setup",
                     lambda: iter(self.train_loader),
                 )
+                batch_iterator = self.batch_iterator(loader_iterator)
                 batch_index = 0
                 window_accumulator = MetricAccumulator(self.metric_specs)
                 for window_offset, window_size in enumerate(window_sizes):
@@ -561,8 +567,7 @@ class Trainer:
                             break
                         synchronizes_gradients = local_window_offset + 1 == window_size
                         try:
-                            batch = next(loader_iterator)
-                            moved = self.batch_mover(batch, self.device)
+                            moved = next(batch_iterator)
                             context = StepContext(
                                 training=True,
                                 epoch=epoch,
@@ -711,6 +716,9 @@ class Trainer:
                 message=str(error),
             )
             raise
+        finally:
+            if batch_iterator is not None:
+                batch_iterator.close()
         self.observer.emit(
             "task_completed",
             phase=self.config.train_phase,
@@ -737,6 +745,7 @@ class Trainer:
         self.observer.emit(
             "task_started", phase=self.config.validation_phase, task_id=task_id
         )
+        batch_iterator: CudaPrefetchingBatchIterator | None = None
         try:
             self.coordinate(
                 "validation metric setup",
@@ -752,12 +761,12 @@ class Trainer:
                     "validation loader setup",
                     lambda: iter(validation_loader),
                 )
+                batch_iterator = self.batch_iterator(validation_iterator)
                 for batch_index in range(total_batches):
                     if validation_error is not None:
                         break
                     try:
-                        batch = next(validation_iterator)
-                        moved = self.batch_mover(batch, self.device)
+                        moved = next(batch_iterator)
                         context = StepContext(
                             training=False,
                             epoch=epoch,
@@ -853,6 +862,9 @@ class Trainer:
                 message=str(error),
             )
             raise
+        finally:
+            if batch_iterator is not None:
+                batch_iterator.close()
         self.observer.emit(
             "task_completed",
             phase=self.config.validation_phase,
@@ -1697,6 +1709,20 @@ class Trainer:
             batch,
             device,
             non_blocking=self.config.non_blocking_transfer,
+        )
+
+    def _prefetch_batch_mover(self, batch: Any, device: torch.device) -> Any:
+        return move_batch_to_device(batch, device, non_blocking=True)
+
+    def batch_iterator(self, batches: Iterator[Any]) -> CudaPrefetchingBatchIterator:
+        """Return the bounded default-mover CUDA prefetch pipeline for one loader."""
+        prefetch = self.config.cuda_prefetch and self._uses_default_batch_mover
+        return CudaPrefetchingBatchIterator(
+            batches,
+            self.device,
+            self.batch_mover,
+            enabled=prefetch,
+            prefetch_mover=self._prefetch_batch_mover if prefetch else None,
         )
 
 

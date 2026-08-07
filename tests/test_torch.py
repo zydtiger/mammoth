@@ -7,7 +7,7 @@ import os
 import stat
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext, suppress
 from pathlib import Path
@@ -72,6 +72,7 @@ from mammoth.torch import (
     weighted_partition_counts,
     weighted_partition_indices,
 )
+from mammoth.torch.batch import CudaPrefetchingBatchIterator, batch_is_cuda_prefetch_eligible
 from mammoth.torch.metrics import compute_stateful_metrics, scalar_metrics
 
 
@@ -3004,6 +3005,139 @@ def test_recursive_batch_transfer_preserves_common_container_structure() -> None
     assert isinstance(moved["list"], list)
 
 
+def test_batch_prefetch_iterator_preserves_sync_order_when_cuda_is_ineligible() -> None:
+    moved_values: list[int] = []
+    yielded_values: list[int] = []
+
+    def batches() -> Iterator[torch.Tensor]:
+        for value in (1, 2):
+            yielded_values.append(value)
+            yield torch.tensor(value)
+
+    def mover(batch: torch.Tensor, device: torch.device) -> torch.Tensor:
+        assert device.type == "cpu"
+        moved_values.append(int(batch.item()))
+        return batch
+
+    iterator = CudaPrefetchingBatchIterator(
+        batches(),
+        torch.device("cpu"),
+        mover,
+        enabled=True,
+    )
+
+    first = next(iterator)
+    assert first.item() == 1
+    assert yielded_values == [1]
+    second = next(iterator)
+    assert second.item() == 2
+    assert yielded_values == [1, 2]
+    with pytest.raises(StopIteration):
+        next(iterator)
+    assert moved_values == [1, 2]
+    assert not batch_is_cuda_prefetch_eligible(torch.tensor(1), torch.device("cpu"))
+    iterator.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_prefetch_iterator_stages_one_pinned_batch_on_a_copy_stream() -> None:
+    device = torch.device("cuda")
+    sync_moves: list[int] = []
+    prefetch_moves: list[int] = []
+
+    def sync_mover(batch: torch.Tensor, target: torch.device) -> torch.Tensor:
+        sync_moves.append(int(batch.item()))
+        return batch.to(target)
+
+    def prefetch_mover(batch: torch.Tensor, target: torch.device) -> torch.Tensor:
+        prefetch_moves.append(int(batch.item()))
+        return batch.to(target, non_blocking=True)
+
+    iterator = CudaPrefetchingBatchIterator(
+        iter((torch.tensor(1).pin_memory(), torch.tensor(2).pin_memory())),
+        device,
+        sync_mover,
+        enabled=True,
+        prefetch_mover=prefetch_mover,
+    )
+
+    assert iterator._stream is not None
+    assert iterator._stream != torch.cuda.current_stream(device)
+    first = next(iterator)
+    assert first.item() == 1
+    assert sync_moves == [1]
+    assert prefetch_moves == [2]
+    assert iterator._prefetched.device.type == "cuda"
+    second = next(iterator)
+    assert second.item() == 2
+    assert prefetch_moves == [2]
+    with pytest.raises(StopIteration):
+        next(iterator)
+    iterator.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_prefetch_preserves_training_and_validation_results() -> None:
+    torch.manual_seed(41)
+    features = torch.randn(12, 2)
+    targets = (features[:, 0] > features[:, 1]).long()
+    training_loader = DataLoader(
+        TensorDataset(features, targets),
+        batch_size=3,
+        pin_memory=True,
+    )
+    validation_loader = DataLoader(
+        TensorDataset(features, targets),
+        batch_size=3,
+        pin_memory=True,
+    )
+    baseline_model = torch.nn.Linear(2, 2)
+    prefetched_model = torch.nn.Linear(2, 2)
+    prefetched_model.load_state_dict(baseline_model.state_dict())
+    baseline_optimizer = torch.optim.SGD(baseline_model.parameters(), lr=0.1)
+    prefetched_optimizer = torch.optim.SGD(prefetched_model.parameters(), lr=0.1)
+
+    with Trainer(
+        model=baseline_model,
+        optimizer=baseline_optimizer,
+        train_loader=training_loader,
+        train_step=classification_step,
+        validation_loader=validation_loader,
+        validation_step=classification_step,
+        config=TrainerConfig(
+            epochs=1,
+            device="cuda",
+            cuda_prefetch=False,
+            checkpoint_every_epochs=None,
+        ),
+    ) as trainer:
+        baseline_result = trainer.fit()
+    with Trainer(
+        model=prefetched_model,
+        optimizer=prefetched_optimizer,
+        train_loader=training_loader,
+        train_step=classification_step,
+        validation_loader=validation_loader,
+        validation_step=classification_step,
+        config=TrainerConfig(
+            epochs=1,
+            device="cuda",
+            cuda_prefetch=True,
+            checkpoint_every_epochs=None,
+        ),
+    ) as trainer:
+        prefetched_result = trainer.fit()
+
+    assert baseline_result.training_history == pytest.approx(prefetched_result.training_history)
+    assert baseline_result.validation_history == pytest.approx(prefetched_result.validation_history)
+    for baseline, prefetched in zip(
+        baseline_model.parameters(),
+        prefetched_model.parameters(),
+        strict=True,
+    ):
+        assert torch.allclose(baseline, prefetched)
+
+
 def test_metric_accumulator_supports_mean_sum_and_last() -> None:
     accumulator = MetricAccumulator(
         {
@@ -4194,10 +4328,13 @@ def test_checkpoint_capture_configuration_defaults_and_rejects_invalid_modes() -
 
     assert config.checkpoint_capture_mode == "auto"
     assert config.checkpoint_cuda_headroom_bytes == 0
+    assert config.cuda_prefetch
     with pytest.raises(ValueError, match="checkpoint_capture_mode"):
         TrainerConfig(epochs=1, checkpoint_capture_mode=cast(Any, "gpu"))
     with pytest.raises(ValueError, match="checkpoint_cuda_headroom_bytes"):
         TrainerConfig(epochs=1, checkpoint_cuda_headroom_bytes=-1)
+    with pytest.raises(ValueError, match="cuda_prefetch"):
+        TrainerConfig(epochs=1, cuda_prefetch=cast(Any, "enabled"))
     with pytest.raises(ValueError, match="checkpoint capture mode"):
         AsyncCheckpointPublisher(capture_mode=cast(Any, "gpu"))
 
