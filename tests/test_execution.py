@@ -161,6 +161,48 @@ def test_lineage_is_explicit_and_not_inferred(tmp_path: Path) -> None:
     assert latest_execution_id(layout.run_dir) == "second"
 
 
+def test_resume_checkpoint_without_explicit_parent_records_no_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resume artifact stays independent from execution lineage metadata."""
+    layout = RunLayout(tmp_path, "resume-without-parent").prepare()
+    checkpoint = layout.run_dir / "checkpoints" / "checkpoint.pt"
+    checkpoint.parent.mkdir(exist_ok=True)
+    checkpoint.write_bytes(b"checkpoint")
+
+    original_stat = Path.stat
+    original_resolve = Path.resolve
+
+    def reject_checkpoint_stat(path: Path, *args: object, **kwargs: object) -> object:
+        if path == checkpoint:
+            pytest.fail("execution lineage must not inspect the resume artifact")
+        return original_stat(path, *args, **kwargs)
+
+    def reject_checkpoint_resolve(path: Path, *args: object, **kwargs: object) -> Path:
+        if path == checkpoint:
+            pytest.fail("execution lineage must not inspect the resume artifact")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", reject_checkpoint_stat)
+    monkeypatch.setattr(Path, "resolve", reject_checkpoint_resolve)
+
+    context = create_execution_context(
+        layout.run_dir,
+        run_name=layout.run_name,
+        invocation_kind="test",
+        intended_phases=("train",),
+        world_size=1,
+        execution_mode="single",
+        command=("python", "job.py"),
+        execution_id="resumed",
+        resume_checkpoint=checkpoint,
+    )
+
+    assert context.metadata.resume_checkpoint == str(checkpoint)
+    assert context.metadata.parent_execution_id is None
+
+
 def test_schema_v1_metadata_from_originating_project_remains_readable(tmp_path: Path) -> None:
     layout = RunLayout(tmp_path, "legacy-run").prepare(project_directories=False)
     execution_dir = layout.execution_dir("legacy-attempt")
@@ -191,12 +233,41 @@ def test_schema_v1_metadata_from_originating_project_remains_readable(tmp_path: 
     assert context.metadata.world_size == 2
 
 
-def test_environment_hook_accepts_mammoth_and_legacy_names() -> None:
+def test_environment_hook_accepts_canonical_and_explicit_alias_names() -> None:
     assert execution_id_from_environment({"MAMMOTH_EXECUTION_ID": "one"}) == "one"
-    assert execution_id_from_environment({"TISAM_EXECUTION_ID": "two"}) == "two"
+    assert execution_id_from_environment(
+        {"CALLER_EXECUTION_ID": "two"}, aliases=("CALLER_EXECUTION_ID",)
+    ) == "two"
+    assert execution_id_from_environment(
+        {"MAMMOTH_EXECUTION_ID": "one", "CALLER_EXECUTION_ID": "one"},
+        aliases=("CALLER_EXECUTION_ID",),
+    ) == "one"
     assert execution_id_from_environment({}) is None
     with pytest.raises(ValueError, match="disagree"):
-        execution_id_from_environment({"MAMMOTH_EXECUTION_ID": "one", "TISAM_EXECUTION_ID": "two"})
+        execution_id_from_environment(
+            {"MAMMOTH_EXECUTION_ID": "one", "CALLER_EXECUTION_ID": "two"},
+            aliases=("CALLER_EXECUTION_ID",),
+        )
+
+
+def test_environment_hook_validates_multiple_aliases_and_declarations() -> None:
+    with pytest.raises(ValueError, match="disagree"):
+        execution_id_from_environment(
+            {"FIRST_EXECUTION_ID": "one", "SECOND_EXECUTION_ID": "two"},
+            aliases=("FIRST_EXECUTION_ID", "SECOND_EXECUTION_ID"),
+        )
+    with pytest.raises(ValueError, match="Execution IDs"):
+        execution_id_from_environment(
+            {"CALLER_EXECUTION_ID": "not/an-id"}, aliases=("CALLER_EXECUTION_ID",)
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        execution_id_from_environment(aliases=("CALLER_EXECUTION_ID", "CALLER_EXECUTION_ID"))
+    with pytest.raises(ValueError, match="Invalid"):
+        execution_id_from_environment(aliases=("",))
+    with pytest.raises(ValueError, match="canonical"):
+        execution_id_from_environment(aliases=("MAMMOTH_EXECUTION_ID",))
+    with pytest.raises(ValueError, match="Invalid"):
+        execution_id_from_environment(aliases=([],))  # type: ignore[arg-type]
 
 
 def test_logical_run_lease_rejects_a_second_producer(tmp_path: Path) -> None:

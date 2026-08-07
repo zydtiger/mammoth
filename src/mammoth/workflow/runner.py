@@ -24,7 +24,6 @@ from mammoth.core.events import ExecutionEventWriter
 from mammoth.core.execution import (
     EXECUTION_ID_ENV,
     INVOCATION_KIND_ENV,
-    LEGACY_EXECUTION_ID_ENV,
     PHASE_ENV,
     RUN_NAME_ENV,
 )
@@ -301,7 +300,6 @@ def child_environment(
     environment.update(
         {
             EXECUTION_ID_ENV: execution_id,
-            LEGACY_EXECUTION_ID_ENV: execution_id,
             RUN_NAME_ENV: run_name,
             INVOCATION_KIND_ENV: "workflow",
             PHASE_ENV: phase,

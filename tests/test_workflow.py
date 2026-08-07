@@ -227,7 +227,7 @@ def test_local_workflow_inherits_explicit_environment_and_writes_runner_events(
         "Path('child.json').write_text(__import__('json').dumps({"
         "'custom': os.environ['CUSTOM'], "
         "'mammoth': os.environ['MAMMOTH_EXECUTION_ID'], "
-        "'legacy': os.environ['TISAM_EXECUTION_ID'], "
+        "'caller_alias': os.environ.get('CALLER_EXECUTION_ID'), "
         "'phase': os.environ['MAMMOTH_PHASE']}))"
     )
     path = write_workflow(
@@ -260,7 +260,8 @@ def test_local_workflow_inherits_explicit_environment_and_writes_runner_events(
     assert result.successful
     child = json.loads((tmp_path / "child.json").read_text())
     assert child["custom"] == "step-value"
-    assert child["mammoth"] == child["legacy"] == result.runs[0].execution_id
+    assert child["mammoth"] == result.runs[0].execution_id
+    assert child["caller_alias"] is None
     assert child["phase"] == "opaque-step"
     layout = RunLayout(entry, "project-a")
     execution_dir = layout.execution_dir(result.runs[0].execution_id or "missing")

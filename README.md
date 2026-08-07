@@ -187,7 +187,12 @@ with create_execution_observability(
 
 Use `create_execution_logging` instead when Mammoth should also own the
 process-exclusive plain-text handler. Applications attach that returned handler
-to their chosen Python logger.
+to their chosen Python logger. Dispatch gives each sink a bounded worker,
+coalesces only JSONL's unprocessed non-final progress,
+and retains TensorBoard scalar history. It accepts scalar CPU observations only
+and currently rejects media until Mammoth defines an immutable CPU snapshot
+contract. `max_pending_observations` bounds each sink's active queue and also
+the number of retained JSONL progress scopes.
 
 ## Optional integrations
 
@@ -268,6 +273,15 @@ gradient accumulation, validation, callbacks, scheduling, and checkpoints. It
 does not choose your architecture, dataset, batch format, loss, or metric
 meaning.
 
+For the default batch mover, `TrainerConfig.cuda_prefetch` defaults to `True`.
+On CUDA it uses one dedicated copy stream to transfer one following batch while
+the current batch runs on the compute stream. This path activates only when all
+CPU tensor leaves of that batch are pinned; pageable or unsupported batches,
+CPU devices, and caller-supplied `batch_mover` functions retain their existing
+synchronous movement. Set `cuda_prefetch=False` to disable the pipeline
+deterministically. Mammoth does not change DataLoader pin-memory, worker,
+sampling, or collation policy.
+
 `WarmupLinearLR` supplies a reusable optimizer-step schedule with linear
 warmup and decay. Projects choose its warmup ratio and total-step horizon; an
 extended resume rebases optimizer learning rates, while a shortened horizon is
@@ -311,6 +325,13 @@ runtime before the trainer. Rank zero creates the immutable execution, every
 rank joins it and receives its own JSONL and text stream, and the trainer uses
 the runtime's device and rank identity:
 
+When resuming, the caller must resolve artifact provenance before constructing
+the request and provide the producing attempt as `parent_execution_id`.
+`resume_checkpoint` is only a sanitized artifact reference: it never causes
+Mammoth to infer a parent from a path, filename, phase, or timestamp. Omit
+`parent_execution_id` for legacy or externally supplied artifacts without
+trusted producer provenance; the stored parent remains `None`.
+
 ```python
 from pathlib import Path
 
@@ -331,6 +352,8 @@ with initialize_torch_runtime(runtime_config) as runtime:
             invocation_kind="train",
             intended_phases=("train",),
             command=("python", "train.py"),
+            resume_checkpoint=Path("runs/example/checkpoints/latest.pt"),
+            parent_execution_id="producer-attempt",
         )
     )
     with Trainer(

@@ -77,7 +77,7 @@ def test_discovery_selects_latest_valid_execution_and_isolates_warning(tmp_path:
     assert select_execution(layout, "first") == first
 
 
-def test_lineage_follows_only_explicit_links_without_cycles(tmp_path: Path) -> None:
+def test_lineage_follows_only_explicit_links(tmp_path: Path) -> None:
     layout = RunLayout(tmp_path, "run").prepare()
     create_context(layout, "root", "2026-01-01T00:00:00Z")
     parent = create_context(
@@ -96,6 +96,48 @@ def test_lineage_follows_only_explicit_links_without_cycles(tmp_path: Path) -> N
 
     assert execution_lineage(layout, current.metadata) == ("parent", "root")
     assert execution_lineage(layout, parent.metadata) == ("root",)
+
+
+def test_run_monitor_stops_on_unknown_and_cyclic_explicit_parents(tmp_path: Path) -> None:
+    """Missing and cyclic explicit parents do not make monitor reconstruction loop."""
+    unknown_layout = RunLayout(tmp_path / "unknown", "run").prepare()
+    create_context(
+        unknown_layout,
+        "unknown-parent",
+        "2026-01-01T00:00:00Z",
+        parent_execution_id="missing",
+    )
+    unknown_snapshot = RunMonitor(unknown_layout).poll()
+    assert [item.execution_id for item in unknown_snapshot.resume_lineage] == ["unknown-parent"]
+    assert unknown_snapshot.metric_history == {}
+
+    self_layout = RunLayout(tmp_path / "self", "run").prepare()
+    create_context(
+        self_layout,
+        "self-parent",
+        "2026-01-01T00:00:00Z",
+        parent_execution_id="self-parent",
+    )
+    self_snapshot = RunMonitor(self_layout).poll()
+    assert [item.execution_id for item in self_snapshot.resume_lineage] == ["self-parent"]
+    assert self_snapshot.metric_history == {}
+
+    cycle_layout = RunLayout(tmp_path / "cycle", "run").prepare()
+    create_context(
+        cycle_layout,
+        "first",
+        "2026-01-01T00:00:00Z",
+        parent_execution_id="second",
+    )
+    create_context(
+        cycle_layout,
+        "second",
+        "2026-01-02T00:00:00Z",
+        parent_execution_id="first",
+    )
+    cycle_snapshot = RunMonitor(cycle_layout).poll()
+    assert [item.execution_id for item in cycle_snapshot.resume_lineage] == ["first", "second"]
+    assert cycle_snapshot.metric_history == {}
 
 
 def test_run_monitor_exposes_execution_history_and_lineage_metrics(tmp_path: Path) -> None:
