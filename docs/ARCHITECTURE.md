@@ -244,6 +244,14 @@ device/rank identity and its active execution observer; constructing the
 trainer without a runtime remains supported for callers that already own their
 process group.
 
+For the built-in batch mover, a CUDA trainer may prefetch one fully pinned CPU
+batch on a dedicated copy stream while the current compute stream consumes the
+previous batch. The compute stream waits only for that batch's copy-stream
+transfer before invoking the project step and records the stream against its
+CUDA tensor storage. The pipeline never changes DataLoader policy or runs a
+project-supplied batch mover on a Mammoth-owned stream; ineligible batches use
+the ordinary mover.
+
 For DDP, Mammoth suppresses reducer communication only for non-final
 microbatches in an accumulation window. Every rank reaches a Python-status
 consensus before its final backward, then lets PyTorch's native DDP reducer
