@@ -9,10 +9,12 @@ from mammoth.workflow.config import (
     load_workflow,
 )
 from mammoth.workflow.launch import (
+    CapturedProcessResult,
     CommandPlan,
     ProcessResult,
     SupervisedProcess,
     command_for_step,
+    run_captured_process,
 )
 from mammoth.workflow.runner import (
     RunResult,
@@ -23,6 +25,7 @@ from mammoth.workflow.runner import (
 )
 
 __all__ = [
+    "CapturedProcessResult",
     "CommandPlan",
     "ProcessResult",
     "RunConfig",
@@ -35,5 +38,6 @@ __all__ = [
     "command_for_step",
     "load_workflow",
     "plan_workflow",
+    "run_captured_process",
     "run_workflow",
 ]

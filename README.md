@@ -158,6 +158,30 @@ Mammoth validates unknown settings, missing dependencies, and dependency
 cycles before launching commands. Run `uv run mammoth workflow run --help` for
 the full CLI reference.
 
+## Capture a supervised command
+
+For callers that need a child's text output without reimplementing pipe
+draining or process-tree cleanup, use the opt-in one-call API. Commands remain
+tokenized argument arrays: Mammoth does not invoke a shell.
+
+```python
+from mammoth.workflow import run_captured_process
+
+result = run_captured_process(
+    ("python", "-c", "print('hello')"),
+    cwd=None,
+    environment={},
+    timeout_seconds=30,
+)
+print(result.stdout)
+```
+
+`stdout` and `stderr` are captured separately. A non-zero return code remains
+a returned process fact with its output intact. On timeout, Mammoth terminates
+and reaps the observable process tree, then returns the partial output along
+with `timed_out`; callers retain all retry, logging, artifact, and status
+policy.
+
 ## Compose execution observability
 
 For a process that already has an `ExecutionContext`, create JSONL and optional
