@@ -69,7 +69,6 @@ Precision = Literal["fp32", "bf16", "fp16"]
 Strategy = Literal["single", "ddp"]
 SchedulerInterval = Literal["optimizer", "epoch", "validation"]
 OptimizerStepLogicalClock = Literal["completed", "zero_based"]
-DdpGradientSync = Literal["native", "manual"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,7 +166,6 @@ class TrainerConfig:
     display_metric_names: tuple[str, ...] = ("loss",)
     emit_fit_phase_events: bool = True
     optimizer_step_logical_clock: OptimizerStepLogicalClock = "completed"
-    ddp_gradient_sync: DdpGradientSync = "native"
     compile_config: TorchCompileConfig | None = None
 
     def __post_init__(self) -> None:
@@ -188,8 +186,6 @@ class TrainerConfig:
             raise ValueError(
                 "optimizer_step_logical_clock must be 'completed' or 'zero_based'"
             )
-        if self.ddp_gradient_sync not in {"native", "manual"}:
-            raise ValueError("ddp_gradient_sync must be 'native' or 'manual'")
         if self.max_gradient_norm is not None and (
             isinstance(self.max_gradient_norm, bool)
             or not math.isfinite(self.max_gradient_norm)
@@ -596,10 +592,7 @@ class Trainer:
                                 )
                                 backward_loss = self.scaler.scale(scaled)
                                 assert isinstance(backward_loss, torch.Tensor)
-                                if (
-                                    synchronizes_gradients
-                                    and self.uses_native_ddp_gradient_sync
-                                ):
+                                if synchronizes_gradients and self._ddp_model is not None:
                                     final_backward_loss = backward_loss
                                 else:
                                     backward_loss.backward()  # type: ignore[no-untyped-call]
@@ -609,11 +602,9 @@ class Trainer:
                             last_batch_index = batch_index
                             batch_index += 1
                     self.raise_distributed_failure("train step", window_error)
-                    if self.uses_native_ddp_gradient_sync:
+                    if self._ddp_model is not None:
                         assert final_backward_loss is not None
                         final_backward_loss.backward()  # type: ignore[no-untyped-call]
-                    else:
-                        self.synchronize_gradients()
                     self.coordinate("optimizer step", self.optimizer_step)
                     self.state.global_step += global_window_sizes[window_offset]
                     optimizer_step_metrics = self.optimizer_step_metrics
@@ -952,51 +943,11 @@ class Trainer:
         for callback in self.callbacks:
             callback.on_checkpoint_published(self.state, publication)
 
-    @property
-    def uses_native_ddp_gradient_sync(self) -> bool:
-        """Return whether DDP final backwards use PyTorch's bucket reducer."""
-        return self._ddp_model is not None and self.config.ddp_gradient_sync == "native"
-
     def gradient_accumulation_context(self, *, synchronizes_gradients: bool = False) -> Any:
         """Suppress DDP reduction only before a native window's final backward."""
-        if self._ddp_model is not None and (
-            not self.uses_native_ddp_gradient_sync or not synchronizes_gradients
-        ):
+        if self._ddp_model is not None and not synchronizes_gradients:
             return self._ddp_model.no_sync()
         return nullcontext()
-
-    def synchronize_gradients(self) -> None:
-        """Average accumulated gradients after rank-wide metadata consensus."""
-        if self.config.strategy == "single":
-            return
-        parameters = tuple(self.base_model.named_parameters())
-        local_metadata = tuple(
-            (
-                name,
-                parameter.grad is not None,
-                None if parameter.grad is None else tuple(parameter.grad.shape),
-                None if parameter.grad is None else str(parameter.grad.dtype),
-                None if parameter.grad is None else str(parameter.grad.layout),
-            )
-            for name, parameter in parameters
-        )
-        gathered_metadata = self.all_gather_object(local_metadata)
-        if any(metadata != local_metadata for metadata in gathered_metadata):
-            raise RuntimeError("gradient presence or tensor metadata differs across ranks")
-        for _, parameter in parameters:
-            gradient = parameter.grad
-            if gradient is None:
-                continue
-            if gradient.layout != torch.strided:
-                raise ValueError("distributed accumulated gradients must use strided layout")
-            if self.runtime is not None:
-                self.runtime.all_reduce_sum(gradient)
-            else:
-                torch.distributed.all_reduce(
-                    gradient,
-                    op=torch.distributed.ReduceOp.SUM,
-                )
-            gradient.div_(self.world_size)
 
     def autocast_context(self) -> Any:
         """Return configured device autocast without affecting fp32 execution."""

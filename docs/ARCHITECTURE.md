@@ -224,18 +224,17 @@ device/rank identity and its active execution observer; constructing the
 trainer without a runtime remains supported for callers that already own their
 process group.
 
-For the default DDP gradient mode, Mammoth suppresses reducer communication
-only for non-final microbatches in an accumulation window. Every rank reaches a
-Python-status consensus before its final backward, then lets PyTorch's native
-DDP reducer average gradient buckets during that backward. This preserves one
-reduction boundary per logical optimizer step without trainer-owned CUDA scalar
+For DDP, Mammoth suppresses reducer communication only for non-final
+microbatches in an accumulation window. Every rank reaches a Python-status
+consensus before its final backward, then lets PyTorch's native DDP reducer
+average gradient buckets during that backward. This preserves one reduction
+boundary per logical optimizer step without trainer-owned CUDA scalar
 materialization or per-parameter reductions. A rank-local error before that
 final backward is reported coherently; a failure during native backward follows
 the DDP launcher's fail-fast behavior because another rank may already be in a
-reducer collective. Projects with dynamic gradient participation that cannot
-satisfy native reducer invariants must explicitly select the trainer's `manual`
-DDP gradient mode, which retains metadata validation and post-window manual
-reduction.
+reducer collective. The trainer requires standard native-reducer invariants;
+projects with dynamic gradient participation must configure or own a compatible
+DDP training loop.
 
 `WarmupLinearLR` provides the reusable BERT-style zero-to-base warmup followed
 by linear decay to zero. Projects choose its warmup ratio and optimizer-step
@@ -277,9 +276,7 @@ returns the local microbatch count and loss scale for each shared optimizer
 window. Every rank must produce the same number of optimizer windows. Explicit
 per-window scales cover unequal partial windows without assigning workload
 meaning to Mammoth. Native DDP reaches failure consensus before each final
-backward and lets the reducer average that window's gradient buckets; the
-explicit `manual` fallback instead keeps every backward local and averages
-validated gradients in stable parameter order at the window boundary. The
+backward and lets the reducer average that window's gradient buckets. The
 persisted global-step cursor counts all ranks' microbatches at completed
 windows; step callbacks receive a deterministic rank-ordered position inside
 the active window.
