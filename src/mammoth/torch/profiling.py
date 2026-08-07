@@ -122,6 +122,14 @@ class CudaMemoryStats:
 
 
 @dataclass(frozen=True, slots=True)
+class PhaseLatencySummary:
+    """Immutable wall and optional device latency summaries for one named phase."""
+
+    wall_latency: LatencySummary
+    device_latency: LatencySummary | None
+
+
+@dataclass(frozen=True, slots=True)
 class OperationProfile:
     """Normalized aggregate for one operation emitted by ``torch.profiler``."""
 
@@ -182,6 +190,64 @@ class ProfileReport:
         }
 
 
+class NamedPhaseProfiler:
+    """Measure caller-owned dependent regions under opaque caller-selected names.
+
+    Callers use :meth:`measure` around arbitrary zero-argument callables and
+    retain each returned value for later regions. This class owns only local
+    timing and aggregation; it neither assigns phase meaning nor manages a
+    ``torch.profiler`` lifecycle.
+    """
+
+    def __init__(self, device: str | torch.device = "auto") -> None:
+        self._device = _resolve_profile_device(device)
+        self._wall_samples: dict[str, list[float]] = {}
+        self._device_samples: dict[str, list[float]] = {}
+
+    @property
+    def device(self) -> torch.device:
+        """Return the resolved device used for measurements."""
+        return self._device
+
+    def measure[T](
+        self,
+        phase: str,
+        workload: Callable[[], T],
+        *,
+        record: bool = True,
+    ) -> T:
+        """Run one named region and optionally retain its completed timing sample."""
+        _validate_phase_name(phase)
+        if not callable(workload):
+            raise TypeError("workload must be callable")
+        if not isinstance(record, bool):
+            raise TypeError("record must be a bool")
+
+        with record_function(phase):
+            result, timing = _measure_invocation(self._device, workload)
+        if record:
+            self._wall_samples.setdefault(phase, []).append(timing.wall_ms)
+            if timing.device_ms is not None:
+                self._device_samples.setdefault(phase, []).append(timing.device_ms)
+        return result
+
+    def summaries(self) -> Mapping[str, PhaseLatencySummary]:
+        """Return immutable repeated-sample summaries keyed by caller phase name."""
+        return MappingProxyType(
+            {
+                phase: PhaseLatencySummary(
+                    wall_latency=summarize_latency(wall_samples),
+                    device_latency=(
+                        summarize_latency(self._device_samples[phase])
+                        if phase in self._device_samples
+                        else None
+                    ),
+                )
+                for phase, wall_samples in self._wall_samples.items()
+            }
+        )
+
+
 def profile_callable(
     workload: Callable[[], Any],
     *,
@@ -217,7 +283,7 @@ def profile_callable(
             workload()
         _synchronize(device)
 
-        _reset_memory_stats(device)
+        reset_cuda_peak_memory_stats(device)
         wall_samples: list[float] = []
         device_samples: list[float] = []
         for _ in range(selected_config.measured_iterations):
@@ -225,7 +291,7 @@ def profile_callable(
             wall_samples.append(timing.wall_ms)
             if timing.device_ms is not None:
                 device_samples.append(timing.device_ms)
-        memory = _collect_memory_stats(device)
+        memory = collect_cuda_memory_stats(device)
 
         top_operations: tuple[OperationProfile, ...] = ()
         trace_path: str | None = None
@@ -237,7 +303,7 @@ def profile_callable(
                 components=selected_components,
                 config=selected_config,
             )
-            top_operations = _top_operations(
+            top_operations = normalize_operation_profiles(
                 profiler,
                 device=device,
                 row_limit=selected_config.row_limit,
@@ -321,10 +387,10 @@ def current_torch_runtime_state() -> TorchRuntimeState:
     return current_torch_backend_state()
 
 
-def _measure_invocation(
+def _measure_invocation[T](
     device: torch.device,
-    workload: Callable[[], Any],
-) -> tuple[Any, ProfileTiming]:
+    workload: Callable[[], T],
+) -> tuple[T, ProfileTiming]:
     use_cuda = device.type == "cuda"
     start_event: torch.cuda.Event | None = None
     end_event: torch.cuda.Event | None = None
@@ -409,22 +475,32 @@ def _component_ranges(components: Mapping[str, torch.nn.Module]) -> Iterator[Non
             handle.remove()
 
 
-def _top_operations(
-    profiler: profile,
+def normalize_operation_profiles(
+    profiler: Any,
     *,
-    device: torch.device,
-    row_limit: int,
-    sort_by: str | None,
+    device: str | torch.device = "auto",
+    row_limit: int | None = None,
+    sort_by: str | None = None,
     record_shapes: bool = False,
 ) -> tuple[OperationProfile, ...]:
-    selected_sort = sort_by or ("device_time_total" if device.type == "cuda" else "cpu_time_total")
+    """Normalize and sort rows from a caller-owned ``torch.profiler`` result.
+
+    The input profiler lifecycle remains caller-owned. Both legacy CUDA and
+    current device field names are normalized into :class:`OperationProfile`.
+    """
+    selected_device = _resolve_operation_device(device)
+    if row_limit is not None:
+        _positive_integer("row_limit", row_limit)
+    selected_sort = sort_by or (
+        "device_time_total" if selected_device.type == "cuda" else "cpu_time_total"
+    )
     rows = list(
         profiler.key_averages(group_by_input_shape=True)
         if record_shapes
         else profiler.key_averages()
     )
     rows.sort(key=lambda row: _row_sort_value(row, selected_sort), reverse=True)
-    return tuple(
+    normalized = tuple(
         OperationProfile(
             key=str(row.key),
             count=int(getattr(row, "count", 0)),
@@ -449,8 +525,9 @@ def _top_operations(
             flops=int(getattr(row, "flops", 0) or 0),
             input_shapes=_input_shapes(row),
         )
-        for row in rows[:row_limit]
+        for row in rows
     )
+    return normalized if row_limit is None else normalized[:row_limit]
 
 
 def _input_shapes(row: Any) -> tuple[tuple[int | str, ...], ...]:
@@ -493,9 +570,23 @@ def _row_sort_value(row: Any, name: str) -> float:
     return _row_number(row, name, fallbacks.get(name))
 
 
-def _reset_memory_stats(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
+def synchronize_device(device: str | torch.device = "auto") -> None:
+    """Synchronize one caller-selected CUDA device without initializing CUDA on CPU."""
+    _synchronize(_resolve_profile_device(device))
+
+
+def reset_cuda_peak_memory_stats(device: str | torch.device = "auto") -> None:
+    """Reset peak allocator accounting for one caller-selected CUDA device."""
+    selected_device = _resolve_profile_device(device)
+    if selected_device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(selected_device)
+
+
+def collect_cuda_memory_stats(
+    device: str | torch.device = "auto",
+) -> CudaMemoryStats | None:
+    """Return current CUDA allocator state and peaks, or ``None`` for CPU."""
+    return _collect_memory_stats(_resolve_profile_device(device))
 
 
 def _collect_memory_stats(device: torch.device) -> CudaMemoryStats | None:
@@ -514,6 +605,25 @@ def _collect_memory_stats(device: torch.device) -> CudaMemoryStats | None:
 def _synchronize(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _resolve_profile_device(device: str | torch.device) -> torch.device:
+    if not isinstance(device, str | torch.device):
+        raise TypeError("device must be a string or torch.device")
+    return resolve_device(str(device))
+
+
+def _resolve_operation_device(device: str | torch.device) -> torch.device:
+    if not isinstance(device, str | torch.device):
+        raise TypeError("device must be a string or torch.device")
+    if device == "auto":
+        return resolve_device("auto")
+    return torch.device(device)
+
+
+def _validate_phase_name(phase: str) -> None:
+    if not isinstance(phase, str) or not phase.strip():
+        raise ValueError("phase must be a non-empty string")
 
 
 def _validate_components(

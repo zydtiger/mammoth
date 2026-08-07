@@ -447,6 +447,15 @@ architecture components, generate inputs, load checkpoints, select compile
 scopes, or define what one work unit means. Instrumented profiler time remains
 separate from the uninstrumented latency distribution.
 
+For compound workflows, `NamedPhaseProfiler` measures caller-owned dependent
+zero-argument regions under arbitrary caller-selected names and returns each
+region result unchanged. It aggregates only completed caller-selected samples,
+so callers can time warmup or diagnostic regions without reporting them.
+Mammoth also exposes process-local device synchronization, CUDA allocator peak
+reset and snapshots, and profiler-row normalization. Callers retain phase
+names and order, profiler lifecycles, workload semantics, report schemas, and
+any distributed aggregation policy.
+
 ## Compatibility policy
 
 Artifact readers preserve compatibility with schema-version-1 execution and

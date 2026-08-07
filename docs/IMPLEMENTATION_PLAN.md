@@ -258,6 +258,23 @@ Exit condition: training, inference, and profiling consumers share one backend
 implementation while retaining their concrete values, logging policy, and data
 seeding behavior.
 
+## Phase 13: Named-phase PyTorch profiling
+
+Status: complete.
+
+Add project-neutral timing for dependent caller-owned regions:
+
+- opaque non-empty caller-selected phase names and returned results;
+- optional unreported warmup or diagnostic samples;
+- immutable wall and optional CUDA-device latency summaries per phase;
+- caller-visible profiler ranges without a prescribed phase vocabulary;
+- public process-local CUDA synchronization and allocator operations; and
+- public operation-row normalization for caller-owned profiler sessions.
+
+Exit condition: a consuming project can measure dependent regions and preserve
+its own workload construction, profiler lifecycle, phase semantics, and report
+format without reimplementing generic PyTorch profiling mechanics.
+
 ## Deferred capabilities
 
 Defer these until another real project supplies requirements:
