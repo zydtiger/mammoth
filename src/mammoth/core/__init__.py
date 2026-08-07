@@ -40,8 +40,18 @@ from mammoth.core.execution import (
 )
 from mammoth.core.identity import validate_execution_id, validate_run_name
 from mammoth.core.layout import RunLayout
+from mammoth.core.pipeline import (
+    BackgroundPipelineError,
+    BackgroundPipelineResult,
+    BackgroundPipelineSubmission,
+    BoundedBackgroundPipeline,
+)
 
 __all__ = [
+    "BackgroundPipelineError",
+    "BackgroundPipelineResult",
+    "BackgroundPipelineSubmission",
+    "BoundedBackgroundPipeline",
     "ExecutionContext",
     "ExecutionEvent",
     "ExecutionEventReadError",
