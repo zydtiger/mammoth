@@ -161,6 +161,48 @@ def test_lineage_is_explicit_and_not_inferred(tmp_path: Path) -> None:
     assert latest_execution_id(layout.run_dir) == "second"
 
 
+def test_resume_checkpoint_without_explicit_parent_records_no_lineage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resume artifact stays independent from execution lineage metadata."""
+    layout = RunLayout(tmp_path, "resume-without-parent").prepare()
+    checkpoint = layout.run_dir / "checkpoints" / "checkpoint.pt"
+    checkpoint.parent.mkdir(exist_ok=True)
+    checkpoint.write_bytes(b"checkpoint")
+
+    original_stat = Path.stat
+    original_resolve = Path.resolve
+
+    def reject_checkpoint_stat(path: Path, *args: object, **kwargs: object) -> object:
+        if path == checkpoint:
+            pytest.fail("execution lineage must not inspect the resume artifact")
+        return original_stat(path, *args, **kwargs)
+
+    def reject_checkpoint_resolve(path: Path, *args: object, **kwargs: object) -> Path:
+        if path == checkpoint:
+            pytest.fail("execution lineage must not inspect the resume artifact")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", reject_checkpoint_stat)
+    monkeypatch.setattr(Path, "resolve", reject_checkpoint_resolve)
+
+    context = create_execution_context(
+        layout.run_dir,
+        run_name=layout.run_name,
+        invocation_kind="test",
+        intended_phases=("train",),
+        world_size=1,
+        execution_mode="single",
+        command=("python", "job.py"),
+        execution_id="resumed",
+        resume_checkpoint=checkpoint,
+    )
+
+    assert context.metadata.resume_checkpoint == str(checkpoint)
+    assert context.metadata.parent_execution_id is None
+
+
 def test_schema_v1_metadata_from_originating_project_remains_readable(tmp_path: Path) -> None:
     layout = RunLayout(tmp_path, "legacy-run").prepare(project_directories=False)
     execution_dir = layout.execution_dir("legacy-attempt")
