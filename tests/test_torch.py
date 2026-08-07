@@ -2999,6 +2999,19 @@ def test_metric_accumulator_supports_mean_sum_and_last() -> None:
         MetricRoute(batch_name="loss", epoch_name="loss")
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_metric_accumulator_matches_host_precision_for_low_precision_tensors(
+    dtype: torch.dtype,
+) -> None:
+    value = torch.tensor(0.1, dtype=dtype)
+    accumulator = MetricAccumulator({"metric": MetricSpec("sum")})
+
+    for _ in range(100):
+        accumulator.update({"metric": value})
+
+    assert accumulator.compute()["metric"] == pytest.approx(float(value) * 100)
+
+
 @pytest.mark.parametrize(
     "device",
     [
@@ -3025,16 +3038,17 @@ def test_output_metrics_defers_tensor_materialization(
 
     metrics = trainer_module.output_metrics(
         StepOutput(
-            loss=torch.tensor(1.0, device=device),
+            loss=torch.tensor(1.0, device=device, requires_grad=True),
             metrics={
-                "score": torch.tensor(0.5, device=device),
-                "loss": torch.tensor(2.0, device=device),
+                "score": torch.tensor(0.5, device=device, requires_grad=True),
+                "loss": torch.tensor(2.0, device=device, requires_grad=True),
             },
         )
     )
 
     assert materializations == 0
     assert all(isinstance(value, torch.Tensor) for value in metrics.values())
+    assert all(not value.requires_grad for value in metrics.values())
 
 
 def test_training_reduces_scalar_metrics_only_at_observation_boundaries(

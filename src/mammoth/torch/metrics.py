@@ -450,7 +450,12 @@ def scalar_metrics(metrics: Mapping[str, float | torch.Tensor]) -> dict[str, flo
 
 
 def _scale_metric_scalar(value: MetricScalar, weight: float) -> MetricScalar:
-    """Multiply one detached scalar without changing its device residency."""
+    """Multiply one detached scalar while preserving host-accumulator precision."""
+    if isinstance(value, torch.Tensor) and not value.is_complex() and value.device.type in {
+        "cpu",
+        "cuda",
+    }:
+        return value.to(dtype=torch.float64) * weight
     return value * weight
 
 
