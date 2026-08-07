@@ -42,6 +42,18 @@ class ProcessResult:
     signal: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class CapturedProcessResult:
+    """Terminal facts and separate text streams from one supervised process."""
+
+    stdout: str
+    stderr: str
+    return_code: int
+    duration_seconds: float
+    timed_out: bool = False
+    signal: int | None = None
+
+
 @dataclass(slots=True)
 class SupervisedProcess:
     """Own one child launcher and bounded cleanup of its observable descendants.
@@ -82,6 +94,10 @@ class SupervisedProcess:
 
     def start(self) -> SupervisedProcess:
         """Launch exactly once and return this supervisor for fluent use."""
+        return self._start(capture_output=False)
+
+    def _start(self, *, capture_output: bool) -> SupervisedProcess:
+        """Launch once, optionally configuring the pipes for the one-call facade."""
         if self._process is not None:
             raise RuntimeError("process has already been started")
         options: dict[str, Any] = {
@@ -90,6 +106,12 @@ class SupervisedProcess:
         }
         if self.start_new_session:
             options["start_new_session"] = True
+        if capture_output:
+            options.update(
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
         self._process = self.process_factory(self.command, **options)
         return self
 
@@ -158,6 +180,62 @@ def launch_process(
             signal=signal.SIGINT,
         )
     return ProcessResult(
+        return_code=return_code,
+        duration_seconds=time.monotonic() - started,
+        signal=-return_code if return_code < 0 else None,
+    )
+
+
+def run_captured_process(
+    command: tuple[str, ...],
+    *,
+    cwd: Path | None,
+    environment: Mapping[str, str],
+    timeout_seconds: float | None,
+    terminate_grace_seconds: float = 5.0,
+    descendant_grace_seconds: float = 1.0,
+) -> CapturedProcessResult:
+    """Run one command with separately captured text output and bounded cleanup.
+
+    This one-call facade owns pipe configuration and uses :class:`SupervisedProcess`
+    for the existing launcher and descendant cleanup policy. A timeout is a process
+    fact, not a success policy: partial output is returned after the process tree is
+    reaped. Other exceptions, including ``KeyboardInterrupt``, are propagated only
+    after the owned process tree has been stopped.
+    """
+    started = time.monotonic()
+    supervisor = SupervisedProcess(
+        command,
+        cwd=cwd,
+        environment=environment,
+        terminate_grace_seconds=terminate_grace_seconds,
+        descendant_grace_seconds=descendant_grace_seconds,
+    )
+    process = supervisor._start(capture_output=True).process
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        supervisor.stop()
+        # A second communicate returns the complete stream contents. Do not combine
+        # TimeoutExpired.output with it: subprocess may expose overlapping data.
+        stdout, stderr = process.communicate()
+        return_code = process.returncode if process.returncode is not None else -signal.SIGKILL
+        return CapturedProcessResult(
+            stdout=stdout,
+            stderr=stderr,
+            return_code=return_code,
+            duration_seconds=time.monotonic() - started,
+            timed_out=True,
+            signal=-return_code if return_code < 0 else None,
+        )
+    except BaseException:
+        supervisor.stop()
+        raise
+
+    return_code = process.returncode if process.returncode is not None else -signal.SIGKILL
+    return CapturedProcessResult(
+        stdout=stdout,
+        stderr=stderr,
         return_code=return_code,
         duration_seconds=time.monotonic() - started,
         signal=-return_code if return_code < 0 else None,

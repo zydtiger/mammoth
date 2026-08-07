@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -12,7 +13,13 @@ from typer.testing import CliRunner
 
 from mammoth.cli import app
 from mammoth.core import RunLayout, read_execution_events
-from mammoth.workflow import SupervisedProcess, load_workflow, plan_workflow, run_workflow
+from mammoth.workflow import (
+    SupervisedProcess,
+    load_workflow,
+    plan_workflow,
+    run_captured_process,
+    run_workflow,
+)
 
 
 def write_workflow(tmp_path: Path, payload: dict) -> Path:
@@ -420,6 +427,137 @@ def test_supervisor_stops_descendant_in_an_independent_session(tmp_path: Path) -
         os.kill(supervisor.pid, 0)
     with pytest.raises(ProcessLookupError):
         os.kill(worker_pid, 0)
+
+
+def test_captured_process_separates_stdout_stderr_and_nonzero_exit() -> None:
+    result = run_captured_process(
+        (
+            sys.executable,
+            "-c",
+            "import sys; print('standard'); print('diagnostic', file=sys.stderr); "
+            "raise SystemExit(7)",
+        ),
+        cwd=None,
+        environment={},
+        timeout_seconds=None,
+    )
+
+    assert result.stdout == "standard\n"
+    assert result.stderr == "diagnostic\n"
+    assert result.return_code == 7
+    assert result.duration_seconds >= 0
+    assert not result.timed_out
+    assert result.signal is None
+
+
+def test_captured_process_drains_large_both_streams_without_deadlock() -> None:
+    result = run_captured_process(
+        (
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('out' * 300_000); sys.stderr.write('err' * 300_000)",
+        ),
+        cwd=None,
+        environment={},
+        timeout_seconds=5,
+    )
+
+    assert result.return_code == 0
+    assert result.stdout == "out" * 300_000
+    assert result.stderr == "err" * 300_000
+
+
+def test_captured_process_timeout_returns_partial_output_and_reaps_launcher() -> None:
+    result = run_captured_process(
+        (
+            sys.executable,
+            "-c",
+            "import sys, time; print('before timeout', flush=True); "
+            "print('before diagnostic', file=sys.stderr, flush=True); time.sleep(60)",
+        ),
+        cwd=None,
+        environment={},
+        timeout_seconds=0.05,
+        terminate_grace_seconds=0.1,
+    )
+
+    assert result.timed_out
+    assert result.return_code < 0
+    assert result.signal is not None
+    assert result.stdout == "before timeout\n"
+    assert result.stderr == "before diagnostic\n"
+
+
+def test_captured_process_timeout_stops_independent_descendant(tmp_path: Path) -> None:
+    worker_pid_path = tmp_path / "captured-worker.pid"
+    launcher = "\n".join(
+        (
+            "import subprocess",
+            "import sys",
+            "import time",
+            "from pathlib import Path",
+            "worker = subprocess.Popen(",
+            "    (sys.executable, '-c', 'import time; time.sleep(60)'),",
+            "    start_new_session=True,",
+            ")",
+            f"Path({str(worker_pid_path)!r}).write_text(str(worker.pid), encoding='utf-8')",
+            "print('started', flush=True)",
+            "while True:",
+            "    time.sleep(1)",
+        )
+    )
+
+    result = run_captured_process(
+        (sys.executable, "-c", launcher),
+        cwd=None,
+        environment={},
+        timeout_seconds=0.1,
+        terminate_grace_seconds=0.1,
+        descendant_grace_seconds=0.1,
+    )
+    worker_pid = int(worker_pid_path.read_text(encoding="utf-8"))
+
+    assert result.timed_out
+    assert result.stdout == "started\n"
+    with pytest.raises(ProcessLookupError):
+        os.kill(worker_pid, 0)
+
+
+def test_captured_process_cleans_up_when_communication_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child_pid_path = tmp_path / "interrupted-child.pid"
+
+    def interrupt_communication(
+        process: subprocess.Popen[str],
+        input: str | None = None,
+        timeout: float | None = None,
+    ) -> tuple[str, str]:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not child_pid_path.is_file():
+            time.sleep(0.01)
+        raise RuntimeError("injected communication interruption")
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", interrupt_communication)
+    with pytest.raises(RuntimeError, match="injected communication interruption"):
+        run_captured_process(
+            (
+                sys.executable,
+                "-c",
+                "import os, time; from pathlib import Path; "
+                f"Path({str(child_pid_path)!r}).write_text(str(os.getpid()), encoding='utf-8'); "
+                "time.sleep(60)",
+            ),
+            cwd=None,
+            environment={},
+            timeout_seconds=None,
+            terminate_grace_seconds=0.1,
+        )
+    child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
 
 
 def test_workflow_cli_dry_run_is_side_effect_free(tmp_path: Path) -> None:
