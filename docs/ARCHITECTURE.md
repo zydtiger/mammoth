@@ -224,6 +224,18 @@ device/rank identity and its active execution observer; constructing the
 trainer without a runtime remains supported for callers that already own their
 process group.
 
+For DDP, Mammoth suppresses reducer communication only for non-final
+microbatches in an accumulation window. Every rank reaches a Python-status
+consensus before its final backward, then lets PyTorch's native DDP reducer
+average gradient buckets during that backward. This preserves one reduction
+boundary per logical optimizer step without trainer-owned CUDA scalar
+materialization or per-parameter reductions. A rank-local error before that
+final backward is reported coherently; a failure during native backward follows
+the DDP launcher's fail-fast behavior because another rank may already be in a
+reducer collective. The trainer requires standard native-reducer invariants;
+projects with dynamic gradient participation must configure or own a compatible
+DDP training loop.
+
 `WarmupLinearLR` provides the reusable BERT-style zero-to-base warmup followed
 by linear decay to zero. Projects choose its warmup ratio and optimizer-step
 horizon. Checkpoint restore preserves the saved cursor, accepts an unchanged or
@@ -234,9 +246,10 @@ The caller-supplied module remains the canonical `base_model`. Mammoth derives
 an `execution_model` by applying device placement, then optional DDP wrapping,
 then optional caller-configured `torch.compile`. Step functions receive the
 execution model. Mammoth retains the underlying DDP wrapper privately so
-gradient accumulation continues to use `no_sync()` even when the execution
-path is compiled. Projects keep architecture-specific methods on the canonical
-model when those methods are not part of the ordinary forward contract.
+native gradient accumulation can use `no_sync()` only before its final
+microbatch even when the execution path is compiled. Projects keep
+architecture-specific methods on the canonical model when those methods are
+not part of the ordinary forward contract.
 
 Mammoth's validation-metric early-stopping callback owns the generic best-value
 and consecutive-failure state machine and stops on the `patience`-th failed
@@ -262,11 +275,11 @@ An accumulation policy receives rank identity and the local loader length, then
 returns the local microbatch count and loss scale for each shared optimizer
 window. Every rank must produce the same number of optimizer windows. Explicit
 per-window scales cover unequal partial windows without assigning workload
-meaning to Mammoth. DDP forwards and backwards remain local until each shared
-window boundary, where Mammoth first reaches failure consensus and then
-averages gradients in stable parameter order. The persisted global-step cursor
-counts all ranks' microbatches at completed windows; step callbacks receive a
-deterministic rank-ordered position inside the active window.
+meaning to Mammoth. Native DDP reaches failure consensus before each final
+backward and lets the reducer average that window's gradient buckets. The
+persisted global-step cursor counts all ranks' microbatches at completed
+windows; step callbacks receive a deterministic rank-ordered position inside
+the active window.
 Consumers may supply post-optimizer metric providers for values, such as the
 current scheduler rate, that only become authoritative after Mammoth completes
 the optimizer and scheduler boundary.
