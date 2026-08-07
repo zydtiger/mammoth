@@ -166,6 +166,7 @@ with create_execution_observability(
     context,
     rank=rank,
     additional_sinks=(tensorboard,),
+    asynchronous=True,
 ) as observability:
     with observability.observer.periodic_heartbeats(phase="train"):
         observability.observer.progress(
@@ -181,7 +182,12 @@ with create_execution_observability(
 
 Use `create_execution_logging` instead when Mammoth should also own the
 process-exclusive plain-text handler. Applications attach that returned handler
-to their chosen Python logger.
+to their chosen Python logger. Asynchronous dispatch is opt-in: it gives each
+sink a bounded worker, coalesces only JSONL's unprocessed non-final progress,
+and retains TensorBoard scalar history. It accepts scalar CPU observations only
+and currently rejects media until Mammoth defines an immutable CPU snapshot
+contract. `max_pending_observations` bounds each sink's active queue and also
+the number of retained JSONL progress scopes.
 
 ## Optional integrations
 

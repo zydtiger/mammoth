@@ -15,6 +15,8 @@ from contextlib import contextmanager, suppress
 from typing import Any, Protocol
 
 from mammoth.core.events import DEFAULT_HEARTBEAT_INTERVAL_SECONDS, EventName
+from mammoth.logging.dispatch import AsyncObservationSink
+from mammoth.logging.jsonl import JsonlEventSink
 from mammoth.logging.model import Media, Observation
 
 logger = logging.getLogger(__name__)
@@ -42,8 +44,30 @@ class RunObserver:
         *,
         heartbeat_interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
         monotonic_clock: Callable[[], float] = time.monotonic,
+        asynchronous: bool = False,
+        max_pending_observations: int = 64,
     ) -> None:
-        self._sinks = tuple(sinks)
+        if not isinstance(asynchronous, bool):
+            raise TypeError("asynchronous must be a boolean")
+        if (
+            isinstance(max_pending_observations, bool)
+            or not isinstance(max_pending_observations, int)
+            or max_pending_observations < 1
+        ):
+            raise ValueError("max_pending_observations must be a positive integer")
+        self._sinks: tuple[ObservationSink, ...] = (
+            tuple(
+                AsyncObservationSink(
+                    sink,
+                    max_pending=max_pending_observations,
+                    coalesce_progress=isinstance(sink, JsonlEventSink),
+                )
+                for sink in sinks
+            )
+            if asynchronous
+            else tuple(sinks)
+        )
+        self.asynchronous = asynchronous
         self._disabled: set[int] = set()
         self._closed = False
         self._heartbeat_interval_seconds = _validate_heartbeat_interval(
@@ -80,6 +104,8 @@ class RunObserver:
                 self._last_activity = self._monotonic_clock()
             dense_metrics = {} if metrics is None else metrics
             displayed = dense_metrics if display_metrics is None else display_metrics
+            if self.asynchronous and media:
+                raise ValueError("asynchronous observation dispatch does not support media")
             observation = Observation(
                 event=event,
                 fields=fields,
@@ -88,12 +114,15 @@ class RunObserver:
                 media={} if media is None else media,
                 logical_step=logical_step,
             )
+            dispatched = (
+                _snapshot_async_observation(observation) if self.asynchronous else observation
+            )
             for sink in self._sinks:
                 identifier = id(sink)
                 if identifier in self._disabled:
                     continue
                 try:
-                    sink.observe(observation)
+                    sink.observe(dispatched)
                 except Exception:
                     self._disabled.add(identifier)
                     logger.exception(
@@ -326,6 +355,38 @@ class RunObserver:
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         self.close()
+
+
+def _snapshot_async_observation(observation: Observation) -> Observation:
+    """Create the worker-owned copy without exposing caller aliases to a sink."""
+    return Observation(
+        event=observation.event,
+        fields=_snapshot_async_value(observation.fields),
+        metrics=observation.metrics,
+        display_metrics=observation.display_metrics,
+        logical_step=observation.logical_step,
+    )
+
+
+def _snapshot_async_value(value: Any) -> Any:
+    """Copy JSON-shaped values and reject caller-owned runtime objects."""
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, Mapping):
+        snapshot: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError("asynchronous observation mappings require string keys")
+            snapshot[key] = _snapshot_async_value(item)
+        return snapshot
+    if isinstance(value, list):
+        return [_snapshot_async_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_snapshot_async_value(item) for item in value)
+    raise ValueError(
+        "asynchronous observation dispatch accepts only JSON-shaped CPU values; "
+        f"got {type(value).__name__}"
+    )
 
 
 def _validate_heartbeat_interval(value: float) -> float:
