@@ -117,6 +117,15 @@ opaque project coordinates and metrics. Progress may be throttled and replaced;
 lifecycle and terminal records flush immediately. A writer failure disables
 only that writer and must not terminate the workload.
 
+`RunObserver` asynchronously dispatches CPU-owned scalar observations. It owns
+one bounded ordered worker per sink, so a slow TensorBoard writer cannot stall
+JSONL dispatch. JSONL may coalesce unprocessed
+non-final task progress; TensorBoard retains dense scalar history and applies
+backpressure instead. Lifecycle, terminal, explicit flush, and shutdown
+operations are per-sink barriers. Asynchronous mode currently rejects media
+until it has an explicit immutable CPU snapshot contract. Its per-sink pending
+bound also limits the number of retained JSONL progress scopes.
+
 ### TensorBoard
 
 TensorBoard stores dense numerical and media history. Mammoth manages writer
