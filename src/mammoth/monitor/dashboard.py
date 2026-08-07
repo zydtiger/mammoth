@@ -62,7 +62,6 @@ class _ProgressView:
     task: TaskState
     completed: int
     total: int | None
-    unit: str | None
     throughput: float | None
     eta_seconds: float | None
     aggregation_pending: bool = False
@@ -76,13 +75,7 @@ class _MonitorSpeedColumn(ProgressColumn):
         throughput = task.fields.get("monitor_throughput")
         if not isinstance(throughput, int | float):
             return Text("--")
-        unit = task.fields.get("monitor_unit")
-        phase = task.fields.get("monitor_phase")
-        unit_text = _rate_unit(
-            str(unit) if unit else None,
-            phase=str(phase) if phase else None,
-        )
-        return Text(f"{float(throughput):.1f} {unit_text}/s", style="progress.data.speed")
+        return Text(f"{float(throughput):.1f} b/s", style="progress.data.speed")
 
 
 class _MetricTrend:
@@ -653,13 +646,11 @@ def _progress_view(selected: MonitorSnapshot) -> _ProgressView | None:
             task=view.task,
             completed=view.completed,
             total=view.total,
-            unit=view.unit,
             throughput=view.throughput,
             eta_seconds=view.eta_seconds,
             aggregation_pending=True,
         )
-    units = {item.unit for item in matching}
-    if len(units) != 1 or any(item.total is None for item in matching):
+    if any(item.total is None for item in matching):
         return _task_progress_view(task)
     counts = {(item.completed, item.total) for item in matching}
     if len(counts) == 1:
@@ -682,7 +673,6 @@ def _progress_view(selected: MonitorSnapshot) -> _ProgressView | None:
         task=task,
         completed=completed,
         total=total,
-        unit=task.unit,
         throughput=throughput,
         eta_seconds=eta,
     )
@@ -716,7 +706,6 @@ def _task_progress_view(task: TaskState) -> _ProgressView:
         task=task,
         completed=task.completed,
         total=task.total,
-        unit=task.unit,
         throughput=task.throughput,
         eta_seconds=task.eta_seconds,
     )
@@ -743,8 +732,6 @@ def _progress_renderable(progress_view: _ProgressView, *, label: str) -> Progres
             else f"{progress_view.completed:,}/?"
         ),
         monitor_throughput=progress_view.throughput,
-        monitor_unit=progress_view.unit,
-        monitor_phase=progress_view.task.phase,
     )
     return progress
 
@@ -1036,13 +1023,13 @@ def _task_counts(task: TaskState | None) -> str:
 def _task_rate(task: TaskState | None) -> str:
     if task is None or task.throughput is None:
         return "--"
-    return f"{task.throughput:.1f} {_rate_unit(task.unit, phase=task.phase)}/s"
+    return f"{task.throughput:.1f} b/s"
 
 
 def _compact_task_rate(task: TaskState | None) -> str:
     if task is None or task.throughput is None:
         return "--"
-    return f"{task.throughput:.1f} {_rate_unit(task.unit, phase=task.phase)}/s"
+    return f"{task.throughput:.1f} b/s"
 
 
 def _progress_text(progress: _ProgressView) -> str:
@@ -1051,23 +1038,14 @@ def _progress_text(progress: _ProgressView) -> str:
         if progress.total is not None
         else f"{progress.completed:,}/?"
     )
-    unit = f" {progress.unit}" if progress.unit else ""
     rate = (
-        f" · {progress.throughput:.1f} "
-        f"{_rate_unit(progress.unit, phase=progress.task.phase)}/s"
+        f" · {progress.throughput:.1f} b/s"
         if progress.throughput is not None
-        else ""
+        else " · --"
     )
     eta = format_duration(progress.eta_seconds)
     eta_text = f" · ETA {eta}" if eta is not None else ""
-    return f"{counts}{unit}{rate}{eta_text}"
-
-
-def _rate_unit(unit: str | None, *, phase: str | None = None) -> str:
-    batch_units = {"batch", "microbatch"}
-    if phase == "test/segmentation":
-        batch_units.update(("patch", "patches"))
-    return "b" if unit in batch_units else unit or "unit"
+    return f"{counts}{rate}{eta_text}"
 
 
 def _logical_eta_text(

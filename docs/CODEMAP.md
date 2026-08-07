@@ -58,7 +58,7 @@ src/mammoth/
 | Import path | Symbols |
 | --- | --- |
 | `mammoth` | `__version__` |
-| `mammoth.core` | `RunLayout`, `ExecutionContext`, `ExecutionMetadata`, `LogicalRunLease`, `ExecutionEvent`, `ExecutionEventWriter`, `ExecutionEventTailReader`, `ExecutionEventReadError`, `BoundedBackgroundPipeline`, typed background submissions/results, attributed background failures, atomic and prepared artifact publication helpers, explicit-only execution lifecycle functions, event readers, sanitizers, and identity validators |
+| `mammoth.core` | `RunLayout`, `ExecutionContext`, `ExecutionMetadata`, `LogicalRunLease`, unitless `ExecutionEvent` and `ExecutionEventWriter` APIs with schema-v1 legacy-unit reading, `ExecutionEventTailReader`, `ExecutionEventReadError`, `BoundedBackgroundPipeline`, typed background submissions/results, attributed background failures, atomic and prepared artifact publication helpers, explicit-only execution lifecycle functions, event readers, sanitizers, and identity validators |
 | `mammoth.logging` | `Observation`, `Media`, `ObservationSink`, `RunObserver`, `JsonlEventSink`, `ExecutionObservability`, `ExecutionLogging`, `ProcessTextLogHandler`, `ProcessTextLogLease`, `claim_process_text_log`, `create_execution_observability`, `create_execution_logging`, `create_process_text_handler` |
 | `mammoth.logging.tensorboard` | `TensorBoardSink` |
 | `mammoth.monitor` | `ExecutionMonitor`, `RunMonitor`, `MonitorSnapshot`, `RunSnapshot`, `ProducerKey`, `ProducerState`, `TaskState`, `MetricPoint`, `ViewerTelemetry`, discovery/folding/rendering functions, and viewer telemetry sampling |

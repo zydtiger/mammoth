@@ -182,6 +182,7 @@ def test_progress_fans_out_distinct_jsonl_and_dense_history(tmp_path: Path) -> N
     event = read_execution_events(context.execution_dir / "rank-0.jsonl")[0]
     assert event.display_metrics == {"train/loss": 0.25}
     assert "metrics" not in event.to_dict()
+    assert "unit" not in event.to_dict()
     assert recording.observations[0].metrics == {
         "train/loss": 0.25,
         "train/lr": 0.001,
@@ -202,6 +203,27 @@ def test_observer_isolates_failed_sink_and_keeps_healthy_sinks() -> None:
         "execution_completed",
     ]
     assert failing.closed == 1
+
+
+def test_observer_rejects_retired_unit_without_disabling_jsonl_sink(tmp_path: Path) -> None:
+    context = execution_context(tmp_path)
+    jsonl = JsonlEventSink(ExecutionEventWriter.for_process(context, rank=0))
+    observer = RunObserver((jsonl,))
+
+    with pytest.raises(TypeError, match="unit is no longer supported"):
+        observer.emit(
+            "progress",
+            phase="phase",
+            task_id="task",
+            completed=1,
+            unit="items",
+        )
+    observer.emit("progress", phase="phase", task_id="task", completed=1, total=2)
+    observer.close()
+
+    assert observer.disabled_sink_count == 0
+    events = read_execution_events(context.execution_dir / "rank-0.jsonl")
+    assert [event.completed for event in events] == [1]
 
 
 def test_async_observer_uses_independent_per_sink_workers() -> None:
