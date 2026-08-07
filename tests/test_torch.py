@@ -5588,15 +5588,9 @@ def test_world_size_one_cpu_ddp_uses_same_project_step_contract(tmp_path: Path) 
         torch.distributed.destroy_process_group()
 
 
-@pytest.mark.parametrize(
-    ("ddp_gradient_sync", "expected_no_sync_calls"),
-    [("native", 2), ("manual", 5)],
-)
-def test_ddp_gradient_sync_uses_native_reducer_only_for_window_finals(
+def test_native_ddp_reducer_runs_only_for_window_finals(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    ddp_gradient_sync: Literal["native", "manual"],
-    expected_no_sync_calls: int,
 ) -> None:
     """Native DDP leaves each final backward available to its bucket reducer."""
     rendezvous = tmp_path / "rendezvous"
@@ -5639,15 +5633,10 @@ def test_ddp_gradient_sync_uses_native_reducer_only_for_window_finals(
                 strategy="ddp",
                 gradient_accumulation_steps=2,
                 checkpoint_every_epochs=None,
-                ddp_gradient_sync=ddp_gradient_sync,
             ),
         ) as trainer:
-            if ddp_gradient_sync == "native":
-                trainer.synchronize_gradients = lambda: pytest.fail(
-                    "native DDP must not manually synchronize parameter gradients"
-                )
             trainer.fit()
-        assert no_sync_calls == expected_no_sync_calls
+        assert no_sync_calls == 2
     finally:
         torch.distributed.destroy_process_group()
 
