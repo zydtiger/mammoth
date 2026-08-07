@@ -33,6 +33,7 @@ from mammoth.core import (
     create_execution_context,
     execution_id_from_environment,
     join_execution_context,
+    normalize_execution_id_environment_aliases,
 )
 from mammoth.logging import (
     ExecutionLogging,
@@ -114,7 +115,11 @@ class TorchRuntimeConfig:
 
 @dataclass(frozen=True, slots=True)
 class TorchExecutionRequest:
-    """Project-neutral facts needed to establish one immutable execution."""
+    """Project-neutral facts needed to establish one immutable execution.
+
+    Consumers may declare temporary execution-ID environment aliases here; the
+    runtime passes them to Mammoth's generic resolver without persisting them.
+    """
 
     run_dir: Path
     run_name: str
@@ -129,12 +134,18 @@ class TorchExecutionRequest:
     starting_epoch: int | None = None
     starting_global_step: int | None = None
     runtime: Mapping[str, Any] = field(default_factory=dict)
+    execution_id_environment_aliases: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "run_dir", Path(self.run_dir))
         object.__setattr__(self, "intended_phases", tuple(self.intended_phases))
         object.__setattr__(self, "command", tuple(self.command))
         object.__setattr__(self, "runtime", dict(self.runtime))
+        object.__setattr__(
+            self,
+            "execution_id_environment_aliases",
+            normalize_execution_id_environment_aliases(self.execution_id_environment_aliases),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -477,7 +488,9 @@ class TorchExecutionRuntime:
         primary_result: _PrimaryResult | None = None
         if self.is_primary:
             try:
-                provided_execution_id = execution_id_from_environment()
+                provided_execution_id = execution_id_from_environment(
+                    aliases=request.execution_id_environment_aliases
+                )
                 if provided_execution_id is not None:
                     primary_context = join_execution_context(
                         request.run_dir,

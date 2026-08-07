@@ -6558,6 +6558,50 @@ def test_single_runtime_joins_runner_execution_from_environment(
         assert runtime.execution_context.metadata.execution_id == "runner-attempt"
 
 
+def test_single_runtime_joins_execution_from_request_owned_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "joined-run"
+    create_execution_context(
+        run_dir,
+        run_name="joined-run",
+        invocation_kind="workflow",
+        intended_phases=("train",),
+        world_size=1,
+        execution_mode="single",
+        command=("mammoth", "workflow", "run"),
+        execution_id="runner-attempt",
+    )
+    monkeypatch.setenv("CALLER_EXECUTION_ID", "runner-attempt")
+
+    with initialize_torch_runtime(TorchRuntimeConfig(device="cpu")) as runtime:
+        runtime.start_execution(
+            TorchExecutionRequest(
+                run_dir=run_dir,
+                run_name="joined-run",
+                invocation_kind="train",
+                intended_phases=("train",),
+                command=("python", "train.py"),
+                execution_id_environment_aliases=("CALLER_EXECUTION_ID",),
+            )
+        )
+        assert runtime.execution_context is not None
+        assert runtime.execution_context.metadata.execution_id == "runner-attempt"
+
+
+def test_execution_request_rejects_invalid_alias_declarations(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="not a string"):
+        TorchExecutionRequest(
+            run_dir=tmp_path,
+            run_name="alias-validation",
+            invocation_kind="test",
+            intended_phases=("test",),
+            command=("python", "test.py"),
+            execution_id_environment_aliases="CALLER_EXECUTION_ID",  # type: ignore[arg-type]
+        )
+
+
 def test_execution_establishment_can_be_used_without_mammoth_logging(tmp_path: Path) -> None:
     run_dir = tmp_path / "adapter-run"
     runtime = initialize_torch_runtime(TorchRuntimeConfig(device="cpu"))
