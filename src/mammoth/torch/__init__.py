@@ -19,6 +19,7 @@ from mammoth.torch.callbacks import Callback, EarlyStopping
 from mammoth.torch.checkpoint import (
     AsyncCheckpointPublisher,
     CheckpointArtifact,
+    CheckpointCaptureMode,
     CheckpointComponent,
     CheckpointInspection,
     CheckpointMode,
@@ -96,6 +97,7 @@ __all__ = [
     "AccumulationPolicy",
     "Callback",
     "CheckpointArtifact",
+    "CheckpointCaptureMode",
     "CheckpointComponent",
     "CheckpointInspection",
     "CheckpointMode",

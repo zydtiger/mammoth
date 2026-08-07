@@ -28,6 +28,7 @@ from mammoth.torch.batch import move_batch_to_device
 from mammoth.torch.callbacks import Callback, EarlyStopping
 from mammoth.torch.checkpoint import (
     AsyncCheckpointPublisher,
+    CheckpointCaptureMode,
     CheckpointComponent,
     CheckpointInspection,
     CheckpointPublication,
@@ -159,6 +160,8 @@ class TrainerConfig:
     checkpoint_every_epochs: int | None = 1
     checkpoint_filename: str = "checkpoint-{epoch:04d}.pt"
     max_pending_checkpoints: int = 1
+    checkpoint_capture_mode: CheckpointCaptureMode = "auto"
+    checkpoint_cuda_headroom_bytes: int = 0
     checkpoint_on_interrupt: bool = True
     non_blocking_transfer: bool = False
     train_phase: str = "train"
@@ -174,6 +177,14 @@ class TrainerConfig:
         positive_integer("validation_every_epochs", self.validation_every_epochs)
         positive_integer("log_every_batches", self.log_every_batches)
         positive_integer("max_pending_checkpoints", self.max_pending_checkpoints)
+        if self.checkpoint_capture_mode not in {"auto", "cpu"}:
+            raise ValueError("checkpoint_capture_mode must be 'auto' or 'cpu'")
+        if (
+            isinstance(self.checkpoint_cuda_headroom_bytes, bool)
+            or not isinstance(self.checkpoint_cuda_headroom_bytes, int)
+            or self.checkpoint_cuda_headroom_bytes < 0
+        ):
+            raise ValueError("checkpoint_cuda_headroom_bytes must be a non-negative integer")
         if self.checkpoint_every_epochs is not None:
             positive_integer("checkpoint_every_epochs", self.checkpoint_every_epochs)
         if self.strategy not in {"single", "ddp"}:
@@ -357,7 +368,9 @@ class Trainer:
         )
         self._checkpoint_restore: TrainerCheckpointRestore | None = None
         self.publisher = AsyncCheckpointPublisher(
-            max_pending=config.max_pending_checkpoints
+            max_pending=config.max_pending_checkpoints,
+            capture_mode=config.checkpoint_capture_mode,
+            cuda_headroom_bytes=config.checkpoint_cuda_headroom_bytes,
         )
         self._checkpoint_publication_futures: deque[
             Future[CheckpointPublication]
