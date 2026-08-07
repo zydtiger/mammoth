@@ -56,7 +56,12 @@ block the sole work thread and callback failures cannot replace worker outcomes.
 `AsyncCheckpointPublisher` is a compatibility adapter over this pipeline. It
 retains checkpoint-specific snapshot, plan, receipt, and `Future` APIs while
 delegating ordered execution, pending bounds, failure ownership, and shutdown
-to the framework-neutral lifecycle.
+to the framework-neutral lifecycle. Its generic mapping APIs default to an
+`auto` capture policy: a conservative pre-allocation CUDA-memory check may
+capture one immutable GPU snapshot and transfer it in the worker, otherwise
+they retain the synchronous CPU snapshot path. The `cpu` policy always takes
+the compatibility path. Project-owned ordered publication plans continue to
+require caller-owned immutable captures.
 
 ## Runtime model
 

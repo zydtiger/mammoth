@@ -4189,6 +4189,192 @@ def test_generic_receipt_publication_replaces_destination_symlink(
     assert receipt.path == destination.absolute()
 
 
+def test_checkpoint_capture_configuration_defaults_and_rejects_invalid_modes() -> None:
+    config = TrainerConfig(epochs=1)
+
+    assert config.checkpoint_capture_mode == "auto"
+    assert config.checkpoint_cuda_headroom_bytes == 0
+    with pytest.raises(ValueError, match="checkpoint_capture_mode"):
+        TrainerConfig(epochs=1, checkpoint_capture_mode=cast(Any, "gpu"))
+    with pytest.raises(ValueError, match="checkpoint_cuda_headroom_bytes"):
+        TrainerConfig(epochs=1, checkpoint_cuda_headroom_bytes=-1)
+    with pytest.raises(ValueError, match="checkpoint capture mode"):
+        AsyncCheckpointPublisher(capture_mode=cast(Any, "gpu"))
+
+
+def test_cpu_checkpoint_capture_does_not_inspect_cuda_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_cuda_inspection(payload: Mapping[str, Any]) -> None:
+        del payload
+        raise AssertionError("cpu capture must not inspect CUDA state")
+
+    monkeypatch.setattr(checkpoint_module, "inspect_cuda_snapshot", unexpected_cuda_inspection)
+    with AsyncCheckpointPublisher(capture_mode="cpu") as publisher:
+        future = publisher.publish(tmp_path / "checkpoint.pt", {"value": torch.tensor([1])})
+        publisher.flush()
+
+    assert future.result() == tmp_path / "checkpoint.pt"
+    assert torch.load(tmp_path / "checkpoint.pt", weights_only=True)["value"].tolist() == [1]
+
+
+def test_cuda_snapshot_inspection_rejects_aliases_and_noncontiguous_tensors() -> None:
+    shared = torch.tensor([1.0, 2.0, 3.0])
+
+    assert checkpoint_module.inspect_cuda_snapshot({"first": shared, "second": shared}) is None
+    assert checkpoint_module.inspect_cuda_snapshot({"value": shared[::2]}) is None
+    assert checkpoint_module.inspect_cuda_snapshot({"value": shared, "custom": object()}) is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_snapshot_inspection_counts_nested_tensor_storage() -> None:
+    first = torch.ones(4, device="cuda")
+    second = torch.ones(3, dtype=torch.int64, device="cuda")
+
+    inspection = checkpoint_module.inspect_cuda_snapshot(
+        {"model": {"weight": first}, "optimizer": ([second],)}
+    )
+
+    assert inspection == (
+        first.numel() * first.element_size() + second.numel() * second.element_size(),
+        first.device,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_auto_cuda_capture_preserves_submission_boundary_and_releases_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = torch.tensor([1.0], device="cuda")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (2**62, 2**62))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+    publisher = AsyncCheckpointPublisher(capture_mode="auto", max_pending=2)
+
+    future = publisher.publish(tmp_path / "checkpoint.pt", {"value": value})
+    value.add_(1)
+    publisher.flush()
+    publisher.close()
+
+    assert future.result() == tmp_path / "checkpoint.pt"
+    assert not publisher._gpu_snapshot_pending
+    assert torch.load(tmp_path / "checkpoint.pt", weights_only=True)["value"].tolist() == [1.0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_auto_cuda_capture_falls_back_before_allocation_when_headroom_is_insufficient(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_gpu_capture(payload: Any) -> Any:
+        del payload
+        raise AssertionError("unsafe CUDA capture must not allocate a snapshot")
+
+    monkeypatch.setattr(checkpoint_module, "snapshot_to_gpu", unexpected_gpu_capture)
+    publisher = AsyncCheckpointPublisher(
+        capture_mode="auto",
+        cuda_headroom_bytes=2**62,
+    )
+    future = publisher.publish(tmp_path / "checkpoint.pt", {"value": torch.ones(1, device="cuda")})
+    publisher.flush()
+    publisher.close()
+
+    assert future.result() == tmp_path / "checkpoint.pt"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_auto_cuda_capture_oom_falls_back_to_one_complete_cpu_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_oom(payload: Any) -> Any:
+        del payload
+        raise torch.OutOfMemoryError("synthetic GPU snapshot failure")
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (2**62, 2**62))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+    monkeypatch.setattr(checkpoint_module, "snapshot_to_gpu", raise_oom)
+    publisher = AsyncCheckpointPublisher(capture_mode="auto")
+    future = publisher.publish(tmp_path / "checkpoint.pt", {"value": torch.ones(1, device="cuda")})
+    publisher.flush()
+    publisher.close()
+
+    assert future.result() == tmp_path / "checkpoint.pt"
+    assert not publisher._gpu_snapshot_pending
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_auto_cuda_capture_uses_cpu_while_another_gpu_snapshot_is_retained() -> None:
+    publisher = AsyncCheckpointPublisher(capture_mode="auto", max_pending=2)
+    publisher._gpu_snapshot_pending = True
+
+    decision = publisher._capture_decision({"value": torch.ones(1, device="cuda")})
+
+    assert decision.path == "cpu"
+    assert decision.reason == "gpu-snapshot-pending"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_auto_cuda_capture_clears_its_gpu_snapshot_claim_after_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def interrupt_submission(operation: Callable[[], Any]) -> Any:
+        del operation
+        raise KeyboardInterrupt("synthetic submission interruption")
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (2**62, 2**62))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+    publisher = AsyncCheckpointPublisher(capture_mode="auto")
+    monkeypatch.setattr(publisher, "_submit_operation", interrupt_submission)
+
+    with pytest.raises(KeyboardInterrupt, match="synthetic submission interruption"):
+        publisher.publish(tmp_path / "checkpoint.pt", {"value": torch.ones(1, device="cuda")})
+
+    assert not publisher._gpu_snapshot_pending
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_auto_cuda_capture_flushes_while_the_worker_releases_gpu_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started_transfer = threading.Event()
+    release_transfer = threading.Event()
+    real_snapshot_to_cpu = checkpoint_module.snapshot_to_cpu
+
+    def block_gpu_transfer(payload: Any) -> Any:
+        if (
+            isinstance(payload, Mapping)
+            and isinstance(payload.get("value"), torch.Tensor)
+            and payload["value"].device.type == "cuda"
+        ):
+            started_transfer.set()
+            if not release_transfer.wait(timeout=5):
+                raise TimeoutError("test did not release GPU checkpoint transfer")
+        return real_snapshot_to_cpu(payload)
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (2**62, 2**62))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+    monkeypatch.setattr(checkpoint_module, "snapshot_to_cpu", block_gpu_transfer)
+    publisher = AsyncCheckpointPublisher(capture_mode="auto")
+    publisher.publish(tmp_path / "checkpoint.pt", {"value": torch.ones(1, device="cuda")})
+    assert started_transfer.wait(timeout=5)
+    flushed = threading.Event()
+    flusher = threading.Thread(
+        target=lambda: (publisher.flush(), flushed.set()),
+        daemon=True,
+    )
+    flusher.start()
+    release_transfer.set()
+    flusher.join(timeout=5)
+
+    assert not flusher.is_alive()
+    assert flushed.is_set()
+    publisher.close()
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs require POSIX")
 def test_generic_receipt_rejects_fifo_without_blocking(
     tmp_path: Path,
