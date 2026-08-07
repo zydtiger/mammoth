@@ -149,6 +149,9 @@ progress, throughput, arbitrary metrics, failures, and lineage. Generic ETA
 uses only completed work, total work, and observed time. A run-level monitor
 keeps every valid immutable execution available for navigation while selected
 resume-lineage histories provide continuous project-neutral metric state.
+Callers record that continuity explicitly with `parent_execution_id`; a
+`resume_checkpoint` is an independent sanitized artifact reference and never
+causes Mammoth to infer a parent from its location, name, phase, or timestamp.
 
 An interactive terminal launches the optional Textual dashboard by default.
 Textual owns refresh workers, keyboard navigation, scrolling, and responsive

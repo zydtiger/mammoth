@@ -611,32 +611,6 @@ def latest_execution_id(run_dir: Path) -> str | None:
     return latest.execution_id
 
 
-def parent_execution_id_for_checkpoint(run_dir: Path, checkpoint_path: Path) -> str | None:
-    """Find the latest training attempt established before a checkpoint write."""
-    try:
-        checkpoint_time = datetime.fromtimestamp(checkpoint_path.stat().st_mtime, UTC)
-        resolved_checkpoint = checkpoint_path.resolve(strict=True)
-        resolved_checkpoint_dir = (run_dir / "checkpoints").resolve(strict=True)
-    except OSError:
-        return None
-    if not resolved_checkpoint.is_relative_to(resolved_checkpoint_dir):
-        return None
-
-    candidates = [
-        metadata
-        for metadata in _valid_execution_records(run_dir)
-        if "train" in metadata.intended_phases
-        and _parse_created_at(metadata.created_at) <= checkpoint_time
-    ]
-    if not candidates:
-        return None
-    latest = max(
-        candidates,
-        key=lambda item: (_parse_created_at(item.created_at), item.execution_id),
-    )
-    return latest.execution_id
-
-
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
