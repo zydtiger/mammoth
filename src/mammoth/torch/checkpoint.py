@@ -7,6 +7,7 @@ responsibility for deciding whether their model and checkpoint states match.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import stat
 from collections import deque
@@ -16,8 +17,8 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from threading import Condition, RLock, Thread
-from typing import Any, Literal, Protocol
+from threading import Condition, Lock, RLock, Thread
+from typing import Any, Literal, Protocol, cast
 
 import torch
 
@@ -39,6 +40,7 @@ from mammoth.core.pipeline import (
 CHECKPOINT_SCHEMA_VERSION = 1
 CheckpointReason = Literal["scheduled", "manual", "interrupted"]
 CheckpointMode = Literal["all", "latest"]
+CheckpointCaptureMode = Literal["auto", "cpu"]
 CheckpointRole = Literal["epoch", "latest", "best"]
 CheckpointComponent = Literal[
     "model",
@@ -63,6 +65,29 @@ _CHECKPOINT_COMPONENTS = frozenset(
         "project",
     }
 )
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class _CudaEvent(Protocol):
+    """Minimal CUDA-event behavior required by the checkpoint worker."""
+
+    def record(self, stream: Any = None) -> None:
+        """Record work completion on one CUDA stream."""
+
+    def synchronize(self) -> None:
+        """Wait until the recorded CUDA work completes."""
+
+
+@dataclass(frozen=True, slots=True)
+class _CheckpointCaptureDecision:
+    """Describe the capture path selected for one generic checkpoint."""
+
+    path: Literal["cpu", "gpu"]
+    reason: str
+    snapshot_bytes: int = 0
+    available_bytes: int | None = None
+    required_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,10 +467,26 @@ def _run_checkpoint_publication[ResultT](
 class AsyncCheckpointPublisher:
     """Adapt checkpoint publication to Mammoth's bounded background pipeline."""
 
-    def __init__(self, *, max_pending: int = 1) -> None:
+    def __init__(
+        self,
+        *,
+        max_pending: int = 1,
+        capture_mode: CheckpointCaptureMode = "auto",
+        cuda_headroom_bytes: int = 0,
+    ) -> None:
         if isinstance(max_pending, bool) or not isinstance(max_pending, int) or max_pending < 1:
             raise ValueError("max_pending must be a positive integer")
+        if capture_mode not in {"auto", "cpu"}:
+            raise ValueError("checkpoint capture mode must be 'auto' or 'cpu'")
+        if (
+            isinstance(cuda_headroom_bytes, bool)
+            or not isinstance(cuda_headroom_bytes, int)
+            or cuda_headroom_bytes < 0
+        ):
+            raise ValueError("cuda_headroom_bytes must be a non-negative integer")
         self.max_pending = max_pending
+        self.capture_mode = capture_mode
+        self.cuda_headroom_bytes = cuda_headroom_bytes
         self._pipeline: BoundedBackgroundPipeline[
             _CheckpointPublicationTask[Any],
             Any,
@@ -466,6 +507,8 @@ class AsyncCheckpointPublisher:
         self._deferred_interrupt: KeyboardInterrupt | SystemExit | None = None
         self._closing = False
         self._closed = False
+        self._gpu_snapshot_pending = False
+        self._gpu_snapshot_lock = Lock()
         self._lock = RLock()
         self._lifecycle_condition = Condition(self._lock)
 
@@ -492,14 +535,14 @@ class AsyncCheckpointPublisher:
             self._await_submission_slot()
 
     def publish(self, path: Path, payload: Mapping[str, Any]) -> Future[Path]:
-        """Clone state to CPU and submit one bounded atomic publication."""
+        """Capture state and submit one bounded atomic publication."""
         with self._lock:
             if self._closed or self._closing:
                 raise RuntimeError("checkpoint publisher is closed")
             self._await_submission_slot()
-            snapshot = snapshot_to_cpu(payload)
-            return self._submit_operation(
-                partial(publish_torch_payload, Path(path), snapshot)
+            return self._publish_mapping(
+                payload,
+                lambda snapshot: partial(publish_torch_payload, Path(path), snapshot),
             )
 
     def publish_with_receipt(
@@ -515,15 +558,15 @@ class AsyncCheckpointPublisher:
             if self._closed or self._closing:
                 raise RuntimeError("checkpoint publisher is closed")
             self._await_submission_slot()
-            snapshot = snapshot_to_cpu(payload)
-            return self._submit_operation(
-                partial(
+            return self._publish_mapping(
+                payload,
+                lambda snapshot: partial(
                     publish_torch_payload_with_receipt,
                     Path(path),
                     snapshot,
                     role=role,
                     epoch=epoch,
-                )
+                ),
             )
 
     def submit(self, plan: CheckpointPlan) -> Future[CheckpointPublication]:
@@ -638,6 +681,125 @@ class AsyncCheckpointPublisher:
                 continue
             break
         return future
+
+    def _publish_mapping[ResultT](
+        self,
+        payload: Mapping[str, Any],
+        operation_for_snapshot: Callable[[Mapping[str, Any]], Callable[[], ResultT]],
+    ) -> Future[ResultT]:
+        decision = self._capture_decision(payload)
+        _LOGGER.debug(
+            "Checkpoint capture path=%s reason=%s snapshot_bytes=%d available_bytes=%s "
+            "required_bytes=%s",
+            decision.path,
+            decision.reason,
+            decision.snapshot_bytes,
+            decision.available_bytes,
+            decision.required_bytes,
+        )
+        if decision.path == "cpu":
+            return self._submit_operation(operation_for_snapshot(snapshot_to_cpu(payload)))
+
+        snapshot: Mapping[str, Any] | None = None
+        try:
+            snapshot = snapshot_to_gpu(payload)
+            device = cuda_snapshot_device(snapshot)
+            if device is None:
+                raise RuntimeError("GPU checkpoint capture did not retain CUDA state")
+            event_factory = cast(Callable[[], _CudaEvent], torch.cuda.Event)
+            ready = event_factory()
+            ready.record(torch.cuda.current_stream(device))
+        except torch.OutOfMemoryError:
+            snapshot = None
+            self._record_gpu_fallback("gpu-snapshot-oom", decision)
+            return self._submit_operation(operation_for_snapshot(snapshot_to_cpu(payload)))
+        except BaseException:
+            snapshot = None
+            raise
+
+        try:
+            with self._gpu_snapshot_lock:
+                self._gpu_snapshot_pending = True
+            return self._submit_operation(
+                self._gpu_transfer_operation(snapshot, ready, operation_for_snapshot)
+            )
+        except BaseException:
+            with self._gpu_snapshot_lock:
+                self._gpu_snapshot_pending = False
+            raise
+
+    def _capture_decision(self, payload: Mapping[str, Any]) -> _CheckpointCaptureDecision:
+        if self.capture_mode == "cpu":
+            return _CheckpointCaptureDecision("cpu", "configured-cpu-mode")
+        with self._gpu_snapshot_lock:
+            gpu_snapshot_pending = self._gpu_snapshot_pending
+        if gpu_snapshot_pending:
+            return _CheckpointCaptureDecision("cpu", "gpu-snapshot-pending")
+        inspected = inspect_cuda_snapshot(payload)
+        if inspected is None:
+            return _CheckpointCaptureDecision("cpu", "unsupported-or-ambiguous-payload")
+        snapshot_bytes, device = inspected
+        if snapshot_bytes == 0:
+            return _CheckpointCaptureDecision("cpu", "no-cuda-tensors")
+        try:
+            available_bytes, _ = torch.cuda.mem_get_info(device)
+            allocated_bytes = torch.cuda.memory_allocated(device)
+        except RuntimeError:
+            return _CheckpointCaptureDecision("cpu", "cuda-memory-query-failed", snapshot_bytes)
+        headroom_bytes = max(
+            self.cuda_headroom_bytes,
+            snapshot_bytes,
+            allocated_bytes // 2,
+        )
+        required_bytes = snapshot_bytes + headroom_bytes
+        if available_bytes < required_bytes:
+            return _CheckpointCaptureDecision(
+                "cpu",
+                "insufficient-cuda-headroom",
+                snapshot_bytes,
+                available_bytes,
+                required_bytes,
+            )
+        return _CheckpointCaptureDecision(
+            "gpu",
+            "sufficient-cuda-headroom",
+            snapshot_bytes,
+            available_bytes,
+            required_bytes,
+        )
+
+    def _record_gpu_fallback(
+        self,
+        reason: str,
+        decision: _CheckpointCaptureDecision,
+    ) -> None:
+        _LOGGER.debug(
+            "Checkpoint capture path=cpu reason=%s snapshot_bytes=%d available_bytes=%s "
+            "required_bytes=%s",
+            reason,
+            decision.snapshot_bytes,
+            decision.available_bytes,
+            decision.required_bytes,
+        )
+
+    def _gpu_transfer_operation[ResultT](
+        self,
+        snapshot: Mapping[str, Any],
+        ready: _CudaEvent,
+        operation_for_snapshot: Callable[[Mapping[str, Any]], Callable[[], ResultT]],
+    ) -> Callable[[], ResultT]:
+        def operation() -> ResultT:
+            nonlocal snapshot
+            try:
+                ready.synchronize()
+                cpu_snapshot = snapshot_to_cpu(snapshot)
+            finally:
+                snapshot = {}
+                with self._gpu_snapshot_lock:
+                    self._gpu_snapshot_pending = False
+            return operation_for_snapshot(cpu_snapshot)()
+
+        return operation
 
     @staticmethod
     def _complete_public_future[ResultT](
@@ -1236,6 +1398,77 @@ def snapshot_to_cpu(value: Any) -> Any:
     if isinstance(value, list):
         return [snapshot_to_cpu(item) for item in value]
     return value
+
+
+def inspect_cuda_snapshot(value: Any) -> tuple[int, torch.device] | None:
+    """Return safe CUDA snapshot storage or reject ambiguous checkpoint state."""
+    cuda_device: torch.device | None = None
+    snapshot_bytes = 0
+    seen_containers: set[int] = set()
+    seen_storages: set[tuple[str, int]] = set()
+
+    def inspect(item: Any) -> bool:
+        nonlocal cuda_device, snapshot_bytes
+        if isinstance(item, torch.Tensor):
+            if item.layout != torch.strided or item.is_quantized or not item.is_contiguous():
+                return False
+            try:
+                storage = item.untyped_storage()
+                storage_key = (str(item.device), storage.data_ptr())
+            except RuntimeError:
+                return False
+            if storage_key in seen_storages:
+                return False
+            seen_storages.add(storage_key)
+            if item.device.type == "cuda":
+                if cuda_device is None:
+                    cuda_device = item.device
+                elif item.device != cuda_device:
+                    return False
+                snapshot_bytes += item.numel() * item.element_size()
+            return True
+        if isinstance(item, (Mapping, tuple, list)):
+            identity = id(item)
+            if identity in seen_containers:
+                return False
+            seen_containers.add(identity)
+            values = item.values() if isinstance(item, Mapping) else item
+            return all(inspect(child) for child in values)
+        return item is None or isinstance(item, (bool, int, float, str, bytes))
+
+    if not inspect(value):
+        return None
+    return snapshot_bytes, cuda_device or torch.device("cpu")
+
+
+def snapshot_to_gpu(value: Any) -> Any:
+    """Clone supported CUDA state before later training mutations can race it."""
+    if isinstance(value, torch.Tensor):
+        if value.device.type == "cuda":
+            return value.detach().clone()
+        return value.detach().cpu().clone()
+    if isinstance(value, Mapping):
+        return {key: snapshot_to_gpu(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(snapshot_to_gpu(item) for item in value)
+    if isinstance(value, list):
+        return [snapshot_to_gpu(item) for item in value]
+    return value
+
+
+def cuda_snapshot_device(value: Any) -> torch.device | None:
+    """Find the sole CUDA device in a snapshot already validated for capture."""
+    if isinstance(value, torch.Tensor):
+        return value.device if value.device.type == "cuda" else None
+    if isinstance(value, Mapping):
+        for item in value.values():
+            if (device := cuda_snapshot_device(item)) is not None:
+                return device
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            if (device := cuda_snapshot_device(item)) is not None:
+                return device
+    return None
 
 
 def publish_torch_payload(path: Path, payload: Mapping[str, Any]) -> Path:
