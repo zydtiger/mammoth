@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import stat
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -42,6 +43,7 @@ CheckpointReason = Literal["scheduled", "manual", "interrupted"]
 CheckpointMode = Literal["all", "latest"]
 CheckpointCaptureMode = Literal["auto", "cpu"]
 CheckpointRole = Literal["epoch", "latest", "best"]
+ResumableCheckpointRole = Literal["epoch", "latest"]
 CheckpointComponent = Literal[
     "model",
     "optimizer",
@@ -67,6 +69,9 @@ _CHECKPOINT_COMPONENTS = frozenset(
 )
 
 _LOGGER = logging.getLogger(__name__)
+_RESUMABLE_CHECKPOINT_FILENAME = re.compile(
+    r"(?:(?P<latest>latest_epoch_)|(?P<epoch>epoch_))(?P<number>-1|0|[1-9][0-9]*)\.pt\Z"
+)
 
 
 class _CudaEvent(Protocol):
@@ -274,6 +279,28 @@ class PublishedCheckpoint:
             character not in "0123456789abcdef" for character in self.sha256
         ):
             raise ValueError("published checkpoint sha256 must be lowercase hexadecimal")
+
+
+@dataclass(frozen=True, slots=True)
+class ResumableCheckpointCandidate:
+    """One filename-derived standard trainer checkpoint candidate.
+
+    Discovery is intentionally ephemeral and syntactic: this value does not
+    claim that its path is a regular file, symlink-safe, readable, or compatible
+    with any model or trainer state.
+    """
+
+    path: Path
+    role: ResumableCheckpointRole
+    epoch: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, Path):
+            raise TypeError("checkpoint candidate path must be a Path")
+        if self.role not in {"epoch", "latest"}:
+            raise ValueError("checkpoint candidate role must be 'epoch' or 'latest'")
+        if isinstance(self.epoch, bool) or not isinstance(self.epoch, int) or self.epoch < -1:
+            raise ValueError("checkpoint candidate epoch must be an integer >= -1")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1044,21 +1071,21 @@ def build_trainer_checkpoint_plan(
 
     retirements: tuple[Path, ...] = ()
     if save_resumable:
-        prefix = "epoch_" if save_policy.mode == "all" else "latest_epoch_"
-        destination = root / f"{prefix}{epoch}.pt"
+        role: ResumableCheckpointRole = "epoch" if save_policy.mode == "all" else "latest"
+        destination = root / resumable_checkpoint_filename(role, epoch)
         artifacts.append(
             CheckpointArtifact(
                 destination=destination,
                 writer=writers.resumable,
-                role="epoch" if save_policy.mode == "all" else "latest",
+                role=role,
                 epoch=epoch,
             )
         )
         if save_policy.mode == "latest":
             retirements = tuple(
-                path
-                for path in sorted(root.glob("latest_epoch_*.pt"))
-                if path != destination and _latest_checkpoint_epoch(path) is not None
+                candidate.path
+                for candidate in discover_resumable_checkpoints(root)
+                if candidate.role == "latest" and candidate.path != destination
             )
 
     return CheckpointPlan(
@@ -1068,15 +1095,59 @@ def build_trainer_checkpoint_plan(
     )
 
 
-def _latest_checkpoint_epoch(path: Path) -> int | None:
-    """Parse one Mammoth-owned latest-checkpoint filename."""
-    if path.suffix != ".pt" or not path.stem.startswith("latest_epoch_"):
+def resumable_checkpoint_filename(role: ResumableCheckpointRole, epoch: int) -> str:
+    """Return Mammoth's canonical filename for one resumable trainer checkpoint."""
+    if role not in {"epoch", "latest"}:
+        raise ValueError("resumable checkpoint role must be 'epoch' or 'latest'")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < -1:
+        raise ValueError("checkpoint epoch must be an integer >= -1")
+    prefix = "epoch_" if role == "epoch" else "latest_epoch_"
+    return f"{prefix}{epoch}.pt"
+
+
+def parse_resumable_checkpoint(path: Path) -> ResumableCheckpointCandidate | None:
+    """Parse one standard resumable checkpoint path without opening it."""
+    checkpoint_path = Path(path)
+    if checkpoint_path.parent != Path("."):
         return None
+    match = _RESUMABLE_CHECKPOINT_FILENAME.fullmatch(checkpoint_path.name)
+    if match is None:
+        return None
+    role: ResumableCheckpointRole = "latest" if match["latest"] is not None else "epoch"
+    return ResumableCheckpointCandidate(
+        path=checkpoint_path,
+        role=role,
+        epoch=int(match["number"]),
+    )
+
+
+def discover_resumable_checkpoints(
+    checkpoint_root: Path,
+) -> tuple[ResumableCheckpointCandidate, ...]:
+    """Return direct-child standard candidates in deterministic resume precedence.
+
+    Matching regular files, directories, and symlinks are returned alike. Callers
+    own every filesystem-safety, payload-readability, and compatibility decision.
+    """
     try:
-        epoch = int(path.stem.removeprefix("latest_epoch_"))
-    except ValueError:
-        return None
-    return epoch if epoch >= -1 else None
+        children = tuple(Path(checkpoint_root).iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return ()
+    candidates = [
+        ResumableCheckpointCandidate(child, candidate.role, candidate.epoch)
+        for child in children
+        if (candidate := parse_resumable_checkpoint(Path(child.name))) is not None
+    ]
+    return tuple(
+        sorted(
+            candidates,
+            key=lambda candidate: (
+                -candidate.epoch,
+                candidate.role != "latest",
+                candidate.path.name,
+            ),
+        )
+    )
 
 
 def resolve_confined_path(root: Path, path: Path, *, role: str) -> Path:
