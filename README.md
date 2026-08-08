@@ -425,6 +425,24 @@ its path, role, epoch, byte size, and SHA-256. The hash and size describe the
 completed temporary artifact immediately before atomic publication, so projects
 can update manifests without reopening the checkpoint.
 
+After a restart, `discover_resumable_checkpoints(checkpoint_root)` returns
+immutable filename-derived `ResumableCheckpointCandidate` values for direct
+children named `epoch_<N>.pt` or `latest_epoch_<N>.pt`. Candidates are ordered
+by descending epoch, with `latest` before `epoch` on an exact tie. Discovery
+does not open, hash, or validate entries; projects still own regular-file and
+symlink policy, payload compatibility, warnings, and final resume selection.
+
+```python
+from pathlib import Path
+
+from mammoth.torch import discover_resumable_checkpoints
+
+checkpoint_root = Path("runs/example/checkpoints")
+for candidate in discover_resumable_checkpoints(checkpoint_root):
+    # Project code validates candidate.path and its payload before restoring it.
+    print(candidate.path, candidate.role, candidate.epoch)
+```
+
 Framework-independent callers can overlap ordered CPU or I/O work with their
 main workload through `BoundedBackgroundPipeline`. Submissions retain their
 typed input association, and the pending bound applies backpressure before more

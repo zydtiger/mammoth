@@ -48,6 +48,7 @@ from mammoth.torch import (
     MetricSpec,
     PublishedCheckpoint,
     RestoreOptions,
+    ResumableCheckpointCandidate,
     RuntimeConfig,
     StateRegistry,
     StepContext,
@@ -65,10 +66,13 @@ from mammoth.torch import (
     WeightedDistributedBatchSampler,
     allocate_weighted_tasks,
     checkpoint_payload,
+    discover_resumable_checkpoints,
     initialize_runtime,
     move_batch_to_device,
+    parse_resumable_checkpoint,
     publish_checkpoint_plan,
     restore_checkpoint,
+    resumable_checkpoint_filename,
     weighted_partition_counts,
     weighted_partition_indices,
 )
@@ -2488,6 +2492,91 @@ def test_checkpoint_save_policy_validates_configuration() -> None:
             CheckpointSavePolicy(every_epochs=cast(Any, every_epochs))
     with pytest.raises(ValueError, match="boolean"):
         CheckpointSavePolicy(save_best=cast(Any, 1))
+
+
+@pytest.mark.parametrize(
+    ("name", "role", "epoch"),
+    [
+        ("epoch_-1.pt", "epoch", -1),
+        ("epoch_0.pt", "epoch", 0),
+        ("epoch_12.pt", "epoch", 12),
+        ("latest_epoch_-1.pt", "latest", -1),
+        ("latest_epoch_0.pt", "latest", 0),
+        ("latest_epoch_12.pt", "latest", 12),
+    ],
+)
+def test_parse_resumable_checkpoint_recognizes_canonical_names(
+    name: str,
+    role: Literal["epoch", "latest"],
+    epoch: int,
+) -> None:
+    candidate = parse_resumable_checkpoint(Path(name))
+
+    assert candidate == ResumableCheckpointCandidate(Path(name), role, epoch)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "epoch_00.pt",
+        "epoch_+1.pt",
+        "epoch_-0.pt",
+        "epoch_-2.pt",
+        "latest_epoch_01.pt",
+        "latest_epoch_+1.pt",
+        "latest_epoch_-0.pt",
+        "epoch_.pt",
+        "epoch_1.pth",
+        "best.safetensors",
+        "checkpoint-0001.pt",
+        "nested_epoch_1.pt",
+    ],
+)
+def test_parse_resumable_checkpoint_rejects_noncanonical_names(name: str) -> None:
+    assert parse_resumable_checkpoint(Path(name)) is None
+
+
+def test_parse_resumable_checkpoint_rejects_nested_path() -> None:
+    assert parse_resumable_checkpoint(Path("nested") / "epoch_1.pt") is None
+
+
+def test_discover_resumable_checkpoints_returns_direct_candidates_in_precedence_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("epoch_5.pt", "latest_epoch_5.pt", "epoch_3.pt", "best.safetensors"):
+        (tmp_path / name).write_text(name, encoding="utf-8")
+    (tmp_path / "epoch_8.pt").mkdir()
+    (tmp_path / "unrelated.pt").write_text("unrelated", encoding="utf-8")
+    target = tmp_path / "payload.pt"
+    target.write_text("payload", encoding="utf-8")
+    (tmp_path / "latest_epoch_6.pt").symlink_to(target)
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "latest_epoch_99.pt").write_text("nested", encoding="utf-8")
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: pytest.fail("unexpected load"))
+
+    candidates = discover_resumable_checkpoints(tmp_path)
+
+    assert [(candidate.path.name, candidate.role, candidate.epoch) for candidate in candidates] == [
+        ("epoch_8.pt", "epoch", 8),
+        ("latest_epoch_6.pt", "latest", 6),
+        ("latest_epoch_5.pt", "latest", 5),
+        ("epoch_5.pt", "epoch", 5),
+        ("epoch_3.pt", "epoch", 3),
+    ]
+
+
+def test_discover_resumable_checkpoints_returns_empty_for_missing_and_empty_roots(
+    tmp_path: Path,
+) -> None:
+    assert discover_resumable_checkpoints(tmp_path / "missing") == ()
+    assert discover_resumable_checkpoints(tmp_path) == ()
+
+
+def test_resumable_checkpoint_filename_matches_parser_contract() -> None:
+    assert resumable_checkpoint_filename("epoch", -1) == "epoch_-1.pt"
+    assert resumable_checkpoint_filename("latest", 12) == "latest_epoch_12.pt"
 
 
 def test_trainer_delivers_checkpoint_receipts_to_callbacks_and_observer(
