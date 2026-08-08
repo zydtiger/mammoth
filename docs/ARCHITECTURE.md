@@ -39,6 +39,20 @@ consuming project
 Textual, psutil, and PyTorch belong in optional dependency groups and must not
 be imported by the core package.
 
+`mammoth.core` also owns framework-neutral identity for raw local-file bytes.
+`inspect_artifact(path)` reads one regular file through a single open descriptor
+and returns an immutable `ArtifactReceipt` containing the caller-supplied path,
+byte size, and lowercase SHA-256 digest. `verify_artifact(receipt)` repeats that
+inspection and succeeds only when the visible path still names exactly those
+bytes. Receipts do not encode roles, schemas, content meaning, or a promise
+that bytes remain unchanged after verification. The default rejects final-path
+symlinks, directories, and special files; missing paths retain
+`FileNotFoundError`, observed replacement or mutation raises
+`ArtifactChangedError`, and a stable but different regular file raises
+`ArtifactVerificationError`. Lower layers may create the same generic receipt
+from a publication descriptor before atomic rename, while callers own any
+portable path serialization.
+
 The workflow layer owns project-neutral local process supervision. Its ordinary
 workflow launcher inherits the parent terminal streams; callers that explicitly
 need captured output use `run_captured_process()` for separately drained text
