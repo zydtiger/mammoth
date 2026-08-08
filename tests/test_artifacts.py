@@ -9,14 +9,270 @@ from pathlib import Path
 import pytest
 
 from mammoth.core import (
+    ArtifactChangedError,
+    ArtifactReceipt,
+    ArtifactVerificationError,
+    artifacts,
     atomic_publish,
     atomic_write_bytes,
     atomic_write_json,
     atomic_write_text,
     discard_prepared_artifact,
+    inspect_artifact,
     prepare_artifact,
     publish_prepared_artifact,
+    verify_artifact,
 )
+
+
+@pytest.mark.parametrize(
+    ("path", "size_bytes", "sha256", "error"),
+    [
+        ("not-a-path", 0, "0" * 64, TypeError),
+        (Path("artifact.bin"), -1, "0" * 64, ValueError),
+        (Path("artifact.bin"), 0, "A" * 64, ValueError),
+        (Path("artifact.bin"), 0, "0" * 63, ValueError),
+    ],
+)
+def test_artifact_receipt_validates_canonical_fields(
+    path: object,
+    size_bytes: int,
+    sha256: str,
+    error: type[Exception],
+) -> None:
+    with pytest.raises(error):
+        ArtifactReceipt(path=path, size_bytes=size_bytes, sha256=sha256)  # type: ignore[arg-type]
+
+
+def test_inspect_artifact_records_empty_small_and_multi_chunk_files(tmp_path: Path) -> None:
+    empty = tmp_path / "empty.bin"
+    small = tmp_path / "small.bin"
+    multi_chunk = tmp_path / "multi.bin"
+    empty.write_bytes(b"")
+    small.write_bytes(b"small")
+    multi_chunk.write_bytes(b"abcdefgh")
+
+    assert inspect_artifact(empty, chunk_size=3) == ArtifactReceipt(
+        path=empty,
+        size_bytes=0,
+        sha256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    )
+    assert inspect_artifact(small, chunk_size=3).size_bytes == 5
+    assert inspect_artifact(multi_chunk, chunk_size=3).sha256 == (
+        "9c56cc51b374c3ba189210d5b6d4bf57790d351c96c47c02190ecf1e430635ab"
+    )
+
+
+def test_inspect_artifact_rejects_missing_directory_special_file_and_symlink(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(FileNotFoundError):
+        inspect_artifact(tmp_path / "missing.bin")
+    with pytest.raises(ValueError, match="regular file"):
+        inspect_artifact(tmp_path)
+
+    fifo = tmp_path / "stream"
+    os.mkfifo(fifo)
+    with pytest.raises(ValueError, match="regular file"):
+        inspect_artifact(fifo)
+
+    target = tmp_path / "target.bin"
+    link = tmp_path / "target-link.bin"
+    target.write_bytes(b"target")
+    link.symlink_to(target)
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        inspect_artifact(link)
+
+
+def test_inspect_artifact_rejects_in_place_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "artifact.bin"
+    artifact.write_bytes(b"first-second")
+    original_read = artifacts.os.read
+    mutated = False
+
+    def read_and_mutate(descriptor: int, count: int) -> bytes:
+        nonlocal mutated
+        chunk = original_read(descriptor, count)
+        if chunk and not mutated:
+            mutated = True
+            artifact.write_bytes(b"changed-data")
+        return chunk
+
+    monkeypatch.setattr(artifacts.os, "read", read_and_mutate)
+
+    with pytest.raises(ArtifactChangedError, match="changed while"):
+        inspect_artifact(artifact, chunk_size=5)
+
+
+def test_inspect_artifact_rejects_path_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "artifact.bin"
+    replacement = tmp_path / "replacement.bin"
+    artifact.write_bytes(b"first-second")
+    replacement.write_bytes(b"replacement!")
+    original_read = artifacts.os.read
+    replaced = False
+
+    def read_and_replace(descriptor: int, count: int) -> bytes:
+        nonlocal replaced
+        chunk = original_read(descriptor, count)
+        if chunk and not replaced:
+            replaced = True
+            os.replace(replacement, artifact)
+        return chunk
+
+    monkeypatch.setattr(artifacts.os, "read", read_and_replace)
+
+    with pytest.raises(ArtifactChangedError, match="changed while"):
+        inspect_artifact(artifact, chunk_size=5)
+
+
+def test_inspect_artifact_rejects_symlink_replacement_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "artifact.bin"
+    target = tmp_path / "target.bin"
+    replacement = tmp_path / "replacement-link.bin"
+    artifact.write_bytes(b"artifact")
+    target.write_bytes(b"target")
+    replacement.symlink_to(target)
+    original_open = artifacts.os.open
+    replaced = False
+
+    def replace_then_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal replaced
+        if Path(path) == artifact and not replaced:
+            replaced = True
+            os.replace(replacement, artifact)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(artifacts.os, "open", replace_then_open)
+
+    with pytest.raises(ArtifactChangedError, match="changed before"):
+        inspect_artifact(artifact)
+
+
+@pytest.mark.parametrize("replacement_kind", ("directory", "fifo"))
+def test_inspect_artifact_rejects_non_regular_replacement_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_kind: str,
+) -> None:
+    artifact = tmp_path / "artifact.bin"
+    replacement = tmp_path / "replacement"
+    artifact.write_bytes(b"artifact")
+    if replacement_kind == "directory":
+        replacement.mkdir()
+    else:
+        os.mkfifo(replacement)
+    original_open = artifacts.os.open
+    replaced = False
+
+    def replace_then_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal replaced
+        if Path(path) == artifact and not replaced:
+            replaced = True
+            if replacement_kind == "directory":
+                artifact.unlink()
+            os.replace(replacement, artifact)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(artifacts.os, "open", replace_then_open)
+
+    with pytest.raises(ArtifactChangedError, match="changed before"):
+        inspect_artifact(artifact)
+
+
+def test_inspect_artifact_rejects_deletion_before_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "artifact.bin"
+    artifact.write_bytes(b"artifact")
+    original_open = artifacts.os.open
+    deleted = False
+
+    def delete_then_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal deleted
+        if Path(path) == artifact and not deleted:
+            deleted = True
+            artifact.unlink()
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(artifacts.os, "open", delete_then_open)
+
+    with pytest.raises(ArtifactChangedError, match="changed before"):
+        inspect_artifact(artifact)
+
+
+def test_inspect_artifact_treats_no_follow_loop_as_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "artifact.bin"
+    artifact.write_bytes(b"artifact")
+
+    def reject_with_no_follow_loop(
+        _path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        _flags: int,
+        _mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        del dir_fd
+        raise OSError(errno.ELOOP, "too many levels of symbolic links")
+
+    monkeypatch.setattr(artifacts.os, "open", reject_with_no_follow_loop)
+
+    with pytest.raises(ArtifactChangedError, match="changed before"):
+        inspect_artifact(artifact)
+
+
+def test_verify_artifact_requires_current_exact_bytes(tmp_path: Path) -> None:
+    artifact = tmp_path / "artifact.bin"
+    artifact.write_bytes(b"original")
+    receipt = inspect_artifact(artifact)
+
+    assert verify_artifact(receipt) is None
+
+    for replacement in (b"short", b"original-more", b"replaced"):
+        artifact.write_bytes(replacement)
+        with pytest.raises(ArtifactVerificationError, match="does not match"):
+            verify_artifact(receipt)
+
+    replacement = tmp_path / "replacement.bin"
+    replacement.write_bytes(b"new-bytes")
+    os.replace(replacement, artifact)
+    with pytest.raises(ArtifactVerificationError, match="does not match"):
+        verify_artifact(receipt)
+
+    artifact.unlink()
+    with pytest.raises(FileNotFoundError):
+        verify_artifact(receipt)
 
 
 def test_atomic_writers_publish_complete_payloads(tmp_path: Path) -> None:
