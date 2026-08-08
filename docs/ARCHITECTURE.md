@@ -188,6 +188,12 @@ The optional PyTorch integration may provide a training view for Mammoth's own
 trainer. Project-specific pipeline projections are supplied as data or plugins,
 not embedded in the monitor.
 
+Mammoth owns the canonical names for standard resumable trainer checkpoints and
+can discover matching direct children as ephemeral, filename-derived candidates.
+Discovery neither opens artifacts nor establishes regular-file, symlink,
+readability, payload, or compatibility guarantees; consuming projects retain
+those validations and their resume-selection policy.
+
 Viewer-host telemetry and execution-host telemetry are distinct. Local resource
 sampling must never be presented as historical or remote execution provenance.
 The Textual dashboard samples optional viewer CPU, memory, and GPU state,
