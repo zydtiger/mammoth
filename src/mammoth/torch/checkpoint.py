@@ -6,7 +6,6 @@ responsibility for deciding whether their model and checkpoint states match.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import re
@@ -28,6 +27,7 @@ from mammoth.core.artifacts import (
     atomic_publish,
     directory_open_flags,
     discard_prepared_artifact,
+    inspect_artifact_descriptor,
     prepare_artifact_in_directory,
     publish_prepared_artifact,
     sync_directory_descriptor,
@@ -1249,18 +1249,13 @@ def checkpoint_receipt_for_descriptor(
     epoch: int,
 ) -> PublishedCheckpoint:
     """Hash a validated open artifact before permissions can prevent reading."""
-    digest = hashlib.sha256()
-    size_bytes = 0
-    os.lseek(descriptor, 0, os.SEEK_SET)
-    while chunk := os.read(descriptor, 1024 * 1024):
-        size_bytes += len(chunk)
-        digest.update(chunk)
+    receipt = inspect_artifact_descriptor(descriptor, path=destination)
     return PublishedCheckpoint(
         path=destination,
         role=role,
         epoch=epoch,
-        size_bytes=size_bytes,
-        sha256=digest.hexdigest(),
+        size_bytes=receipt.size_bytes,
+        sha256=receipt.sha256,
     )
 
 

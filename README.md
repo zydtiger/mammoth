@@ -129,6 +129,27 @@ explicit compatibility. Plain mode works without the monitor extra; requesting
 the dashboard without its optional dependencies reports the exact installation
 command.
 
+## Identify an existing artifact's exact bytes
+
+`mammoth.core` can record and later verify the raw bytes of one local regular
+file without assigning it a role or interpreting its contents:
+
+```python
+from pathlib import Path
+
+from mammoth.core import inspect_artifact, verify_artifact
+
+receipt = inspect_artifact(Path("checkpoints/latest.pt"))
+# Store receipt.path, receipt.size_bytes, and receipt.sha256 in your own schema.
+verify_artifact(receipt)
+```
+
+Inspection uses bounded chunks through one open file descriptor and rejects a
+changing path or file. Final-component symlinks, directories, and special files
+are rejected; missing paths raise `FileNotFoundError`. A receipt identifies only
+the bytes observed during inspection, so verify it again immediately before an
+operation that depends on those bytes.
+
 ## Select only part of a workflow
 
 Use exact run and step names to narrow an invocation:
