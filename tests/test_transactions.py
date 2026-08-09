@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import tempfile
 from ctypes import CDLL
 from pathlib import Path
 from typing import cast
@@ -684,6 +685,244 @@ def test_plan_rejects_nested_mount_artifacts_outside_journal_filesystem(tmp_path
             seal_artifact_transaction(plan)
     finally:
         shutil.rmtree(temporary_root)
+
+
+def create_multi_root_plan(
+    tmp_path: Path, *, mode: str = "create_only"
+) -> tuple[ArtifactTransactionPlan, Path]:
+    """Build a plan whose journal and payload directory use separate local devices."""
+    shared_memory = Path("/dev/shm")
+    if not shared_memory.is_dir() or shared_memory.stat().st_dev == tmp_path.stat().st_dev:
+        pytest.skip("the host has no separate shared-memory filesystem")
+    coordinator_root = tmp_path / "coordinator-root"
+    coordinator_root.mkdir()
+    payload_root = Path(tempfile.mkdtemp(prefix="mammoth-multi-root-", dir=shared_memory))
+    report_target = coordinator_root / "report.json"
+    payload_target = payload_root / "payload"
+    if mode == "replace":
+        report_target.write_text("old report")
+        payload_target.mkdir()
+        (payload_target / "old.txt").write_text("old payload")
+    transaction_id = "multi-root-generation"
+    report_stage = coordinator_root / f".mammoth-txn-{transaction_id}-report.stage"
+    report_stage.write_text("new report")
+    payload_stage = payload_root / f".mammoth-txn-{transaction_id}-payload.stage"
+    payload_stage.mkdir()
+    (payload_stage / "part.txt").write_text("new payload")
+    return (
+        ArtifactTransactionPlan(
+            transaction_id=transaction_id,
+            lease_root=coordinator_root,
+            lease_roots=(coordinator_root, payload_root),
+            artifacts=(
+                TransactionArtifact("report", report_stage, report_target, "file"),
+                TransactionArtifact("payload", payload_stage, payload_target, "directory"),
+            ),
+            mode=mode,  # type: ignore[arg-type]
+            recovery_policy=(
+                "roll_forward" if mode == "create_only" else "rollback_before_commit"
+            ),
+        ),
+        payload_root,
+    )
+
+
+def test_multi_root_transaction_publishes_local_artifacts_without_cross_device_rename(
+    tmp_path: Path,
+) -> None:
+    plan, payload_root = create_multi_root_plan(tmp_path)
+    try:
+        result = publish_artifact_transaction(plan)
+
+        assert result.cleanup_complete
+        assert plan.artifacts[0].target.read_text() == "new report"
+        assert (plan.artifacts[1].target / "part.txt").read_text() == "new payload"
+        assert not transaction_journal_path(plan).exists()
+    finally:
+        shutil.rmtree(payload_root)
+
+
+def test_multi_root_recovery_rolls_forward_after_a_partial_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, payload_root = create_multi_root_plan(tmp_path)
+    original_rename = transactions.rename_without_overwrite
+    interrupted = False
+
+    def rename_then_interrupt(
+        source: Path, destination: Path, *, lease_root: Path | None = None
+    ) -> None:
+        nonlocal interrupted
+        original_rename(source, destination, lease_root=lease_root)
+        if destination == plan.artifacts[0].target and not interrupted:
+            interrupted = True
+            raise InjectedInterruption("after first local publication")
+
+    monkeypatch.setattr(transactions, "rename_without_overwrite", rename_then_interrupt)
+    try:
+        with pytest.raises(InjectedInterruption):
+            publish_artifact_transaction(plan)
+        monkeypatch.setattr(transactions, "rename_without_overwrite", original_rename)
+
+        result = recover_artifact_transaction(plan)
+
+        assert result.cleanup_complete
+        assert plan.artifacts[0].target.read_text() == "new report"
+        assert (plan.artifacts[1].target / "part.txt").read_text() == "new payload"
+    finally:
+        shutil.rmtree(payload_root)
+
+
+def test_multi_root_recovery_accepts_reordered_declared_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, payload_root = create_multi_root_plan(tmp_path)
+    original_rename = transactions.rename_without_overwrite
+    interrupted = False
+
+    def rename_then_interrupt(
+        source: Path, destination: Path, *, lease_root: Path | None = None
+    ) -> None:
+        nonlocal interrupted
+        original_rename(source, destination, lease_root=lease_root)
+        if destination == plan.artifacts[0].target and not interrupted:
+            interrupted = True
+            raise InjectedInterruption("after first local publication")
+
+    monkeypatch.setattr(transactions, "rename_without_overwrite", rename_then_interrupt)
+    try:
+        with pytest.raises(InjectedInterruption):
+            publish_artifact_transaction(plan)
+        monkeypatch.setattr(transactions, "rename_without_overwrite", original_rename)
+        reordered = ArtifactTransactionPlan(
+            transaction_id=plan.transaction_id,
+            lease_root=plan.lease_root,
+            lease_roots=tuple(reversed(plan.lease_roots)),
+            artifacts=plan.artifacts,
+            mode=plan.mode,
+            recovery_policy=plan.recovery_policy,
+        )
+
+        result = recover_artifact_transaction(reordered)
+
+        assert result.cleanup_complete
+        assert reordered.artifacts[0].target.read_text() == "new report"
+        assert (reordered.artifacts[1].target / "part.txt").read_text() == "new payload"
+    finally:
+        shutil.rmtree(payload_root)
+
+
+def test_multi_root_replacement_recovery_restores_prior_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, payload_root = create_multi_root_plan(tmp_path, mode="replace")
+    original_rename = transactions.rename_without_overwrite
+    interrupted = False
+
+    def publish_then_interrupt(
+        source: Path, destination: Path, *, lease_root: Path | None = None
+    ) -> None:
+        nonlocal interrupted
+        original_rename(source, destination, lease_root=lease_root)
+        if destination == plan.artifacts[0].target and not interrupted:
+            interrupted = True
+            raise InjectedInterruption("after first local replacement publication")
+
+    monkeypatch.setattr(transactions, "rename_without_overwrite", publish_then_interrupt)
+    try:
+        with pytest.raises(InjectedInterruption):
+            publish_artifact_transaction(plan)
+        monkeypatch.setattr(transactions, "rename_without_overwrite", original_rename)
+
+        result = recover_artifact_transaction(plan)
+
+        assert result.cleanup_complete
+        assert result.restored_targets == (plan.artifacts[0].target,)
+        assert plan.artifacts[0].target.read_text() == "old report"
+        assert (plan.artifacts[1].target / "old.txt").read_text() == "old payload"
+        for artifact in plan.artifacts:
+            assert not transactions.transaction_backup_path(plan, artifact).exists()
+    finally:
+        shutil.rmtree(payload_root)
+
+
+def test_multi_root_lease_failure_closes_previously_opened_root_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan, payload_root = create_multi_root_plan(tmp_path)
+    original_open = transactions.open_absolute_directory_without_symlinks
+    descriptors: list[int] = []
+
+    def open_then_fail(path: Path) -> int:
+        if path == payload_root:
+            raise OSError("synthetic second-root failure")
+        descriptor = original_open(path)
+        descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(transactions, "open_absolute_directory_without_symlinks", open_then_fail)
+    try:
+        with pytest.raises(OSError, match="second-root failure"):
+            claim_artifact_transaction_leases(plan)
+        assert descriptors
+        for descriptor in descriptors:
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+    finally:
+        shutil.rmtree(payload_root)
+
+
+def test_schema_v1_journal_recovers_a_one_root_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = create_plan(tmp_path)
+    original_create = transactions.create_transaction_journal
+
+    def create_legacy_journal_then_interrupt(
+        path: Path, payload: dict[str, object]
+    ) -> transactions._JournalHandle:
+        legacy_payload = dict(payload)
+        legacy_payload["version"] = 1
+        del legacy_payload["lease_roots"]
+        original_create(path, legacy_payload)
+        raise InjectedInterruption("after schema-v1 journal creation")
+
+    monkeypatch.setattr(
+        transactions, "create_transaction_journal", create_legacy_journal_then_interrupt
+    )
+    with pytest.raises(InjectedInterruption):
+        publish_artifact_transaction(plan)
+    monkeypatch.setattr(transactions, "create_transaction_journal", original_create)
+
+    result = recover_artifact_transaction(plan)
+
+    assert result.cleanup_complete
+    assert plan.artifacts[0].target.read_text() == "new report"
+    assert (plan.artifacts[1].target / "nested" / "part.txt").read_text() == "new payload"
+
+
+def test_multi_root_plan_rejects_an_undeclared_artifact_root(tmp_path: Path) -> None:
+    plan, payload_root = create_multi_root_plan(tmp_path)
+    outside_root = tmp_path / "outside-root"
+    outside_root.mkdir()
+    outside_stage = outside_root / ".mammoth-txn-multi-root-generation-report.stage"
+    outside_stage.write_text("outside")
+    invalid = ArtifactTransactionPlan(
+        transaction_id=plan.transaction_id,
+        lease_root=plan.lease_root,
+        lease_roots=plan.lease_roots,
+        artifacts=(
+            TransactionArtifact("report", outside_stage, outside_root / "report.json", "file"),
+            plan.artifacts[1],
+        ),
+        mode=plan.mode,
+        recovery_policy=plan.recovery_policy,
+    )
+    try:
+        with pytest.raises(ArtifactTransactionValidationError, match="declared lease root"):
+            seal_artifact_transaction(invalid)
+    finally:
+        shutil.rmtree(payload_root)
 
 
 def test_public_lease_api_rejects_a_target_outside_its_lease_root(tmp_path: Path) -> None:
