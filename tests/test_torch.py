@@ -838,6 +838,92 @@ def run_two_process_runtime(
     return sorted(results)
 
 
+def _resume_join_mismatch_worker(
+    rank: int,
+    rendezvous: str,
+    run_dir: str,
+    result_queue: Any,
+) -> None:
+    """Report the startup-consensus result when one DDP rank has a bad resume fact."""
+    try:
+        os.environ["MAMMOTH_EXECUTION_ID"] = "resume-attempt"
+        with initialize_runtime(
+            RuntimeConfig(
+                strategy="ddp",
+                device="cpu",
+                backend="gloo",
+                init_method=rendezvous,
+                timeout_seconds=30,
+                rank=rank,
+                local_rank=rank,
+                world_size=2,
+            )
+        ) as runtime:
+            runtime.establish_execution(
+                ExecutionRequest(
+                    run_dir=Path(run_dir),
+                    run_name="resume-ddp",
+                    invocation_kind="train",
+                    intended_phases=("train",),
+                    command=("python", "train.py"),
+                    resume_checkpoint="checkpoints/resume.pt",
+                    resume_checkpoint_sha256="b" * 64 if rank == 1 else "a" * 64,
+                    parent_execution_id="producer",
+                    starting_epoch=4,
+                    starting_global_step=12,
+                )
+            )
+        result_queue.put((rank, None))
+    except BaseException as error:
+        result_queue.put((rank, str(error)))
+
+
+def run_two_process_resume_join_mismatch(tmp_path: Path) -> list[tuple[int, str | None]]:
+    """Launch a CPU DDP join where only rank one declares a mismatched digest."""
+    run_dir = tmp_path / "resume-ddp"
+    create_execution_context(
+        run_dir,
+        run_name="resume-ddp",
+        invocation_kind="workflow",
+        intended_phases=("train",),
+        world_size=1,
+        execution_mode="single",
+        command=("mammoth", "workflow", "run"),
+        execution_id="resume-attempt",
+        resume_checkpoint="checkpoints/resume.pt",
+        resume_checkpoint_sha256="a" * 64,
+        parent_execution_id="producer",
+        starting_epoch=4,
+        starting_global_step=12,
+    )
+    process_context = multiprocessing.get_context("spawn")
+    result_queue = process_context.Queue()
+    rendezvous = f"file://{tmp_path / 'resume-rendezvous'}"
+    processes = [
+        process_context.Process(
+            target=_resume_join_mismatch_worker,
+            args=(rank, rendezvous, str(run_dir), result_queue),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=40)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            pytest.fail("CPU DDP resumed-join worker did not shut down coherently")
+        assert process.exitcode == 0
+    results: list[tuple[int, str | None]] = []
+    for _ in processes:
+        try:
+            results.append(result_queue.get(timeout=5))
+        except Empty:
+            pytest.fail("CPU DDP resumed-join worker returned no result")
+    return sorted(results)
+
+
 def _distributed_interrupt_worker(
     rank: int,
     rendezvous: str,
@@ -6620,12 +6706,202 @@ def test_runtime_preserves_caller_supplied_parent_execution_id(tmp_path: Path) -
                 command=("python", "train.py"),
                 execution_id="child",
                 resume_checkpoint=run_dir / "checkpoint-copy.pt",
+                resume_checkpoint_sha256="a" * 64,
                 parent_execution_id="producer",
+                starting_epoch=4,
             )
         )
 
     assert context.metadata.resume_checkpoint == str(run_dir / "checkpoint-copy.pt")
+    assert context.metadata.resume_checkpoint_sha256 == "a" * 64
     assert context.metadata.parent_execution_id == "producer"
+    assert context.metadata.starting_epoch == 4
+
+
+def _create_resumed_execution_context(
+    tmp_path: Path,
+    *,
+    resume_checkpoint: str = "checkpoints/resume.pt",
+    resume_checkpoint_sha256: str = "a" * 64,
+    parent_execution_id: str | None = "producer",
+    starting_epoch: int = 4,
+    starting_global_step: int | None = 12,
+) -> Path:
+    """Create immutable runner metadata used by resumed execution-join tests."""
+    run_dir = tmp_path / "resumed-join"
+    create_execution_context(
+        run_dir,
+        run_name="resumed-join",
+        invocation_kind="workflow",
+        intended_phases=("train",),
+        world_size=1,
+        execution_mode="single",
+        command=("mammoth", "workflow", "run"),
+        execution_id="runner-attempt",
+        resume_checkpoint=resume_checkpoint,
+        resume_checkpoint_sha256=resume_checkpoint_sha256,
+        parent_execution_id=parent_execution_id,
+        starting_epoch=starting_epoch,
+        starting_global_step=starting_global_step,
+    )
+    return run_dir
+
+
+def _resumed_join_request(run_dir: Path, **overrides: Any) -> ExecutionRequest:
+    """Return a matching child request with one optional resume-fact override."""
+    facts: dict[str, Any] = {
+        "resume_checkpoint": "checkpoints/resume.pt",
+        "resume_checkpoint_sha256": "a" * 64,
+        "parent_execution_id": "producer",
+        "starting_epoch": 4,
+        "starting_global_step": 12,
+    }
+    facts.update(overrides)
+    return ExecutionRequest(
+        run_dir=run_dir,
+        run_name="resumed-join",
+        invocation_kind="train",
+        intended_phases=("train",),
+        command=("python", "train.py"),
+        **facts,
+    )
+
+
+def test_runtime_joins_matching_resume_facts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resuming child joins only metadata that attests its exact resume state."""
+    run_dir = _create_resumed_execution_context(tmp_path)
+    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
+
+    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
+        context = runtime.establish_execution(_resumed_join_request(run_dir))
+
+    assert context.metadata.execution_id == "runner-attempt"
+
+
+@pytest.mark.parametrize(
+    ("field_name", "override"),
+    (
+        ("resume_checkpoint", "checkpoints/other.pt"),
+        ("resume_checkpoint_sha256", "b" * 64),
+        ("parent_execution_id", "other-producer"),
+        ("starting_epoch", 5),
+        ("starting_global_step", 13),
+    ),
+)
+def test_runtime_rejects_each_mismatched_resume_fact_before_logging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    override: object,
+) -> None:
+    """Every declared resume fact must agree before the child opens logging."""
+    run_dir = _create_resumed_execution_context(tmp_path)
+    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
+
+    with (
+        initialize_runtime(RuntimeConfig(device="cpu")) as runtime,
+        pytest.raises(RuntimeError, match=field_name),
+    ):
+        runtime.establish_execution(_resumed_join_request(run_dir, **{field_name: override}))
+
+    execution_dir = run_dir / "logs" / "executions" / "runner-attempt"
+    assert not (execution_dir / "rank-0.log").exists()
+    assert not (execution_dir / "rank-0.jsonl").exists()
+
+
+def test_runtime_compares_sanitized_resume_checkpoint_references(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Equivalent credential-bearing checkpoint URLs join through canonical sanitization."""
+    run_dir = _create_resumed_execution_context(
+        tmp_path,
+        resume_checkpoint="https://first:secret@example.test/checkpoints/resume.pt?token=one",
+    )
+    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
+
+    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
+        runtime.establish_execution(
+            _resumed_join_request(
+                run_dir,
+                resume_checkpoint="https://second:secret@example.test/checkpoints/resume.pt?token=two",
+            )
+        )
+
+
+def test_runtime_allows_external_resume_without_parent_or_global_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unknown external lineage and global-step coordinates remain explicit ``None`` facts."""
+    run_dir = _create_resumed_execution_context(
+        tmp_path,
+        parent_execution_id=None,
+        starting_global_step=None,
+    )
+    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
+
+    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
+        runtime.establish_execution(
+            _resumed_join_request(
+                run_dir,
+                parent_execution_id=None,
+                starting_global_step=None,
+            )
+        )
+
+
+def test_execution_request_requires_resume_digest_and_starting_epoch(tmp_path: Path) -> None:
+    """Resume requests cannot defer their immutable attestation facts."""
+    common = {
+        "run_dir": tmp_path,
+        "run_name": "resume-request",
+        "invocation_kind": "train",
+        "intended_phases": ("train",),
+        "command": ("python", "train.py"),
+        "resume_checkpoint": "checkpoint.pt",
+    }
+    with pytest.raises(ValueError, match="resume_checkpoint_sha256"):
+        ExecutionRequest(**common)
+    with pytest.raises(ValueError, match="starting_epoch"):
+        ExecutionRequest(**common, resume_checkpoint_sha256="a" * 64)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("starting_epoch", 4.0),
+        ("starting_epoch", True),
+        ("starting_epoch", -1),
+        ("starting_global_step", 12.0),
+        ("starting_global_step", True),
+        ("starting_global_step", -1),
+    ),
+)
+def test_execution_request_rejects_non_integral_resume_coordinates(
+    tmp_path: Path,
+    field_name: str,
+    value: object,
+) -> None:
+    """Resume coordinate equality cannot be bypassed by Python numeric coercion."""
+    request = {
+        "run_dir": tmp_path,
+        "run_name": "resume-coordinate",
+        "invocation_kind": "train",
+        "intended_phases": ("train",),
+        "command": ("python", "train.py"),
+        "resume_checkpoint": "checkpoint.pt",
+        "resume_checkpoint_sha256": "a" * 64,
+        "starting_epoch": 4,
+        "starting_global_step": 12,
+    }
+    request[field_name] = value
+
+    with pytest.raises(ValueError, match=field_name):
+        ExecutionRequest(**request)
 
 
 def test_single_runtime_owns_weighted_helpers_and_execution_lifecycle(
@@ -7269,6 +7545,11 @@ def test_single_runtime_joins_runner_execution_from_environment(
         execution_mode="single",
         command=("mammoth", "workflow", "run"),
         execution_id="runner-attempt",
+        resume_checkpoint="checkpoints/runner-resume.pt",
+        resume_checkpoint_sha256="a" * 64,
+        parent_execution_id="previous-runner-attempt",
+        starting_epoch=3,
+        starting_global_step=9,
     )
     monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
 
@@ -7385,3 +7666,22 @@ def test_two_process_runtime_propagates_rank_logging_startup_failure(
     assert "execution logging" in error
     assert "rank 1" in error
     assert "rank log unavailable" in error
+
+
+def test_two_process_runtime_reaches_consensus_on_resume_join_mismatch(
+    tmp_path: Path,
+) -> None:
+    """One rank's resumed-join mismatch fails every DDP rank before logging starts."""
+    results = run_two_process_resume_join_mismatch(tmp_path)
+
+    assert [rank for rank, _ in results] == [0, 1]
+    errors = {error for _, error in results}
+    assert len(errors) == 1
+    error = errors.pop()
+    assert error is not None
+    assert "execution join" in error
+    assert "rank 1" in error
+    assert "resume_checkpoint_sha256" in error
+    execution_dir = tmp_path / "resume-ddp" / "logs" / "executions" / "resume-attempt"
+    assert not (execution_dir / "rank-0.log").exists()
+    assert not (execution_dir / "rank-1.log").exists()

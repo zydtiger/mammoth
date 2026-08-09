@@ -369,11 +369,14 @@ rank joins it and receives its own JSONL and text stream, and the trainer uses
 the runtime's device and rank identity:
 
 When resuming, the caller must resolve artifact provenance before constructing
-the request and provide the producing attempt as `parent_execution_id`.
-`resume_checkpoint` is only a sanitized artifact reference: it never causes
-Mammoth to infer a parent from a path, filename, phase, or timestamp. Omit
-`parent_execution_id` for legacy or externally supplied artifacts without
-trusted producer provenance; the stored parent remains `None`.
+the request and provide the checkpoint's canonical lowercase SHA-256 and
+starting epoch. `parent_execution_id` remains optional for legacy or externally
+supplied artifacts without trusted producer provenance, as does
+`starting_global_step` when it is unknown. `resume_checkpoint` is only a
+sanitized artifact reference: it never causes Mammoth to inspect the checkpoint
+or infer a parent from a path, filename, phase, or timestamp. On a resumed join,
+Mammoth compares these caller-supplied facts with immutable execution metadata
+before opening logging or project work.
 
 ```python
 from pathlib import Path
@@ -396,7 +399,10 @@ with initialize_runtime(runtime_config) as runtime:
             intended_phases=("train",),
             command=("python", "train.py"),
             resume_checkpoint=Path("runs/example/checkpoints/latest.pt"),
+            resume_checkpoint_sha256="a" * 64,
             parent_execution_id="producer-attempt",
+            starting_epoch=4,
+            starting_global_step=1200,
         )
     )
     with Trainer(
