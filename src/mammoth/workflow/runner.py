@@ -49,6 +49,38 @@ StepOutcome = Literal["completed", "failed", "skipped", "interrupted"]
 RunOutcome = Literal["completed", "failed", "blocked", "interrupted", "dry-run"]
 WorkflowFailurePolicy = Literal["stop", "continue"]
 
+_LIFECYCLE_RESERVED_FIELDS = frozenset(
+    {
+        "schema_version",
+        "sequence",
+        "time",
+        "execution_id",
+        "run_name",
+        "source",
+        "rank",
+        "world_size",
+        "phase",
+        "task_id",
+        "parent_task_id",
+        "event",
+        "coordinates",
+        "throughput",
+        "duration_seconds",
+        "exit_code",
+        "signal",
+        "completed",
+        "total",
+        "unit",
+        "final",
+        "message",
+        "metrics",
+        "media",
+        "display_metrics",
+        "logical_step",
+        "child_pid",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ExecutionInputs:
@@ -103,6 +135,7 @@ class ProgrammaticRun:
     execution: ExecutionInputs
     environment: Mapping[str, str] = field(default_factory=dict)
     resolve_previous_execution: bool = field(default=False, repr=False)
+    lifecycle_fields: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Validate run-local mechanics before the global plan is dispatched."""
@@ -131,6 +164,11 @@ class ProgrammaticRun:
             self,
             "environment",
             MappingProxyType(_validate_environment(self.environment)),
+        )
+        object.__setattr__(
+            self,
+            "lifecycle_fields",
+            _freeze_lifecycle_fields(self.lifecycle_fields),
         )
 
     def step(self, name: str) -> StepConfig:
@@ -173,6 +211,29 @@ PreDispatchHook = Callable[[PreDispatchContext], None]
 
 
 @dataclass(frozen=True, slots=True)
+class LifecycleEventContext:
+    """Read-only facts supplied when enriching one Mammoth-owned lifecycle event.
+
+    Mammoth supplies the event identity and execution facts, including a
+    sanitized resolved command and a real launcher PID only after a child has
+    started.  The context intentionally exposes neither an observer, lease,
+    nor process supervisor, so callers cannot append records or manage child
+    lifetime themselves.
+    """
+
+    event: EventName
+    run: ProgrammaticRun
+    step: StepConfig | None
+    execution: ExecutionContext
+    command: tuple[str, ...] | None
+    child_pid: int | None
+    result: StepResult | None
+
+
+LifecycleEventFieldProvider = Callable[[LifecycleEventContext], Mapping[str, Any] | None]
+
+
+@dataclass(frozen=True, slots=True)
 class ProgrammaticWorkflow:
     """Fully caller-compiled, serial workflow representation.
 
@@ -186,6 +247,11 @@ class ProgrammaticWorkflow:
     dispatch: tuple[DispatchEntry, ...]
     failure_policy: WorkflowFailurePolicy = "stop"
     pre_dispatch: PreDispatchHook | None = field(default=None, compare=False, repr=False)
+    lifecycle_field_provider: LifecycleEventFieldProvider | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         """Reject invalid top-level fields before a side-effect-free preflight."""
@@ -209,6 +275,13 @@ class ProgrammaticWorkflow:
             raise ValueError("Programmatic workflow failure_policy must be 'stop' or 'continue'")
         if self.pre_dispatch is not None and not callable(self.pre_dispatch):
             raise ValueError("Programmatic workflow pre_dispatch must be callable or None")
+        if (
+            self.lifecycle_field_provider is not None
+            and not callable(self.lifecycle_field_provider)
+        ):
+            raise ValueError(
+                "Programmatic workflow lifecycle_field_provider must be callable or None"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +311,7 @@ class RunResult:
     outcome: RunOutcome
     execution_id: str | None
     steps: tuple[StepResult, ...]
+    reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +350,9 @@ class _ActiveRun:
     lease: LogicalRunLease
     context: ExecutionContext
     observer: RunObserver
+    lifecycle_field_provider: LifecycleEventFieldProvider | None
+    lifecycle_provider_failed: bool = False
+    startup_failure: str | None = None
 
 
 @dataclass(slots=True)
@@ -291,6 +368,10 @@ class _WorkflowInterrupted(BaseException):
 
     def __init__(self, signal_number: int) -> None:
         self.signal_number = signal_number
+
+
+class _LifecycleFieldProviderError(RuntimeError):
+    """Mark one dynamic enrichment failure after disabling its provider."""
 
 
 @dataclass(slots=True)
@@ -503,10 +584,16 @@ def run_programmatic_workflow(
             for entry in workflow.dispatch:
                 current = active.get(entry.run_name)
                 if current is None:
-                    current = _start_run(by_name[entry.run_name], active)
+                    current = _start_run(
+                        by_name[entry.run_name],
+                        active,
+                        workflow.lifecycle_field_provider,
+                    )
                 step = current.run.step(entry.step_name)
                 pending = _PendingDispatch(entry)
-                if workflow_failure is not None:
+                if current.startup_failure is not None:
+                    result = _record_startup_provider_failure(current, step, pending)
+                elif workflow_failure is not None:
                     result = _skip_step(
                         current,
                         step,
@@ -648,7 +735,11 @@ def child_environment(
     return environment
 
 
-def _start_run(run: ProgrammaticRun, active: dict[str, _ActiveRun]) -> _ActiveRun:
+def _start_run(
+    run: ProgrammaticRun,
+    active: dict[str, _ActiveRun],
+    lifecycle_field_provider: LifecycleEventFieldProvider | None,
+) -> _ActiveRun:
     """Prepare one independently owned layout, lease, context, and observer."""
     current: _ActiveRun | None = None
     lease: LogicalRunLease | None = None
@@ -677,9 +768,16 @@ def _start_run(run: ProgrammaticRun, active: dict[str, _ActiveRun]) -> _ActiveRu
                 runtime=_thaw_runtime_metadata(inputs.runtime),
             )
             observer = RunObserver((JsonlEventSink(ExecutionEventWriter.for_runner(context)),))
-            current = _ActiveRun(run, lease, context, observer)
+            current = _ActiveRun(run, lease, context, observer, lifecycle_field_provider)
             active[run.name] = current
-            observer.emit("execution_started")
+            try:
+                _emit_started_lifecycle_event(
+                    current,
+                    "execution_started",
+                    fields={},
+                )
+            except _LifecycleFieldProviderError as error:
+                current.startup_failure = f"lifecycle event field provider failed: {error}"
         return current
     except BaseException:
         if current is None and lease is not None:
@@ -697,19 +795,63 @@ def _execute_step(
 ) -> StepResult:
     """Run one child while emitting paired phase and task lifecycle records."""
     task_id = step.name
-    observer = active.observer
+    command = sanitize_command(command_for_step(step))
+    enrichment_enabled = _lifecycle_enrichment_enabled(active)
     phase_started = False
     task_started = False
     running_hook = hook is not None
     try:
         with _blocked_interruption_signals():
-            phase_started = True
-            observer.emit("phase_started", phase=step.name)
-            task_started = True
-            observer.emit("task_started", phase=step.name, task_id=task_id)
+            try:
+                _emit_started_lifecycle_event(
+                    active,
+                    "phase_started",
+                    step=step,
+                    command=command,
+                    fields={"phase": step.name},
+                )
+            except _LifecycleFieldProviderError:
+                phase_started = True
+                raise
+            else:
+                phase_started = True
+            if not enrichment_enabled:
+                _emit_lifecycle_event(
+                    active,
+                    "task_started",
+                    step=step,
+                    command=command,
+                    fields={"phase": step.name, "task_id": task_id},
+                    include_provider=False,
+                )
+                task_started = True
         if hook is not None:
             hook(PreDispatchContext(dispatch, active.run, step, active.context))
         running_hook = False
+
+        def record_task_started(child_pid: int) -> None:
+            nonlocal task_started
+            task_fields: dict[str, Any] = {
+                "phase": step.name,
+                "task_id": task_id,
+            }
+            task_fields["child_pid"] = child_pid
+            with _blocked_interruption_signals():
+                try:
+                    _emit_started_lifecycle_event(
+                        active,
+                        "task_started",
+                        step=step,
+                        command=command,
+                        child_pid=child_pid,
+                        fields=task_fields,
+                    )
+                except _LifecycleFieldProviderError:
+                    task_started = True
+                    raise
+                else:
+                    task_started = True
+
         process = launch_process(
             command_for_step(step),
             cwd=step.cwd,
@@ -723,15 +865,31 @@ def _execute_step(
                 phase=step.name,
             ),
             timeout_seconds=step.timeout_seconds,
+            on_started=record_task_started if enrichment_enabled else None,
         )
-        return _finish_process_step(observer, step, task_id, process, pending)
+        return _finish_process_step(active, step, command, task_id, process, pending)
+    except _LifecycleFieldProviderError as error:
+        reason = f"lifecycle event field provider failed: {error}"
+        return _emit_step_terminal(
+            active,
+            step,
+            command,
+            pending,
+            StepResult(step.name, "failed", reason=reason),
+            task_event="task_failed" if task_started else None,
+            task_fields={"phase": step.name, "task_id": task_id, "message": reason},
+            phase_event="phase_failed" if phase_started else None,
+            phase_fields={"phase": step.name, "message": reason},
+        )
     except _WorkflowInterrupted as error:
         if pending.result is not None:
             pending.result = _with_step_signal(pending.result, error.signal_number)
             return pending.result
         reason = "interrupted"
-        _emit_step_terminal(
-            observer,
+        return _emit_step_terminal(
+            active,
+            step,
+            command,
             pending,
             StepResult(step.name, "interrupted", reason=reason, signal=error.signal_number),
             task_event="task_failed" if task_started else None,
@@ -739,14 +897,15 @@ def _execute_step(
             phase_event="phase_failed" if phase_started else None,
             phase_fields={"phase": step.name, "message": reason},
         )
-        return _terminal_step_result(pending)
     except KeyboardInterrupt:
         if pending.result is not None:
             pending.result = _with_step_signal(pending.result, signal.SIGINT)
             return pending.result
         reason = "interrupted"
-        _emit_step_terminal(
-            observer,
+        return _emit_step_terminal(
+            active,
+            step,
+            command,
             pending,
             StepResult(step.name, "interrupted", reason=reason, signal=signal.SIGINT),
             task_event="task_failed" if task_started else None,
@@ -754,14 +913,15 @@ def _execute_step(
             phase_event="phase_failed" if phase_started else None,
             phase_fields={"phase": step.name, "message": reason},
         )
-        return _terminal_step_result(pending)
     except OSError as error:
         reason = f"could not launch: {error}"
-        _emit_step_terminal(
-            observer,
+        return _emit_step_terminal(
+            active,
+            step,
+            command,
             pending,
             StepResult(step.name, "failed", reason=reason),
-            task_event="task_failed",
+            task_event="task_failed" if task_started else None,
             task_fields={
                 "phase": step.name,
                 "task_id": task_id,
@@ -771,25 +931,26 @@ def _execute_step(
             phase_event="phase_failed",
             phase_fields={"phase": step.name, "message": reason, "exit_code": 127},
         )
-        return _terminal_step_result(pending)
     except Exception as error:
         prefix = "pre-dispatch hook failed" if running_hook else "workflow execution failed"
         reason = f"{prefix}: {error}"
-        _emit_step_terminal(
-            observer,
+        return _emit_step_terminal(
+            active,
+            step,
+            command,
             pending,
             StepResult(step.name, "failed", reason=reason),
-            task_event="task_failed",
+            task_event="task_failed" if task_started else None,
             task_fields={"phase": step.name, "task_id": task_id, "message": reason},
             phase_event="phase_failed",
             phase_fields={"phase": step.name, "message": reason},
         )
-        return _terminal_step_result(pending)
 
 
 def _finish_process_step(
-    observer: RunObserver,
+    active: _ActiveRun,
     step: StepConfig,
+    command: tuple[str, ...],
     task_id: str,
     process: ProcessResult,
     pending: _PendingDispatch,
@@ -797,8 +958,10 @@ def _finish_process_step(
     """Publish one supervised process outcome as an indivisible terminal pair."""
     if process.interrupted:
         reason = "interrupted"
-        _emit_step_terminal(
-            observer,
+        return _emit_step_terminal(
+            active,
+            step,
+            command,
             pending,
             StepResult(step.name, "interrupted", process, reason, process.signal),
             task_event="task_failed",
@@ -811,10 +974,11 @@ def _finish_process_step(
                 "message": reason,
             },
         )
-        return _terminal_step_result(pending)
     if process.return_code == 0 and not process.timed_out:
-        _emit_step_terminal(
-            observer,
+        return _emit_step_terminal(
+            active,
+            step,
+            command,
             pending,
             StepResult(step.name, "completed", process),
             task_event="task_completed",
@@ -826,10 +990,11 @@ def _finish_process_step(
                 "duration_seconds": process.duration_seconds,
             },
         )
-        return _terminal_step_result(pending)
     reason = "timed out" if process.timed_out else f"exit code {process.return_code}"
-    _emit_step_terminal(
-        observer,
+    return _emit_step_terminal(
+        active,
+        step,
+        command,
         pending,
         StepResult(step.name, "failed", process, reason),
         task_event="task_failed",
@@ -847,7 +1012,6 @@ def _finish_process_step(
             "message": reason,
         },
     )
-    return _terminal_step_result(pending)
 
 
 def _skip_step(
@@ -857,8 +1021,10 @@ def _skip_step(
     pending: _PendingDispatch,
 ) -> StepResult:
     """Record a terminal skip without launching a child process."""
-    _emit_step_terminal(
-        active.observer,
+    return _emit_step_terminal(
+        active,
+        step,
+        sanitize_command(command_for_step(step)),
         pending,
         StepResult(step.name, "skipped", reason=reason),
         task_event="task_skipped",
@@ -866,11 +1032,27 @@ def _skip_step(
         phase_event="phase_skipped",
         phase_fields={"phase": step.name, "message": reason},
     )
-    return _terminal_step_result(pending)
+
+
+def _record_startup_provider_failure(
+    active: _ActiveRun,
+    step: StepConfig,
+    pending: _PendingDispatch,
+) -> StepResult:
+    """Fail the first selected step without a child after execution-start enrichment fails."""
+    reason = active.startup_failure
+    if reason is None:
+        raise RuntimeError("missing startup lifecycle provider failure")
+    active.startup_failure = None
+    result = StepResult(step.name, "failed", reason=reason)
+    pending.result = result
+    return result
 
 
 def _emit_step_terminal(
-    observer: RunObserver,
+    active: _ActiveRun,
+    step: StepConfig,
+    command: tuple[str, ...],
     pending: _PendingDispatch,
     result: StepResult,
     *,
@@ -878,20 +1060,176 @@ def _emit_step_terminal(
     task_fields: Mapping[str, Any],
     phase_event: EventName | None,
     phase_fields: Mapping[str, Any],
-) -> None:
+) -> StepResult:
     """Publish a step's terminal task/phase pair without splitting its lifecycle."""
+    try:
+        prepared_task_fields = (
+            _lifecycle_event_fields(
+                active,
+                task_event,
+                step=step,
+                command=command,
+                result=result,
+                fields=task_fields,
+            )
+            if task_event is not None
+            else None
+        )
+        prepared_phase_fields = (
+            _lifecycle_event_fields(
+                active,
+                phase_event,
+                step=step,
+                command=command,
+                result=result,
+                fields=phase_fields,
+            )
+            if phase_event is not None
+            else None
+        )
+    except _LifecycleFieldProviderError as error:
+        reason = f"lifecycle event field provider failed: {error}"
+        failure = StepResult(step.name, "failed", process=result.process, reason=reason)
+        return _emit_step_terminal(
+            active,
+            step,
+            command,
+            pending,
+            failure,
+            task_event="task_failed" if task_event is not None else None,
+            task_fields={"phase": step.name, "task_id": step.name, "message": reason},
+            phase_event="phase_failed" if phase_event is not None else None,
+            phase_fields={"phase": step.name, "message": reason},
+        )
+
     deferred_signals: list[int] = []
     with _blocked_interruption_signals(
         deliver_deferred=False,
         deferred_signals=deferred_signals,
     ):
         pending.result = result
-        if task_event is not None:
-            observer.emit(task_event, **task_fields)
-        if phase_event is not None:
-            observer.emit(phase_event, **phase_fields)
+        if task_event is not None and prepared_task_fields is not None:
+            active.observer.emit(task_event, **prepared_task_fields)
+        if phase_event is not None and prepared_phase_fields is not None:
+            active.observer.emit(phase_event, **prepared_phase_fields)
     if deferred_signals:
         pending.result = _with_step_signal(result, deferred_signals[0])
+    return _terminal_step_result(pending)
+
+
+def _emit_started_lifecycle_event(
+    active: _ActiveRun,
+    event: EventName,
+    *,
+    step: StepConfig | None = None,
+    command: tuple[str, ...] | None = None,
+    fields: Mapping[str, Any],
+    child_pid: int | None = None,
+) -> None:
+    """Emit one start record or preserve its pair before reporting provider failure."""
+    try:
+        _emit_lifecycle_event(
+            active,
+            event,
+            step=step,
+            command=command,
+            child_pid=child_pid,
+            fields=fields,
+        )
+    except _LifecycleFieldProviderError:
+        _emit_lifecycle_event(
+            active,
+            event,
+            step=step,
+            command=command,
+            child_pid=child_pid,
+            fields=fields,
+            include_provider=False,
+        )
+        raise
+
+
+def _lifecycle_enrichment_enabled(active: _ActiveRun) -> bool:
+    """Return whether a caller selected the programmatic enrichment contract."""
+    return active.lifecycle_field_provider is not None or bool(active.run.lifecycle_fields)
+
+
+def _emit_lifecycle_event(
+    active: _ActiveRun,
+    event: EventName,
+    *,
+    step: StepConfig | None = None,
+    command: tuple[str, ...] | None = None,
+    child_pid: int | None = None,
+    result: StepResult | None = None,
+    fields: Mapping[str, Any] = MappingProxyType({}),
+    include_provider: bool = True,
+) -> None:
+    """Append one Mammoth-owned event after safely composing caller extensions."""
+    prepared_fields = _lifecycle_event_fields(
+        active,
+        event,
+        step=step,
+        command=command,
+        child_pid=child_pid,
+        result=result,
+        fields=fields,
+        include_provider=include_provider,
+    )
+    active.observer.emit(event, **prepared_fields)
+
+
+def _lifecycle_event_fields(
+    active: _ActiveRun,
+    event: EventName,
+    *,
+    step: StepConfig | None,
+    command: tuple[str, ...] | None,
+    child_pid: int | None = None,
+    result: StepResult | None,
+    fields: Mapping[str, Any],
+    include_provider: bool = True,
+) -> dict[str, Any]:
+    """Combine immutable static fields with one provider response and runner facts."""
+    static_fields = dict(_thaw_runtime_metadata(active.run.lifecycle_fields) or {})
+    dynamic_fields: dict[str, Any] = {}
+    provider = active.lifecycle_field_provider
+    if include_provider and provider is not None and not active.lifecycle_provider_failed:
+        context = LifecycleEventContext(
+            event=event,
+            run=active.run,
+            step=step,
+            execution=active.context,
+            command=command,
+            child_pid=child_pid,
+            result=result,
+        )
+        try:
+            provided = provider(context)
+            if provided is not None:
+                dynamic_fields = dict(
+                    _thaw_runtime_metadata(_freeze_lifecycle_fields(provided)) or {}
+                )
+        except _WorkflowInterrupted:
+            raise
+        except BaseException as error:
+            active.lifecycle_provider_failed = True
+            raise _LifecycleFieldProviderError(str(error)) from error
+    overlap = set(static_fields).intersection(dynamic_fields)
+    if overlap:
+        active.lifecycle_provider_failed = True
+        raise _LifecycleFieldProviderError(
+            "provider fields duplicate static lifecycle fields: "
+            f"{', '.join(sorted(overlap))}"
+        )
+    caller_fields = {**static_fields, **dynamic_fields}
+    collision = set(caller_fields).intersection(fields)
+    if collision:
+        raise RuntimeError(
+            "caller lifecycle fields unexpectedly collide with Mammoth event fields: "
+            f"{', '.join(sorted(collision))}"
+        )
+    return {**caller_fields, **fields}
 
 
 def _terminal_step_result(pending: _PendingDispatch) -> StepResult:
@@ -952,17 +1290,26 @@ def _finalize_active_runs(
             interrupted_signal=interrupted_signal,
             executor_failed=executor_failed,
         )
+        reason: str | None = None
         try:
-            if outcome == "completed":
-                current.observer.emit("execution_completed", exit_code=0)
-            elif outcome == "interrupted":
-                terminal_signal = interrupted_signal or _step_interruption_signal(step_results)
-                current.observer.emit(
-                    "execution_interrupted",
-                    signal=terminal_signal,
+            event, fields = _execution_terminal_event(
+                outcome,
+                interrupted_signal=interrupted_signal,
+                step_results=step_results,
+            )
+            try:
+                _emit_lifecycle_event(current, event, fields=fields)
+            except _LifecycleFieldProviderError as error:
+                reason = f"lifecycle event field provider failed: {error}"
+                if outcome == "completed":
+                    outcome = "failed"
+                event, fields = _execution_terminal_event(
+                    outcome,
+                    interrupted_signal=interrupted_signal,
+                    step_results=step_results,
+                    reason=reason,
                 )
-            else:
-                current.observer.emit("execution_failed", exit_code=1)
+                _emit_lifecycle_event(current, event, fields=fields, include_provider=False)
         finally:
             try:
                 current.observer.close()
@@ -974,9 +1321,33 @@ def _finalize_active_runs(
                 outcome=outcome,
                 execution_id=current.context.metadata.execution_id,
                 steps=step_results,
+                reason=reason,
             )
         )
     return tuple(finalized)
+
+
+def _execution_terminal_event(
+    outcome: RunOutcome,
+    *,
+    interrupted_signal: int | None,
+    step_results: Sequence[StepResult],
+    reason: str | None = None,
+) -> tuple[EventName, dict[str, int | str]]:
+    """Return one runner-owned execution terminal event and its fixed fields."""
+    if outcome == "completed":
+        return "execution_completed", {"exit_code": 0}
+    if outcome == "interrupted":
+        interrupted_fields: dict[str, int | str] = {
+            "signal": interrupted_signal or _step_interruption_signal(step_results),
+        }
+        if reason is not None:
+            interrupted_fields["message"] = reason
+        return "execution_interrupted", interrupted_fields
+    fields: dict[str, int | str] = {"exit_code": 1}
+    if reason is not None:
+        fields["message"] = reason
+    return "execution_failed", fields
 
 
 def _run_outcome(
@@ -1091,6 +1462,31 @@ def _freeze_runtime_metadata(runtime: Mapping[str, Any]) -> Mapping[str, Any]:
     return MappingProxyType(
         {name: _freeze_runtime_value(value) for name, value in runtime.items()}
     )
+
+
+def _freeze_lifecycle_fields(fields: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Validate, redact-check, and detach caller extensions before dispatch."""
+    if not isinstance(fields, Mapping):
+        raise ValueError("lifecycle fields must be a mapping")
+    collisions = _LIFECYCLE_RESERVED_FIELDS.intersection(fields)
+    if collisions:
+        raise ValueError(
+            "lifecycle fields collide with Mammoth-owned event fields: "
+            f"{', '.join(sorted(collisions))}"
+        )
+    sanitized = sanitize_metadata_fields(fields)
+    if _normalised_lifecycle_value(fields) != _normalised_lifecycle_value(sanitized):
+        raise ValueError("lifecycle fields must not contain credentials or unsafe references")
+    return _freeze_runtime_metadata(sanitized)
+
+
+def _normalised_lifecycle_value(value: Any) -> Any:
+    """Normalize JSON-shaped values solely to detect sanitizer redaction changes."""
+    if isinstance(value, Mapping):
+        return {key: _normalised_lifecycle_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_normalised_lifecycle_value(item) for item in value]
+    return value
 
 
 def _freeze_runtime_value(value: Any) -> Any:
