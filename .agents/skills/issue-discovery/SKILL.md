@@ -12,6 +12,8 @@ Turn an initial request into one evidence-backed GitHub or Gitea issue. Creating
 - Read and obey repository instructions before inspecting or writing.
 - Treat code, tests, docs, history, and existing issues as evidence; separate facts from inference.
 - Remain read-only until the user approves the complete issue draft.
+- Apply `$issue-pr-body-contract` to every drafted or published issue body. Require that skill to validate the body before presentation and creation and to verify the published result.
+- Render the complete drafted issue body directly as Markdown; never wrap it in a fenced code block. Keep draft metadata, such as the target, title, and labels, separate from the body.
 - Preserve approved detail. Never create a duplicate or invent a missing label.
 - Never expose credentials or private content outside the selected forge.
 
@@ -25,7 +27,7 @@ Turn an initial request into one evidence-backed GitHub or Gitea issue. Creating
 3. **Investigate.** Inspect relevant implementation, tests, docs, configuration, and history. Establish current behavior, impact, affected components, constraints, and material compatibility, security, migration, or data-loss risks. Do not implement a fix.
 4. **Search existing work.** Search open and closed issues for duplicates or substantial overlap. If one exists, report it and stop unless the user explicitly wants a distinct follow-up.
 5. **Query labels.** Read the repository's current labels and select only applicable existing labels.
-6. **Draft.** Read [references/issue-template.md](references/issue-template.md). Present the exact forge, repository, title, labels, complete body, acceptance criteria, tests, and exclusions.
+6. **Draft.** Read [references/issue-template.md](references/issue-template.md). Build the complete intended body, have `$issue-pr-body-contract` validate it, then present the exact forge, repository, title, labels, complete body, acceptance criteria, tests, and exclusions.
 7. **Approve.** Obtain explicit approval to create that exact issue. Revise and re-present after feedback; material post-approval changes require renewed approval. Approval to investigate or draft is not approval to create.
-8. **Write and verify.** Immediately restate the target, title, labels, and single intended write. Create through the selected adapter, read it back, and verify number, URL, title, labels, and body.
+8. **Write and verify.** Immediately restate the target, title, labels, and single intended write. Create and verify the body through `$issue-pr-body-contract`, then confirm number, URL, title, labels, and body.
 9. **Stop.** Report the created issue. Do not create a branch, worktree, commit, or pull request without a separate pickup request.

@@ -56,12 +56,14 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `.agents/skills/issue-delivery/.skillctl-managed` | Skillctl ownership and provenance marker for the vendored issue-delivery tree. | Never edit manually; update only through skillctl. |
 | `.agents/skills/issue-delivery/SKILL.md` | Canonical issue implementation, review, publication, merge-gate, verification, and cleanup workflow. | Never edit here; update the canonical source and apply it with skillctl. |
 | `.agents/skills/issue-delivery/agents/openai.yaml` | OpenAI agent metadata for discovering the issue-delivery skill. | Never edit here; update the canonical source and apply it with skillctl. |
-| `.agents/skills/issue-delivery/references/forge-body-round-trip.md` | Exact Markdown source, transport, and raw forge-body verification procedure. | Never edit here; update the canonical source and apply it with skillctl. |
 | `.agents/skills/issue-delivery/references/forge-closeout.md` | Acceptance-criteria, issue-state, and milestone reconciliation procedure after merge. | Never edit here; update the canonical source and apply it with skillctl. |
 | `.agents/skills/issue-delivery/references/pr-body.md` | Required pull-request body structure and refresh rules. | Never edit here; update the canonical source and apply it with skillctl. |
 | `.agents/skills/issue-delivery/references/worktree-reconciliation.md` | Branch, worktree, local/remote head, publication, and cleanup reconciliation procedure. | Never edit here; update the canonical source and apply it with skillctl. |
-| `.agents/skills/issue-delivery/scripts/forge_body.py` | Markdown source validator and raw forge-body round-trip verifier. | Never edit here; update the canonical source and apply it with skillctl. |
-| `.agents/skills/issue-delivery/scripts/test_forge_body.py` | Unit tests for the forge-body validator and verifier. | Never edit here; update the canonical source and apply it with skillctl. |
+| `.agents/skills/issue-pr-body-contract/.skillctl-managed` | Skillctl ownership and provenance marker for the vendored issue-pr-body-contract tree. | Never edit manually; update only through skillctl. |
+| `.agents/skills/issue-pr-body-contract/SKILL.md` | Shared issue and pull-request body validation, publication, verification, and closeout-preservation contract. | Never edit here; update the canonical source and apply it with skillctl. |
+| `.agents/skills/issue-pr-body-contract/agents/openai.yaml` | OpenAI agent metadata for discovering the issue-pr-body-contract skill. | Never edit here; update the canonical source and apply it with skillctl. |
+| `.agents/skills/issue-pr-body-contract/scripts/forge_body.py` | Markdown source, raw round-trip, and marker-only validator and verifier. | Never edit here; update the canonical source and apply it with skillctl. |
+| `.agents/skills/issue-pr-body-contract/scripts/test_forge_body.py` | Unit tests for the shared forge-body contract. | Never edit here; update the canonical source and apply it with skillctl. |
 | `src/mammoth/__init__.py` | Lightweight root package metadata and intentionally small stable exports. | Package version or a truly root-level stable export changes. |
 | `src/mammoth/__main__.py` | `python -m mammoth` forwarding entry point. | Module execution behavior changes. |
 | `src/mammoth/cli.py` | Public Typer application, typed commands, and console exit routing. | A public command, option, or exit behavior changes. |

@@ -1,5 +1,5 @@
 version: 1
-entry: issue-delivery
+entry: issue-pr-body-contract
 scope: project
 lock: .agents/skills.lock.yaml
 repository: https://github.com/zydtiger/agent-workflows.git

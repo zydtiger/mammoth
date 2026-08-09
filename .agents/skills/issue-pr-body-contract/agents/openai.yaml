@@ -1,0 +1,4 @@
+interface:
+  display_name: "Issue and PR Body Contract"
+  short_description: "Validate and round-trip forge body Markdown"
+  default_prompt: "Use $issue-pr-body-contract to validate and verify an issue or pull-request body."

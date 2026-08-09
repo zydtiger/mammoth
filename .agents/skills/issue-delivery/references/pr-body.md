@@ -2,7 +2,7 @@
 
 Build the body from the actual issue, commits, diff, and latest validation. Never reuse stale counts or claim checks that were not run.
 
-Construct the complete intended body as an explicit UTF-8 Markdown source file. Follow [the forge-body round-trip procedure](forge-body-round-trip.md) for source formatting, newline-preserving transport, raw read-back, comparison, and remediation. A created or updated pull request is not successfully published until its latest raw body passes that verification.
+Construct the complete intended body, then return it to the main delivery workflow for publication through `$issue-pr-body-contract`.
 
 ## Summary
 
@@ -30,4 +30,4 @@ Use linkage syntax supported by the selected forge. Verify closure after merge i
 
 ## After follow-up commits
 
-Refresh the summary, design details, commit structure, validation, limitations, and linkage in a new authoritative source file. Publish it through a newline-preserving adapter, then repeat raw forge read-back and exact verification.
+Refresh the summary, design details, commit structure, validation, limitations, and linkage in a new authoritative source file, then return it to the main delivery workflow for verified publication.

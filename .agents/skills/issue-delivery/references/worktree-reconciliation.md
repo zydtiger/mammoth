@@ -39,7 +39,7 @@ If the original task worktree is dirty or unsafe for PR follow-up, preserve it. 
 4. Immediately before pushing, verify the exact audited commit, clean worktree, destination ref, and expected remote commit.
 5. Push the audited commit itself as `<audited-oid>:<remote-feature-ref>`. For a rewrite, use the approved exact force-with-lease expectation.
 6. Fetch immediately after the push. Verify the remote feature ref and existing PR head equal the audited commit. For a new PR, verify the remote ref first, create the approved PR, then read it back and verify its head.
-7. Refresh the PR body and validation evidence whenever the published head changes. Use an explicit intended Markdown source, a newline-preserving transport, and raw forge read-back comparison for every refresh.
+7. Refresh the PR body and validation evidence whenever the published head changes. Apply `$issue-pr-body-contract` to every refresh.
 
 Do not merge unless the audited local head, remote feature head, and PR head are identical.
 
@@ -57,8 +57,10 @@ Use every commit precondition the adapter supports. If it cannot bind the base o
 
 ## Synchronize and clean up
 
+- When the merge used the main workflow's compound authorization, that same approval covers the expected safe cleanup after merged delivery and linked-issue reconciliation are both verified; do not request a second approval merely to remove the clean task-owned worktree and expected branches.
 - Update a local base only when it is the expected branch, its worktree is clean and not in use, and the fetched base is a fast-forward. Use fast-forward-only behavior with autostash disabled. Otherwise leave it untouched and report why.
 - Before removing a feature worktree, inventory tracked, untracked, ignored, and initialized-submodule state. Preserve anything dirty or unexplained and never use forced removal.
 - Delete a local feature branch only after verifying delivery, confirming no worktree uses it, and confirming it still names the expected commit. Remove its repository-local `branch.<name>.*` configuration as part of the same approved cleanup.
 - Delete a remote feature branch only when policy and approval allow it, and protect deletion with the expected remote OID.
+- Stop and obtain fresh approval instead of consuming the compound cleanup authority when merged delivery or issue reconciliation is incomplete, the target OIDs or ownership differ from the ready snapshot, cleanup would discard or force anything, or repository policy requires a separate gate.
 - Report every deferred update and retained worktree, branch, ref, or artifact.

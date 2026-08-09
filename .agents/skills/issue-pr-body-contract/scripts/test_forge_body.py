@@ -138,6 +138,11 @@ class MarkdownFormatTests(unittest.TestCase):
             "- `tisam` supports the workflow.\n", "capitalized introductory word"
         )
 
+    def test_source_validation_does_not_gate_editorial_style(self):
+        self.assertEqual(
+            [], forge_body.validate_markdown("- [ ] `legacy` criterion.\n", check_editorial_style=False)
+        )
+
     def test_link_cannot_begin_a_bullet(self):
         self.assertInvalid(
             "- [Gitea](https://gitea.com/) documents the API.\n",
@@ -397,6 +402,174 @@ class RoundTripTests(unittest.TestCase):
             )
         self.assertEqual(2, result.returncode)
         self.assertIn("publication verification incomplete", result.stderr)
+
+
+class MarkerOnlyUpdateTests(unittest.TestCase):
+    def test_legacy_inline_code_checklist_can_be_checked(self):
+        base = "## Acceptance criteria\n\n- [ ] `issue-discovery` renders Markdown.\n"
+        intended = "## Acceptance criteria\n\n- [x] `issue-discovery` renders Markdown.\n"
+        self.assertEqual([], forge_body.validate_marker_only_update(base, intended))
+
+    def test_marker_only_update_rejects_wording_changes(self):
+        base = "- [ ] Preserve wording.\n"
+        intended = "- [x] Rewrite wording.\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+
+class AdditionalMarkerOnlyUpdateTests(unittest.TestCase):
+    def test_marker_only_update_rejects_reopening(self):
+        base = "- [x] Completed criterion.\n"
+        intended = "- [ ] Completed criterion.\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_ordered_checklist_can_be_checked(self):
+        self.assertEqual([], forge_body.validate_marker_only_update("## Acceptance criteria\n\n1. [ ] Criterion.\n", "## Acceptance criteria\n\n1. [x] Criterion.\n"))
+
+    def test_legacy_body_round_trips_without_source_style_lint(self):
+        body = "## Acceptance criteria\n\n- [x] `legacy` criterion.\n"
+        self.assertEqual([], forge_body.verify_marker_only_round_trip("## Acceptance criteria\n\n- [ ] `legacy` criterion.\n", body, body))
+
+    def test_marker_only_update_rejects_non_acceptance_checklist(self):
+        base = "## Acceptance criteria\n\n- [ ] Criterion.\n\n## Operator checklist\n\n- [ ] Deploy production.\n"
+        intended = "## Acceptance criteria\n\n- [ ] Criterion.\n\n## Operator checklist\n\n- [x] Deploy production.\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_marker_only_update_rejects_checkbox_like_code(self):
+        base = "## Acceptance criteria\n\n```text\n- [ ] Example only.\n```\n"
+        intended = "## Acceptance criteria\n\n```text\n- [x] Example only.\n```\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_marker_only_update_rejects_nested_fenced_checkbox(self):
+        base = "## Acceptance criteria\n\n- Example:\n\n    ```text\n    - [ ] Example only.\n    ```\n"
+        intended = "## Acceptance criteria\n\n- Example:\n\n    ```text\n    - [x] Example only.\n    ```\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_fenced_heading_does_not_open_acceptance_criteria(self):
+        base = "```text\n# Acceptance criteria\n```\n\n- [ ] Unrelated task.\n"
+        intended = "```text\n# Acceptance criteria\n```\n\n- [x] Unrelated task.\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_fence_like_content_does_not_close_before_checkbox(self):
+        base = "## Acceptance criteria\n\n```text\n````still code\n- [ ] Example only.\n```\n"
+        intended = "## Acceptance criteria\n\n```text\n````still code\n- [x] Example only.\n```\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_nested_fence_like_content_does_not_close_before_checkbox(self):
+        base = "## Acceptance criteria\n\n    ```text\n    ````still code\n    - [ ] Example only.\n    ```\n"
+        intended = "## Acceptance criteria\n\n    ```text\n    ````still code\n    - [x] Example only.\n    ```\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_indented_heading_closes_acceptance_criteria_section(self):
+        base = "## Acceptance criteria\n\n- [ ] Criterion.\n\n  ## Operator checklist\n\n- [ ] Deploy.\n"
+        intended = "## Acceptance criteria\n\n- [ ] Criterion.\n\n  ## Operator checklist\n\n- [x] Deploy.\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_acceptance_heading_with_closing_hashes_allows_marker_update(self):
+        base = "## Acceptance criteria ##\n\n- [ ] Criterion.\n"
+        intended = "## Acceptance criteria ##\n\n- [x] Criterion.\n"
+        self.assertEqual([], forge_body.validate_marker_only_update(base, intended))
+
+    def test_over_indented_closing_fence_does_not_end_top_level_fence(self):
+        base = "## Acceptance criteria\n\n```text\n    ```\n- [ ] Example only.\n```\n"
+        intended = "## Acceptance criteria\n\n```text\n    ```\n- [x] Example only.\n```\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_over_indented_closing_fence_does_not_end_nested_fence(self):
+        base = "## Acceptance criteria\n\n- Example:\n\n    ```text\n        ```\n    - [ ] Example only.\n    ```\n"
+        intended = "## Acceptance criteria\n\n- Example:\n\n    ```text\n        ```\n    - [x] Example only.\n    ```\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_standalone_indented_code_checkbox_is_rejected(self):
+        base = "## Acceptance criteria\n\n    - [ ] Example only.\n"
+        intended = "## Acceptance criteria\n\n    - [x] Example only.\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_standalone_tab_indented_code_checkbox_is_rejected(self):
+        base = "## Acceptance criteria\n\n\t- [ ] Example only.\n"
+        intended = "## Acceptance criteria\n\n\t- [x] Example only.\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_nested_list_checkbox_is_allowed(self):
+        base = "## Acceptance criteria\n\n- [ ] Parent criterion.\n    - [ ] Child criterion.\n"
+        intended = "## Acceptance criteria\n\n- [ ] Parent criterion.\n    - [x] Child criterion.\n"
+        self.assertEqual([], forge_body.validate_marker_only_update(base, intended))
+
+    def test_optional_opening_indent_does_not_raise_closing_indent_limit(self):
+        base = "## Acceptance criteria\n\n   ```text\n      ```\n- [ ] Example only.\n```\n"
+        intended = "## Acceptance criteria\n\n   ```text\n      ```\n- [x] Example only.\n```\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_less_indented_closer_ends_optionally_indented_fence(self):
+        base = "## Acceptance criteria\n\n   ```text\nExample.\n```\n\n- [ ] Criterion.\n"
+        intended = "## Acceptance criteria\n\n   ```text\nExample.\n```\n\n- [x] Criterion.\n"
+        self.assertEqual([], forge_body.validate_marker_only_update(base, intended))
+
+    def test_parent_marker_content_indent_blocks_false_nested_checkbox(self):
+        base = "## Acceptance criteria\n\n   - Context item.\n\n    - [ ] Example only.\n"
+        intended = "## Acceptance criteria\n\n   - Context item.\n\n    - [x] Example only.\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_top_level_fence_clears_previous_list_container(self):
+        base = "## Acceptance criteria\n\n- Parent.\n\n```text\nCode.\n```\n\n    - [ ] Example only.\n"
+        intended = "## Acceptance criteria\n\n- Parent.\n\n```text\nCode.\n```\n\n    - [x] Example only.\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_over_indented_nested_pseudo_fence_does_not_open(self):
+        base = "## Acceptance criteria\n\n- Parent.\n\n      ```\n    ```\n    - [ ] Example only.\n    ```\n"
+        intended = "## Acceptance criteria\n\n- Parent.\n\n      ```\n    ```\n    - [x] Example only.\n    ```\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_backtick_in_info_string_does_not_open_fence(self):
+        base = "## Acceptance criteria\n\n```bad`tick\n```\n- [ ] Example only.\n```\n"
+        intended = "## Acceptance criteria\n\n```bad`tick\n```\n- [x] Example only.\n```\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_continuation_preserves_parent_for_nested_checkbox(self):
+        base = "## Acceptance criteria\n\n- Parent.\n  Continuation.\n\n  - [ ] Child criterion.\n"
+        intended = "## Acceptance criteria\n\n- Parent.\n  Continuation.\n\n  - [x] Child criterion.\n"
+        self.assertEqual([], forge_body.validate_marker_only_update(base, intended))
+
+    def test_tab_content_indent_preserves_nested_checkbox(self):
+        base = "## Acceptance criteria\n\n-\tParent.\n\t- [ ] Child criterion.\n"
+        intended = "## Acceptance criteria\n\n-\tParent.\n\t- [x] Child criterion.\n"
+        self.assertEqual([], forge_body.validate_marker_only_update(base, intended))
+
+    def test_list_item_inline_fence_rejects_checkbox_update(self):
+        base = "## Acceptance criteria\n\n- ```text\n  - [ ] Example only.\n  ```\n"
+        intended = "## Acceptance criteria\n\n- ```text\n  - [x] Example only.\n  ```\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_ordered_list_inline_tilde_fence_rejects_checkbox_update(self):
+        base = "## Acceptance criteria\n\n1. ~~~text\n   - [ ] Example only.\n   ~~~\n"
+        intended = "## Acceptance criteria\n\n1. ~~~text\n   - [x] Example only.\n   ~~~\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_ten_digit_ordered_pseudo_list_is_rejected(self):
+        base = "## Acceptance criteria\n\n1234567890. [ ] Not a list.\n"
+        intended = "## Acceptance criteria\n\n1234567890. [x] Not a list.\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_list_item_heading_closes_acceptance_section(self):
+        base = "## Acceptance criteria\n\n- ## Operator checklist\n  - [ ] Deploy.\n"
+        intended = "## Acceptance criteria\n\n- ## Operator checklist\n  - [x] Deploy.\n"
+        self.assertTrue(forge_body.validate_marker_only_update(base, intended))
+
+    def test_list_item_heading_opens_acceptance_section(self):
+        base = "## Context\n\n- ## Acceptance criteria\n  - [ ] Criterion.\n"
+        intended = "## Context\n\n- ## Acceptance criteria\n  - [x] Criterion.\n"
+        self.assertEqual([], forge_body.validate_marker_only_update(base, intended))
+
+    def test_marker_only_validation_fails_closed_without_commonmark_parser(self):
+        parser = forge_body.MarkdownIt
+        forge_body.MarkdownIt = None
+        try:
+            errors = forge_body.validate_marker_only_update(
+                "## Acceptance criteria\n\n- [ ] Criterion.\n",
+                "## Acceptance criteria\n\n- [x] Criterion.\n",
+            )
+        finally:
+            forge_body.MarkdownIt = parser
+        self.assertIn("requires markdown-it-py", errors[0])
 
 
 if __name__ == "__main__":
