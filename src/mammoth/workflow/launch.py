@@ -11,8 +11,8 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -132,7 +132,7 @@ class SupervisedProcess:
 def command_for_step(step: StepConfig) -> tuple[str, ...]:
     """Return a local command or standard ``torch.distributed.run`` command."""
     if step.launcher == "local":
-        return step.command
+        return tuple(step.command)
     return (
         sys.executable,
         "-m",
@@ -164,7 +164,8 @@ def launch_process(
     try:
         return_code = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
-        process.stop()
+        with _defer_termination_signals():
+            process.stop()
         return ProcessResult(
             return_code=process.returncode if process.returncode is not None else -signal.SIGKILL,
             duration_seconds=time.monotonic() - started,
@@ -172,13 +173,21 @@ def launch_process(
             signal=signal.SIGTERM,
         )
     except KeyboardInterrupt:
-        process.stop()
+        with _defer_termination_signals():
+            process.stop()
         return ProcessResult(
             return_code=process.returncode if process.returncode is not None else -signal.SIGINT,
             duration_seconds=time.monotonic() - started,
             interrupted=True,
             signal=signal.SIGINT,
         )
+    except BaseException:
+        # Programmatic workflow runners translate termination signals into a
+        # caller-owned interruption type.  Reap the owned child before that
+        # type reaches their attempt/lease cleanup path.
+        with _defer_termination_signals():
+            process.stop()
+        raise
     return ProcessResult(
         return_code=return_code,
         duration_seconds=time.monotonic() - started,
@@ -215,7 +224,8 @@ def run_captured_process(
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
-        supervisor.stop()
+        with _defer_termination_signals():
+            supervisor.stop()
         # A second communicate returns the complete stream contents. Do not combine
         # TimeoutExpired.output with it: subprocess may expose overlapping data.
         stdout, stderr = process.communicate()
@@ -229,7 +239,8 @@ def run_captured_process(
             signal=-return_code if return_code < 0 else None,
         )
     except BaseException:
-        supervisor.stop()
+        with _defer_termination_signals():
+            supervisor.stop()
         raise
 
     return_code = process.returncode if process.returncode is not None else -signal.SIGKILL
@@ -240,6 +251,34 @@ def run_captured_process(
         duration_seconds=time.monotonic() - started,
         signal=-return_code if return_code < 0 else None,
     )
+
+
+@contextmanager
+def _defer_termination_signals() -> Iterator[None]:
+    """Keep a second termination request from interrupting child reaping."""
+    if not hasattr(signal, "SIGTERM"):
+        yield
+        return
+    signals = (signal.SIGINT, signal.SIGTERM)
+    previous: dict[signal.Signals, Any] = {}
+    installed: list[signal.Signals] = []
+
+    def defer(_signal_number: int, _frame: object) -> None:
+        return
+
+    try:
+        try:
+            for signal_number in signals:
+                previous[signal_number] = signal.getsignal(signal_number)
+                signal.signal(signal_number, defer)
+                installed.append(signal_number)
+        except ValueError:
+            yield
+        else:
+            yield
+    finally:
+        for signal_number in reversed(installed):
+            signal.signal(signal_number, previous[signal_number])
 
 
 def terminate_process_tree(

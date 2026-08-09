@@ -63,7 +63,7 @@ src/mammoth/
 | `mammoth.logging` | `Observation`, `Media`, `ObservationSink`, `RunObserver`, `JsonlEventSink`, `ExecutionObservability`, `ExecutionLogging`, `ProcessTextLogHandler`, `ProcessTextLogLease`, `claim_process_text_log`, `create_execution_observability`, `create_execution_logging`, `create_process_text_handler` |
 | `mammoth.logging.tensorboard` | `TensorBoardSink` |
 | `mammoth.monitor` | `ExecutionMonitor`, `RunMonitor`, `MonitorSnapshot`, `RunSnapshot`, `ProducerKey`, `ProducerState`, `TaskState`, `MetricPoint`, `ViewerTelemetry`, discovery/folding/rendering functions, and viewer telemetry sampling |
-| `mammoth.workflow` | `WorkflowConfig`, `RunConfig`, `StepConfig`, `CommandPlan`, `SupervisedProcess`, `ProcessResult`, `CapturedProcessResult`, `run_captured_process`, `WorkflowResult`, `RunResult`, `StepResult`, workflow loading/planning/running functions, and command construction |
+| `mammoth.workflow` | Schema-v1 `WorkflowConfig`, `RunConfig`, and `StepConfig`; caller-built `ProgrammaticWorkflow`, `ProgrammaticRun`, `ExecutionInputs`, `DispatchEntry`, and read-only pre-dispatch context; `CommandPlan`, supervised process values, structured run/step/dispatch results, schema compilation, programmatic planning/validation/execution, YAML compatibility functions, and command construction |
 | `mammoth.torch` | `TorchBackendConfig`, `TorchBackendState`, `TorchSeedPolicy`, backend/seed application and reversible backend context, shared device resolution, `Runtime`, context-managed `ExecutionSession` with owned observer/background-pipeline/trainer factories, `RuntimeConfig`, `ExecutionRequest` with automatic resumed-join fact validation, `initialize_runtime`, `Trainer`, `TrainerConfig`, `TorchCompileConfig`, `TrainerState`, `TrainerResult`, `StepContext`, `StepFunction`, `StepOutput`, `WarmupLinearLR`, `AccumulationPlan`, `AccumulationPolicy`, `UniformAccumulationPolicy`, `WeightedAccumulationPolicy`, `WeightedDistributedBatchSampler`, `WeightedTaskAssignment`, weighted task allocation and count/index partition helpers, `MetricSpec`, `MetricRoute`, `MetricAccumulator`, `StatefulMetric`, callable profiling configuration/results/runtime controls/report publication, named-phase measurement and immutable summaries, public CUDA synchronization/allocator helpers, public profiler-row normalization, `Callback`, `EarlyStopping`, `CheckpointMode`, `CheckpointCaptureMode`, `CheckpointRole`, `CheckpointSavePolicy`, `CheckpointComponent`, `CheckpointInspection`, `RestoreOptions`, `TrainerCheckpointContext`, `TrainerCheckpointRestore`, `TrainerCheckpointWriters`, `TrainerCheckpointPolicy`, `StateRegistry`, `CheckpointArtifact`, `CheckpointPlan`, `PublishedCheckpoint`, `ResumableCheckpointCandidate`, and standard checkpoint filename/parser/discovery APIs, `CheckpointPublication`, `AsyncCheckpointPublisher` compatibility adapter over the core pipeline, recursive batch movement with bounded CUDA copy-stream prefetch for eligible pinned batches, trainer-owned checkpoint selection/naming/retention, ordered publication and exact-byte receipt delivery, checkpoint creation, and checkpoint restoration |
 
 ## Command Routes
@@ -80,6 +80,11 @@ mammoth.cli.app (Typer)
     └── mammoth workflow run
         └── mammoth.cli.run_workflow_command
             └── mammoth.workflow.run_workflow
+                └── compile_workflow → run_programmatic_workflow
+
+caller-owned configuration
+    └── mammoth.workflow.ProgrammaticWorkflow
+        └── validate_programmatic_workflow → run_programmatic_workflow
 ```
 
 ## Current Import Graph

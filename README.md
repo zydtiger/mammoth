@@ -179,6 +179,66 @@ Mammoth validates unknown settings, missing dependencies, and dependency
 cycles before launching commands. Run `uv run mammoth workflow run --help` for
 the full CLI reference.
 
+## Execute a caller-compiled workflow
+
+Projects that already have their own runset schema can keep it. Compile that
+schema into Mammoth's programmatic API when you need isolated run attempts and
+an explicit serial order that interleaves runs. Mammoth validates the complete
+plan before creating an entry directory, lease, execution context, or event.
+
+```python
+from pathlib import Path
+
+from mammoth.core import RunLayout
+from mammoth.workflow import (
+    DispatchEntry,
+    ExecutionInputs,
+    ProgrammaticRun,
+    ProgrammaticWorkflow,
+    StepConfig,
+    run_programmatic_workflow,
+)
+
+entry = Path("runs")
+
+def make_run(name: str) -> ProgrammaticRun:
+    return ProgrammaticRun(
+        name=name,
+        layout=RunLayout(entry, name),
+        steps=(
+            StepConfig("train", ("project-train", "--run", name)),
+            StepConfig("validate", ("project-validate", "--run", name), needs=("train",)),
+        ),
+        execution=ExecutionInputs(
+            invocation_kind="project-workflow",
+            command=("project", "runset", "campaign.yaml"),
+            config_reference="campaign.yaml",
+        ),
+    )
+
+workflow = ProgrammaticWorkflow(
+    runs=(make_run("a"), make_run("b")),
+    dispatch=(
+        DispatchEntry("a", "train"),
+        DispatchEntry("b", "train"),
+        DispatchEntry("a", "validate"),
+        DispatchEntry("b", "validate"),
+    ),
+)
+result = run_programmatic_workflow(workflow)
+```
+
+Each run gets its own `RunLayout`, logical-run lease, execution ID, immutable
+metadata, and `runner.jsonl` event stream. `result.dispatch` preserves the
+explicit global order, while `result.run(name)` and `result.step(run, step)`
+provide direct lookup. Use `dry_run=True` to receive the fully resolved command
+plan with no filesystem or execution side effects.
+
+The caller owns compilation, phase names, command arguments, and optional
+pre-dispatch project work. Mammoth owns serial dispatch, dependency and
+first-failure propagation, lifecycle events, child cleanup, and lease release.
+Commands remain tokenized argv sequences; no command is run through a shell.
+
 ## Capture a supervised command
 
 For callers that need a child's text output without reimplementing pipe
