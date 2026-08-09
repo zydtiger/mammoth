@@ -30,7 +30,7 @@ type PublicationMode = Literal["create_only", "replace"]
 type RecoveryPolicy = Literal["roll_forward", "rollback_before_commit"]
 type ArtifactValidator = Callable[[Path], object]
 
-_JOURNAL_VERSION = 1
+_JOURNAL_VERSION = 2
 _TRANSACTION_DIRECTORY_NAME = ".mammoth-transactions"
 _JOURNAL_DIRECTORY_NAME = "journals"
 _TRANSACTION_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
@@ -41,8 +41,8 @@ _ARTIFACT_STATES = frozenset(
 )
 _RENAME_NOREPLACE = 1
 _RENAME_EXCHANGE = 2
-_ACTIVE_TRANSACTION_ROOT: ContextVar[tuple[Path, int] | None] = ContextVar(
-    "mammoth_active_transaction_root", default=None
+_ACTIVE_TRANSACTION_ROOTS: ContextVar[tuple[tuple[Path, int], ...] | None] = ContextVar(
+    "mammoth_active_transaction_roots", default=None
 )
 
 
@@ -86,7 +86,9 @@ class TransactionArtifact:
 class ArtifactTransactionPlan:
     """Immutable caller contract for one local publication transaction.
 
-    Every target and stage must live beneath the pre-existing ``lease_root``.
+    ``lease_root`` is the pre-existing coordinator root that owns the journal.
+    ``artifact_roots`` optionally declares the local filesystem boundaries that
+    contain artifacts. Omitting it preserves the original one-root contract.
     ``create_only`` plans roll forward after interruption; ``replace`` plans
     restore their authenticated prior generation before the commit point.
     """
@@ -96,6 +98,7 @@ class ArtifactTransactionPlan:
     artifacts: tuple[TransactionArtifact, ...]
     mode: PublicationMode
     recovery_policy: RecoveryPolicy
+    artifact_roots: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,7 +180,7 @@ def transaction_retired_object_path(
     if role not in {"stage", "backup", "rollback-stage", "rollback-backup", "rollback-target"}:
         raise ValueError(f"transaction cleanup role is unsupported: {role}")
     return (
-        Path(plan.lease_root)
+        transaction_artifact_root(plan, artifact)
         / _TRANSACTION_DIRECTORY_NAME
         / "retired"
         / plan.transaction_id
@@ -288,7 +291,7 @@ def validate_artifact_transaction_plan(
             "create_only requires roll_forward and replace requires rollback_before_commit"
         )
     lease_root = require_safe_directory(Path(plan.lease_root), "lease_root")
-    lease_root_device = lease_root.stat().st_dev
+    artifact_roots = normalize_transaction_artifact_roots(plan, lease_root)
     if not plan.artifacts or len(plan.artifacts) < 2:
         raise ArtifactTransactionValidationError(
             "a transaction must contain at least two artifacts"
@@ -307,9 +310,17 @@ def validate_artifact_transaction_plan(
             raise ArtifactTransactionValidationError("transaction artifact kind is invalid")
         if artifact.validator is not None and not callable(artifact.validator):
             raise TypeError("transaction artifact validator must be callable or None")
-        target = normalize_transaction_path(artifact.target, lease_root, "target")
-        stage = normalize_transaction_path(artifact.stage, lease_root, "stage")
-        if target == lease_root or target.is_relative_to(lease_root / _TRANSACTION_DIRECTORY_NAME):
+        target = normalize_transaction_path(artifact.target, "target")
+        stage = normalize_transaction_path(artifact.stage, "stage")
+        target_root = transaction_root_for_path(target, artifact_roots, "target")
+        stage_root = transaction_root_for_path(stage, artifact_roots, "stage")
+        if target_root != stage_root:
+            raise ArtifactTransactionValidationError(
+                "transaction target and stage must share one declared artifact_root"
+            )
+        if target == target_root or target.is_relative_to(
+            target_root / _TRANSACTION_DIRECTORY_NAME
+        ):
             raise ArtifactTransactionValidationError("transaction target overlaps Mammoth metadata")
         if target.parent != stage.parent:
             raise ArtifactTransactionValidationError(
@@ -324,13 +335,13 @@ def validate_artifact_transaction_plan(
             raise ArtifactTransactionValidationError("transaction stage and target must differ")
         validate_existing_object(stage, artifact.kind, "stage", allow_missing=allow_missing_stages)
         validate_existing_object(target, artifact.kind, "target", allow_missing=True)
-        if target.parent.stat().st_dev != lease_root_device:
+        if target.parent.stat().st_dev != target_root.stat().st_dev:
             raise ArtifactTransactionValidationError(
-                "transaction target parent must share lease_root's filesystem"
+                "transaction target parent must share its artifact_root's filesystem"
             )
-        if object_exists(stage) and stage.stat().st_dev != lease_root_device:
+        if object_exists(stage) and stage.stat().st_dev != target_root.stat().st_dev:
             raise ArtifactTransactionValidationError(
-                "transaction stage must share lease_root's filesystem"
+                "transaction stage must share its artifact_root's filesystem"
             )
         normalized.append(
             TransactionArtifact(
@@ -341,16 +352,18 @@ def validate_artifact_transaction_plan(
                 validator=artifact.validator,
             )
         )
-    for index, first in enumerate(normalized):
-        for second in normalized[index + 1 :]:
-            validate_artifact_topology_pair(plan, first, second)
-    return ArtifactTransactionPlan(
+    normalized_plan = ArtifactTransactionPlan(
         transaction_id=plan.transaction_id,
         lease_root=lease_root,
         artifacts=tuple(normalized),
         mode=plan.mode,
         recovery_policy=plan.recovery_policy,
+        artifact_roots=artifact_roots,
     )
+    for index, first in enumerate(normalized):
+        for second in normalized[index + 1 :]:
+            validate_artifact_topology_pair(normalized_plan, first, second)
+    return normalized_plan
 
 
 def validate_artifact_topology_pair(
@@ -414,15 +427,47 @@ def require_safe_directory(path: Path, label: str) -> Path:
     return absolute
 
 
-def normalize_transaction_path(path: Path, lease_root: Path, label: str) -> Path:
-    """Constrain a final path to the real caller-selected transaction root."""
+def normalize_transaction_artifact_roots(
+    plan: ArtifactTransactionPlan, coordinator_root: Path
+) -> tuple[Path, ...]:
+    """Validate caller-selected artifact roots without inferring mount boundaries."""
+    raw_roots = plan.artifact_roots or (coordinator_root,)
+    roots = tuple(require_safe_directory(Path(root), "artifact_root") for root in raw_roots)
+    if len(set(roots)) != len(roots):
+        raise ArtifactTransactionValidationError("transaction artifact_roots must be unique")
+    for index, first in enumerate(roots):
+        for second in roots[index + 1 :]:
+            if first.is_relative_to(second) or second.is_relative_to(first):
+                raise ArtifactTransactionValidationError(
+                    "transaction artifact_roots must not overlap or nest"
+                )
+    return tuple(sorted(roots, key=str))
+
+
+def transaction_root_for_path(path: Path, roots: tuple[Path, ...], label: str) -> Path:
+    """Find the one declared root that confines one artifact path."""
+    matches = tuple(root for root in roots if path.is_relative_to(root))
+    if len(matches) != 1:
+        raise ArtifactTransactionValidationError(
+            "transaction "
+            f"{label} must be beneath lease_root or exactly one declared artifact root: {path}"
+        )
+    return matches[0]
+
+
+def transaction_artifact_root(
+    plan: ArtifactTransactionPlan, artifact: TransactionArtifact
+) -> Path:
+    """Return the declared local root that owns one artifact's durable mutations."""
+    roots = plan.artifact_roots or (Path(plan.lease_root),)
+    return transaction_root_for_path(Path(artifact.target), roots, "target")
+
+
+def normalize_transaction_path(path: Path, label: str) -> Path:
+    """Normalize one no-follow artifact path before assigning its declared root."""
     if not isinstance(path, Path):
         raise TypeError(f"transaction {label} must be a pathlib.Path")
     absolute = Path(os.path.abspath(path))
-    if not absolute.is_relative_to(lease_root):
-        raise ArtifactTransactionValidationError(
-            f"transaction {label} must be beneath lease_root: {absolute}"
-        )
     require_no_symlink_components(absolute.parent)
     if absolute.exists() or absolute.is_symlink():
         final_stat = os.lstat(absolute)
@@ -481,9 +526,12 @@ def claim_artifact_transaction_leases(plan: ArtifactTransactionPlan) -> _Transac
     """Acquire every target and ancestor lease in deterministic order."""
     validated = validate_artifact_transaction_plan(plan, allow_missing_stages=True)
     leases: list[_TransactionLease] = []
-    root_descriptor = open_absolute_directory_without_symlinks(validated.lease_root)
+    root_descriptors: list[tuple[Path, int]] = []
     try:
-        for protected_path in transaction_protected_paths(validated):
+        roots = tuple(dict.fromkeys((validated.lease_root, *validated.artifact_roots)))
+        for root in roots:
+            root_descriptors.append((root, open_absolute_directory_without_symlinks(root)))
+        for protected_path, _root in transaction_protected_paths(validated):
             digest = hashlib.sha256(str(protected_path).encode("utf-8")).hexdigest()
             lease_path = protected_path.parent / f".mammoth-txn-lease-{digest}.lock"
             descriptor = open_transaction_lease(lease_path)
@@ -498,9 +546,10 @@ def claim_artifact_transaction_leases(plan: ArtifactTransactionPlan) -> _Transac
     except BaseException:
         for lease in reversed(leases):
             lease.close()
-        os.close(root_descriptor)
+        for _root, descriptor in reversed(root_descriptors):
+            os.close(descriptor)
         raise
-    return _TransactionLeases(leases, validated.lease_root, root_descriptor)
+    return _TransactionLeases(leases, root_descriptors)
 
 
 @dataclass(slots=True)
@@ -508,36 +557,37 @@ class _TransactionLeases:
     """Context manager that owns all leases acquired for one operation."""
 
     leases: list[_TransactionLease]
-    lease_root: Path
-    root_descriptor: int
-    context_token: Token[tuple[Path, int] | None] | None = None
+    root_descriptors: list[tuple[Path, int]]
+    context_token: Token[tuple[tuple[Path, int], ...] | None] | None = None
 
     def __enter__(self) -> _TransactionLeases:
         """Keep all target locks until publication or recovery has finished."""
-        self.context_token = _ACTIVE_TRANSACTION_ROOT.set((self.lease_root, self.root_descriptor))
+        self.context_token = _ACTIVE_TRANSACTION_ROOTS.set(tuple(self.root_descriptors))
         return self
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         """Release every lease in reverse order after the operation boundary."""
         if self.context_token is not None:
-            _ACTIVE_TRANSACTION_ROOT.reset(self.context_token)
+            _ACTIVE_TRANSACTION_ROOTS.reset(self.context_token)
             self.context_token = None
         for lease in reversed(self.leases):
             lease.close()
-        os.close(self.root_descriptor)
+        for _root, descriptor in reversed(self.root_descriptors):
+            os.close(descriptor)
 
 
-def transaction_protected_paths(plan: ArtifactTransactionPlan) -> tuple[Path, ...]:
+def transaction_protected_paths(plan: ArtifactTransactionPlan) -> tuple[tuple[Path, Path], ...]:
     """Return ordered target and ancestor identities so overlap shares a lease."""
-    protected: set[Path] = set()
+    protected: set[tuple[Path, Path]] = set()
     for artifact in plan.artifacts:
+        root = transaction_artifact_root(plan, artifact)
         current = artifact.target
         while True:
-            protected.add(current)
-            if current == plan.lease_root:
+            protected.add((current, root))
+            if current == root:
                 break
             current = current.parent
-    return tuple(sorted(protected, key=str))
+    return tuple(sorted(protected, key=lambda item: (str(item[1]), str(item[0]))))
 
 
 def ensure_transaction_metadata_directory(lease_root: Path) -> Path:
@@ -555,13 +605,16 @@ def ensure_transaction_journal_directory(lease_root: Path) -> Path:
     return journal_directory
 
 
-def ensure_transaction_retired_directory(plan: ArtifactTransactionPlan) -> Path:
+def ensure_transaction_retired_directory(
+    plan: ArtifactTransactionPlan, artifact: TransactionArtifact
+) -> Path:
     """Create the private deterministic holding directory for one transaction cleanup."""
-    metadata_directory = ensure_transaction_metadata_directory(plan.lease_root)
+    root = transaction_artifact_root(plan, artifact)
+    metadata_directory = ensure_transaction_metadata_directory(root)
     retired_directory = metadata_directory / "retired"
     transaction_directory = retired_directory / plan.transaction_id
-    ensure_confined_directory(retired_directory, plan.lease_root)
-    ensure_confined_directory(transaction_directory, plan.lease_root)
+    ensure_confined_directory(retired_directory, root)
+    ensure_confined_directory(transaction_directory, root)
     return transaction_directory
 
 
@@ -625,9 +678,10 @@ def create_transaction_records(plan: ArtifactTransactionPlan) -> list[dict[str, 
     """Seal stages and capture the authenticated prior generation before journaling."""
     records: list[dict[str, Any]] = []
     for artifact in plan.artifacts:
+        root = transaction_artifact_root(plan, artifact)
         stage_identity = inspect_transaction_object(artifact.stage, artifact.kind, synchronize=True)
         run_artifact_validator(artifact, artifact.stage, "staged")
-        sync_directory_strict(artifact.stage.parent)
+        sync_directory_strict(artifact.stage.parent, lease_root=root)
         original_identity = (
             inspect_transaction_object(artifact.target, artifact.kind, synchronize=False)
             if artifact.target.exists()
@@ -789,8 +843,18 @@ def open_confined_directory(path: Path, *, lease_root: Path | None = None) -> in
         raise ArtifactTransactionValidationError(
             f"transaction path escapes lease_root: {path}"
         ) from error
-    active_root = _ACTIVE_TRANSACTION_ROOT.get()
-    if active_root is not None and active_root[0] == root:
+    active_roots = _ACTIVE_TRANSACTION_ROOTS.get()
+    active_root = None
+    if active_roots is not None:
+        active_root = next(
+            (
+                (active_path, descriptor)
+                for active_path, descriptor in active_roots
+                if active_path == root
+            ),
+            None,
+        )
+    if active_root is not None:
         current_descriptor = open_absolute_directory_without_symlinks(root)
         try:
             active_stat = os.fstat(active_root[1])
@@ -874,11 +938,12 @@ def identity_from_json(value: object) -> TransactionObjectIdentity:
 def create_journal_payload(
     plan: ArtifactTransactionPlan, records: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """Build the durable schema-v1 record before any target path changes."""
+    """Build the durable schema-v2 record before any target path changes."""
     return {
         "version": _JOURNAL_VERSION,
         "transaction_id": plan.transaction_id,
         "lease_root": str(plan.lease_root),
+        "lease_roots": [str(root) for root in plan.artifact_roots],
         "mode": plan.mode,
         "recovery_policy": plan.recovery_policy,
         "state": "prepared",
@@ -1059,25 +1124,36 @@ def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def validate_journal_schema(value: object) -> None:
     """Require the complete versioned journal shape before recovery reads it."""
-    journal = require_exact_mapping(
-        value,
-        {
-            "version",
-            "transaction_id",
-            "lease_root",
-            "mode",
-            "recovery_policy",
-            "state",
-            "artifacts",
-        },
-        "journal",
-    )
-    if journal["version"] != _JOURNAL_VERSION:
+    journal = require_mapping(value, "journal")
+    version = journal.get("version")
+    required = {
+        "version",
+        "transaction_id",
+        "lease_root",
+        "mode",
+        "recovery_policy",
+        "state",
+        "artifacts",
+    }
+    if version == 2:
+        required.add("lease_roots")
+    elif version != 1:
         raise ArtifactTransactionRecoveryError("transaction journal version is unsupported")
+    if set(journal) != required:
+        raise ArtifactTransactionRecoveryError("journal fields are unsupported")
     transaction_id = require_string(journal["transaction_id"], "journal transaction_id")
     if not _TRANSACTION_ID_PATTERN.fullmatch(transaction_id):
         raise ArtifactTransactionRecoveryError("journal transaction_id is invalid")
     require_string(journal["lease_root"], "journal lease_root")
+    if version == 2:
+        roots = journal["lease_roots"]
+        if (
+            not isinstance(roots, list)
+            or not roots
+            or not all(isinstance(root, str) and root for root in roots)
+            or len(set(roots)) != len(roots)
+        ):
+            raise ArtifactTransactionRecoveryError("journal lease_roots are invalid")
     if journal["mode"] not in {"create_only", "replace"}:
         raise ArtifactTransactionRecoveryError("journal mode is invalid")
     if journal["recovery_policy"] not in {"roll_forward", "rollback_before_commit"}:
@@ -1175,6 +1251,15 @@ def validate_journal_matches_plan(journal: dict[str, Any], plan: ArtifactTransac
         raise ArtifactTransactionRecoveryError(
             "journal does not match the expected transaction plan"
         )
+    if journal["version"] == 1:
+        if plan.artifact_roots != (plan.lease_root,):
+            raise ArtifactTransactionRecoveryError(
+                "schema-v1 journal cannot recover a multi-root transaction"
+            )
+    elif journal["lease_roots"] != [str(root) for root in plan.artifact_roots]:
+        raise ArtifactTransactionRecoveryError(
+            "journal does not match the expected transaction roots"
+        )
     records = journal["artifacts"]
     if not isinstance(records, list) or len(records) != len(plan.artifacts):
         raise ArtifactTransactionRecoveryError("journal artifact topology does not match plan")
@@ -1234,6 +1319,7 @@ def publish_journal_record(
     record: dict[str, Any],
 ) -> None:
     """Publish or authenticate exactly one target while preserving its prior generation."""
+    root = transaction_artifact_root(plan, artifact)
     stage_identity = identity_from_json(record["stage_identity"])
     original_identity = (
         identity_from_json(record["original_identity"])
@@ -1280,9 +1366,9 @@ def publish_journal_record(
     record["status"] = "publishing"
     update_transaction_journal(journal_handle, journal, lease_root=plan.lease_root)
     rename_without_overwrite(
-        artifact.stage, artifact.target, lease_root=plan.lease_root
+        artifact.stage, artifact.target, lease_root=root
     )
-    sync_directory_strict(artifact.target.parent, lease_root=plan.lease_root)
+    sync_directory_strict(artifact.target.parent, lease_root=root)
     require_matching_object(artifact.target, stage_identity, "published target")
     run_artifact_validator(artifact, artifact.target, "published")
     record["status"] = "published"
@@ -1300,6 +1386,7 @@ def move_original_to_backup(
     target_exists: bool,
 ) -> None:
     """Durably retain the authenticated original before replacement publication."""
+    root = transaction_artifact_root(plan, artifact)
     if original_identity is None:
         if target_exists:
             raise ArtifactTransactionRecoveryError(
@@ -1322,8 +1409,8 @@ def move_original_to_backup(
     require_matching_object(artifact.target, original_identity, "replacement original")
     record["status"] = "backup_moving"
     update_transaction_journal(journal_handle, journal, lease_root=plan.lease_root)
-    rename_without_overwrite(artifact.target, backup, lease_root=plan.lease_root)
-    sync_directory_strict(artifact.target.parent, lease_root=plan.lease_root)
+    rename_without_overwrite(artifact.target, backup, lease_root=root)
+    sync_directory_strict(artifact.target.parent, lease_root=root)
     require_matching_object(backup, original_identity, "replacement backup")
     record["status"] = "backup_moved"
     update_transaction_journal(journal_handle, journal, lease_root=plan.lease_root)
@@ -1393,6 +1480,7 @@ def rollback_journaled_transaction(
         )
     restored: list[Path] = []
     for artifact, record in zip(plan.artifacts, journal_records(journal), strict=True):
+        root = transaction_artifact_root(plan, artifact)
         stage_identity = identity_from_json(record["stage_identity"])
         original_identity = (
             identity_from_json(record["original_identity"])
@@ -1424,9 +1512,9 @@ def rollback_journaled_transaction(
                     )
                 else:
                     rename_without_overwrite(
-                        backup, artifact.target, lease_root=plan.lease_root
+                        backup, artifact.target, lease_root=root
                     )
-                    sync_directory_strict(artifact.target.parent, lease_root=plan.lease_root)
+                    sync_directory_strict(artifact.target.parent, lease_root=root)
                     require_matching_object(artifact.target, original_identity, "restored target")
                     restored.append(artifact.target)
             elif not object_exists(artifact.target):
@@ -1581,7 +1669,8 @@ def retire_and_remove_transaction_object(
     after the first rename leaves a discoverable object that a later recovery
     can remove without requiring the original caller-visible name to reappear.
     """
-    ensure_transaction_retired_directory(plan)
+    root = transaction_artifact_root(plan, artifact)
+    ensure_transaction_retired_directory(plan, artifact)
     retired = transaction_retired_object_path(plan, artifact, role)
     path_exists = object_exists(path)
     retired_exists = object_exists(retired)
@@ -1591,14 +1680,14 @@ def retire_and_remove_transaction_object(
         )
     if path_exists:
         require_matching_object(path, identity, f"{role} cleanup object")
-        rename_without_overwrite(path, retired, lease_root=plan.lease_root)
-        sync_directory_strict(path.parent, lease_root=plan.lease_root)
-        sync_directory_strict(retired.parent, lease_root=plan.lease_root)
+        rename_without_overwrite(path, retired, lease_root=root)
+        sync_directory_strict(path.parent, lease_root=root)
+        sync_directory_strict(retired.parent, lease_root=root)
         if not object_matches(retired, identity):
             if not object_exists(path):
-                rename_without_overwrite(retired, path, lease_root=plan.lease_root)
-                sync_directory_strict(path.parent, lease_root=plan.lease_root)
-                sync_directory_strict(retired.parent, lease_root=plan.lease_root)
+                rename_without_overwrite(retired, path, lease_root=root)
+                sync_directory_strict(path.parent, lease_root=root)
+                sync_directory_strict(retired.parent, lease_root=root)
             raise ArtifactTransactionRecoveryError(
                 f"{role} cleanup object changed during retirement; preserving evidence: {path}"
             )
@@ -1607,11 +1696,11 @@ def retire_and_remove_transaction_object(
         return
     if identity.kind == "file":
         require_matching_object(retired, identity, f"retired {role} cleanup object")
-        remove_file_at_path(retired, lease_root=plan.lease_root)
-        sync_directory_strict(retired.parent, lease_root=plan.lease_root)
+        remove_file_at_path(retired, lease_root=root)
+        sync_directory_strict(retired.parent, lease_root=root)
         return
-    remove_retired_directory_tree(retired, identity, lease_root=plan.lease_root)
-    sync_directory_strict(retired.parent, lease_root=plan.lease_root)
+    remove_retired_directory_tree(retired, identity, lease_root=root)
+    sync_directory_strict(retired.parent, lease_root=root)
 
 
 def remove_file_at_path(path: Path, *, lease_root: Path) -> None:
