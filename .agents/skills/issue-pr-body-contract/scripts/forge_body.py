@@ -9,6 +9,11 @@ import sys
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
+try:
+    from markdown_it import MarkdownIt
+except ImportError:  # pragma: no cover - exercised by the fail-closed unit test
+    MarkdownIt = None  # type: ignore[assignment,misc]
+
 
 FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 NESTED_FENCE_RE = re.compile(r"^ {4,}(`{3,}|~{3,})(.*)$")
@@ -165,7 +170,7 @@ def _table_line_numbers(lines: Sequence[str]) -> set:
     return table_lines
 
 
-def validate_markdown(body: str) -> List[str]:
+def validate_markdown(body: str, *, check_editorial_style: bool = True) -> List[str]:
     """Return source-format violations without altering substantive content."""
 
     normalized = body.replace("\r\n", "\n")
@@ -264,11 +269,12 @@ def validate_markdown(body: str) -> List[str]:
                         f"{kind} blocks with one blank line"
                     )
 
-        capitalization_error = _capitalization_error(
-            line_number, line, nested_list_context=nested_list_context
-        )
-        if capitalization_error:
-            errors.append(capitalization_error)
+        if check_editorial_style:
+            capitalization_error = _capitalization_error(
+                line_number, line, nested_list_context=nested_list_context
+            )
+            if capitalization_error:
+                errors.append(capitalization_error)
 
         previous_nonblank = (line_number, kind)
         blank_since_previous = False
@@ -292,7 +298,7 @@ def validate_markdown(body: str) -> List[str]:
 def verify_round_trip(intended: str, returned: str) -> List[str]:
     """Validate the source and compare it with the raw forge body."""
 
-    errors = validate_markdown(intended)
+    errors = validate_markdown(intended, check_editorial_style=False)
     if normalize_for_comparison(intended) == normalize_for_comparison(returned):
         return errors
 
@@ -313,6 +319,69 @@ def verify_round_trip(intended: str, returned: str) -> List[str]:
         "returned body does not match the intended Markdown after CRLF and "
         "single trailing-newline normalization"
     )
+    return errors
+
+
+def validate_marker_only_update(base: str, intended: str) -> List[str]:
+    """Allow only unchecked-to-checked checklist marker changes in a body."""
+
+    base_lines = normalize_for_comparison(base).split("\n")
+    intended_lines = normalize_for_comparison(intended).split("\n")
+    if len(base_lines) != len(intended_lines):
+        return ["marker-only update changes the body line count"]
+    if MarkdownIt is None:
+        return [
+            "marker-only validation requires markdown-it-py for CommonMark structure"
+        ]
+
+    marker = re.compile(
+        r"^(?P<prefix>\s*(?:[-+*]|\d+[.)])\s+\[)"
+        r"(?P<state> |x|X)(?P<suffix>\]\s+.*)$"
+    )
+    errors: List[str] = []
+    acceptance_list_lines: set[int] = set()
+    in_acceptance_criteria = False
+    tokens = MarkdownIt("commonmark").parse("\n".join(base_lines))
+    for index, token in enumerate(tokens):
+        if token.type == "heading_open":
+            inline = tokens[index + 1] if index + 1 < len(tokens) else None
+            heading_text = inline.content if inline and inline.type == "inline" else ""
+            in_acceptance_criteria = (
+                heading_text.strip().casefold() == "acceptance criteria"
+            )
+        elif (
+            in_acceptance_criteria
+            and token.type == "list_item_open"
+            and token.map is not None
+        ):
+            acceptance_list_lines.add(token.map[0] + 1)
+
+    for line_number, (before, after) in enumerate(zip(base_lines, intended_lines), start=1):
+        if before == after:
+            continue
+        before_match = marker.match(before)
+        after_match = marker.match(after)
+        if (
+            before_match is None
+            or after_match is None
+            or before_match.group("prefix") != after_match.group("prefix")
+            or before_match.group("suffix") != after_match.group("suffix")
+            or before_match.group("state") != " "
+            or after_match.group("state").lower() != "x"
+            or line_number not in acceptance_list_lines
+        ):
+            errors.append(
+                f"line {line_number}: marker-only update changes content other than an unchecked acceptance-criterion marker"
+            )
+    return errors
+
+
+def verify_marker_only_round_trip(base: str, intended: str, returned: str) -> List[str]:
+    """Verify a preserved legacy body without imposing source-style rules."""
+
+    errors = validate_marker_only_update(base, intended)
+    if normalize_for_comparison(intended) != normalize_for_comparison(returned):
+        errors.append("returned body does not match the intended Markdown after CRLF and single trailing-newline normalization")
     return errors
 
 
@@ -347,11 +416,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     verify_parser.add_argument("source", type=Path)
     verify_parser.add_argument("returned", type=Path)
 
+    marker_parser = subparsers.add_parser(
+        "check-marker-only", help="allow only unchecked-to-checked checklist markers"
+    )
+    marker_parser.add_argument("base", type=Path)
+    marker_parser.add_argument("intended", type=Path)
+
+    marker_verify_parser = subparsers.add_parser(
+        "verify-marker-only", help="verify a marker-only update against a raw body"
+    )
+    marker_verify_parser.add_argument("base", type=Path)
+    marker_verify_parser.add_argument("intended", type=Path)
+    marker_verify_parser.add_argument("returned", type=Path)
+
     args = parser.parse_args(argv)
     try:
+        if args.command == "check-marker-only":
+            errors = validate_marker_only_update(
+                read_utf8(args.base, "base"), read_utf8(args.intended, "intended")
+            )
+            if errors:
+                return _print_errors(errors)
+            print("marker-only update is valid")
+            return 0
+        if args.command == "verify-marker-only":
+            errors = verify_marker_only_round_trip(
+                read_utf8(args.base, "base"),
+                read_utf8(args.intended, "intended"),
+                read_utf8(args.returned, "returned"),
+            )
+            if errors:
+                return _print_errors(errors)
+            print("marker-only body round trip verified")
+            return 0
+
         intended = read_utf8(args.source, "intended")
         if args.command == "check-source":
-            errors = validate_markdown(intended)
+            errors = validate_markdown(intended, check_editorial_style=False)
             if errors:
                 return _print_errors(errors)
             print("forge body source is valid")
