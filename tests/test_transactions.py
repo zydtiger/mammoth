@@ -681,7 +681,7 @@ def test_plan_rejects_nested_mount_artifacts_outside_journal_filesystem(tmp_path
             recovery_policy="roll_forward",
         )
 
-        with pytest.raises(ArtifactTransactionValidationError, match="lease_root's filesystem"):
+        with pytest.raises(ArtifactTransactionValidationError, match="artifact_root's filesystem"):
             seal_artifact_transaction(plan)
     finally:
         shutil.rmtree(temporary_root)
@@ -713,7 +713,7 @@ def create_multi_root_plan(
         ArtifactTransactionPlan(
             transaction_id=transaction_id,
             lease_root=coordinator_root,
-            lease_roots=(coordinator_root, payload_root),
+            artifact_roots=(coordinator_root, payload_root),
             artifacts=(
                 TransactionArtifact("report", report_stage, report_target, "file"),
                 TransactionArtifact("payload", payload_stage, payload_target, "directory"),
@@ -797,7 +797,7 @@ def test_multi_root_recovery_accepts_reordered_declared_roots(
         reordered = ArtifactTransactionPlan(
             transaction_id=plan.transaction_id,
             lease_root=plan.lease_root,
-            lease_roots=tuple(reversed(plan.lease_roots)),
+            artifact_roots=tuple(reversed(plan.artifact_roots)),
             artifacts=plan.artifacts,
             mode=plan.mode,
             recovery_policy=plan.recovery_policy,
@@ -910,7 +910,7 @@ def test_multi_root_plan_rejects_an_undeclared_artifact_root(tmp_path: Path) -> 
     invalid = ArtifactTransactionPlan(
         transaction_id=plan.transaction_id,
         lease_root=plan.lease_root,
-        lease_roots=plan.lease_roots,
+        artifact_roots=plan.artifact_roots,
         artifacts=(
             TransactionArtifact("report", outside_stage, outside_root / "report.json", "file"),
             plan.artifacts[1],
@@ -919,7 +919,7 @@ def test_multi_root_plan_rejects_an_undeclared_artifact_root(tmp_path: Path) -> 
         recovery_policy=plan.recovery_policy,
     )
     try:
-        with pytest.raises(ArtifactTransactionValidationError, match="declared lease root"):
+        with pytest.raises(ArtifactTransactionValidationError, match="declared artifact root"):
             seal_artifact_transaction(invalid)
     finally:
         shutil.rmtree(payload_root)
