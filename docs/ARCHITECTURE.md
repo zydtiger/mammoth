@@ -55,30 +55,36 @@ portable path serialization.
 
 For one logical result that spans several local paths, `mammoth.core` owns a
 separate `ArtifactTransactionPlan` protocol. A caller supplies at least two
-prepared `TransactionArtifact` values beneath one pre-existing `lease_root`,
-using the reserved sibling stage path for every stable key. Files are identified
-through `ArtifactReceipt`; ordinary directory trees are sealed, synchronized,
-and recorded with a transaction-local tree identity. Callers may add validators
-that authenticate their own marker or payload semantics, while Mammoth never
-interprets them. The plan explicitly selects `create_only` plus roll-forward
-recovery or `replace` plus rollback-before-commit recovery.
+prepared `TransactionArtifact` values and a pre-existing coordinator
+`lease_root`, which owns the journal. By default every artifact stays below that
+root. A plan may instead declare non-overlapping `lease_roots`; every target and
+its reserved sibling stage must belong to exactly one declared root, and that
+root owns the artifact's backups and retired cleanup objects. Files are
+identified through `ArtifactReceipt`; ordinary directory trees are sealed,
+synchronized, and recorded with a transaction-local tree identity. Callers may
+add validators that authenticate their own marker or payload semantics, while
+Mammoth never interprets them. The plan explicitly selects `create_only` plus
+roll-forward recovery or `replace` plus rollback-before-commit recovery.
 
 Publication first acquires deterministic advisory leases for all target paths
-and their ancestors, anchors the lease root with no-follow directory FDs, then
-writes a strict no-clobber schema-v1 journal below
-`<lease_root>/.mammoth-transactions/`. It synchronizes every staged object
-before the journal and synchronizes each parent directory after a backup move,
-target rename, journal mutation, or cleanup mutation. Replacement retains an
-authenticated original at its transaction-specific backup path until every new
-target is visible and revalidated, at which point the journal's durable
-`committed` state is the recovery boundary. Cleanup first moves remnants to
-deterministic private retired paths, so a crash never leaves an unrecorded
-random quarantine name; it also retires the journal at a deterministic name
-before its final removal. `recover_artifact_transaction()` binds either journal
-name back to the complete caller-supplied plan; it rejects target substitution,
-malformed state, identities that no longer match, symlinks, and special files
-without speculative cleanup. Existing journals always require that explicit
-recovery call.
+and their ancestors within their individual roots, anchors the coordinator and
+all declared roots with no-follow directory FDs, then writes a strict
+no-clobber schema-v2 journal below
+`<lease_root>/.mammoth-transactions/`. The journal records the canonical set of
+artifact roots; schema-v1 journals remain recoverable only with the original
+one-root plan. Mammoth synchronizes every staged object before the journal and
+synchronizes each parent directory after a local backup move, target rename,
+journal mutation, or cleanup mutation. Replacement retains an authenticated
+original at its transaction-specific backup path until every new target is
+visible and revalidated, at which point the journal's durable `committed` state
+is the recovery boundary. Cleanup first moves remnants to deterministic private
+retired paths on the artifact's own root, so a crash never leaves an unrecorded
+random quarantine name; it also retires the coordinator journal at a
+deterministic name before its final removal. `recover_artifact_transaction()`
+binds either journal name back to the complete caller-supplied plan; it rejects
+target substitution, malformed state, identities that no longer match,
+symlinks, and special files without speculative cleanup. Existing journals
+always require that explicit recovery call.
 
 This is a Linux local-filesystem protocol: it requires no-follow opens,
 advisory `flock`, `renameat2(RENAME_NOREPLACE | RENAME_EXCHANGE)`,
@@ -90,8 +96,11 @@ which another process deliberately replaces private cleanup entries between
 identity verification and unlinking them. Several final paths may be visible
 one by one during ordered publication; Mammoth never claims simultaneous
 filesystem-atomic visibility. Network filesystems, object stores,
-cross-filesystem transactions, reader-side generation selection, and
-cross-host coordination remain outside this contract.
+distributed coordination, reader-side generation selection, and cross-host
+coordination remain outside this contract. The protocol never moves or copies
+an artifact between declared roots: each publication rename is local to one
+root, while the coordinator journal makes interrupted multi-root publication
+recoverable.
 
 The workflow layer owns project-neutral local process supervision and serial
 multi-run orchestration. A caller may use Mammoth's schema-v1 YAML adapter or
