@@ -38,6 +38,7 @@ from mammoth.core.execution import (
     sanitize_command,
     sanitize_metadata_fields,
     sanitize_reference,
+    validate_resume_checkpoint_sha256,
 )
 from mammoth.core.identity import validate_execution_id, validate_run_name
 from mammoth.core.layout import RunLayout
@@ -82,5 +83,6 @@ __all__ = [
     "sanitize_metadata_fields",
     "sanitize_reference",
     "validate_execution_id",
+    "validate_resume_checkpoint_sha256",
     "validate_run_name",
 ]

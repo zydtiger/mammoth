@@ -32,6 +32,7 @@ def create_context(tmp_path: Path, execution_id: str = "attempt-1"):
         previous_execution_id="previous-1",
         parent_execution_id="parent-1",
         resume_checkpoint="/safe/checkpoint.pt",
+        resume_checkpoint_sha256="a" * 64,
         created_at="2026-01-02T03:04:05Z",
     )
 
@@ -44,6 +45,7 @@ def test_create_and_join_publish_immutable_sanitized_metadata(tmp_path: Path) ->
     assert payload["execution_id"] == "attempt-1"
     assert payload["previous_execution_id"] == "previous-1"
     assert payload["parent_execution_id"] == "parent-1"
+    assert payload["resume_checkpoint_sha256"] == "a" * 64
     assert payload["command"][2] == "--token=<redacted>"
     assert payload["command"][3] == "https://<redacted>@example.test/x"
     assert payload["config_reference"] == "https://<redacted>@example.test/config.yaml"
@@ -78,6 +80,7 @@ def test_runtime_metadata_is_optional_sanitized_schema_v1_data(tmp_path: Path) -
 
     payload = json.loads(context.metadata_path.read_text())
     assert payload["schema_version"] == 1
+    assert payload["resume_checkpoint_sha256"] is None
     assert payload["runtime"] == {
         "AWS_ACCESS_KEY_ID": "<redacted>",
         "credentials": "<redacted>",
@@ -203,6 +206,38 @@ def test_resume_checkpoint_without_explicit_parent_records_no_lineage(
     assert context.metadata.parent_execution_id is None
 
 
+@pytest.mark.parametrize(
+    "digest",
+    ("A" * 64, "a" * 63, "a" * 65, "g" * 64, 7),
+)
+def test_resume_checkpoint_sha256_requires_canonical_lowercase(
+    tmp_path: Path,
+    digest: object,
+) -> None:
+    """Persisted resume digests are caller-supplied canonical SHA-256 values."""
+    with pytest.raises(ValueError, match="64 lowercase hexadecimal"):
+        create_execution_context(
+            tmp_path / "invalid-digest",
+            run_name="invalid-digest",
+            invocation_kind="test",
+            intended_phases=("train",),
+            world_size=1,
+            execution_mode="single",
+            command=("python", "train.py"),
+            resume_checkpoint="checkpoint.pt",
+            resume_checkpoint_sha256=digest,  # type: ignore[arg-type]
+        )
+
+
+def test_metadata_rejects_malformed_resume_checkpoint_sha256(tmp_path: Path) -> None:
+    """Deserialization enforces the same digest contract as new publication."""
+    payload = create_context(tmp_path).metadata.to_dict()
+    payload["resume_checkpoint_sha256"] = "A" * 64
+
+    with pytest.raises(ValueError, match="64 lowercase hexadecimal"):
+        ExecutionMetadata.from_dict(payload)
+
+
 def test_schema_v1_metadata_from_originating_project_remains_readable(tmp_path: Path) -> None:
     layout = RunLayout(tmp_path, "legacy-run").prepare(project_directories=False)
     execution_dir = layout.execution_dir("legacy-attempt")
@@ -231,6 +266,7 @@ def test_schema_v1_metadata_from_originating_project_remains_readable(tmp_path: 
     assert context.metadata.run_name == "legacy-run"
     assert context.metadata.intended_phases == ("train", "validate")
     assert context.metadata.world_size == 2
+    assert context.metadata.resume_checkpoint_sha256 is None
 
 
 def test_environment_hook_accepts_canonical_and_explicit_alias_names() -> None:
