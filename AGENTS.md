@@ -48,22 +48,6 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `uv.lock` | Exact uv resolution generated from `pyproject.toml`. Never edit manually. | Regenerate with uv whenever dependency metadata changes. |
 | `.python-version` | uv/Python development baseline. | The supported development interpreter changes deliberately. |
 | `.gitignore` | Generated-file and local-environment exclusions. | A new reproducible build, cache, environment, or local artifact needs an exclusion. |
-| `.agents/skills.lock.yaml` | Skillctl-generated project skill declarations, exact source commits, and integrity digests. | Regenerate with skillctl when a managed project skill is added, updated, synchronized, or removed. |
-| `.agents/skills/issue-discovery/.skillctl-managed` | Skillctl ownership and provenance marker for the vendored issue-discovery tree. | Never edit manually; update only through skillctl. |
-| `.agents/skills/issue-discovery/SKILL.md` | Canonical issue investigation, duplicate search, drafting, approval, creation, and verification workflow. | Never edit here; update the canonical source and apply it with skillctl. |
-| `.agents/skills/issue-discovery/agents/openai.yaml` | OpenAI agent metadata for discovering the issue-discovery skill. | Never edit here; update the canonical source and apply it with skillctl. |
-| `.agents/skills/issue-discovery/references/issue-template.md` | Required evidence-backed issue body structure. | Never edit here; update the canonical source and apply it with skillctl. |
-| `.agents/skills/issue-delivery/.skillctl-managed` | Skillctl ownership and provenance marker for the vendored issue-delivery tree. | Never edit manually; update only through skillctl. |
-| `.agents/skills/issue-delivery/SKILL.md` | Canonical issue implementation, review, publication, merge-gate, verification, and cleanup workflow. | Never edit here; update the canonical source and apply it with skillctl. |
-| `.agents/skills/issue-delivery/agents/openai.yaml` | OpenAI agent metadata for discovering the issue-delivery skill. | Never edit here; update the canonical source and apply it with skillctl. |
-| `.agents/skills/issue-delivery/references/forge-closeout.md` | Acceptance-criteria, issue-state, and milestone reconciliation procedure after merge. | Never edit here; update the canonical source and apply it with skillctl. |
-| `.agents/skills/issue-delivery/references/pr-body.md` | Required pull-request body structure and refresh rules. | Never edit here; update the canonical source and apply it with skillctl. |
-| `.agents/skills/issue-delivery/references/worktree-reconciliation.md` | Branch, worktree, local/remote head, publication, and cleanup reconciliation procedure. | Never edit here; update the canonical source and apply it with skillctl. |
-| `.agents/skills/issue-pr-body-contract/.skillctl-managed` | Skillctl ownership and provenance marker for the vendored issue-pr-body-contract tree. | Never edit manually; update only through skillctl. |
-| `.agents/skills/issue-pr-body-contract/SKILL.md` | Shared issue and pull-request body validation, publication, verification, and closeout-preservation contract. | Never edit here; update the canonical source and apply it with skillctl. |
-| `.agents/skills/issue-pr-body-contract/agents/openai.yaml` | OpenAI agent metadata for discovering the issue-pr-body-contract skill. | Never edit here; update the canonical source and apply it with skillctl. |
-| `.agents/skills/issue-pr-body-contract/scripts/forge_body.py` | Markdown source, raw round-trip, and marker-only validator and verifier. | Never edit here; update the canonical source and apply it with skillctl. |
-| `.agents/skills/issue-pr-body-contract/scripts/test_forge_body.py` | Unit tests for the shared forge-body contract. | Never edit here; update the canonical source and apply it with skillctl. |
 | `src/mammoth/__init__.py` | Lightweight root package metadata and intentionally small stable exports. | Package version or a truly root-level stable export changes. |
 | `src/mammoth/__main__.py` | `python -m mammoth` forwarding entry point. | Module execution behavior changes. |
 | `src/mammoth/cli.py` | Public Typer application, typed commands, and console exit routing. | A public command, option, or exit behavior changes. |
@@ -124,20 +108,21 @@ Do not document or commit their generated contents.
 
 ## Issue Workflows
 
-Use the project-local `issue-discovery` skill to investigate, search for
-duplicates, draft, approve, create, and verify Mammoth issues. Issue creation
-does not authorize implementation.
+Before creating an issue, investigate the request, search for duplicates, and
+prepare the exact title, body, and acceptance criteria for user approval. Create
+and verify the issue only after that approval. Issue creation does not authorize
+implementation.
 
-Use the project-local `issue-delivery` skill when an existing issue has an
-explicit pickup request. Follow its isolated-worktree, validation, independent
-review, publication, merge-approval, verification, and cleanup gates.
+Implement an issue only when the existing issue has an explicit pickup request.
+Use an isolated task branch and worktree, satisfy the approved scope, run
+proportionate validation, and obtain an independent clean-context review before
+publication. Pushing or opening a pull request, merging, and closing the issue
+require their applicable explicit approvals. After merge, verify the exact
+commit and issue state before removing only clean task branches and worktrees.
 
-The directories marked `mode: vendored` in `.agents/skills.lock.yaml` are
-read-only snapshots. Run `skillctl check` before changing managed skill state,
-make reusable changes in `zydtiger/agent-workflows` on GitHub, and apply approved
-upstream revisions with `skillctl update`. Commit the generated lock and
-vendored trees together; do not edit their commits, digests, markers, or files
-manually.
+Globally installed `issue-discovery` and `issue-delivery` skills may assist with
+these rules, but generic cross-project skills are optional operator tooling
+rather than Mammoth source or reproducible project dependencies.
 
 ## Python And API Standards
 
