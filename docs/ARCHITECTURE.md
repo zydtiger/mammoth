@@ -104,7 +104,18 @@ child supervision, failure/interrupt cleanup, and structured results. Callers
 retain their configuration schema, command generation, phase meanings,
 pre-dispatch actions, and all domain policy. A pre-dispatch hook receives only
 read-only run, step, layout, and execution context; it never owns a Mammoth
-observer, lease, or child process.
+observer, lease, or child process. A programmatic run may supply frozen static
+`lifecycle_fields`, and its workflow may supply a typed
+`lifecycle_field_provider` for event-specific extensions. Mammoth validates
+those extensions, preserves ownership of append order and all terminal
+transitions, and rejects schema-owned event keys or unsafe metadata. The
+provider receives only a read-only context with the event, run, step,
+execution metadata, sanitized resolved command, and real launcher PID after a
+task starts; it cannot write events or manage the child. Mammoth starts that
+child before `task_started` so the `child_pid` emitted for enriched
+programmatic workflows is real, and a provider failure follows the same owned
+failure, cleanup, and lease-release path as a launch failure. Schema-v1 YAML
+workflows compile without enrichment and preserve their existing event records.
 
 The ordinary workflow launcher inherits the parent terminal streams; callers
 that explicitly need captured output use `run_captured_process()` for separately

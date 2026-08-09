@@ -7,7 +7,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -25,6 +25,7 @@ from mammoth.logging import RunObserver
 from mammoth.workflow import (
     DispatchEntry,
     ExecutionInputs,
+    LifecycleEventContext,
     PreDispatchContext,
     ProgrammaticRun,
     ProgrammaticWorkflow,
@@ -38,7 +39,7 @@ from mammoth.workflow import (
     run_workflow,
 )
 from mammoth.workflow.config import StepConfig
-from mammoth.workflow.launch import terminate_process_tree
+from mammoth.workflow.launch import launch_process, terminate_process_tree
 from mammoth.workflow.runner import _complete_run_results, _execute_step
 
 
@@ -439,6 +440,411 @@ def test_programmatic_workflow_interleaves_runs_with_independent_attempts(tmp_pa
         assert [event.event for event in events].count("phase_started") == 2
         assert [event.event for event in events].count("task_started") == 2
         assert [event.event for event in events].count("task_completed") == 2
+
+
+def test_programmatic_lifecycle_fields_enrich_interleaved_run_events(tmp_path: Path) -> None:
+    def run(name: str) -> ProgrammaticRun:
+        return ProgrammaticRun(
+            name=name,
+            layout=RunLayout(tmp_path / "runs", name),
+            steps=(StepConfig("one", (sys.executable, "-c", "raise SystemExit(0)")),),
+            execution=ExecutionInputs("project", ("project", "run")),
+            lifecycle_fields={"campaign": "summer", "runset_path": f"{name}.yaml"},
+        )
+
+    result = run_programmatic_workflow(
+        ProgrammaticWorkflow(
+            runs=(run("alpha"), run("beta")),
+            dispatch=(DispatchEntry("alpha", "one"), DispatchEntry("beta", "one")),
+        ),
+        base_environment={},
+    )
+
+    assert result.successful
+    for name in ("alpha", "beta"):
+        execution_id = result.run(name).execution_id
+        assert execution_id is not None
+        events = read_execution_events(
+            RunLayout(tmp_path / "runs", name).execution_dir(execution_id) / "runner.jsonl"
+        )
+        assert [event.event for event in events] == [
+            "execution_started",
+            "phase_started",
+            "task_started",
+            "task_completed",
+            "phase_completed",
+            "execution_completed",
+        ]
+        assert all(event.extensions["campaign"] == "summer" for event in events)
+        assert all(event.extensions["runset_path"] == f"{name}.yaml" for event in events)
+
+
+def test_programmatic_lifecycle_provider_receives_immutable_context_and_real_pid(
+    tmp_path: Path,
+) -> None:
+    contexts: list[LifecycleEventContext] = []
+
+    def enrich(context: LifecycleEventContext) -> dict[str, object]:
+        contexts.append(context)
+        assert not hasattr(context, "observer")
+        assert not hasattr(context, "lease")
+        assert not hasattr(context, "process")
+        return {"caller_event": context.event, "provider_pid": context.child_pid}
+
+    command = (sys.executable, "-c", "raise SystemExit(0)", "--api-token", "secret")
+    run = ProgrammaticRun(
+        name="alpha",
+        layout=RunLayout(tmp_path / "runs", "alpha"),
+        steps=(StepConfig("one", command),),
+        execution=ExecutionInputs("project", ("project", "run")),
+    )
+
+    result = run_programmatic_workflow(
+        ProgrammaticWorkflow(
+            runs=(run,),
+            dispatch=(DispatchEntry("alpha", "one"),),
+            lifecycle_field_provider=enrich,
+        ),
+        base_environment={},
+    )
+
+    assert result.successful
+    task_context = next(context for context in contexts if context.event == "task_started")
+    assert task_context.step == run.steps[0]
+    assert task_context.command == (*command[:-1], "<redacted>")
+    assert task_context.child_pid is not None
+    with pytest.raises(AttributeError):
+        cast(Any, task_context).child_pid = 0
+
+    execution_id = result.run("alpha").execution_id
+    assert execution_id is not None
+    events = read_execution_events(
+        RunLayout(tmp_path / "runs", "alpha").execution_dir(execution_id) / "runner.jsonl"
+    )
+    task_started = next(event for event in events if event.event == "task_started")
+    assert task_started.extensions["child_pid"] == task_context.child_pid
+    assert task_started.extensions["provider_pid"] == task_context.child_pid
+    assert all(event.extensions["caller_event"] == event.event for event in events)
+
+
+@pytest.mark.parametrize(
+    ("fields", "message"),
+    [
+        ({"phase": "caller-owned"}, "Mammoth-owned"),
+        ({"metrics": {"score": 1.0}}, "Mammoth-owned"),
+        ({"media": {"preview": "image"}}, "Mammoth-owned"),
+        ({"logical_step": 1}, "Mammoth-owned"),
+        ({"context": object()}, "JSON-compatible"),
+        ({"api_token": "secret"}, "credentials or unsafe"),
+    ],
+)
+def test_programmatic_lifecycle_fields_reject_unsafe_values_before_side_effects(
+    tmp_path: Path,
+    fields: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        ProgrammaticRun(
+            name="alpha",
+            layout=RunLayout(tmp_path / "runs", "alpha"),
+            steps=(StepConfig("one", (sys.executable, "-c", "raise SystemExit(0)")),),
+            execution=ExecutionInputs("project", ("project", "run")),
+            lifecycle_fields=fields,
+        )
+
+    assert not (tmp_path / "runs").exists()
+
+
+def test_programmatic_run_retains_existing_positional_constructor_order(tmp_path: Path) -> None:
+    run = ProgrammaticRun(
+        "alpha",
+        RunLayout(tmp_path / "runs", "alpha"),
+        (StepConfig("one", (sys.executable, "-c", "raise SystemExit(0)")),),
+        ExecutionInputs("project", ("project", "run")),
+        {},
+        True,
+    )
+
+    assert run.resolve_previous_execution is True
+    assert run.lifecycle_fields == {}
+
+
+def test_programmatic_invalid_dynamic_lifecycle_fields_reap_started_child(tmp_path: Path) -> None:
+    marker = tmp_path / "must-not-exist"
+    child = (
+        "import time; from pathlib import Path; "
+        "time.sleep(1); "
+        f"Path({str(marker)!r}).touch()"
+    )
+    launched_pids: list[int] = []
+
+    def invalid_task_start_fields(context: LifecycleEventContext) -> dict[str, object]:
+        if context.event == "task_started":
+            assert context.child_pid is not None
+            launched_pids.append(context.child_pid)
+            return {"metrics": {"score": 1.0}}
+        return {}
+
+    run = ProgrammaticRun(
+        name="alpha",
+        layout=RunLayout(tmp_path / "runs", "alpha"),
+        steps=(StepConfig("one", (sys.executable, "-c", child)),),
+        execution=ExecutionInputs("project", ("project", "run")),
+        lifecycle_fields={"campaign": "summer"},
+    )
+    result = run_programmatic_workflow(
+        ProgrammaticWorkflow(
+            runs=(run,),
+            dispatch=(DispatchEntry("alpha", "one"),),
+            lifecycle_field_provider=invalid_task_start_fields,
+        ),
+        base_environment={},
+    )
+
+    assert result.run("alpha").outcome == "failed"
+    assert "lifecycle event field provider failed" in (result.step("alpha", "one").reason or "")
+    assert launched_pids
+    with pytest.raises(ProcessLookupError):
+        os.kill(launched_pids[0], 0)
+    assert not marker.exists()
+    execution_id = result.run("alpha").execution_id
+    assert execution_id is not None
+    events = read_execution_events(
+        RunLayout(tmp_path / "runs", "alpha").execution_dir(execution_id) / "runner.jsonl"
+    )
+    assert [event.event for event in events] == [
+        "execution_started",
+        "phase_started",
+        "task_started",
+        "task_failed",
+        "phase_failed",
+        "execution_failed",
+    ]
+    assert all(event.extensions["campaign"] == "summer" for event in events)
+    with claim_logical_run_lease(RunLayout(tmp_path / "runs", "alpha").run_dir):
+        pass
+
+
+def test_programmatic_enriched_task_start_signal_keeps_lifecycle_paired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = ProgrammaticRun(
+        name="alpha",
+        layout=RunLayout(tmp_path / "runs", "alpha"),
+        steps=(StepConfig("one", (sys.executable, "-c", "import time; time.sleep(60)")),),
+        execution=ExecutionInputs("project", ("project", "run")),
+        lifecycle_fields={"campaign": "summer"},
+    )
+    original_emit = RunObserver.emit
+    sent = False
+
+    def terminate_after_task_start(
+        observer: RunObserver,
+        event: Any,
+        **fields: Any,
+    ) -> None:
+        nonlocal sent
+        original_emit(observer, event, **fields)
+        if event == "task_started" and not sent:
+            sent = True
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    monkeypatch.setattr(
+        "mammoth.workflow.runner.RunObserver.emit",
+        terminate_after_task_start,
+    )
+    result = run_programmatic_workflow(
+        ProgrammaticWorkflow(runs=(run,), dispatch=(DispatchEntry("alpha", "one"),)),
+        base_environment={},
+    )
+
+    assert result.run("alpha").outcome == "interrupted"
+    execution_id = result.run("alpha").execution_id
+    assert execution_id is not None
+    events = read_execution_events(
+        RunLayout(tmp_path / "runs", "alpha").execution_dir(execution_id) / "runner.jsonl"
+    )
+    assert [event.event for event in events] == [
+        "execution_started",
+        "phase_started",
+        "task_started",
+        "task_failed",
+        "phase_failed",
+        "execution_interrupted",
+    ]
+    task_started = next(event for event in events if event.event == "task_started")
+    child_pid = task_started.extensions["child_pid"]
+    assert isinstance(child_pid, int)
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+    assert all(event.extensions["campaign"] == "summer" for event in events)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [KeyboardInterrupt(), SystemExit("provider exited"), BaseException("provider escaped")],
+)
+def test_programmatic_provider_base_exception_is_structured_failure(
+    tmp_path: Path,
+    failure: BaseException,
+) -> None:
+    marker = tmp_path / "must-not-run"
+
+    def fail_at_phase_start(context: LifecycleEventContext) -> None:
+        if context.event == "phase_started":
+            raise failure
+        return None
+
+    run = ProgrammaticRun(
+        name="alpha",
+        layout=RunLayout(tmp_path / "runs", "alpha"),
+        steps=(
+            StepConfig(
+                "one",
+                (
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(marker)!r}).touch()",
+                ),
+            ),
+        ),
+        execution=ExecutionInputs("project", ("project", "run")),
+    )
+    result = run_programmatic_workflow(
+        ProgrammaticWorkflow(
+            runs=(run,),
+            dispatch=(DispatchEntry("alpha", "one"),),
+            lifecycle_field_provider=fail_at_phase_start,
+        ),
+        base_environment={},
+    )
+
+    assert result.run("alpha").outcome == "failed"
+    assert "lifecycle event field provider failed" in (result.step("alpha", "one").reason or "")
+    assert not marker.exists()
+    execution_id = result.run("alpha").execution_id
+    assert execution_id is not None
+    events = read_execution_events(
+        RunLayout(tmp_path / "runs", "alpha").execution_dir(execution_id) / "runner.jsonl"
+    )
+    assert [event.event for event in events] == [
+        "execution_started",
+        "phase_started",
+        "phase_failed",
+        "execution_failed",
+    ]
+    with claim_logical_run_lease(RunLayout(tmp_path / "runs", "alpha").run_dir):
+        pass
+
+
+def test_programmatic_execution_start_provider_failure_is_a_structured_result(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "must-not-run"
+
+    def fail_at_execution_start(context: LifecycleEventContext) -> None:
+        if context.event == "execution_started":
+            raise RuntimeError("startup provider exploded")
+        return None
+
+    run = ProgrammaticRun(
+        name="alpha",
+        layout=RunLayout(tmp_path / "runs", "alpha"),
+        steps=(
+            StepConfig(
+                "one",
+                (
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(marker)!r}).touch()",
+                ),
+            ),
+        ),
+        execution=ExecutionInputs("project", ("project", "run")),
+    )
+    result = run_programmatic_workflow(
+        ProgrammaticWorkflow(
+            runs=(run,),
+            dispatch=(DispatchEntry("alpha", "one"),),
+            lifecycle_field_provider=fail_at_execution_start,
+        ),
+        base_environment={},
+    )
+
+    assert result.run("alpha").outcome == "failed"
+    assert "lifecycle event field provider failed" in (result.step("alpha", "one").reason or "")
+    assert not marker.exists()
+    execution_id = result.run("alpha").execution_id
+    assert execution_id is not None
+    events = read_execution_events(
+        RunLayout(tmp_path / "runs", "alpha").execution_dir(execution_id) / "runner.jsonl"
+    )
+    assert [event.event for event in events] == ["execution_started", "execution_failed"]
+    with claim_logical_run_lease(RunLayout(tmp_path / "runs", "alpha").run_dir):
+        pass
+
+
+def test_programmatic_execution_terminal_provider_failure_keeps_its_reason(
+    tmp_path: Path,
+) -> None:
+    def fail_at_execution_terminal(context: LifecycleEventContext) -> dict[str, object]:
+        if context.event == "execution_completed":
+            raise RuntimeError("terminal provider exploded")
+        return {}
+
+    run = ProgrammaticRun(
+        name="alpha",
+        layout=RunLayout(tmp_path / "runs", "alpha"),
+        steps=(StepConfig("one", (sys.executable, "-c", "raise SystemExit(0)")),),
+        execution=ExecutionInputs("project", ("project", "run")),
+    )
+    result = run_programmatic_workflow(
+        ProgrammaticWorkflow(
+            runs=(run,),
+            dispatch=(DispatchEntry("alpha", "one"),),
+            lifecycle_field_provider=fail_at_execution_terminal,
+        ),
+        base_environment={},
+    )
+
+    run_result = result.run("alpha")
+    assert run_result.outcome == "failed"
+    assert run_result.reason == "lifecycle event field provider failed: terminal provider exploded"
+    assert result.step("alpha", "one").outcome == "completed"
+    execution_id = run_result.execution_id
+    assert execution_id is not None
+    events = read_execution_events(
+        RunLayout(tmp_path / "runs", "alpha").execution_dir(execution_id) / "runner.jsonl"
+    )
+    assert events[-1].event == "execution_failed"
+    assert events[-1].message == run_result.reason
+
+
+def test_schema_v1_workflow_events_remain_unenriched(tmp_path: Path) -> None:
+    path = write_workflow(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "runs": {
+                "alpha": {
+                    "steps": {
+                        "one": {"command": [sys.executable, "-c", "raise SystemExit(0)"]}
+                    }
+                }
+            },
+        },
+    )
+
+    result = run_workflow(load_workflow(path), entry=tmp_path / "runs", base_environment={})
+
+    assert result.successful
+    execution_id = result.run("alpha").execution_id
+    assert execution_id is not None
+    events = read_execution_events(
+        RunLayout(tmp_path / "runs", "alpha").execution_dir(execution_id) / "runner.jsonl"
+    )
+    assert all(event.extensions == {} for event in events)
 
 
 @pytest.mark.parametrize(
@@ -1345,6 +1751,20 @@ def test_launch_failure_becomes_a_step_result_instead_of_crashing(tmp_path: Path
     assert result.runs[0].outcome == "failed"
     assert result.runs[0].steps[0].outcome == "failed"
     assert "could not launch" in (result.runs[0].steps[0].reason or "")
+    execution_id = result.runs[0].execution_id
+    assert execution_id is not None
+    events = read_execution_events(
+        RunLayout(tmp_path / "runs", "run").execution_dir(execution_id) / "runner.jsonl"
+    )
+    assert [event.event for event in events] == [
+        "execution_started",
+        "phase_started",
+        "task_started",
+        "task_failed",
+        "phase_failed",
+        "execution_failed",
+    ]
+    assert all(event.extensions == {} for event in events)
 
 
 def test_continue_and_run_dependency_policy_executes_after_failure(tmp_path: Path) -> None:
@@ -1483,6 +1903,44 @@ def test_timeout_terminates_child_process_group(tmp_path: Path) -> None:
     process = result.runs[0].steps[0].process
     assert process is not None and process.timed_out
     assert result.runs[0].outcome == "failed"
+
+
+def test_launch_timeout_includes_started_callback_latency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeouts: list[float | None] = []
+    clock = [0.0]
+
+    class FakeSupervisedProcess:
+        pid = 123
+        returncode = 0
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def start(self) -> FakeSupervisedProcess:
+            return self
+
+        def wait(self, timeout: float | None = None) -> int:
+            timeouts.append(timeout)
+            return 0
+
+    def slow_started(_pid: int) -> None:
+        clock[0] = 0.1
+
+    monkeypatch.setattr("mammoth.workflow.launch.SupervisedProcess", FakeSupervisedProcess)
+    monkeypatch.setattr("mammoth.workflow.launch.time.monotonic", lambda: clock[0])
+    result = launch_process(
+        ("ignored",),
+        cwd=None,
+        environment={},
+        timeout_seconds=0.05,
+        on_started=slow_started,
+    )
+
+    assert timeouts == [0.0]
+    assert result.timed_out
+    assert result.duration_seconds == 0.1
 
 
 def test_supervisor_stops_descendant_in_an_independent_session(tmp_path: Path) -> None:
