@@ -53,6 +53,46 @@ symlinks, directories, and special files; missing paths retain
 from a publication descriptor before atomic rename, while callers own any
 portable path serialization.
 
+For one logical result that spans several local paths, `mammoth.core` owns a
+separate `ArtifactTransactionPlan` protocol. A caller supplies at least two
+prepared `TransactionArtifact` values beneath one pre-existing `lease_root`,
+using the reserved sibling stage path for every stable key. Files are identified
+through `ArtifactReceipt`; ordinary directory trees are sealed, synchronized,
+and recorded with a transaction-local tree identity. Callers may add validators
+that authenticate their own marker or payload semantics, while Mammoth never
+interprets them. The plan explicitly selects `create_only` plus roll-forward
+recovery or `replace` plus rollback-before-commit recovery.
+
+Publication first acquires deterministic advisory leases for all target paths
+and their ancestors, anchors the lease root with no-follow directory FDs, then
+writes a strict no-clobber schema-v1 journal below
+`<lease_root>/.mammoth-transactions/`. It synchronizes every staged object
+before the journal and synchronizes each parent directory after a backup move,
+target rename, journal mutation, or cleanup mutation. Replacement retains an
+authenticated original at its transaction-specific backup path until every new
+target is visible and revalidated, at which point the journal's durable
+`committed` state is the recovery boundary. Cleanup first moves remnants to
+deterministic private retired paths, so a crash never leaves an unrecorded
+random quarantine name; it also retires the journal at a deterministic name
+before its final removal. `recover_artifact_transaction()` binds either journal
+name back to the complete caller-supplied plan; it rejects target substitution,
+malformed state, identities that no longer match, symlinks, and special files
+without speculative cleanup. Existing journals always require that explicit
+recovery call.
+
+This is a Linux local-filesystem protocol: it requires no-follow opens,
+advisory `flock`, `renameat2(RENAME_NOREPLACE | RENAME_EXCHANGE)`,
+same-filesystem renames, and successful file/directory `fsync`. It rejects
+unsupported or unsafe topology rather than weakening its durability claim.
+The cleanup protocol assumes local writers cooperate through Mammoth's target
+leases. It does not attempt a hostile same-UID filesystem-security model in
+which another process deliberately replaces private cleanup entries between
+identity verification and unlinking them. Several final paths may be visible
+one by one during ordered publication; Mammoth never claims simultaneous
+filesystem-atomic visibility. Network filesystems, object stores,
+cross-filesystem transactions, reader-side generation selection, and
+cross-host coordination remain outside this contract.
+
 The workflow layer owns project-neutral local process supervision. Its ordinary
 workflow launcher inherits the parent terminal streams; callers that explicitly
 need captured output use `run_captured_process()` for separately drained text
