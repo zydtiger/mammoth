@@ -1,6 +1,0 @@
-version: 1
-entry: issue-discovery
-scope: project
-lock: .agents/skills.lock.yaml
-repository: https://github.com/zydtiger/agent-workflows.git
-commit: 5176a648436d9c5d7dd71d25c7024d3b3b723b6a
