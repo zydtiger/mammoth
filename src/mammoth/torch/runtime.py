@@ -34,6 +34,8 @@ from mammoth.core import (
     execution_id_from_environment,
     join_execution_context,
     normalize_execution_id_environment_aliases,
+    sanitize_reference,
+    validate_resume_checkpoint_sha256,
 )
 from mammoth.logging import (
     ExecutionLogging,
@@ -130,6 +132,7 @@ class ExecutionRequest:
     execution_id: str | None = None
     previous_execution_id: str | None = None
     resume_checkpoint: str | Path | None = None
+    resume_checkpoint_sha256: str | None = None
     parent_execution_id: str | None = None
     starting_epoch: int | None = None
     starting_global_step: int | None = None
@@ -141,6 +144,13 @@ class ExecutionRequest:
         object.__setattr__(self, "intended_phases", tuple(self.intended_phases))
         object.__setattr__(self, "command", tuple(self.command))
         object.__setattr__(self, "runtime", dict(self.runtime))
+        if self.resume_checkpoint is not None:
+            if self.resume_checkpoint_sha256 is None:
+                raise ValueError("resume_checkpoint requires resume_checkpoint_sha256.")
+            if self.starting_epoch is None:
+                raise ValueError("resume_checkpoint requires starting_epoch.")
+        if self.resume_checkpoint_sha256 is not None:
+            validate_resume_checkpoint_sha256(self.resume_checkpoint_sha256)
         object.__setattr__(
             self,
             "execution_id_environment_aliases",
@@ -497,7 +507,6 @@ class Runtime:
                         provided_execution_id,
                         expected_run_name=request.run_name,
                     )
-                    self._validate_context(primary_context, request)
                 else:
                     self._logical_run_lease = claim_logical_run_lease(request.run_dir)
                     runtime_metadata = dict(request.runtime)
@@ -514,6 +523,7 @@ class Runtime:
                         execution_id=request.execution_id,
                         previous_execution_id=request.previous_execution_id,
                         resume_checkpoint=request.resume_checkpoint,
+                        resume_checkpoint_sha256=request.resume_checkpoint_sha256,
                         parent_execution_id=request.parent_execution_id,
                         starting_epoch=request.starting_epoch,
                         starting_global_step=request.starting_global_step,
@@ -583,6 +593,22 @@ class Runtime:
                 f"Execution {metadata.execution_id!r} omits phases: "
                 f"{', '.join(sorted(missing_phases))}"
             )
+        if request.resume_checkpoint is None:
+            return
+        expected_facts = {
+            "resume_checkpoint": sanitize_reference(request.resume_checkpoint),
+            "resume_checkpoint_sha256": request.resume_checkpoint_sha256,
+            "parent_execution_id": request.parent_execution_id,
+            "starting_epoch": request.starting_epoch,
+            "starting_global_step": request.starting_global_step,
+        }
+        for field_name, expected_value in expected_facts.items():
+            actual_value = getattr(metadata, field_name)
+            if actual_value != expected_value:
+                raise ValueError(
+                    f"Execution {metadata.execution_id!r} resume field {field_name!r} "
+                    f"does not match: metadata={actual_value!r}, request={expected_value!r}."
+                )
 
     def _validate_initialized_group(self) -> None:
         """Reject a preinitialized default group that disagrees with this runtime."""

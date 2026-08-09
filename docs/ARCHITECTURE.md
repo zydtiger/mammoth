@@ -174,6 +174,11 @@ fields remain readable but do not affect reconstructed state or presentation.
 Callers record that continuity explicitly with `parent_execution_id`; a
 `resume_checkpoint` is an independent sanitized artifact reference and never
 causes Mammoth to infer a parent from its location, name, phase, or timestamp.
+When a PyTorch execution request resumes and joins an existing attempt, Mammoth
+requires its caller-provided lowercase SHA-256 and starting epoch, then compares
+the sanitized checkpoint reference, digest, parent ID, epoch, and optional
+global step with immutable metadata before project work begins. Mammoth does
+not inspect checkpoint contents or infer any of these facts.
 
 An interactive terminal launches the optional Textual dashboard by default.
 Textual owns refresh workers, keyboard navigation, scrolling, and responsive
@@ -209,8 +214,8 @@ uninitialized default process group; exposes common object and tensor
 collectives; validates optional caller-selected launch constraints; applies
 caller-supplied rank weights to generic count and index partitions; and destroys
 only a process group that it created. Execution establishment is available
-separately from rank-logging startup so projects can validate their own lineage
-and attach presentation sinks without recreating the runtime. The runtime does
+separately from rank-logging startup so projects can attach presentation sinks
+without recreating the runtime. The runtime does
 not encode GPU models, concrete workload weights, or project topology rules.
 
 Rank zero creates a direct execution and holds its logical-run lease, or joins

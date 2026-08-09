@@ -223,12 +223,15 @@ class ExecutionMetadata:
     config_reference: str
     previous_execution_id: str | None = None
     resume_checkpoint: str | None = None
+    resume_checkpoint_sha256: str | None = None
     parent_execution_id: str | None = None
     starting_epoch: int | None = None
     starting_global_step: int | None = None
     runtime: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.resume_checkpoint_sha256 is not None:
+            validate_resume_checkpoint_sha256(self.resume_checkpoint_sha256)
         if self.runtime is not None:
             sanitized = sanitize_metadata_fields(self.runtime)
             object.__setattr__(self, "runtime", _freeze_metadata_mapping(sanitized))
@@ -248,6 +251,7 @@ class ExecutionMetadata:
             "config_reference": self.config_reference,
             "previous_execution_id": self.previous_execution_id,
             "resume_checkpoint": self.resume_checkpoint,
+            "resume_checkpoint_sha256": self.resume_checkpoint_sha256,
             "parent_execution_id": self.parent_execution_id,
             "starting_epoch": self.starting_epoch,
             "starting_global_step": self.starting_global_step,
@@ -308,6 +312,9 @@ class ExecutionMetadata:
             config_reference=_required_string(payload, "config_reference", allow_empty=True),
             previous_execution_id=_optional_execution_id(payload, "previous_execution_id"),
             resume_checkpoint=_optional_string(payload, "resume_checkpoint"),
+            resume_checkpoint_sha256=_optional_resume_checkpoint_sha256(
+                payload, "resume_checkpoint_sha256"
+            ),
             parent_execution_id=_optional_execution_id(payload, "parent_execution_id"),
             starting_epoch=_optional_nonnegative_int(payload, "starting_epoch"),
             starting_global_step=_optional_nonnegative_int(payload, "starting_global_step"),
@@ -415,6 +422,15 @@ def sanitize_reference(reference: str | os.PathLike[str]) -> str:
     return urlunsplit((parsed.scheme, netloc, path, "", ""))
 
 
+def validate_resume_checkpoint_sha256(value: str) -> str:
+    """Validate the caller-provided exact-byte digest for a resume checkpoint."""
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(
+            "resume_checkpoint_sha256 must be exactly 64 lowercase hexadecimal characters."
+        )
+    return value
+
+
 def sanitize_command(command: Sequence[str | os.PathLike[str]]) -> tuple[str, ...]:
     """Redact credential-like option values and sanitize URL-like arguments."""
     arguments = _validated_command_arguments(command)
@@ -482,6 +498,7 @@ def create_execution_context(
     execution_id: str | None = None,
     previous_execution_id: str | None = None,
     resume_checkpoint: str | os.PathLike[str] | None = None,
+    resume_checkpoint_sha256: str | None = None,
     parent_execution_id: str | None = None,
     starting_epoch: int | None = None,
     starting_global_step: int | None = None,
@@ -513,6 +530,8 @@ def create_execution_context(
     sanitized_resume_checkpoint = (
         sanitize_reference(resume_checkpoint) if resume_checkpoint is not None else None
     )
+    if resume_checkpoint_sha256 is not None:
+        validate_resume_checkpoint_sha256(resume_checkpoint_sha256)
     sanitized_runtime = sanitize_metadata_fields(runtime) if runtime is not None else None
     if not isinstance(world_size, int) or isinstance(world_size, bool) or world_size < 1:
         raise ValueError(f"world_size must be a positive integer, got {world_size!r}.")
@@ -570,6 +589,7 @@ def create_execution_context(
             config_reference=sanitized_config_reference,
             previous_execution_id=previous_execution_id,
             resume_checkpoint=sanitized_resume_checkpoint,
+            resume_checkpoint_sha256=resume_checkpoint_sha256,
             parent_execution_id=parent_execution_id,
             starting_epoch=starting_epoch,
             starting_global_step=starting_global_step,
@@ -894,6 +914,11 @@ def _optional_string(payload: Mapping[str, Any], key: str) -> str | None:
     if value is not None and not isinstance(value, str):
         raise ValueError(f"Execution metadata field {key!r} must be a string or null.")
     return value
+
+
+def _optional_resume_checkpoint_sha256(payload: Mapping[str, Any], key: str) -> str | None:
+    value = _optional_string(payload, key)
+    return validate_resume_checkpoint_sha256(value) if value is not None else None
 
 
 def _string_tuple(
