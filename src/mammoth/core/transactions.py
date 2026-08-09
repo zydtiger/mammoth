@@ -87,7 +87,7 @@ class ArtifactTransactionPlan:
     """Immutable caller contract for one local publication transaction.
 
     ``lease_root`` is the pre-existing coordinator root that owns the journal.
-    ``lease_roots`` optionally declares the local filesystem boundaries that
+    ``artifact_roots`` optionally declares the local filesystem boundaries that
     contain artifacts. Omitting it preserves the original one-root contract.
     ``create_only`` plans roll forward after interruption; ``replace`` plans
     restore their authenticated prior generation before the commit point.
@@ -98,7 +98,7 @@ class ArtifactTransactionPlan:
     artifacts: tuple[TransactionArtifact, ...]
     mode: PublicationMode
     recovery_policy: RecoveryPolicy
-    lease_roots: tuple[Path, ...] = ()
+    artifact_roots: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +180,7 @@ def transaction_retired_object_path(
     if role not in {"stage", "backup", "rollback-stage", "rollback-backup", "rollback-target"}:
         raise ValueError(f"transaction cleanup role is unsupported: {role}")
     return (
-        transaction_artifact_lease_root(plan, artifact)
+        transaction_artifact_root(plan, artifact)
         / _TRANSACTION_DIRECTORY_NAME
         / "retired"
         / plan.transaction_id
@@ -291,7 +291,7 @@ def validate_artifact_transaction_plan(
             "create_only requires roll_forward and replace requires rollback_before_commit"
         )
     lease_root = require_safe_directory(Path(plan.lease_root), "lease_root")
-    lease_roots = normalize_transaction_lease_roots(plan, lease_root)
+    artifact_roots = normalize_transaction_artifact_roots(plan, lease_root)
     if not plan.artifacts or len(plan.artifacts) < 2:
         raise ArtifactTransactionValidationError(
             "a transaction must contain at least two artifacts"
@@ -312,11 +312,11 @@ def validate_artifact_transaction_plan(
             raise TypeError("transaction artifact validator must be callable or None")
         target = normalize_transaction_path(artifact.target, "target")
         stage = normalize_transaction_path(artifact.stage, "stage")
-        target_root = transaction_root_for_path(target, lease_roots, "target")
-        stage_root = transaction_root_for_path(stage, lease_roots, "stage")
+        target_root = transaction_root_for_path(target, artifact_roots, "target")
+        stage_root = transaction_root_for_path(stage, artifact_roots, "stage")
         if target_root != stage_root:
             raise ArtifactTransactionValidationError(
-                "transaction target and stage must share one declared lease_root"
+                "transaction target and stage must share one declared artifact_root"
             )
         if target == target_root or target.is_relative_to(
             target_root / _TRANSACTION_DIRECTORY_NAME
@@ -337,11 +337,11 @@ def validate_artifact_transaction_plan(
         validate_existing_object(target, artifact.kind, "target", allow_missing=True)
         if target.parent.stat().st_dev != target_root.stat().st_dev:
             raise ArtifactTransactionValidationError(
-                "transaction target parent must share its lease_root's filesystem"
+                "transaction target parent must share its artifact_root's filesystem"
             )
         if object_exists(stage) and stage.stat().st_dev != target_root.stat().st_dev:
             raise ArtifactTransactionValidationError(
-                "transaction stage must share its lease_root's filesystem"
+                "transaction stage must share its artifact_root's filesystem"
             )
         normalized.append(
             TransactionArtifact(
@@ -358,7 +358,7 @@ def validate_artifact_transaction_plan(
         artifacts=tuple(normalized),
         mode=plan.mode,
         recovery_policy=plan.recovery_policy,
-        lease_roots=lease_roots,
+        artifact_roots=artifact_roots,
     )
     for index, first in enumerate(normalized):
         for second in normalized[index + 1 :]:
@@ -427,19 +427,19 @@ def require_safe_directory(path: Path, label: str) -> Path:
     return absolute
 
 
-def normalize_transaction_lease_roots(
+def normalize_transaction_artifact_roots(
     plan: ArtifactTransactionPlan, coordinator_root: Path
 ) -> tuple[Path, ...]:
     """Validate caller-selected artifact roots without inferring mount boundaries."""
-    raw_roots = plan.lease_roots or (coordinator_root,)
-    roots = tuple(require_safe_directory(Path(root), "lease_root") for root in raw_roots)
+    raw_roots = plan.artifact_roots or (coordinator_root,)
+    roots = tuple(require_safe_directory(Path(root), "artifact_root") for root in raw_roots)
     if len(set(roots)) != len(roots):
-        raise ArtifactTransactionValidationError("transaction lease_roots must be unique")
+        raise ArtifactTransactionValidationError("transaction artifact_roots must be unique")
     for index, first in enumerate(roots):
         for second in roots[index + 1 :]:
             if first.is_relative_to(second) or second.is_relative_to(first):
                 raise ArtifactTransactionValidationError(
-                    "transaction lease_roots must not overlap or nest"
+                    "transaction artifact_roots must not overlap or nest"
                 )
     return tuple(sorted(roots, key=str))
 
@@ -450,16 +450,16 @@ def transaction_root_for_path(path: Path, roots: tuple[Path, ...], label: str) -
     if len(matches) != 1:
         raise ArtifactTransactionValidationError(
             "transaction "
-            f"{label} must be beneath lease_root or exactly one declared lease root: {path}"
+            f"{label} must be beneath lease_root or exactly one declared artifact root: {path}"
         )
     return matches[0]
 
 
-def transaction_artifact_lease_root(
+def transaction_artifact_root(
     plan: ArtifactTransactionPlan, artifact: TransactionArtifact
 ) -> Path:
     """Return the declared local root that owns one artifact's durable mutations."""
-    roots = plan.lease_roots or (Path(plan.lease_root),)
+    roots = plan.artifact_roots or (Path(plan.lease_root),)
     return transaction_root_for_path(Path(artifact.target), roots, "target")
 
 
@@ -528,7 +528,7 @@ def claim_artifact_transaction_leases(plan: ArtifactTransactionPlan) -> _Transac
     leases: list[_TransactionLease] = []
     root_descriptors: list[tuple[Path, int]] = []
     try:
-        roots = tuple(dict.fromkeys((validated.lease_root, *validated.lease_roots)))
+        roots = tuple(dict.fromkeys((validated.lease_root, *validated.artifact_roots)))
         for root in roots:
             root_descriptors.append((root, open_absolute_directory_without_symlinks(root)))
         for protected_path, _root in transaction_protected_paths(validated):
@@ -580,7 +580,7 @@ def transaction_protected_paths(plan: ArtifactTransactionPlan) -> tuple[tuple[Pa
     """Return ordered target and ancestor identities so overlap shares a lease."""
     protected: set[tuple[Path, Path]] = set()
     for artifact in plan.artifacts:
-        root = transaction_artifact_lease_root(plan, artifact)
+        root = transaction_artifact_root(plan, artifact)
         current = artifact.target
         while True:
             protected.add((current, root))
@@ -609,7 +609,7 @@ def ensure_transaction_retired_directory(
     plan: ArtifactTransactionPlan, artifact: TransactionArtifact
 ) -> Path:
     """Create the private deterministic holding directory for one transaction cleanup."""
-    root = transaction_artifact_lease_root(plan, artifact)
+    root = transaction_artifact_root(plan, artifact)
     metadata_directory = ensure_transaction_metadata_directory(root)
     retired_directory = metadata_directory / "retired"
     transaction_directory = retired_directory / plan.transaction_id
@@ -678,7 +678,7 @@ def create_transaction_records(plan: ArtifactTransactionPlan) -> list[dict[str, 
     """Seal stages and capture the authenticated prior generation before journaling."""
     records: list[dict[str, Any]] = []
     for artifact in plan.artifacts:
-        root = transaction_artifact_lease_root(plan, artifact)
+        root = transaction_artifact_root(plan, artifact)
         stage_identity = inspect_transaction_object(artifact.stage, artifact.kind, synchronize=True)
         run_artifact_validator(artifact, artifact.stage, "staged")
         sync_directory_strict(artifact.stage.parent, lease_root=root)
@@ -943,7 +943,7 @@ def create_journal_payload(
         "version": _JOURNAL_VERSION,
         "transaction_id": plan.transaction_id,
         "lease_root": str(plan.lease_root),
-        "lease_roots": [str(root) for root in plan.lease_roots],
+        "lease_roots": [str(root) for root in plan.artifact_roots],
         "mode": plan.mode,
         "recovery_policy": plan.recovery_policy,
         "state": "prepared",
@@ -1252,11 +1252,11 @@ def validate_journal_matches_plan(journal: dict[str, Any], plan: ArtifactTransac
             "journal does not match the expected transaction plan"
         )
     if journal["version"] == 1:
-        if plan.lease_roots != (plan.lease_root,):
+        if plan.artifact_roots != (plan.lease_root,):
             raise ArtifactTransactionRecoveryError(
                 "schema-v1 journal cannot recover a multi-root transaction"
             )
-    elif journal["lease_roots"] != [str(root) for root in plan.lease_roots]:
+    elif journal["lease_roots"] != [str(root) for root in plan.artifact_roots]:
         raise ArtifactTransactionRecoveryError(
             "journal does not match the expected transaction roots"
         )
@@ -1319,7 +1319,7 @@ def publish_journal_record(
     record: dict[str, Any],
 ) -> None:
     """Publish or authenticate exactly one target while preserving its prior generation."""
-    root = transaction_artifact_lease_root(plan, artifact)
+    root = transaction_artifact_root(plan, artifact)
     stage_identity = identity_from_json(record["stage_identity"])
     original_identity = (
         identity_from_json(record["original_identity"])
@@ -1386,7 +1386,7 @@ def move_original_to_backup(
     target_exists: bool,
 ) -> None:
     """Durably retain the authenticated original before replacement publication."""
-    root = transaction_artifact_lease_root(plan, artifact)
+    root = transaction_artifact_root(plan, artifact)
     if original_identity is None:
         if target_exists:
             raise ArtifactTransactionRecoveryError(
@@ -1480,7 +1480,7 @@ def rollback_journaled_transaction(
         )
     restored: list[Path] = []
     for artifact, record in zip(plan.artifacts, journal_records(journal), strict=True):
-        root = transaction_artifact_lease_root(plan, artifact)
+        root = transaction_artifact_root(plan, artifact)
         stage_identity = identity_from_json(record["stage_identity"])
         original_identity = (
             identity_from_json(record["original_identity"])
@@ -1669,7 +1669,7 @@ def retire_and_remove_transaction_object(
     after the first rename leaves a discoverable object that a later recovery
     can remove without requiring the original caller-visible name to reappear.
     """
-    root = transaction_artifact_lease_root(plan, artifact)
+    root = transaction_artifact_root(plan, artifact)
     ensure_transaction_retired_directory(plan, artifact)
     retired = transaction_retired_object_path(plan, artifact, role)
     path_exists = object_exists(path)

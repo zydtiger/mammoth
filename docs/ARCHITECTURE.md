@@ -57,7 +57,7 @@ For one logical result that spans several local paths, `mammoth.core` owns a
 separate `ArtifactTransactionPlan` protocol. A caller supplies at least two
 prepared `TransactionArtifact` values and a pre-existing coordinator
 `lease_root`, which owns the journal. By default every artifact stays below that
-root. A plan may instead declare non-overlapping `lease_roots`; every target and
+root. A plan may instead declare non-overlapping `artifact_roots`; every target and
 its reserved sibling stage must belong to exactly one declared root, and that
 root owns the artifact's backups and retired cleanup objects. Files are
 identified through `ArtifactReceipt`; ordinary directory trees are sealed,
