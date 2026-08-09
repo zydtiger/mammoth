@@ -6870,6 +6870,40 @@ def test_execution_request_requires_resume_digest_and_starting_epoch(tmp_path: P
         ExecutionRequest(**common, resume_checkpoint_sha256="a" * 64)
 
 
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("starting_epoch", 4.0),
+        ("starting_epoch", True),
+        ("starting_epoch", -1),
+        ("starting_global_step", 12.0),
+        ("starting_global_step", True),
+        ("starting_global_step", -1),
+    ),
+)
+def test_execution_request_rejects_non_integral_resume_coordinates(
+    tmp_path: Path,
+    field_name: str,
+    value: object,
+) -> None:
+    """Resume coordinate equality cannot be bypassed by Python numeric coercion."""
+    request = {
+        "run_dir": tmp_path,
+        "run_name": "resume-coordinate",
+        "invocation_kind": "train",
+        "intended_phases": ("train",),
+        "command": ("python", "train.py"),
+        "resume_checkpoint": "checkpoint.pt",
+        "resume_checkpoint_sha256": "a" * 64,
+        "starting_epoch": 4,
+        "starting_global_step": 12,
+    }
+    request[field_name] = value
+
+    with pytest.raises(ValueError, match=field_name):
+        ExecutionRequest(**request)
+
+
 def test_single_runtime_owns_weighted_helpers_and_execution_lifecycle(
     tmp_path: Path,
 ) -> None:

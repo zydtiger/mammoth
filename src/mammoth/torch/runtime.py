@@ -144,6 +144,8 @@ class ExecutionRequest:
         object.__setattr__(self, "intended_phases", tuple(self.intended_phases))
         object.__setattr__(self, "command", tuple(self.command))
         object.__setattr__(self, "runtime", dict(self.runtime))
+        _validate_resume_coordinate("starting_epoch", self.starting_epoch)
+        _validate_resume_coordinate("starting_global_step", self.starting_global_step)
         if self.resume_checkpoint is not None:
             if self.resume_checkpoint_sha256 is None:
                 raise ValueError("resume_checkpoint requires resume_checkpoint_sha256.")
@@ -156,6 +158,14 @@ class ExecutionRequest:
             "execution_id_environment_aliases",
             normalize_execution_id_environment_aliases(self.execution_id_environment_aliases),
         )
+
+
+def _validate_resume_coordinate(name: str, value: int | None) -> None:
+    """Reject non-integral resume coordinates before their exact join comparison."""
+    if value is not None and (
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+    ):
+        raise ValueError(f"{name} must be a non-negative integer or None, got {value!r}.")
 
 
 @dataclass(frozen=True, slots=True)
