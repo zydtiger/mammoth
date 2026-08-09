@@ -93,12 +93,25 @@ filesystem-atomic visibility. Network filesystems, object stores,
 cross-filesystem transactions, reader-side generation selection, and
 cross-host coordination remain outside this contract.
 
-The workflow layer owns project-neutral local process supervision. Its ordinary
-workflow launcher inherits the parent terminal streams; callers that explicitly
-need captured output use `run_captured_process()` for separately drained text
-stdout and stderr, timeout facts, and the same bounded launcher/descendant
-cleanup. Mammoth does not assign outcome policy, persist captured output, or
-inspect commands beyond executing their already-tokenized argument arrays.
+The workflow layer owns project-neutral local process supervision and serial
+multi-run orchestration. A caller may use Mammoth's schema-v1 YAML adapter or
+compile its own domain configuration into a `ProgrammaticWorkflow`: distinct
+`ProgrammaticRun` values retain independently supplied `RunLayout` and
+immutable execution inputs while an explicit global dispatch sequence may
+interleave their steps. Mammoth validates the complete plan before it creates
+an artifact or claims a lease, then owns the per-run contexts, runner events,
+child supervision, failure/interrupt cleanup, and structured results. Callers
+retain their configuration schema, command generation, phase meanings,
+pre-dispatch actions, and all domain policy. A pre-dispatch hook receives only
+read-only run, step, layout, and execution context; it never owns a Mammoth
+observer, lease, or child process.
+
+The ordinary workflow launcher inherits the parent terminal streams; callers
+that explicitly need captured output use `run_captured_process()` for separately
+drained text stdout and stderr, timeout facts, and the same bounded
+launcher/descendant cleanup. Mammoth does not persist child environments or
+inspect commands beyond executing their already-tokenized argument arrays,
+and does not assign outcome policy or persist captured output.
 
 Framework-neutral callers may submit typed inputs to one
 `BoundedBackgroundPipeline`. Its single worker preserves acceptance order,

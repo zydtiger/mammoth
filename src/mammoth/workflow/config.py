@@ -45,11 +45,11 @@ class StepConfig:
     """One opaque command and its generic execution policy."""
 
     name: str
-    command: tuple[str, ...]
-    needs: tuple[str, ...] = ()
+    command: Sequence[str]
+    needs: Sequence[str] = ()
     launcher: LauncherKind = "local"
     processes: int = 1
-    torchrun_args: tuple[str, ...] = ()
+    torchrun_args: Sequence[str] = ()
     timeout_seconds: float | None = None
     on_failure: FailurePolicy = "stop"
     dependency_failure: DependencyFailurePolicy = "skip"
@@ -58,8 +58,16 @@ class StepConfig:
 
     def __post_init__(self) -> None:
         validate_run_name(self.name)
-        if not self.command or any(not isinstance(item, str) or not item for item in self.command):
+        if isinstance(self.command, str) or not isinstance(self.command, Sequence):
+            raise ValueError(f"Step {self.name!r} command must be a sequence of arguments")
+        command = tuple(self.command)
+        if not command or any(not isinstance(item, str) or not item for item in command):
             raise ValueError(f"Step {self.name!r} command must contain non-empty strings")
+        if isinstance(self.needs, str) or not isinstance(self.needs, Sequence):
+            raise ValueError(f"Step {self.name!r} needs must be a sequence of step names")
+        needs = tuple(self.needs)
+        if any(not isinstance(item, str) or not item for item in needs):
+            raise ValueError(f"Step {self.name!r} needs must contain non-empty strings")
         if self.launcher not in {"local", "torchrun"}:
             raise ValueError(f"Unsupported launcher for {self.name!r}: {self.launcher!r}")
         if (
@@ -81,7 +89,27 @@ class StepConfig:
             raise ValueError(f"Invalid on_failure policy for step {self.name!r}")
         if self.dependency_failure not in {"skip", "run"}:
             raise ValueError(f"Invalid dependency_failure policy for step {self.name!r}")
-        object.__setattr__(self, "environment", MappingProxyType(dict(self.environment)))
+        if isinstance(self.torchrun_args, str) or not isinstance(self.torchrun_args, Sequence):
+            raise ValueError(f"Step {self.name!r} torchrun_args must be a sequence of arguments")
+        torchrun_args = tuple(self.torchrun_args)
+        if any(not isinstance(item, str) or not item for item in torchrun_args):
+            raise ValueError(f"Step {self.name!r} torchrun_args must contain non-empty strings")
+        object.__setattr__(self, "command", command)
+        object.__setattr__(self, "needs", needs)
+        object.__setattr__(self, "torchrun_args", torchrun_args)
+        if self.cwd is not None:
+            try:
+                cwd = Path(self.cwd)
+            except TypeError as error:
+                raise ValueError(
+                    f"Step {self.name!r} cwd must be a path-like value or None"
+                ) from error
+            object.__setattr__(self, "cwd", cwd)
+        object.__setattr__(
+            self,
+            "environment",
+            MappingProxyType(parse_environment(self.environment, f"step {self.name!r}")),
+        )
 
 
 @dataclass(frozen=True, slots=True)
