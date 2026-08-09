@@ -6,6 +6,8 @@ meaning and serialization remain the responsibility of the caller.
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import inspect
 import json
 import os
@@ -16,6 +18,198 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+_DEFAULT_ARTIFACT_CHUNK_SIZE = 1024 * 1024
+
+
+class ArtifactChangedError(RuntimeError):
+    """Raised when an artifact changes before its exact bytes are received."""
+
+
+class ArtifactVerificationError(RuntimeError):
+    """Raised when a visible artifact does not match a recorded receipt."""
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactReceipt:
+    """Immutable exact-byte identity for one regular local file observation."""
+
+    path: Path
+    size_bytes: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, Path):
+            raise TypeError("artifact receipt path must be a pathlib.Path")
+        if (
+            isinstance(self.size_bytes, bool)
+            or not isinstance(self.size_bytes, int)
+            or self.size_bytes < 0
+        ):
+            raise ValueError("artifact receipt size_bytes must be non-negative")
+        if not isinstance(self.sha256, str) or len(self.sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.sha256
+        ):
+            raise ValueError("artifact receipt sha256 must be lowercase hexadecimal")
+
+
+def inspect_artifact(
+    path: Path,
+    *,
+    chunk_size: int = _DEFAULT_ARTIFACT_CHUNK_SIZE,
+) -> ArtifactReceipt:
+    """Return an exact-byte receipt after safely inspecting one regular file.
+
+    The final path component must not be a symlink.  This uses ``O_NOFOLLOW``
+    where available and refuses inspection when the host cannot enforce that
+    invariant.  Missing paths preserve ``FileNotFoundError``; directories,
+    special files, and symlinks raise ``ValueError``; observed replacement or
+    mutation raises ``ArtifactChangedError``.
+    """
+    artifact_path = Path(path)
+    validate_artifact_chunk_size(chunk_size)
+    initial_path_stat = os.lstat(artifact_path)
+    validate_regular_artifact_stat(initial_path_stat, artifact_path)
+    try:
+        descriptor = os.open(artifact_path, artifact_open_flags())
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ArtifactChangedError(
+                f"artifact changed before inspection: {artifact_path}"
+            ) from error
+        try:
+            after_open_failure = os.lstat(artifact_path)
+        except OSError:
+            raise ArtifactChangedError(
+                f"artifact changed before inspection: {artifact_path}"
+            ) from error
+        if not artifact_stats_match(initial_path_stat, after_open_failure):
+            raise ArtifactChangedError(
+                f"artifact changed before inspection: {artifact_path}"
+            ) from error
+        raise
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        if not artifact_stats_match(initial_path_stat, descriptor_stat):
+            raise ArtifactChangedError(
+                f"artifact changed before inspection: {artifact_path}"
+            )
+        validate_regular_artifact_stat(descriptor_stat, artifact_path)
+        receipt = inspect_artifact_descriptor(
+            descriptor,
+            path=artifact_path,
+            chunk_size=chunk_size,
+            verify_stable_reads=True,
+        )
+        final_path_stat = os.lstat(artifact_path)
+        if not artifact_stats_match(descriptor_stat, final_path_stat):
+            raise ArtifactChangedError(
+                f"artifact changed while being inspected: {artifact_path}"
+            )
+        return receipt
+    finally:
+        os.close(descriptor)
+
+
+def verify_artifact(
+    receipt: ArtifactReceipt,
+    *,
+    chunk_size: int = _DEFAULT_ARTIFACT_CHUNK_SIZE,
+) -> None:
+    """Require the currently visible artifact to match one exact-byte receipt."""
+    if not isinstance(receipt, ArtifactReceipt):
+        raise TypeError("receipt must be an ArtifactReceipt")
+    observed = inspect_artifact(receipt.path, chunk_size=chunk_size)
+    if observed.size_bytes != receipt.size_bytes or observed.sha256 != receipt.sha256:
+        raise ArtifactVerificationError(
+            f"artifact does not match receipt: {receipt.path}"
+        )
+
+
+def inspect_artifact_descriptor(
+    descriptor: int,
+    *,
+    path: Path,
+    chunk_size: int = _DEFAULT_ARTIFACT_CHUNK_SIZE,
+    verify_stable_reads: bool = False,
+) -> ArtifactReceipt:
+    """Build a receipt from one already-open regular-file descriptor.
+
+    Prepared-artifact and checkpoint publication use this before atomic rename,
+    so the receipt remains bound to the exact descriptor that will be committed.
+    Path inspection enables a second bounded read to detect same-size changes on
+    filesystems whose metadata timestamps are too coarse to expose a mutation.
+    """
+    if isinstance(descriptor, bool) or not isinstance(descriptor, int):
+        raise TypeError("artifact descriptor must be an integer")
+    if not isinstance(verify_stable_reads, bool):
+        raise TypeError("verify_stable_reads must be a boolean")
+    artifact_path = Path(path)
+    validate_artifact_chunk_size(chunk_size)
+    before = os.fstat(descriptor)
+    validate_regular_artifact_stat(before, artifact_path)
+    digest = hashlib.sha256()
+    size_bytes = 0
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while chunk := os.read(descriptor, chunk_size):
+        size_bytes += len(chunk)
+        digest.update(chunk)
+    if verify_stable_reads:
+        verification_digest = hashlib.sha256()
+        verification_size = 0
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while chunk := os.read(descriptor, chunk_size):
+            verification_size += len(chunk)
+            verification_digest.update(chunk)
+        if (verification_size, verification_digest.digest()) != (size_bytes, digest.digest()):
+            raise ArtifactChangedError(f"artifact changed while being inspected: {artifact_path}")
+    after = os.fstat(descriptor)
+    if not artifact_stats_match(before, after):
+        raise ArtifactChangedError(f"artifact changed while being inspected: {artifact_path}")
+    return ArtifactReceipt(
+        path=artifact_path,
+        size_bytes=size_bytes,
+        sha256=digest.hexdigest(),
+    )
+
+
+def validate_artifact_chunk_size(chunk_size: int) -> None:
+    """Reject chunk sizes that cannot provide bounded incremental reads."""
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
+        raise ValueError("chunk_size must be a positive integer")
+
+
+def artifact_open_flags() -> int:
+    """Return secure read flags that reject final-component symlinks."""
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow:
+        raise NotImplementedError("artifact inspection requires os.O_NOFOLLOW")
+    return os.O_RDONLY | os.O_NONBLOCK | no_follow
+
+
+def validate_regular_artifact_stat(file_stat: os.stat_result, path: Path) -> None:
+    """Reject symlinks and every non-regular artifact type deterministically."""
+    if stat.S_ISLNK(file_stat.st_mode):
+        raise ValueError(f"artifact path must not be a symlink: {path}")
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ValueError(f"artifact path must be a regular file: {path}")
+
+
+def artifact_stats_match(first: os.stat_result, second: os.stat_result) -> bool:
+    """Compare filesystem state that detects replacement or byte mutation."""
+    return (
+        first.st_dev,
+        first.st_ino,
+        first.st_size,
+        first.st_mtime_ns,
+        first.st_ctime_ns,
+    ) == (
+        second.st_dev,
+        second.st_ino,
+        second.st_size,
+        second.st_mtime_ns,
+        second.st_ctime_ns,
+    )
 
 
 @dataclass

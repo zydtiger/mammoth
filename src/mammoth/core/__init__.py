@@ -7,14 +7,19 @@ standard library and never imports model, dataset, or project code.
 from __future__ import annotations
 
 from mammoth.core.artifacts import (
+    ArtifactChangedError,
+    ArtifactReceipt,
+    ArtifactVerificationError,
     PreparedArtifact,
     atomic_publish,
     atomic_write_bytes,
     atomic_write_json,
     atomic_write_text,
     discard_prepared_artifact,
+    inspect_artifact,
     prepare_artifact,
     publish_prepared_artifact,
+    verify_artifact,
 )
 from mammoth.core.events import (
     ExecutionEvent,
@@ -54,6 +59,9 @@ __all__ = [
     "BackgroundPipelineResult",
     "BackgroundPipelineSubmission",
     "BoundedBackgroundPipeline",
+    "ArtifactChangedError",
+    "ArtifactReceipt",
+    "ArtifactVerificationError",
     "ExecutionContext",
     "ExecutionEvent",
     "ExecutionEventReadError",
@@ -72,6 +80,7 @@ __all__ = [
     "discard_prepared_artifact",
     "execution_id_from_environment",
     "generate_execution_id",
+    "inspect_artifact",
     "iter_execution_events",
     "join_execution_context",
     "latest_execution_id",
@@ -85,4 +94,5 @@ __all__ = [
     "validate_execution_id",
     "validate_resume_checkpoint_sha256",
     "validate_run_name",
+    "verify_artifact",
 ]
