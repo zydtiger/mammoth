@@ -120,11 +120,19 @@ those extensions, preserves ownership of append order and all terminal
 transitions, and rejects schema-owned event keys or unsafe metadata. The
 provider receives only a read-only context with the event, run, step,
 execution metadata, sanitized resolved command, and real launcher PID after a
-task starts; it cannot write events or manage the child. Mammoth starts that
-child before `task_started` so the `child_pid` emitted for enriched
-programmatic workflows is real, and a provider failure follows the same owned
-failure, cleanup, and lease-release path as a launch failure. Schema-v1 YAML
-workflows compile without enrichment and preserve their existing event records.
+task starts; it cannot write events or manage the child. A caller may also set
+an explicit immutable `ExecutionInputs.intended_phases` sequence when its
+metadata names intentionally differ from dispatch step names. Immediately
+before a non-dry child launch, a typed `child_environment_provider` receives
+the same read-only pre-dispatch context and may return validated additive
+variables derived from the created execution context. Mammoth never exposes
+the inherited base environment, applies these variables only after static run
+and step fields, then restores ownership of all `MAMMOTH_*` join variables.
+Provider failure follows the same owned failure, cleanup, and lease-release
+path as a launch failure. Mammoth starts an enriched child before
+`task_started` so the `child_pid` emitted for enriched programmatic workflows
+is real. Schema-v1 YAML workflows compile without either programmatic
+extension and preserve their existing event records and environment behavior.
 
 The ordinary workflow launcher inherits the parent terminal streams; callers
 that explicitly need captured output use `run_captured_process()` for separately

@@ -194,6 +194,7 @@ from mammoth.workflow import (
     DispatchEntry,
     ExecutionInputs,
     LifecycleEventContext,
+    PreDispatchContext,
     ProgrammaticRun,
     ProgrammaticWorkflow,
     StepConfig,
@@ -214,6 +215,7 @@ def make_run(name: str) -> ProgrammaticRun:
             invocation_kind="project-workflow",
             command=("project", "runset", "campaign.yaml"),
             config_reference="campaign.yaml",
+            intended_phases=("training", "validation"),
         ),
         lifecycle_fields={"campaign": "summer", "runset_path": "campaign.yaml"},
     )
@@ -222,6 +224,9 @@ def enrich_event(context: LifecycleEventContext) -> dict[str, object]:
     if context.event == "task_started":
         return {"resolved_command": context.command}
     return {}
+
+def child_environment(context: PreDispatchContext) -> dict[str, str]:
+    return {"CALLER_EXECUTION_ID": context.execution.metadata.execution_id}
 
 workflow = ProgrammaticWorkflow(
     runs=(make_run("a"), make_run("b")),
@@ -232,6 +237,7 @@ workflow = ProgrammaticWorkflow(
         DispatchEntry("b", "validate"),
     ),
     lifecycle_field_provider=enrich_event,
+    child_environment_provider=child_environment,
 )
 result = run_programmatic_workflow(workflow)
 ```
@@ -260,6 +266,16 @@ while dynamic fields are checked before their record is appended. Secrets and
 unsafe references are rejected rather than persisted. Providers never receive
 an observer, lease, or process object; if a provider fails, Mammoth emits
 deterministic terminal records and reclaims the owned child and lease.
+
+Set `ExecutionInputs.intended_phases` when execution metadata should use
+caller-defined phase labels instead of dispatched step names. For aliases that
+depend on the newly created execution context, set
+`ProgrammaticWorkflow.child_environment_provider`. Mammoth calls it after
+`pre_dispatch` and immediately before a real child starts; it receives the
+same read-only `PreDispatchContext`, is not called by a dry run, and its values
+override static base, run, and step environment values. Mammoth's own
+`MAMMOTH_*` variables are applied last, so providers cannot set them. Provider
+output stays child-only and is never written into metadata or lifecycle events.
 
 ## Capture a supervised command
 
