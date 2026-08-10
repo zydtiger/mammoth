@@ -847,6 +847,221 @@ def test_schema_v1_workflow_events_remain_unenriched(tmp_path: Path) -> None:
     assert all(event.extensions == {} for event in events)
 
 
+def test_programmatic_workflow_uses_explicit_phase_metadata_and_dynamic_environment(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "child-environment.json"
+    child_code = (
+        "import json, os; from pathlib import Path; "
+        f"Path({str(output_path)!r}).write_text(json.dumps({{"
+        "'mammoth_execution_id': os.environ['MAMMOTH_EXECUTION_ID'], "
+        "'caller_execution_id': os.environ['CALLER_EXECUTION_ID'], "
+        "'override': os.environ['OVERRIDE']}), encoding='utf-8')"
+    )
+    intended_phases = ["validation"]
+    inputs = ExecutionInputs(
+        "project",
+        ("project", "run"),
+        intended_phases=intended_phases,
+    )
+    intended_phases.append("later")
+    contexts: list[PreDispatchContext] = []
+
+    def child_environment_provider(context: PreDispatchContext) -> dict[str, str]:
+        contexts.append(context)
+        return {
+            "CALLER_EXECUTION_ID": context.execution.metadata.execution_id,
+            "OVERRIDE": "dynamic",
+        }
+
+    run = ProgrammaticRun(
+        name="alpha",
+        layout=RunLayout(tmp_path / "runs", "alpha"),
+        steps=(
+            StepConfig(
+                "validate",
+                (sys.executable, "-c", child_code),
+                environment={"OVERRIDE": "step"},
+            ),
+        ),
+        execution=inputs,
+        environment={"OVERRIDE": "run"},
+    )
+    result = run_programmatic_workflow(
+        ProgrammaticWorkflow(
+            runs=(run,),
+            dispatch=(DispatchEntry("alpha", "validate"),),
+            child_environment_provider=child_environment_provider,
+        ),
+        base_environment={"OVERRIDE": "base"},
+    )
+
+    assert result.successful
+    execution_id = result.run("alpha").execution_id
+    assert execution_id is not None
+    assert inputs.intended_phases == ("validation",)
+    assert len(contexts) == 1
+    assert contexts[0].dispatch == DispatchEntry("alpha", "validate")
+    assert contexts[0].execution.metadata.execution_id == execution_id
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload == {
+        "mammoth_execution_id": execution_id,
+        "caller_execution_id": execution_id,
+        "override": "dynamic",
+    }
+    metadata = json.loads(
+        (
+            RunLayout(tmp_path / "runs", "alpha").execution_dir(execution_id) / "execution.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert metadata["intended_phases"] == ["validation"]
+    assert "CALLER_EXECUTION_ID" not in metadata
+
+
+def test_programmatic_workflow_defaults_execution_phase_metadata_to_step_names(
+    tmp_path: Path,
+) -> None:
+    run = ProgrammaticRun(
+        name="alpha",
+        layout=RunLayout(tmp_path / "runs", "alpha"),
+        steps=(StepConfig("validate", (sys.executable, "-c", "raise SystemExit(0)")),),
+        execution=ExecutionInputs("project", ("project", "run")),
+    )
+    result = run_programmatic_workflow(
+        ProgrammaticWorkflow(runs=(run,), dispatch=(DispatchEntry("alpha", "validate"),)),
+        base_environment={},
+    )
+
+    execution_id = result.run("alpha").execution_id
+    assert execution_id is not None
+    metadata = json.loads(
+        (
+            RunLayout(tmp_path / "runs", "alpha").execution_dir(execution_id) / "execution.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert metadata["intended_phases"] == ["validate"]
+
+
+def test_programmatic_child_environment_provider_rejects_mammoth_variable_overrides(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "child-started"
+    run = ProgrammaticRun(
+        name="alpha",
+        layout=RunLayout(tmp_path / "runs", "alpha"),
+        steps=(
+            StepConfig(
+                "one",
+                (
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(marker)!r}).touch()",
+                ),
+            ),
+        ),
+        execution=ExecutionInputs("project", ("project", "run")),
+    )
+    result = run_programmatic_workflow(
+        ProgrammaticWorkflow(
+            runs=(run,),
+            dispatch=(DispatchEntry("alpha", "one"),),
+            child_environment_provider=lambda context: {"MAMMOTH_EXECUTION_ID": "override"},
+        ),
+        base_environment={},
+    )
+
+    assert result.run("alpha").outcome == "failed"
+    assert result.step("alpha", "one").outcome == "failed"
+    assert "child environment provider failed" in (result.step("alpha", "one").reason or "")
+    assert not marker.exists()
+    execution_id = result.run("alpha").execution_id
+    assert execution_id is not None
+    events = read_execution_events(
+        RunLayout(tmp_path / "runs", "alpha").execution_dir(execution_id) / "runner.jsonl"
+    )
+    assert [event.event for event in events] == [
+        "execution_started",
+        "phase_started",
+        "phase_failed",
+        "execution_failed",
+    ]
+    with claim_logical_run_lease(RunLayout(tmp_path / "runs", "alpha").run_dir):
+        pass
+
+
+def test_programmatic_child_environment_provider_rejects_invalid_output(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "child-started"
+
+    def child_environment_provider(context: PreDispatchContext) -> dict[str, str]:
+        del context
+        return cast(dict[str, str], {"CALLER": 1})
+
+    run = ProgrammaticRun(
+        name="alpha",
+        layout=RunLayout(tmp_path / "runs", "alpha"),
+        steps=(
+            StepConfig(
+                "one",
+                (
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(marker)!r}).touch()",
+                ),
+            ),
+        ),
+        execution=ExecutionInputs("project", ("project", "run")),
+    )
+    result = run_programmatic_workflow(
+        ProgrammaticWorkflow(
+            runs=(run,),
+            dispatch=(DispatchEntry("alpha", "one"),),
+            child_environment_provider=child_environment_provider,
+        ),
+        base_environment={},
+    )
+
+    assert result.run("alpha").outcome == "failed"
+    assert "workflow environment values must be strings" in (
+        result.step("alpha", "one").reason or ""
+    )
+    assert not marker.exists()
+
+
+def test_programmatic_child_environment_provider_is_not_called_for_dry_runs(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def child_environment_provider(context: PreDispatchContext) -> dict[str, str]:
+        nonlocal calls
+        del context
+        calls += 1
+        return {"CALLER": "value"}
+
+    entry = tmp_path / "must-not-exist"
+    run = ProgrammaticRun(
+        name="alpha",
+        layout=RunLayout(entry, "alpha"),
+        steps=(StepConfig("one", (sys.executable, "-c", "raise SystemExit(0)")),),
+        execution=ExecutionInputs("project", ("project", "run")),
+    )
+    result = run_programmatic_workflow(
+        ProgrammaticWorkflow(
+            runs=(run,),
+            dispatch=(DispatchEntry("alpha", "one"),),
+            child_environment_provider=child_environment_provider,
+        ),
+        dry_run=True,
+        base_environment={},
+    )
+
+    assert result.successful
+    assert calls == 0
+    assert not entry.exists()
+
+
 @pytest.mark.parametrize(
     ("dispatch", "message"),
     [
