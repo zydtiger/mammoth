@@ -187,11 +187,13 @@ an explicit serial order that interleaves runs. Mammoth validates the complete
 plan before creating an entry directory, lease, execution context, or event.
 
 ```python
+from dataclasses import replace
 from pathlib import Path
 
-from mammoth.core import RunLayout
+from mammoth.core import RunLayout, inspect_artifact
 from mammoth.workflow import (
     DispatchEntry,
+    ExecutionInputResolutionContext,
     ExecutionInputs,
     LifecycleEventContext,
     PreDispatchContext,
@@ -228,6 +230,19 @@ def enrich_event(context: LifecycleEventContext) -> dict[str, object]:
 def child_environment(context: PreDispatchContext) -> dict[str, str]:
     return {"CALLER_EXECUTION_ID": context.execution.metadata.execution_id}
 
+def resolve_execution_inputs(
+    context: ExecutionInputResolutionContext,
+) -> ExecutionInputs:
+    checkpoint = context.layout.checkpoints_dir / "latest.pt"
+    if not checkpoint.is_file():
+        return context.run.execution
+    receipt = inspect_artifact(checkpoint)
+    return replace(
+        context.run.execution,
+        resume_checkpoint=checkpoint,
+        resume_checkpoint_sha256=receipt.sha256,
+    )
+
 workflow = ProgrammaticWorkflow(
     runs=(make_run("a"), make_run("b")),
     dispatch=(
@@ -238,6 +253,7 @@ workflow = ProgrammaticWorkflow(
     ),
     lifecycle_field_provider=enrich_event,
     child_environment_provider=child_environment,
+    execution_input_resolver=resolve_execution_inputs,
 )
 result = run_programmatic_workflow(workflow)
 ```
@@ -247,6 +263,20 @@ metadata, and `runner.jsonl` event stream. `result.dispatch` preserves the
 explicit global order, while `result.run(name)` and `result.step(run, step)`
 provide direct lookup. Use `dry_run=True` to receive the fully resolved command
 plan with no filesystem or execution side effects.
+
+For resume or lineage choices that must be atomic with logical-run ownership,
+set `ProgrammaticWorkflow.execution_input_resolver`. Mammoth calls it once for
+each activated run after preparing its layout and claiming its lease, but
+before publishing `execution.json`, creating an observer, or starting a child.
+It receives only a frozen run and prepared `RunLayout` and must return a
+complete `ExecutionInputs` value. The returned checkpoint path and optional
+SHA-256, lineage IDs, starting coordinates, runtime metadata, and other inputs
+are validated and published as one immutable context. Planning and dry runs
+retain and validate `ProgrammaticRun.execution` as the baseline and never call
+the resolver. `resolve_previous_execution=True` resolves the latest previous
+execution after the resolver returns, while the same lease is still held.
+Resolver failure, invalid output, or interruption publishes no execution
+context, starts no child, and releases the lease.
 
 The caller owns compilation, phase names, command arguments, and optional
 pre-dispatch project work. Mammoth owns serial dispatch, dependency and
