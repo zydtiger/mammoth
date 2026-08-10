@@ -193,6 +193,7 @@ from mammoth.core import RunLayout
 from mammoth.workflow import (
     DispatchEntry,
     ExecutionInputs,
+    LifecycleEventContext,
     ProgrammaticRun,
     ProgrammaticWorkflow,
     StepConfig,
@@ -214,7 +215,13 @@ def make_run(name: str) -> ProgrammaticRun:
             command=("project", "runset", "campaign.yaml"),
             config_reference="campaign.yaml",
         ),
+        lifecycle_fields={"campaign": "summer", "runset_path": "campaign.yaml"},
     )
+
+def enrich_event(context: LifecycleEventContext) -> dict[str, object]:
+    if context.event == "task_started":
+        return {"resolved_command": context.command}
+    return {}
 
 workflow = ProgrammaticWorkflow(
     runs=(make_run("a"), make_run("b")),
@@ -224,6 +231,7 @@ workflow = ProgrammaticWorkflow(
         DispatchEntry("a", "validate"),
         DispatchEntry("b", "validate"),
     ),
+    lifecycle_field_provider=enrich_event,
 )
 result = run_programmatic_workflow(workflow)
 ```
@@ -238,6 +246,20 @@ The caller owns compilation, phase names, command arguments, and optional
 pre-dispatch project work. Mammoth owns serial dispatch, dependency and
 first-failure propagation, lifecycle events, child cleanup, and lease release.
 Commands remain tokenized argv sequences; no command is run through a shell.
+
+Use `ProgrammaticRun.lifecycle_fields` for immutable JSON-compatible fields
+that Mammoth attaches to every lifecycle record for that run. An optional
+`ProgrammaticWorkflow.lifecycle_field_provider` receives a read-only
+`LifecycleEventContext` for event-specific fields. The context exposes the
+event, run, step, immutable execution context, sanitized resolved command, and
+the actual launcher PID once a task has started. When a programmatic caller
+selects enrichment, Mammoth writes that PID as `child_pid` on `task_started`;
+callers cannot replace it or any schema-owned identity, phase, task, timing,
+exit, signal, or message fields. Static fields are checked before side effects,
+while dynamic fields are checked before their record is appended. Secrets and
+unsafe references are rejected rather than persisted. Providers never receive
+an observer, lease, or process object; if a provider fails, Mammoth emits
+deterministic terminal records and reclaims the owned child and lease.
 
 ## Capture a supervised command
 
