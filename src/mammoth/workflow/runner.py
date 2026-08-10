@@ -32,6 +32,7 @@ from mammoth.core import (
     sanitize_metadata_fields,
     sanitize_reference,
     validate_execution_id,
+    validate_resume_checkpoint_sha256,
     validate_run_name,
 )
 from mammoth.core.events import EventName, ExecutionEventWriter
@@ -90,8 +91,9 @@ class ExecutionInputs:
     ``ProgrammaticRun`` supplies the run name and selected step names.  This
     value supplies the remaining generic metadata, including an optional
     caller-owned intended-phase sequence, accepted by
-    :func:`mammoth.core.create_execution_context`; all metadata is validated
-    before the executor prepares a layout or claims a logical-run lease.
+    :func:`mammoth.core.create_execution_context`.  The baseline is validated
+    during preflight; an optional workflow resolver may replace it after the
+    executor claims the logical-run lease.
     """
 
     invocation_kind: str
@@ -106,6 +108,7 @@ class ExecutionInputs:
     starting_global_step: int | None = None
     runtime: Mapping[str, Any] | None = None
     intended_phases: Sequence[str] | None = None
+    resume_checkpoint_sha256: str | None = None
 
     def __post_init__(self) -> None:
         """Freeze structured runtime metadata without persisting environment state."""
@@ -218,6 +221,22 @@ ChildEnvironmentProvider = Callable[[PreDispatchContext], Mapping[str, str] | No
 
 
 @dataclass(frozen=True, slots=True)
+class ExecutionInputResolutionContext:
+    """Read-only compiled-run facts available while its prepared layout is leased.
+
+    The resolver receives no observer, event writer, lease object, process,
+    environment, or child-lifetime control.  Its ``run.execution`` value is the
+    preflight-valid baseline retained by planning and dry runs.
+    """
+
+    run: ProgrammaticRun
+    layout: RunLayout
+
+
+ExecutionInputResolver = Callable[[ExecutionInputResolutionContext], ExecutionInputs]
+
+
+@dataclass(frozen=True, slots=True)
 class LifecycleEventContext:
     """Read-only facts supplied when enriching one Mammoth-owned lifecycle event.
 
@@ -264,6 +283,11 @@ class ProgrammaticWorkflow:
         compare=False,
         repr=False,
     )
+    execution_input_resolver: ExecutionInputResolver | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         """Reject invalid top-level fields before a side-effect-free preflight."""
@@ -300,6 +324,12 @@ class ProgrammaticWorkflow:
         ):
             raise ValueError(
                 "Programmatic workflow lifecycle_field_provider must be callable or None"
+            )
+        if self.execution_input_resolver is not None and not callable(
+            self.execution_input_resolver
+        ):
+            raise ValueError(
+                "Programmatic workflow execution_input_resolver must be callable or None"
             )
 
 
@@ -611,6 +641,7 @@ def run_programmatic_workflow(
                         by_name[entry.run_name],
                         active,
                         workflow.lifecycle_field_provider,
+                        workflow.execution_input_resolver,
                     )
                 step = current.run.step(entry.step_name)
                 pending = _PendingDispatch(entry)
@@ -790,54 +821,107 @@ def _start_run(
     run: ProgrammaticRun,
     active: dict[str, _ActiveRun],
     lifecycle_field_provider: LifecycleEventFieldProvider | None,
+    execution_input_resolver: ExecutionInputResolver | None,
 ) -> _ActiveRun:
     """Prepare one independently owned layout, lease, context, and observer."""
     current: _ActiveRun | None = None
     lease: LogicalRunLease | None = None
     try:
+        if execution_input_resolver is None:
+            with _blocked_interruption_signals():
+                layout = run.layout.prepare()
+                lease = claim_logical_run_lease(layout.run_dir)
+                current = _create_active_run(
+                    run,
+                    layout,
+                    lease,
+                    run.execution,
+                    active,
+                    lifecycle_field_provider,
+                )
+                _emit_execution_started(current)
+            return current
+
         with _blocked_interruption_signals():
             layout = run.layout.prepare()
             lease = claim_logical_run_lease(layout.run_dir)
-            inputs = run.execution
-            previous_execution_id = inputs.previous_execution_id
-            if run.resolve_previous_execution:
-                previous_execution_id = latest_execution_id(layout.run_dir)
-            context = create_execution_context(
-                layout.run_dir,
-                run_name=run.name,
-                invocation_kind=inputs.invocation_kind,
-                intended_phases=(
-                    inputs.intended_phases
-                    if inputs.intended_phases is not None
-                    else tuple(step.name for step in run.steps)
-                ),
-                world_size=inputs.world_size,
-                execution_mode=inputs.execution_mode,
-                command=inputs.command,
-                config_reference=inputs.config_reference,
-                previous_execution_id=previous_execution_id,
-                resume_checkpoint=inputs.resume_checkpoint,
-                parent_execution_id=inputs.parent_execution_id,
-                starting_epoch=inputs.starting_epoch,
-                starting_global_step=inputs.starting_global_step,
-                runtime=_thaw_runtime_metadata(inputs.runtime),
+
+        inputs = execution_input_resolver(
+            ExecutionInputResolutionContext(run=run, layout=layout)
+        )
+        if not isinstance(inputs, ExecutionInputs):
+            raise ValueError(
+                "Programmatic workflow execution_input_resolver must return "
+                "ExecutionInputs"
             )
-            observer = RunObserver((JsonlEventSink(ExecutionEventWriter.for_runner(context)),))
-            current = _ActiveRun(run, lease, context, observer, lifecycle_field_provider)
-            active[run.name] = current
-            try:
-                _emit_started_lifecycle_event(
-                    current,
-                    "execution_started",
-                    fields={},
-                )
-            except _LifecycleFieldProviderError as error:
-                current.startup_failure = f"lifecycle event field provider failed: {error}"
+        _validate_execution_inputs(inputs)
+
+        with _blocked_interruption_signals():
+            current = _create_active_run(
+                run,
+                layout,
+                lease,
+                inputs,
+                active,
+                lifecycle_field_provider,
+            )
+            _emit_execution_started(current)
         return current
     except BaseException:
         if current is None and lease is not None:
             lease.close()
         raise
+
+
+def _create_active_run(
+    run: ProgrammaticRun,
+    layout: RunLayout,
+    lease: LogicalRunLease,
+    inputs: ExecutionInputs,
+    active: dict[str, _ActiveRun],
+    lifecycle_field_provider: LifecycleEventFieldProvider | None,
+) -> _ActiveRun:
+    """Publish and register one context while its caller blocks interruptions."""
+    previous_execution_id = inputs.previous_execution_id
+    if run.resolve_previous_execution:
+        previous_execution_id = latest_execution_id(layout.run_dir)
+    context = create_execution_context(
+        layout.run_dir,
+        run_name=run.name,
+        invocation_kind=inputs.invocation_kind,
+        intended_phases=(
+            inputs.intended_phases
+            if inputs.intended_phases is not None
+            else tuple(step.name for step in run.steps)
+        ),
+        world_size=inputs.world_size,
+        execution_mode=inputs.execution_mode,
+        command=inputs.command,
+        config_reference=inputs.config_reference,
+        previous_execution_id=previous_execution_id,
+        resume_checkpoint=inputs.resume_checkpoint,
+        resume_checkpoint_sha256=inputs.resume_checkpoint_sha256,
+        parent_execution_id=inputs.parent_execution_id,
+        starting_epoch=inputs.starting_epoch,
+        starting_global_step=inputs.starting_global_step,
+        runtime=_thaw_runtime_metadata(inputs.runtime),
+    )
+    observer = RunObserver((JsonlEventSink(ExecutionEventWriter.for_runner(context)),))
+    current = _ActiveRun(run, lease, context, observer, lifecycle_field_provider)
+    active[run.name] = current
+    return current
+
+
+def _emit_execution_started(active: _ActiveRun) -> None:
+    """Emit the registered attempt start or retain its provider failure."""
+    try:
+        _emit_started_lifecycle_event(
+            active,
+            "execution_started",
+            fields={},
+        )
+    except _LifecycleFieldProviderError as error:
+        active.startup_failure = f"lifecycle event field provider failed: {error}"
 
 
 def _execute_step(
@@ -1471,44 +1555,50 @@ def _step_interruption_signal(results: Sequence[StepResult]) -> int:
 def _validate_execution_inputs_for_runs(runs: Sequence[ProgrammaticRun]) -> None:
     """Preflight every immutable execution input using core metadata contracts."""
     for run in runs:
-        inputs = run.execution
-        if not isinstance(inputs.invocation_kind, str) or not inputs.invocation_kind:
-            raise ValueError("execution invocation_kind must be a non-empty string")
-        sanitize_command(inputs.command)
-        if inputs.intended_phases is not None:
-            _freeze_intended_phases(inputs.intended_phases)
-        if inputs.config_reference != "":
-            sanitize_reference(inputs.config_reference)
-        if inputs.resume_checkpoint is not None:
-            sanitize_reference(inputs.resume_checkpoint)
-        if inputs.runtime is not None:
-            runtime = _thaw_runtime_metadata(inputs.runtime)
-            if runtime is None:
-                raise RuntimeError("frozen execution runtime metadata was unexpectedly absent")
-            sanitize_metadata_fields(runtime)
-        if (
-            not isinstance(inputs.world_size, int)
-            or isinstance(inputs.world_size, bool)
-            or inputs.world_size < 1
-        ):
-            raise ValueError("execution world_size must be a positive integer")
-        if inputs.execution_mode not in {"single", "distributed"}:
-            raise ValueError("execution execution_mode must be 'single' or 'distributed'")
-        if (inputs.execution_mode == "single") != (inputs.world_size == 1):
-            raise ValueError("execution execution_mode and world_size disagree")
-        for field_name in ("starting_epoch", "starting_global_step"):
-            value = getattr(inputs, field_name)
-            if value is not None and (
-                not isinstance(value, int) or isinstance(value, bool) or value < 0
-            ):
-                raise ValueError(f"execution {field_name} must be a non-negative integer or None")
-        for field_name in ("previous_execution_id", "parent_execution_id"):
-            value = getattr(inputs, field_name)
-            if value is not None:
-                validate_execution_id(value)
+        _validate_execution_inputs(run.execution)
         _validate_environment(run.environment)
         for step in run.steps:
             _validate_environment(step.environment)
+
+
+def _validate_execution_inputs(inputs: ExecutionInputs) -> None:
+    """Validate one baseline or lease-resolved execution-input value."""
+    if not isinstance(inputs.invocation_kind, str) or not inputs.invocation_kind:
+        raise ValueError("execution invocation_kind must be a non-empty string")
+    sanitize_command(inputs.command)
+    if inputs.intended_phases is not None:
+        _freeze_intended_phases(inputs.intended_phases)
+    if inputs.config_reference != "":
+        sanitize_reference(inputs.config_reference)
+    if inputs.resume_checkpoint is not None:
+        sanitize_reference(inputs.resume_checkpoint)
+    if inputs.resume_checkpoint_sha256 is not None:
+        validate_resume_checkpoint_sha256(inputs.resume_checkpoint_sha256)
+    if inputs.runtime is not None:
+        runtime = _thaw_runtime_metadata(inputs.runtime)
+        if runtime is None:
+            raise RuntimeError("frozen execution runtime metadata was unexpectedly absent")
+        sanitize_metadata_fields(runtime)
+    if (
+        not isinstance(inputs.world_size, int)
+        or isinstance(inputs.world_size, bool)
+        or inputs.world_size < 1
+    ):
+        raise ValueError("execution world_size must be a positive integer")
+    if inputs.execution_mode not in {"single", "distributed"}:
+        raise ValueError("execution execution_mode must be 'single' or 'distributed'")
+    if (inputs.execution_mode == "single") != (inputs.world_size == 1):
+        raise ValueError("execution execution_mode and world_size disagree")
+    for field_name in ("starting_epoch", "starting_global_step"):
+        value = getattr(inputs, field_name)
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            raise ValueError(f"execution {field_name} must be a non-negative integer or None")
+    for field_name in ("previous_execution_id", "parent_execution_id"):
+        value = getattr(inputs, field_name)
+        if value is not None:
+            validate_execution_id(value)
 
 
 def _validate_programmatic_layouts(runs: Sequence[ProgrammaticRun]) -> None:
