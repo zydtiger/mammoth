@@ -120,10 +120,6 @@ publication. Pushing or opening a pull request, merging, and closing the issue
 require their applicable explicit approvals. After merge, verify the exact
 commit and issue state before removing only clean task branches and worktrees.
 
-Globally installed `issue-discovery` and `issue-delivery` skills may assist with
-these rules, but generic cross-project skills are optional operator tooling
-rather than Mammoth source or reproducible project dependencies.
-
 ## Python And API Standards
 
 - Use Python 3.12 syntax unless the project baseline is deliberately changed.
