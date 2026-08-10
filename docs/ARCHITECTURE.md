@@ -109,12 +109,22 @@ compile its own domain configuration into a `ProgrammaticWorkflow`: distinct
 immutable execution inputs while an explicit global dispatch sequence may
 interleave their steps. Mammoth validates the complete plan before it creates
 an artifact or claims a lease, then owns the per-run contexts, runner events,
-child supervision, failure/interrupt cleanup, and structured results. Callers
-retain their configuration schema, command generation, phase meanings,
-pre-dispatch actions, and all domain policy. A pre-dispatch hook receives only
-read-only run, step, layout, and execution context; it never owns a Mammoth
-observer, lease, or child process. A programmatic run may supply frozen static
-`lifecycle_fields`, and its workflow may supply a typed
+child supervision, failure/interrupt cleanup, and structured results. An
+optional `execution_input_resolver` runs once for each activated run after its
+layout is prepared and its logical-run lease is held, but before immutable
+execution metadata or lifecycle records exist. It receives only the frozen
+compiled run and prepared layout and returns a complete `ExecutionInputs`
+replacement. Mammoth validates that replacement and publishes its resume
+checkpoint path and SHA-256, lineage, starting coordinates, runtime metadata,
+and other generic fields into the single child-joined execution context.
+Planning and dry runs validate only the compiled baseline and never invoke the
+resolver. Resolver failure or interruption releases the lease without a
+context or child; schema-v1 and workflows without the extension retain the
+static path. Callers retain their configuration schema, command generation,
+phase meanings, pre-dispatch actions, and all domain policy. A pre-dispatch
+hook receives only read-only run, step, layout, and execution context; it never
+owns a Mammoth observer, lease, or child process. A programmatic run may supply
+frozen static `lifecycle_fields`, and its workflow may supply a typed
 `lifecycle_field_provider` for event-specific extensions. Mammoth validates
 those extensions, preserves ownership of append order and all terminal
 transitions, and rejects schema-owned event keys or unsafe metadata. The
@@ -131,8 +141,8 @@ and step fields, then restores ownership of all `MAMMOTH_*` join variables.
 Provider failure follows the same owned failure, cleanup, and lease-release
 path as a launch failure. Mammoth starts an enriched child before
 `task_started` so the `child_pid` emitted for enriched programmatic workflows
-is real. Schema-v1 YAML workflows compile without either programmatic
-extension and preserve their existing event records and environment behavior.
+is real. Schema-v1 YAML workflows compile without these programmatic
+extensions and preserve their existing event records and environment behavior.
 
 The ordinary workflow launcher inherits the parent terminal streams; callers
 that explicitly need captured output use `run_captured_process()` for separately
