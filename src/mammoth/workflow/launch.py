@@ -152,9 +152,16 @@ def launch_process(
     environment: Mapping[str, str],
     timeout_seconds: float | None,
     terminate_grace_seconds: float = 5.0,
+    on_started: Callable[[int], None] | None = None,
 ) -> ProcessResult:
-    """Run one command and terminate its process group on timeout or interruption."""
+    """Run one command and terminate its process group on timeout or interruption.
+
+    ``on_started`` receives the real launcher PID after Mammoth has started
+    the supervised child and before it waits.  A callback failure follows the
+    same owned cleanup path as any other launch-time failure.
+    """
     started = time.monotonic()
+    deadline = None if timeout_seconds is None else started + timeout_seconds
     process = SupervisedProcess(
         command,
         cwd=cwd,
@@ -162,7 +169,10 @@ def launch_process(
         terminate_grace_seconds=terminate_grace_seconds,
     ).start()
     try:
-        return_code = process.wait(timeout=timeout_seconds)
+        if on_started is not None:
+            on_started(process.pid)
+        remaining_timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+        return_code = process.wait(timeout=remaining_timeout)
     except subprocess.TimeoutExpired:
         with _defer_termination_signals():
             process.stop()
@@ -188,9 +198,11 @@ def launch_process(
         with _defer_termination_signals():
             process.stop()
         raise
+    timed_out = deadline is not None and time.monotonic() > deadline
     return ProcessResult(
         return_code=return_code,
         duration_seconds=time.monotonic() - started,
+        timed_out=timed_out,
         signal=-return_code if return_code < 0 else None,
     )
 
