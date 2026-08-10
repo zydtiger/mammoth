@@ -80,14 +80,16 @@ _LIFECYCLE_RESERVED_FIELDS = frozenset(
         "child_pid",
     }
 )
+_MAMMOTH_CHILD_ENVIRONMENT_PREFIX = "MAMMOTH_"
 
 
 @dataclass(frozen=True, slots=True)
 class ExecutionInputs:
     """Caller-owned immutable inputs for one runner-created execution context.
 
-    ``ProgrammaticRun`` supplies the run name and selected phase names.  This
-    value supplies the remaining generic metadata accepted by
+    ``ProgrammaticRun`` supplies the run name and selected step names.  This
+    value supplies the remaining generic metadata, including an optional
+    caller-owned intended-phase sequence, accepted by
     :func:`mammoth.core.create_execution_context`; all metadata is validated
     before the executor prepares a layout or claims a logical-run lease.
     """
@@ -103,6 +105,7 @@ class ExecutionInputs:
     starting_epoch: int | None = None
     starting_global_step: int | None = None
     runtime: Mapping[str, Any] | None = None
+    intended_phases: Sequence[str] | None = None
 
     def __post_init__(self) -> None:
         """Freeze structured runtime metadata without persisting environment state."""
@@ -112,6 +115,9 @@ class ExecutionInputs:
         if not command or any(not isinstance(item, str) or not item for item in command):
             raise ValueError("execution command must contain non-empty strings")
         object.__setattr__(self, "command", command)
+        if self.intended_phases is not None:
+            intended_phases = _freeze_intended_phases(self.intended_phases)
+            object.__setattr__(self, "intended_phases", intended_phases)
         if self.runtime is not None:
             object.__setattr__(
                 self,
@@ -208,6 +214,7 @@ class PreDispatchContext:
 
 
 PreDispatchHook = Callable[[PreDispatchContext], None]
+ChildEnvironmentProvider = Callable[[PreDispatchContext], Mapping[str, str] | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +259,11 @@ class ProgrammaticWorkflow:
         compare=False,
         repr=False,
     )
+    child_environment_provider: ChildEnvironmentProvider | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         """Reject invalid top-level fields before a side-effect-free preflight."""
@@ -275,6 +287,13 @@ class ProgrammaticWorkflow:
             raise ValueError("Programmatic workflow failure_policy must be 'stop' or 'continue'")
         if self.pre_dispatch is not None and not callable(self.pre_dispatch):
             raise ValueError("Programmatic workflow pre_dispatch must be callable or None")
+        if (
+            self.child_environment_provider is not None
+            and not callable(self.child_environment_provider)
+        ):
+            raise ValueError(
+                "Programmatic workflow child_environment_provider must be callable or None"
+            )
         if (
             self.lifecycle_field_provider is not None
             and not callable(self.lifecycle_field_provider)
@@ -372,6 +391,10 @@ class _WorkflowInterrupted(BaseException):
 
 class _LifecycleFieldProviderError(RuntimeError):
     """Mark one dynamic enrichment failure after disabling its provider."""
+
+
+class _ChildEnvironmentProviderError(RuntimeError):
+    """Translate an invalid dynamic child environment into a launch failure."""
 
 
 @dataclass(slots=True)
@@ -627,6 +650,7 @@ def run_programmatic_workflow(
                         entry,
                         step,
                         workflow.pre_dispatch,
+                        workflow.child_environment_provider,
                         environment,
                         pending,
                     )
@@ -715,6 +739,7 @@ def child_environment(
     *,
     run_environment: Mapping[str, str],
     step_environment: Mapping[str, str],
+    additional_environment: Mapping[str, str] | None = None,
     run_name: str,
     execution_id: str,
     invocation_kind: str,
@@ -724,6 +749,8 @@ def child_environment(
     environment = dict(base)
     environment.update(run_environment)
     environment.update(step_environment)
+    if additional_environment is not None:
+        environment.update(additional_environment)
     environment.update(
         {
             EXECUTION_ID_ENV: execution_id,
@@ -733,6 +760,30 @@ def child_environment(
         }
     )
     return environment
+
+
+def _child_environment_fields(
+    provider: ChildEnvironmentProvider | None,
+    context: PreDispatchContext,
+) -> Mapping[str, str]:
+    """Return validated provider fields without exposing the base environment."""
+    if provider is None:
+        return MappingProxyType({})
+    try:
+        provided = provider(context)
+        fields = _validate_environment({} if provided is None else provided)
+    except _WorkflowInterrupted:
+        raise
+    except BaseException as error:
+        raise _ChildEnvironmentProviderError(str(error)) from error
+    collisions = sorted(
+        name for name in fields if name.startswith(_MAMMOTH_CHILD_ENVIRONMENT_PREFIX)
+    )
+    if collisions:
+        raise _ChildEnvironmentProviderError(
+            "child environment provider cannot override Mammoth-owned variables"
+        )
+    return MappingProxyType(fields)
 
 
 def _start_run(
@@ -755,7 +806,11 @@ def _start_run(
                 layout.run_dir,
                 run_name=run.name,
                 invocation_kind=inputs.invocation_kind,
-                intended_phases=tuple(step.name for step in run.steps),
+                intended_phases=(
+                    inputs.intended_phases
+                    if inputs.intended_phases is not None
+                    else tuple(step.name for step in run.steps)
+                ),
                 world_size=inputs.world_size,
                 execution_mode=inputs.execution_mode,
                 command=inputs.command,
@@ -790,6 +845,7 @@ def _execute_step(
     dispatch: DispatchEntry,
     step: StepConfig,
     hook: PreDispatchHook | None,
+    child_environment_provider: ChildEnvironmentProvider | None,
     base_environment: Mapping[str, str],
     pending: _PendingDispatch,
 ) -> StepResult:
@@ -797,6 +853,7 @@ def _execute_step(
     task_id = step.name
     command = sanitize_command(command_for_step(step))
     enrichment_enabled = _lifecycle_enrichment_enabled(active)
+    task_start_requires_child = enrichment_enabled or child_environment_provider is not None
     phase_started = False
     task_started = False
     running_hook = hook is not None
@@ -815,7 +872,7 @@ def _execute_step(
                 raise
             else:
                 phase_started = True
-            if not enrichment_enabled:
+            if not task_start_requires_child:
                 _emit_lifecycle_event(
                     active,
                     "task_started",
@@ -825,9 +882,14 @@ def _execute_step(
                     include_provider=False,
                 )
                 task_started = True
+        pre_dispatch_context = PreDispatchContext(dispatch, active.run, step, active.context)
         if hook is not None:
-            hook(PreDispatchContext(dispatch, active.run, step, active.context))
+            hook(pre_dispatch_context)
         running_hook = False
+        additional_environment = _child_environment_fields(
+            child_environment_provider,
+            pre_dispatch_context,
+        )
 
         def record_task_started(child_pid: int) -> None:
             nonlocal task_started
@@ -859,13 +921,14 @@ def _execute_step(
                 base_environment,
                 run_environment=active.run.environment,
                 step_environment=step.environment,
+                additional_environment=additional_environment,
                 run_name=active.run.name,
                 execution_id=active.context.metadata.execution_id,
                 invocation_kind=active.context.metadata.invocation_kind,
                 phase=step.name,
             ),
             timeout_seconds=step.timeout_seconds,
-            on_started=record_task_started if enrichment_enabled else None,
+            on_started=record_task_started if task_start_requires_child else None,
         )
         return _finish_process_step(active, step, command, task_id, process, pending)
     except _LifecycleFieldProviderError as error:
@@ -932,7 +995,10 @@ def _execute_step(
             phase_fields={"phase": step.name, "message": reason, "exit_code": 127},
         )
     except Exception as error:
-        prefix = "pre-dispatch hook failed" if running_hook else "workflow execution failed"
+        if isinstance(error, _ChildEnvironmentProviderError):
+            prefix = "child environment provider failed"
+        else:
+            prefix = "pre-dispatch hook failed" if running_hook else "workflow execution failed"
         reason = f"{prefix}: {error}"
         return _emit_step_terminal(
             active,
@@ -1409,6 +1475,8 @@ def _validate_execution_inputs_for_runs(runs: Sequence[ProgrammaticRun]) -> None
         if not isinstance(inputs.invocation_kind, str) or not inputs.invocation_kind:
             raise ValueError("execution invocation_kind must be a non-empty string")
         sanitize_command(inputs.command)
+        if inputs.intended_phases is not None:
+            _freeze_intended_phases(inputs.intended_phases)
         if inputs.config_reference != "":
             sanitize_reference(inputs.config_reference)
         if inputs.resume_checkpoint is not None:
@@ -1462,6 +1530,21 @@ def _freeze_runtime_metadata(runtime: Mapping[str, Any]) -> Mapping[str, Any]:
     return MappingProxyType(
         {name: _freeze_runtime_value(value) for name, value in runtime.items()}
     )
+
+
+def _freeze_intended_phases(phases: Sequence[str]) -> tuple[str, ...]:
+    """Detach explicit execution metadata phase names before plan validation."""
+    if isinstance(phases, str) or not isinstance(phases, Sequence):
+        raise ValueError("execution intended_phases must be a sequence of phase strings")
+    frozen = tuple(phases)
+    if not frozen or any(not isinstance(phase, str) or not phase for phase in frozen):
+        raise ValueError("execution intended_phases must contain non-empty strings")
+    sanitized = sanitize_metadata_fields({"intended_phases": frozen})["intended_phases"]
+    if sanitized != list(frozen):
+        raise ValueError(
+            "execution intended_phases must not contain credentials or unsafe references"
+        )
+    return frozen
 
 
 def _freeze_lifecycle_fields(fields: Mapping[str, Any]) -> Mapping[str, Any]:
