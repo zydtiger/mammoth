@@ -17,6 +17,7 @@ from mammoth.workflow.launch import (
     run_captured_process,
 )
 from mammoth.workflow.runner import (
+    ChildEnvironmentProvider,
     DispatchEntry,
     DispatchResult,
     ExecutionInputs,
@@ -39,6 +40,7 @@ from mammoth.workflow.runner import (
 
 __all__ = [
     "CapturedProcessResult",
+    "ChildEnvironmentProvider",
     "CommandPlan",
     "DispatchEntry",
     "DispatchResult",
