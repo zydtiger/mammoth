@@ -201,7 +201,7 @@ def claim_logical_run_lease(run_dir: Path) -> LogicalRunLease:
             raise RuntimeError(
                 f"Another execution is already active for logical run {run_dir.name!r}: {path}"
             ) from error
-    except Exception:
+    except BaseException:
         os.close(descriptor)
         raise
     return LogicalRunLease(path=path, _descriptor=descriptor)

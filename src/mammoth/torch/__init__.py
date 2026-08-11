@@ -74,6 +74,7 @@ from mammoth.torch.profiling import (
 from mammoth.torch.runtime import (
     ExecutionRequest,
     ExecutionSession,
+    ExecutionSpec,
     Runtime,
     RuntimeConfig,
     initialize_runtime,
@@ -145,6 +146,7 @@ __all__ = [
     "TrainerState",
     "TorchCompileConfig",
     "ExecutionRequest",
+    "ExecutionSpec",
     "Runtime",
     "ExecutionSession",
     "RuntimeConfig",

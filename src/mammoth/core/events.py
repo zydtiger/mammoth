@@ -1078,7 +1078,7 @@ def _open_event_stream(path: Path) -> BinaryIO:
         if not stat.S_ISREG(descriptor_stat.st_mode):
             raise OSError(f"Execution event stream must be a regular file: {path}")
         return cast(BinaryIO, os.fdopen(descriptor, "r+b", buffering=0))
-    except Exception:
+    except BaseException:
         os.close(descriptor)
         raise
 

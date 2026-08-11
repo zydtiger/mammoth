@@ -67,7 +67,7 @@ def claim_process_text_log(path: Path) -> ProcessTextLogLease:
             raise RuntimeError(
                 f"Text log is already owned by another process: {log_path}"
             ) from error
-    except Exception:
+    except BaseException:
         os.close(descriptor)
         raise
     return ProcessTextLogLease(
@@ -88,6 +88,8 @@ class ProcessTextLogHandler(logging.StreamHandler[TextIO]):
         flags = os.O_WRONLY | os.O_APPEND
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
+        descriptor: int | None = None
+        stream: TextIO | None = None
         try:
             descriptor = os.open(self.path, flags)
             descriptor_stat = os.fstat(descriptor)
@@ -96,15 +98,31 @@ class ProcessTextLogHandler(logging.StreamHandler[TextIO]):
                 or descriptor_stat.st_dev != self._lease._device
                 or descriptor_stat.st_ino != self._lease._inode
             ):
-                os.close(descriptor)
                 raise OSError(f"Text log changed while ownership was established: {self.path}")
             stream = cast(TextIO, os.fdopen(descriptor, "a", encoding="utf-8", buffering=1))
+            descriptor = None
             super().__init__(stream)
             self.setLevel(level)
             self.setFormatter(logging.Formatter(DEFAULT_TEXT_FORMAT))
-        except BaseException:
+        except BaseException as error:
             self._mammoth_closed = True
-            self._lease.close()
+            try:
+                if stream is not None:
+                    stream.close()
+                elif descriptor is not None:
+                    os.close(descriptor)
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "Text log descriptor cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            try:
+                self._lease.close()
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "Text log lease cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
             raise
 
     def close(self) -> None:

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import mammoth.core.execution as execution_module
 from mammoth.core import (
     ExecutionMetadata,
     RunLayout,
@@ -312,5 +313,27 @@ def test_logical_run_lease_rejects_a_second_producer(tmp_path: Path) -> None:
         assert first.path.is_file()
         with pytest.raises(RuntimeError, match="already active"):
             claim_logical_run_lease(layout.run_dir)
+    with claim_logical_run_lease(layout.run_dir):
+        pass
+
+
+def test_logical_run_lease_closes_descriptor_after_lock_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``BaseException`` after flock succeeds cannot retain producer ownership."""
+    layout = RunLayout(tmp_path, "interrupted-lock").prepare()
+    original_flock = execution_module.fcntl.flock
+
+    def interrupt_after_lock(descriptor: int, operation: int) -> None:
+        original_flock(descriptor, operation)
+        if operation == execution_module.fcntl.LOCK_EX | execution_module.fcntl.LOCK_NB:
+            raise KeyboardInterrupt("lease acquisition interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(execution_module.fcntl, "flock", interrupt_after_lock)
+        with pytest.raises(KeyboardInterrupt, match="lease acquisition interrupted"):
+            claim_logical_run_lease(layout.run_dir)
+
     with claim_logical_run_lease(layout.run_dir):
         pass
