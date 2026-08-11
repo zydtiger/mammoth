@@ -1,8 +1,8 @@
 """Own generic single-process and standard PyTorch DDP execution state.
 
 CLI entrypoints construct this runtime before project code. The generic trainer
-consumes its device and rank identity, while execution logging uses it to create
-or join one immutable attempt and open one process-owned stream per rank.
+consumes its device and rank identity, while execution logging uses an explicitly
+created or attached immutable attempt and opens one process-owned stream per rank.
 """
 
 from __future__ import annotations
@@ -35,7 +35,6 @@ from mammoth.core import (
     execution_id_from_environment,
     join_execution_context,
     latest_execution_id,
-    normalize_execution_id_environment_aliases,
     sanitize_command,
     sanitize_metadata_fields,
     sanitize_reference,
@@ -179,51 +178,6 @@ class ExecutionSpec:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class ExecutionRequest:
-    """Project-neutral facts needed to establish one immutable execution.
-
-    Consumers may declare temporary execution-ID environment aliases here; the
-    runtime passes them to Mammoth's generic resolver without persisting them.
-    """
-
-    run_dir: Path
-    run_name: str
-    invocation_kind: str
-    intended_phases: tuple[str, ...]
-    command: tuple[str, ...]
-    config_reference: str | Path = ""
-    execution_id: str | None = None
-    previous_execution_id: str | None = None
-    resume_checkpoint: str | Path | None = None
-    resume_checkpoint_sha256: str | None = None
-    parent_execution_id: str | None = None
-    starting_epoch: int | None = None
-    starting_global_step: int | None = None
-    runtime: Mapping[str, Any] = field(default_factory=dict)
-    execution_id_environment_aliases: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "run_dir", Path(self.run_dir))
-        object.__setattr__(self, "intended_phases", tuple(self.intended_phases))
-        object.__setattr__(self, "command", tuple(self.command))
-        object.__setattr__(self, "runtime", dict(self.runtime))
-        _validate_resume_coordinate("starting_epoch", self.starting_epoch)
-        _validate_resume_coordinate("starting_global_step", self.starting_global_step)
-        if self.resume_checkpoint is not None:
-            if self.resume_checkpoint_sha256 is None:
-                raise ValueError("resume_checkpoint requires resume_checkpoint_sha256.")
-            if self.starting_epoch is None:
-                raise ValueError("resume_checkpoint requires starting_epoch.")
-        if self.resume_checkpoint_sha256 is not None:
-            validate_resume_checkpoint_sha256(self.resume_checkpoint_sha256)
-        object.__setattr__(
-            self,
-            "execution_id_environment_aliases",
-            normalize_execution_id_environment_aliases(self.execution_id_environment_aliases),
-        )
-
-
 def _validate_resume_coordinate(name: str, value: int | None) -> None:
     """Reject non-integral resume coordinates before their exact join comparison."""
     if value is not None and (
@@ -322,12 +276,14 @@ class _AttachmentIntent:
     run_name: str
     invocation_kind: str
     intended_phases: tuple[str, ...]
+    config_reference: str
     execution_id: str | None
     resume_checkpoint: str | None
     resume_checkpoint_sha256: str | None
     parent_execution_id: str | None
     starting_epoch: int | None
     starting_global_step: int | None
+    runtime: dict[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -555,24 +511,6 @@ class Runtime:
             details = "; ".join(f"rank {status.rank}: {status.error}" for status in failures)
             raise RuntimeError(f"Distributed startup stage {stage!r} failed: {details}")
 
-    def start_execution(
-        self,
-        request: ExecutionRequest,
-        *,
-        additional_sinks: Sequence[ObservationSink] = (),
-        text_level: int = logging.INFO,
-    ) -> ExecutionLogging:
-        """Create or join one attempt and establish rank-local logging by consensus."""
-        with self._state_lock:
-            self._require_open()
-            if self.execution_logging is not None:
-                raise RuntimeError("This torch runtime has already started an execution")
-            self.establish_execution(request)
-            return self.start_execution_logging(
-                additional_sinks=additional_sinks,
-                text_level=text_level,
-            )
-
     def start_execution_logging(
         self,
         *,
@@ -667,16 +605,6 @@ class Runtime:
             self.execution_context = context
             return context
 
-    def establish_execution(self, request: ExecutionRequest) -> ExecutionContext:
-        """Create or join and validate one immutable execution across all ranks."""
-        with self._state_lock:
-            self._require_open()
-            if self.execution_context is not None:
-                raise RuntimeError("This torch runtime has already established an execution")
-            context = self._establish_execution(request)
-            self.execution_context = context
-            return context
-
     def close_process_group(self) -> None:
         """Destroy the default process group only when this runtime created it."""
         if not self._owns_process_group:
@@ -751,90 +679,6 @@ class Runtime:
             startup_error.add_note(
                 f"Later {resource} cleanup failure: {_error_text(cleanup_failure)}"
             )
-
-    def _establish_execution(self, request: ExecutionRequest) -> ExecutionContext:
-        """Publish on rank zero, then make every rank join and validate one attempt."""
-        primary_result: _PrimaryResult | None = None
-        if self.is_primary:
-            try:
-                provided_execution_id = execution_id_from_environment(
-                    aliases=request.execution_id_environment_aliases
-                )
-                if provided_execution_id is not None:
-                    primary_context = join_execution_context(
-                        request.run_dir,
-                        provided_execution_id,
-                        expected_run_name=request.run_name,
-                    )
-                else:
-                    self._logical_run_lease = claim_logical_run_lease(request.run_dir)
-                    runtime_metadata = dict(request.runtime)
-                    runtime_metadata.update(self.provenance())
-                    primary_context = create_execution_context(
-                        request.run_dir,
-                        run_name=request.run_name,
-                        invocation_kind=request.invocation_kind,
-                        intended_phases=request.intended_phases,
-                        world_size=self.world_size,
-                        execution_mode="distributed" if self.enabled else "single",
-                        command=request.command,
-                        config_reference=request.config_reference,
-                        execution_id=request.execution_id,
-                        previous_execution_id=request.previous_execution_id,
-                        resume_checkpoint=request.resume_checkpoint,
-                        resume_checkpoint_sha256=request.resume_checkpoint_sha256,
-                        parent_execution_id=request.parent_execution_id,
-                        starting_epoch=request.starting_epoch,
-                        starting_global_step=request.starting_global_step,
-                        runtime=runtime_metadata,
-                    )
-                primary_result = _PrimaryResult(
-                    execution_id=primary_context.metadata.execution_id,
-                    error=None,
-                )
-            except BaseException as error:
-                error_text = _error_text(error)
-                try:
-                    self._release_logical_run_lease()
-                except BaseException as cleanup_error:
-                    error_text += f"; lease cleanup failed: {_error_text(cleanup_error)}"
-                primary_result = _PrimaryResult(execution_id=None, error=error_text)
-
-        try:
-            primary_result = self.broadcast_object(primary_result)
-        except BaseException:
-            self._release_logical_run_lease()
-            raise
-        if not isinstance(primary_result, _PrimaryResult):
-            self._release_logical_run_lease()
-            raise RuntimeError("Execution startup returned invalid primary data")
-        if primary_result.error is not None or primary_result.execution_id is None:
-            self._release_logical_run_lease()
-            raise RuntimeError(
-                "Execution initialization failed on rank 0: "
-                f"{primary_result.error or 'missing execution ID'}"
-            )
-
-        context: ExecutionContext | None = None
-        local_error: BaseException | None = None
-        try:
-            context = join_execution_context(
-                request.run_dir,
-                primary_result.execution_id,
-                expected_run_name=request.run_name,
-            )
-            self._validate_context(context, request)
-        except BaseException as error:
-            local_error = error
-        try:
-            self.startup_consensus("execution join", local_error)
-        except BaseException:
-            self._release_logical_run_lease()
-            raise
-        if context is None:
-            self._release_logical_run_lease()
-            raise RuntimeError("Execution join succeeded without a local context")
-        return context
 
     def _create_execution(self, spec: ExecutionSpec) -> ExecutionContext:
         """Coordinate strict creation while retaining the primary producer lease."""
@@ -1041,6 +885,11 @@ class Runtime:
                 run_name=expected.run_name,
                 invocation_kind=expected.invocation_kind,
                 intended_phases=expected.intended_phases,
+                config_reference=(
+                    ""
+                    if expected.config_reference == ""
+                    else sanitize_reference(expected.config_reference)
+                ),
                 execution_id=expected.execution_id,
                 resume_checkpoint=(
                     sanitize_reference(expected.resume_checkpoint)
@@ -1051,6 +900,7 @@ class Runtime:
                 parent_execution_id=expected.parent_execution_id,
                 starting_epoch=expected.starting_epoch,
                 starting_global_step=expected.starting_global_step,
+                runtime=sanitize_metadata_fields(dict(expected.runtime)),
             )
         except BaseException as error:
             intent_error = error
@@ -1066,12 +916,14 @@ class Runtime:
                 "run_name",
                 "invocation_kind",
                 "intended_phases",
+                "config_reference",
                 "execution_id",
                 "resume_checkpoint",
                 "resume_checkpoint_sha256",
                 "parent_execution_id",
                 "starting_epoch",
                 "starting_global_step",
+                "runtime",
             )
             differences = [
                 f"rank {rank}: "
@@ -1179,6 +1031,17 @@ class Runtime:
             raise ValueError(
                 f"Canonical phase {environment.phase!r} is absent from immutable metadata"
             )
+        expected_config_reference = (
+            ""
+            if expected.config_reference == ""
+            else sanitize_reference(expected.config_reference)
+        )
+        if metadata.config_reference != expected_config_reference:
+            raise ValueError("Attached execution has an unexpected config reference")
+        expected_runtime = sanitize_metadata_fields(dict(expected.runtime))
+        actual_runtime = sanitize_metadata_fields(dict(metadata.runtime or {}))
+        if actual_runtime != expected_runtime:
+            raise ValueError("Attached execution has unexpected runtime metadata")
         self._validate_resume_metadata(metadata, expected)
 
     def _expected_runtime_metadata(self, spec: ExecutionSpec) -> dict[str, Any]:
@@ -1207,47 +1070,6 @@ class Runtime:
                 raise ValueError(
                     f"Execution {metadata.execution_id!r} resume field {field_name!r} "
                     f"does not match: metadata={actual_value!r}, expected={expected_value!r}."
-                )
-
-    def _validate_context(
-        self,
-        context: ExecutionContext,
-        request: ExecutionRequest,
-    ) -> None:
-        metadata = context.metadata
-        expected_mode = "distributed" if self.enabled else "single"
-        workflow_child = metadata.invocation_kind == "workflow"
-        if not workflow_child and metadata.world_size != self.world_size:
-            raise ValueError(
-                f"Execution {metadata.execution_id!r} has world_size={metadata.world_size}, "
-                f"but this runtime has world_size={self.world_size}"
-            )
-        if not workflow_child and metadata.execution_mode != expected_mode:
-            raise ValueError(
-                f"Execution {metadata.execution_id!r} uses {metadata.execution_mode!r}, "
-                f"but this runtime uses {expected_mode!r}"
-            )
-        missing_phases = set(request.intended_phases).difference(metadata.intended_phases)
-        if missing_phases:
-            raise ValueError(
-                f"Execution {metadata.execution_id!r} omits phases: "
-                f"{', '.join(sorted(missing_phases))}"
-            )
-        if request.resume_checkpoint is None:
-            return
-        expected_facts = {
-            "resume_checkpoint": sanitize_reference(request.resume_checkpoint),
-            "resume_checkpoint_sha256": request.resume_checkpoint_sha256,
-            "parent_execution_id": request.parent_execution_id,
-            "starting_epoch": request.starting_epoch,
-            "starting_global_step": request.starting_global_step,
-        }
-        for field_name, expected_value in expected_facts.items():
-            actual_value = getattr(metadata, field_name)
-            if actual_value != expected_value:
-                raise ValueError(
-                    f"Execution {metadata.execution_id!r} resume field {field_name!r} "
-                    f"does not match: metadata={actual_value!r}, request={expected_value!r}."
                 )
 
     def _validate_initialized_group(self) -> None:

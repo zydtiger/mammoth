@@ -29,7 +29,7 @@ Dependencies point downward only:
 consuming project
     │
     ├── mammoth.torch       optional generic nn.Module/DataLoader training
-    ├── mammoth.workflow    declarative steps and launchers
+    ├── mammoth.workflow    programmatic serial steps and supervision
     ├── mammoth.monitor     replay, terminal UI, and telemetry
     ├── mammoth.logging     JSONL, text, and TensorBoard sinks
     └── mammoth.core        identities, layout, events, artifacts, provenance
@@ -103,46 +103,37 @@ root, while the coordinator journal makes interrupted multi-root publication
 recoverable.
 
 The workflow layer owns project-neutral local process supervision and serial
-multi-run orchestration. A caller may use Mammoth's schema-v1 YAML adapter or
-compile its own domain configuration into a `ProgrammaticWorkflow`: distinct
-`ProgrammaticRun` values retain independently supplied `RunLayout` and
-immutable execution inputs while an explicit global dispatch sequence may
-interleave their steps. Mammoth validates the complete plan before it creates
-an artifact or claims a lease, then owns the per-run contexts, runner events,
-child supervision, failure/interrupt cleanup, and structured results. An
-optional `execution_input_resolver` runs once for each activated run after its
-layout is prepared and its logical-run lease is held, but before immutable
-execution metadata or lifecycle records exist. It receives only the frozen
-compiled run and prepared layout and returns a complete `ExecutionInputs`
-replacement. Mammoth validates that replacement and publishes its resume
-checkpoint path and SHA-256, lineage, starting coordinates, runtime metadata,
-and other generic fields into the single child-joined execution context.
-Planning and dry runs validate only the compiled baseline and never invoke the
-resolver. Resolver failure or interruption releases the lease without a
-context or child; schema-v1 and workflows without the extension retain the
-static path. Callers retain their configuration schema, command generation,
-phase meanings, pre-dispatch actions, and all domain policy. A pre-dispatch
-hook receives only read-only run, step, layout, and execution context; it never
-owns a Mammoth observer, lease, or child process. A programmatic run may supply
-frozen static `lifecycle_fields`, and its workflow may supply a typed
-`lifecycle_field_provider` for event-specific extensions. Mammoth validates
-those extensions, preserves ownership of append order and all terminal
-transitions, and rejects schema-owned event keys or unsafe metadata. The
-provider receives only a read-only context with the event, run, step,
-execution metadata, sanitized resolved command, and real launcher PID after a
-task starts; it cannot write events or manage the child. A caller may also set
-an explicit immutable `ExecutionInputs.intended_phases` sequence when its
-metadata names intentionally differ from dispatch step names. Immediately
-before a non-dry child launch, a typed `child_environment_provider` receives
-the same read-only pre-dispatch context and may return validated additive
-variables derived from the created execution context. Mammoth never exposes
-the inherited base environment, applies these variables only after static run
-and step fields, then restores ownership of all `MAMMOTH_*` join variables.
-Provider failure follows the same owned failure, cleanup, and lease-release
-path as a launch failure. Mammoth starts an enriched child before
-`task_started` so the `child_pid` emitted for enriched programmatic workflows
-is real. Schema-v1 YAML workflows compile without these programmatic
-extensions and preserve their existing event records and environment behavior.
+multi-run orchestration through Python values only. `Workflow`, `Run`, `Step`,
+and `Execution` are immutable caller inputs; step commands are already-final
+argv, step names are canonical phases, and workflow/run roots derive each
+`RunLayout`. `Workflow.plan()` validates the complete model and returns command
+plans without touching the filesystem, claiming a lease, resolving execution
+inputs, or emitting lifecycle records. Run-major order preserves declared runs
+and steps. Step-major order interleaves runs through one explicit canonical
+`step_order`; each run must declare a duplicate-free subsequence and may omit
+canonical phases.
+
+`Workflow.run()` owns prepared layouts, logical-run leases, immutable execution
+contexts, observers, lifecycle transitions, child supervision, interruption,
+and cleanup. For each activated run, `resolve_execution()` may replace the
+baseline `Execution` after layout preparation and lease acquisition but before
+metadata publication. Mammoth records the workflow invocation from `sys.argv`,
+derives intended phases from the run's steps, and resolves the previous attempt
+under the lease. `before_first_step()` runs at most once after
+`execution_started` and before the first `phase_started`; its failure therefore
+produces only execution-level failure lifecycle. These are the only caller
+lifecycle boundaries. Callers retain command construction, phase meanings,
+configuration schemas, and all domain policy.
+
+Static workflow, run, and step environments are copied and frozen. Child
+launches strip inherited `MAMMOTH_*` values and inject only the canonical
+execution ID, run name, invocation kind, and current phase. The first ordinary
+failure stops dispatch and determines the structured `WorkflowResult` exit
+code. Runs that never activate become blocked in memory without artifacts.
+A post-lease resolver exception remains exceptional: Mammoth finalizes active
+runs, terminates or reaps any child, closes observers, releases every lease,
+and then re-raises the original error without allowing cleanup failures to
+replace it.
 
 The ordinary workflow launcher inherits the parent terminal streams; callers
 that explicitly need captured output use `run_captured_process()` for separately
@@ -323,15 +314,19 @@ separately from rank-logging startup so projects can attach presentation sinks
 without recreating the runtime. The runtime does
 not encode GPU models, concrete workload weights, or project topology rules.
 
-Rank zero creates a direct execution and holds its logical-run lease, or joins
-an execution identified by `MAMMOTH_EXECUTION_ID`. A consuming project may
-explicitly pass temporary compatibility alias names through
-`ExecutionRequest`; Mammoth validates those names and their values with
-the canonical variable, but does not define, publish, or persist any
-consumer-specific alias. Every rank validates the same immutable context, opens
-its own JSONL and text streams, and reaches startup consensus. A failure on any
-rank is reported coherently before project work begins. TensorBoard's rank-aware
-sink and trainer checkpoints default to rank zero.
+Execution establishment is explicit and strict. `create_execution(spec)`
+rejects a populated canonical execution-ID environment, claims the logical-run
+lease on rank zero, resolves the previous attempt while holding that lease, and
+publishes a new immutable execution using the invocation snapshot agreed by all
+ranks. `attach_execution(expected)` requires the four canonical workflow-child
+variables, joins their exact execution ID, and never creates metadata or claims
+the producer lease. It validates the resolved run directory, run name,
+invocation kind, phase membership, execution mode, world size, config reference,
+runtime metadata, and all five nullable resume facts. Both operations propagate
+rank-local preparation or validation failures through distributed startup
+consensus before workload construction. After either operation succeeds, every
+rank may open its own JSONL and text streams. TensorBoard's rank-aware sink and
+trainer checkpoints default to rank zero.
 
 `ExecutionSession` owns process and phase lifecycle events after logging
 starts. It is also the context-managed owner of observers, background
@@ -345,10 +340,10 @@ created by the runtime. Projects may attach presentation cleanup through the
 session close hook. Cleanup is idempotent, and cleanup failures are attached to
 an active workload exception instead of replacing it.
 
-A workflow execution is owned by its single runner and may launch steps with
-different process counts. Joined workflow children therefore validate run and
-phase identity while their process streams record the child runtime's actual
-world size; direct executions retain strict metadata/runtime topology matching.
+A workflow execution is owned by its single runner. Projects are responsible
+for constructing any `torchrun` argv and for declaring execution topology that
+matches the child runtime exactly; strict attachment does not relax workflow
+metadata topology.
 
 ## Generic PyTorch trainer
 

@@ -7,7 +7,7 @@ them.
 
 You can use Mammoth to:
 
-- run commands in dependency order from a YAML file;
+- plan and run serial command workflows from Python;
 - keep each attempt and its logs under a predictable artifact directory;
 - inspect a completed run or watch one while it is active; and
 - add a reusable training loop to an existing PyTorch project.
@@ -34,45 +34,50 @@ not required.
 
 ## Run your first workflow
 
-A workflow groups commands into named runs and steps. Create `workflow.yaml`:
+A workflow groups final command arguments into named runs and steps. Define it
+in Python, inspect the side-effect-free plan, then run it:
 
-```yaml
-schema_version: 1
-runs:
-  demo:
-    steps:
-      prepare:
-        command: [python, -c, "print('Preparing data')"]
-      train:
-        command: [python, -c, "print('Training model')"]
-        needs: [prepare]
+```python
+from pathlib import Path
+
+from mammoth.workflow import Run, Step, Workflow
+
+workflow = Workflow(
+    root=Path("runs"),
+    runs=(
+        Run(
+            "demo",
+            steps=(
+                Step("prepare", ("python", "-c", "print('Preparing data')")),
+                Step("train", ("python", "-c", "print('Training model')")),
+            ),
+        ),
+    ),
+)
+
+for command in workflow.plan():
+    print(command.run_name, command.step_name, command.command)
+
+result = workflow.run()
+raise SystemExit(result.exit_code)
 ```
 
-First validate the file and see the commands without running them:
-
-```bash
-uv run mammoth workflow run workflow.yaml --entry runs --dry-run
-```
-
-Then execute the workflow:
-
-```bash
-uv run mammoth workflow run workflow.yaml --entry runs
-```
-
-The command reports whether `demo` completed and prints its execution ID. The
-`--entry runs` option tells Mammoth to store operational artifacts beneath the
-`runs/` directory. In this example, they appear under:
+`Workflow.plan()` validates names and ordering and derives each `RunLayout`
+without creating directories, leases, metadata, or lifecycle events.
+`Workflow.run()` stores each activated run beneath the workflow root. In this
+example, operational artifacts appear under:
 
 ```text
 runs/demo/
-├── manifest.json
+├── checkpoints/
+├── results/
+├── vis/
 └── logs/executions/<execution-id>/
 ```
 
 The names have a simple hierarchy:
 
-- **entry**: the artifact root supplied with `--entry`, such as `runs`;
+- **root**: the workflow artifact root, such as `runs`;
 - **run**: a reusable logical job, such as `demo`;
 - **step**: one command within a run, such as `prepare`; and
 - **execution**: one immutable attempt to run that job.
@@ -150,162 +155,45 @@ are rejected; missing paths raise `FileNotFoundError`. A receipt identifies only
 the bytes observed during inspection, so verify it again immediately before an
 operation that depends on those bytes.
 
-## Select only part of a workflow
+## Control workflow ordering and execution metadata
 
-Use exact run and step names to narrow an invocation:
-
-```bash
-uv run mammoth workflow run workflow.yaml --entry runs --run demo
-uv run mammoth workflow run workflow.yaml --entry runs --run demo --step train
-```
-
-Selecting `train` also selects its dependency, `prepare`. Repeat `--run` or
-`--step` to select more than one name.
-
-Common step settings include:
-
-| Setting | Purpose |
-| --- | --- |
-| `command` | Required list containing the program and each argument. |
-| `needs` | Steps that must run before this step. |
-| `cwd` | Working directory, resolved relative to the workflow file. |
-| `environment` | Explicit environment variables for the command. |
-| `timeout_seconds` | Positive time limit for the command. |
-| `on_failure` | `stop` (default) or `continue` with later steps. |
-| `launcher` | `local` (default) or `torchrun`. |
-| `processes` | Number of processes for a `torchrun` step. |
-
-Mammoth validates unknown settings, missing dependencies, and dependency
-cycles before launching commands. Run `uv run mammoth workflow run --help` for
-the full CLI reference.
-
-## Execute a caller-compiled workflow
-
-Projects that already have their own runset schema can keep it. Compile that
-schema into Mammoth's programmatic API when you need isolated run attempts and
-an explicit serial order that interleaves runs. Mammoth validates the complete
-plan before creating an entry directory, lease, execution context, or event.
+`run-major` is the default: Mammoth dispatches runs in declaration order and
+each run's steps in declaration order. `step-major` interleaves runs by an
+explicit canonical phase order:
 
 ```python
-from dataclasses import replace
-from pathlib import Path
-
-from mammoth.core import RunLayout, inspect_artifact
-from mammoth.workflow import (
-    DispatchEntry,
-    ExecutionInputResolutionContext,
-    ExecutionInputs,
-    LifecycleEventContext,
-    PreDispatchContext,
-    ProgrammaticRun,
-    ProgrammaticWorkflow,
-    StepConfig,
-    run_programmatic_workflow,
-)
-
-entry = Path("runs")
-
-def make_run(name: str) -> ProgrammaticRun:
-    return ProgrammaticRun(
-        name=name,
-        layout=RunLayout(entry, name),
-        steps=(
-            StepConfig("train", ("project-train", "--run", name)),
-            StepConfig("validate", ("project-validate", "--run", name), needs=("train",)),
-        ),
-        execution=ExecutionInputs(
-            invocation_kind="project-workflow",
-            command=("project", "runset", "campaign.yaml"),
-            config_reference="campaign.yaml",
-            intended_phases=("training", "validation"),
-        ),
-        lifecycle_fields={"campaign": "summer", "runset_path": "campaign.yaml"},
-    )
-
-def enrich_event(context: LifecycleEventContext) -> dict[str, object]:
-    if context.event == "task_started":
-        return {"resolved_command": context.command}
-    return {}
-
-def child_environment(context: PreDispatchContext) -> dict[str, str]:
-    return {"CALLER_EXECUTION_ID": context.execution.metadata.execution_id}
-
-def resolve_execution_inputs(
-    context: ExecutionInputResolutionContext,
-) -> ExecutionInputs:
-    checkpoint = context.layout.checkpoints_dir / "latest.pt"
-    if not checkpoint.is_file():
-        return context.run.execution
-    receipt = inspect_artifact(checkpoint)
-    return replace(
-        context.run.execution,
-        resume_checkpoint=checkpoint,
-        resume_checkpoint_sha256=receipt.sha256,
-    )
-
-workflow = ProgrammaticWorkflow(
-    runs=(make_run("a"), make_run("b")),
-    dispatch=(
-        DispatchEntry("a", "train"),
-        DispatchEntry("b", "train"),
-        DispatchEntry("a", "validate"),
-        DispatchEntry("b", "validate"),
+workflow = Workflow(
+    root=Path("runs"),
+    order="step-major",
+    step_order=("train", "validate"),
+    runs=(
+        Run("a", (Step("train", ("train-a",)), Step("validate", ("validate-a",)))),
+        Run("b", (Step("train", ("train-b",)), Step("validate", ("validate-b",)))),
     ),
-    lifecycle_field_provider=enrich_event,
-    child_environment_provider=child_environment,
-    execution_input_resolver=resolve_execution_inputs,
 )
-result = run_programmatic_workflow(workflow)
 ```
 
-Each run gets its own `RunLayout`, logical-run lease, execution ID, immutable
-metadata, and `runner.jsonl` event stream. `result.dispatch` preserves the
-explicit global order, while `result.run(name)` and `result.step(run, step)`
-provide direct lookup. Use `dry_run=True` to receive the fully resolved command
-plan with no filesystem or execution side effects.
+Each run's declaration must be a duplicate-free subsequence of `step_order`;
+a run may omit a canonical phase. `Run.root` may override `Workflow.root` for
+mixed-root plans. A `Step` accepts only the final `command` argv plus optional
+`cwd`, `timeout_seconds`, and `environment`; projects construct `torchrun` argv
+themselves when needed.
 
-For resume or lineage choices that must be atomic with logical-run ownership,
-set `ProgrammaticWorkflow.execution_input_resolver`. Mammoth calls it once for
-each activated run after preparing its layout and claiming its lease, but
-before publishing `execution.json`, creating an observer, or starting a child.
-It receives only a frozen run and prepared `RunLayout` and must return a
-complete `ExecutionInputs` value. The returned checkpoint path and optional
-SHA-256, lineage IDs, starting coordinates, runtime metadata, and other inputs
-are validated and published as one immutable context. Planning and dry runs
-retain and validate `ProgrammaticRun.execution` as the baseline and never call
-the resolver. `resolve_previous_execution=True` resolves the latest previous
-execution after the resolver returns, while the same lease is still held.
-Resolver failure, invalid output, or interruption publishes no execution
-context, starts no child, and releases the lease.
+Use `Execution` for generic immutable metadata. Mammoth derives intended phases
+from step names, records the workflow invocation from `sys.argv`, and resolves
+the previous execution while holding the logical-run lease. A run-local
+`resolve_execution(context)` hook may replace its baseline `Execution` after
+layout preparation and lease acquisition but before metadata publication. A
+`before_first_step(context)` hook runs once after `execution_started` and before
+the first `phase_started` record.
 
-The caller owns compilation, phase names, command arguments, and optional
-pre-dispatch project work. Mammoth owns serial dispatch, dependency and
-first-failure propagation, lifecycle events, child cleanup, and lease release.
-Commands remain tokenized argv sequences; no command is run through a shell.
-
-Use `ProgrammaticRun.lifecycle_fields` for immutable JSON-compatible fields
-that Mammoth attaches to every lifecycle record for that run. An optional
-`ProgrammaticWorkflow.lifecycle_field_provider` receives a read-only
-`LifecycleEventContext` for event-specific fields. The context exposes the
-event, run, step, immutable execution context, sanitized resolved command, and
-the actual launcher PID once a task has started. When a programmatic caller
-selects enrichment, Mammoth writes that PID as `child_pid` on `task_started`;
-callers cannot replace it or any schema-owned identity, phase, task, timing,
-exit, signal, or message fields. Static fields are checked before side effects,
-while dynamic fields are checked before their record is appended. Secrets and
-unsafe references are rejected rather than persisted. Providers never receive
-an observer, lease, or process object; if a provider fails, Mammoth emits
-deterministic terminal records and reclaims the owned child and lease.
-
-Set `ExecutionInputs.intended_phases` when execution metadata should use
-caller-defined phase labels instead of dispatched step names. For aliases that
-depend on the newly created execution context, set
-`ProgrammaticWorkflow.child_environment_provider`. Mammoth calls it after
-`pre_dispatch` and immediately before a real child starts; it receives the
-same read-only `PreDispatchContext`, is not called by a dry run, and its values
-override static base, run, and step environment values. Mammoth's own
-`MAMMOTH_*` variables are applied last, so providers cannot set them. Provider
-output stays child-only and is never written into metadata or lifecycle events.
+Every child receives only the four canonical join variables
+`MAMMOTH_EXECUTION_ID`, `MAMMOTH_RUN_NAME`, `MAMMOTH_INVOCATION_KIND`, and
+`MAMMOTH_PHASE`; static run and step environments cannot override Mammoth-owned
+names. On the first timeout, signal, nonzero exit, launch failure, or hook
+failure, dispatch stops. `WorkflowResult` retains structured run and step
+outcomes and exposes the final process-compatible `exit_code`. Runs never
+started after an ordinary failure remain blocked in memory without artifacts.
 
 ## Capture a supervised command
 
@@ -512,26 +400,31 @@ Set `TrainerConfig(emit_fit_phase_events=False, ...)` when a surrounding
 command already owns the outer training phase lifecycle. Mammoth continues to
 emit nested tasks, progress, validation phases, heartbeats, and metrics.
 
-For a direct single-process or `torchrun` invocation, initialize Mammoth's
-runtime before the trainer. Rank zero creates the immutable execution, every
-rank joins it and receives its own JSONL and text stream, and the trainer uses
-the runtime's device and rank identity:
+For a standalone single-process or `torchrun` invocation, initialize Mammoth's
+runtime before the trainer. Every rank calls strict `create_execution()` and
+then opens its rank-local logging stream; rank zero alone publishes metadata
+and retains the logical-run lease. A workflow child instead calls strict
+`attach_execution()` with the expected workflow metadata before constructing
+its model or data loaders. Creation rejects an inherited canonical execution
+ID, while attachment requires all four canonical join variables and never
+claims the producer lease.
 
 When resuming, the caller must resolve artifact provenance before constructing
-the request and provide the checkpoint's canonical lowercase SHA-256 and
-starting epoch. `parent_execution_id` remains optional for legacy or externally
+the `ExecutionSpec` and provide the checkpoint's canonical lowercase SHA-256
+and starting epoch. `parent_execution_id` remains optional for externally
 supplied artifacts without trusted producer provenance, as does
 `starting_global_step` when it is unknown. `resume_checkpoint` is only a
 sanitized artifact reference: it never causes Mammoth to inspect the checkpoint
-or infer a parent from a path, filename, phase, or timestamp. On a resumed join,
-Mammoth compares these caller-supplied facts with immutable execution metadata
-before opening logging or project work.
+or infer a parent from a path, filename, phase, or timestamp. Attachment exactly
+compares the run, invocation, phase membership, topology, config reference,
+runtime metadata, and all five nullable resume facts before logging or project
+work begins.
 
 ```python
 from pathlib import Path
 
 from mammoth.torch import (
-    ExecutionRequest,
+    ExecutionSpec,
     RuntimeConfig,
     Trainer,
     TrainerConfig,
@@ -540,13 +433,12 @@ from mammoth.torch import (
 
 runtime_config = RuntimeConfig(strategy="ddp", device="auto")
 with initialize_runtime(runtime_config) as runtime:
-    runtime.start_execution(
-        ExecutionRequest(
+    runtime.create_execution(
+        ExecutionSpec(
             run_dir=Path("runs/example"),
             run_name="example",
             invocation_kind="train",
             intended_phases=("train",),
-            command=("python", "train.py"),
             resume_checkpoint=Path("runs/example/checkpoints/latest.pt"),
             resume_checkpoint_sha256="a" * 64,
             parent_execution_id="producer-attempt",
@@ -554,6 +446,7 @@ with initialize_runtime(runtime_config) as runtime:
             starting_global_step=1200,
         )
     )
+    runtime.start_execution_logging()
     with Trainer(
         model=model,
         optimizer=optimizer,

@@ -1,15 +1,15 @@
-"""Programmatic and schema-v1 workflow planning with isolated run attempts.
+"""Programmatic serial workflows with isolated execution attempts.
 
-``mammoth.workflow.config`` parses Mammoth's optional schema-v1 YAML format.
-This module owns the project-neutral compiled-plan API used by both that
-compatibility adapter and callers with their own configuration languages.  It
-does not interpret command arguments, phase names, or caller hook behavior.
-``mammoth.workflow.launch`` supplies the bounded child-process supervision
-used for each dispatched step.
+The public :class:`Workflow` model derives run layouts, execution phases, and
+dispatch order from caller-owned Python values.  This module owns logical-run
+leases, immutable execution metadata, lifecycle records, child supervision,
+signal handling, and cleanup; :mod:`mammoth.workflow.launch` owns subprocess
+groups and descendant reaping.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import signal
 import sys
@@ -35,7 +35,7 @@ from mammoth.core import (
     validate_resume_checkpoint_sha256,
     validate_run_name,
 )
-from mammoth.core.events import EventName, ExecutionEventWriter
+from mammoth.core.events import ExecutionEventWriter
 from mammoth.core.execution import (
     EXECUTION_ID_ENV,
     INVOCATION_KIND_ENV,
@@ -43,299 +43,183 @@ from mammoth.core.execution import (
     RUN_NAME_ENV,
 )
 from mammoth.logging import JsonlEventSink, RunObserver
-from mammoth.workflow.config import StepConfig, WorkflowConfig, validate_step_graph
-from mammoth.workflow.launch import CommandPlan, ProcessResult, command_for_step, launch_process
+from mammoth.workflow.launch import CommandPlan, ProcessResult, launch_process
 
-StepOutcome = Literal["completed", "failed", "skipped", "interrupted"]
-RunOutcome = Literal["completed", "failed", "blocked", "interrupted", "dry-run"]
-WorkflowFailurePolicy = Literal["stop", "continue"]
+StepOutcome = Literal["completed", "failed", "interrupted"]
+RunOutcome = Literal["completed", "failed", "blocked", "interrupted"]
+WorkflowOrder = Literal["run-major", "step-major"]
 
-_LIFECYCLE_RESERVED_FIELDS = frozenset(
-    {
-        "schema_version",
-        "sequence",
-        "time",
-        "execution_id",
-        "run_name",
-        "source",
-        "rank",
-        "world_size",
-        "phase",
-        "task_id",
-        "parent_task_id",
-        "event",
-        "coordinates",
-        "throughput",
-        "duration_seconds",
-        "exit_code",
-        "signal",
-        "completed",
-        "total",
-        "unit",
-        "final",
-        "message",
-        "metrics",
-        "media",
-        "display_metrics",
-        "logical_step",
-        "child_pid",
-    }
-)
-_MAMMOTH_CHILD_ENVIRONMENT_PREFIX = "MAMMOTH_"
+_MAMMOTH_ENVIRONMENT_PREFIX = "MAMMOTH_"
+_FINALIZATION_STAGE_ATTEMPTS = 2
 
 
 @dataclass(frozen=True, slots=True)
-class ExecutionInputs:
-    """Caller-owned immutable inputs for one runner-created execution context.
-
-    ``ProgrammaticRun`` supplies the run name and selected step names.  This
-    value supplies the remaining generic metadata, including an optional
-    caller-owned intended-phase sequence, accepted by
-    :func:`mammoth.core.create_execution_context`.  The baseline is validated
-    during preflight; an optional workflow resolver may replace it after the
-    executor claims the logical-run lease.
-    """
-
-    invocation_kind: str
-    command: Sequence[str]
-    config_reference: str | Path = ""
-    world_size: int = 1
-    execution_mode: Literal["single", "distributed"] = "single"
-    previous_execution_id: str | None = None
-    resume_checkpoint: str | Path | None = None
-    parent_execution_id: str | None = None
-    starting_epoch: int | None = None
-    starting_global_step: int | None = None
-    runtime: Mapping[str, Any] | None = None
-    intended_phases: Sequence[str] | None = None
-    resume_checkpoint_sha256: str | None = None
-
-    def __post_init__(self) -> None:
-        """Freeze structured runtime metadata without persisting environment state."""
-        if isinstance(self.command, str) or not isinstance(self.command, Sequence):
-            raise ValueError("execution command must be a sequence of arguments, not a string")
-        command = tuple(self.command)
-        if not command or any(not isinstance(item, str) or not item for item in command):
-            raise ValueError("execution command must contain non-empty strings")
-        object.__setattr__(self, "command", command)
-        if self.intended_phases is not None:
-            intended_phases = _freeze_intended_phases(self.intended_phases)
-            object.__setattr__(self, "intended_phases", intended_phases)
-        if self.runtime is not None:
-            object.__setattr__(
-                self,
-                "runtime",
-                _freeze_runtime_metadata(sanitize_metadata_fields(self.runtime)),
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class ProgrammaticRun:
-    """One independently leased run in a caller-compiled workflow plan.
-
-    The caller supplies generic steps with :class:`StepConfig`; the YAML
-    adapter uses the same step value.  ``layout`` remains caller-owned so one
-    plan may direct each logical run to a different artifact entry.
-    """
+class Step:
+    """One named execution phase whose command is already the final argv."""
 
     name: str
-    layout: RunLayout
-    steps: tuple[StepConfig, ...]
-    execution: ExecutionInputs
+    command: Sequence[str]
+    cwd: Path | None = None
+    timeout_seconds: float | None = None
     environment: Mapping[str, str] = field(default_factory=dict)
-    resolve_previous_execution: bool = field(default=False, repr=False)
-    lifecycle_fields: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Validate run-local mechanics before the global plan is dispatched."""
-        validate_run_name(self.name)
-        if not isinstance(self.layout, RunLayout):
-            raise ValueError("Programmatic run layout must be a RunLayout")
-        if self.layout.run_name != self.name:
-            raise ValueError(
-                f"Programmatic run {self.name!r} does not match layout run name "
-                f"{self.layout.run_name!r}"
-            )
-        if isinstance(self.steps, StepConfig) or not isinstance(self.steps, Sequence):
-            raise ValueError("Programmatic run steps must be a sequence of StepConfig values")
-        steps = tuple(self.steps)
-        if not steps:
-            raise ValueError(f"Programmatic run {self.name!r} must contain at least one step")
-        if any(not isinstance(step, StepConfig) for step in steps):
-            raise ValueError("Programmatic run steps must be StepConfig values")
-        if not isinstance(self.execution, ExecutionInputs):
-            raise ValueError("Programmatic run execution must be ExecutionInputs")
-        if not isinstance(self.resolve_previous_execution, bool):
-            raise ValueError("Programmatic run resolve_previous_execution must be a boolean")
-        object.__setattr__(self, "steps", steps)
-        validate_step_graph(steps)
+        """Detach mutable argv/environment inputs and validate launch policy."""
+        _validate_phase_name(self.name)
+        if isinstance(self.command, str) or not isinstance(self.command, Sequence):
+            raise ValueError(f"Step {self.name!r} command must be a sequence of arguments")
+        command = tuple(self.command)
+        if not command or any(not isinstance(item, str) or not item for item in command):
+            raise ValueError(f"Step {self.name!r} command must contain non-empty strings")
+        object.__setattr__(self, "command", command)
+        if self.cwd is not None:
+            try:
+                object.__setattr__(self, "cwd", Path(self.cwd))
+            except TypeError as error:
+                raise ValueError(
+                    f"Step {self.name!r} cwd must be path-like or None"
+                ) from error
+        timeout = self.timeout_seconds
+        if timeout is not None and (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, int | float)
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError(f"Step {self.name!r} timeout_seconds must be positive")
+        if timeout is not None:
+            object.__setattr__(self, "timeout_seconds", float(timeout))
         object.__setattr__(
             self,
             "environment",
-            MappingProxyType(_validate_environment(self.environment)),
-        )
-        object.__setattr__(
-            self,
-            "lifecycle_fields",
-            _freeze_lifecycle_fields(self.lifecycle_fields),
+            MappingProxyType(_validate_environment(self.environment, scope=f"step {self.name!r}")),
         )
 
-    def step(self, name: str) -> StepConfig:
-        """Return one named compiled step for dispatch validation and execution."""
+
+@dataclass(frozen=True, slots=True)
+class Execution:
+    """Caller-owned execution facts not derived from a :class:`Run` or workflow."""
+
+    invocation_kind: str = "workflow"
+    config_reference: str | Path = ""
+    world_size: int = 1
+    execution_mode: Literal["single", "distributed"] = "single"
+    resume_checkpoint: str | Path | None = None
+    resume_checkpoint_sha256: str | None = None
+    parent_execution_id: str | None = None
+    starting_epoch: int | None = None
+    starting_global_step: int | None = None
+    runtime: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Validate metadata now and retain a deeply immutable runtime copy."""
+        if not isinstance(self.invocation_kind, str) or not self.invocation_kind:
+            raise ValueError("Execution invocation_kind must be a non-empty string")
+        if self.config_reference != "":
+            sanitize_reference(self.config_reference)
+        if (
+            not isinstance(self.world_size, int)
+            or isinstance(self.world_size, bool)
+            or self.world_size < 1
+        ):
+            raise ValueError("Execution world_size must be a positive integer")
+        if self.execution_mode not in {"single", "distributed"}:
+            raise ValueError("Execution mode must be 'single' or 'distributed'")
+        if (self.execution_mode == "single") != (self.world_size == 1):
+            raise ValueError("Execution mode and world_size disagree")
+        _validate_resume_coordinate("starting_epoch", self.starting_epoch)
+        _validate_resume_coordinate("starting_global_step", self.starting_global_step)
+        _validate_resume_facts(self)
+        if not isinstance(self.runtime, Mapping):
+            raise ValueError("Execution runtime must be a mapping")
+        object.__setattr__(
+            self,
+            "runtime",
+            _freeze_runtime_mapping(sanitize_metadata_fields(self.runtime)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Run:
+    """One independently leased logical run and its declaration-ordered steps."""
+
+    name: str
+    steps: Sequence[Step]
+    execution: Execution = field(default_factory=Execution)
+    root: Path | None = None
+    environment: Mapping[str, str] = field(default_factory=dict)
+    resolve_execution: Callable[[ExecutionResolutionContext], Execution] | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    before_first_step: Callable[[BeforeFirstStepContext], None] | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        """Freeze run inputs while leaving cross-run validation to planning."""
+        validate_run_name(self.name)
+        if isinstance(self.steps, Step) or not isinstance(self.steps, Sequence):
+            raise ValueError(f"Run {self.name!r} steps must be a sequence of Step values")
+        steps = tuple(self.steps)
+        if not steps or any(not isinstance(step, Step) for step in steps):
+            raise ValueError(f"Run {self.name!r} must contain Step values")
+        names = [step.name for step in steps]
+        if len(names) != len(set(names)):
+            raise ValueError(f"Run {self.name!r} step names must be unique")
+        object.__setattr__(self, "steps", steps)
+        if not isinstance(self.execution, Execution):
+            raise ValueError(f"Run {self.name!r} execution must be an Execution")
+        if self.root is not None:
+            try:
+                object.__setattr__(self, "root", Path(self.root))
+            except TypeError as error:
+                raise ValueError(f"Run {self.name!r} root must be path-like or None") from error
+        object.__setattr__(
+            self,
+            "environment",
+            MappingProxyType(_validate_environment(self.environment, scope=f"run {self.name!r}")),
+        )
+        for name, hook in (
+            ("resolve_execution", self.resolve_execution),
+            ("before_first_step", self.before_first_step),
+        ):
+            if hook is not None and not callable(hook):
+                raise ValueError(f"Run {self.name!r} {name} must be callable or None")
+
+    def step(self, name: str) -> Step:
+        """Return one exact step from this run."""
         for step in self.steps:
             if step.name == name:
                 return step
-        raise KeyError(f"Programmatic run {self.name!r} has no step {name!r}")
+        raise KeyError(f"Run {self.name!r} has no step {name!r}")
 
 
 @dataclass(frozen=True, slots=True)
-class DispatchEntry:
-    """One caller-selected global ``(run, step)`` dispatch position."""
+class ExecutionResolutionContext:
+    """Run-local facts available after layout preparation and lease acquisition."""
 
-    run_name: str
-    step_name: str
-
-    def __post_init__(self) -> None:
-        """Reject malformed identities before global plan validation."""
-        validate_run_name(self.run_name)
-        validate_run_name(self.step_name)
-
-
-@dataclass(frozen=True, slots=True)
-class PreDispatchContext:
-    """Read-only caller context supplied immediately before a child launch.
-
-    Hooks receive no observer, lease, or child supervisor, preserving Mammoth's
-    ownership of lifecycle records and cleanup.  Callers may use the context
-    for their own immediate pre-launch work, such as resolving project state.
-    """
-
-    dispatch: DispatchEntry
-    run: ProgrammaticRun
-    step: StepConfig
-    execution: ExecutionContext
-
-
-PreDispatchHook = Callable[[PreDispatchContext], None]
-ChildEnvironmentProvider = Callable[[PreDispatchContext], Mapping[str, str] | None]
-
-
-@dataclass(frozen=True, slots=True)
-class ExecutionInputResolutionContext:
-    """Read-only compiled-run facts available while its prepared layout is leased.
-
-    The resolver receives no observer, event writer, lease object, process,
-    environment, or child-lifetime control.  Its ``run.execution`` value is the
-    preflight-valid baseline retained by planning and dry runs.
-    """
-
-    run: ProgrammaticRun
+    run: Run
     layout: RunLayout
-
-
-ExecutionInputResolver = Callable[[ExecutionInputResolutionContext], ExecutionInputs]
+    previous_execution_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
-class LifecycleEventContext:
-    """Read-only facts supplied when enriching one Mammoth-owned lifecycle event.
+class BeforeFirstStepContext:
+    """Immutable attempt facts available immediately before the first phase."""
 
-    Mammoth supplies the event identity and execution facts, including a
-    sanitized resolved command and a real launcher PID only after a child has
-    started.  The context intentionally exposes neither an observer, lease,
-    nor process supervisor, so callers cannot append records or manage child
-    lifetime themselves.
-    """
-
-    event: EventName
-    run: ProgrammaticRun
-    step: StepConfig | None
+    run: Run
+    layout: RunLayout
+    spec: Execution
     execution: ExecutionContext
-    command: tuple[str, ...] | None
-    child_pid: int | None
-    result: StepResult | None
-
-
-LifecycleEventFieldProvider = Callable[[LifecycleEventContext], Mapping[str, Any] | None]
-
-
-@dataclass(frozen=True, slots=True)
-class ProgrammaticWorkflow:
-    """Fully caller-compiled, serial workflow representation.
-
-    ``dispatch`` is intentionally global rather than derived from the run
-    declarations.  It can therefore interleave otherwise independent logical
-    runs while preserving each run's own layout, execution metadata, event
-    stream, and producer lease.
-    """
-
-    runs: tuple[ProgrammaticRun, ...]
-    dispatch: tuple[DispatchEntry, ...]
-    failure_policy: WorkflowFailurePolicy = "stop"
-    pre_dispatch: PreDispatchHook | None = field(default=None, compare=False, repr=False)
-    lifecycle_field_provider: LifecycleEventFieldProvider | None = field(
-        default=None,
-        compare=False,
-        repr=False,
-    )
-    child_environment_provider: ChildEnvironmentProvider | None = field(
-        default=None,
-        compare=False,
-        repr=False,
-    )
-    execution_input_resolver: ExecutionInputResolver | None = field(
-        default=None,
-        compare=False,
-        repr=False,
-    )
-
-    def __post_init__(self) -> None:
-        """Reject invalid top-level fields before a side-effect-free preflight."""
-        if isinstance(self.runs, ProgrammaticRun) or not isinstance(self.runs, Sequence):
-            raise ValueError(
-                "Programmatic workflow runs must be a sequence of ProgrammaticRun values"
-            )
-        if isinstance(self.dispatch, DispatchEntry) or not isinstance(self.dispatch, Sequence):
-            raise ValueError(
-                "Programmatic workflow dispatch must be a sequence of DispatchEntry values"
-            )
-        runs = tuple(self.runs)
-        dispatch = tuple(self.dispatch)
-        if not runs:
-            raise ValueError("Programmatic workflow must contain at least one run")
-        if any(not isinstance(run, ProgrammaticRun) for run in runs):
-            raise ValueError("Programmatic workflow runs must be ProgrammaticRun values")
-        object.__setattr__(self, "runs", runs)
-        object.__setattr__(self, "dispatch", dispatch)
-        if self.failure_policy not in {"stop", "continue"}:
-            raise ValueError("Programmatic workflow failure_policy must be 'stop' or 'continue'")
-        if self.pre_dispatch is not None and not callable(self.pre_dispatch):
-            raise ValueError("Programmatic workflow pre_dispatch must be callable or None")
-        if (
-            self.child_environment_provider is not None
-            and not callable(self.child_environment_provider)
-        ):
-            raise ValueError(
-                "Programmatic workflow child_environment_provider must be callable or None"
-            )
-        if (
-            self.lifecycle_field_provider is not None
-            and not callable(self.lifecycle_field_provider)
-        ):
-            raise ValueError(
-                "Programmatic workflow lifecycle_field_provider must be callable or None"
-            )
-        if self.execution_input_resolver is not None and not callable(
-            self.execution_input_resolver
-        ):
-            raise ValueError(
-                "Programmatic workflow execution_input_resolver must be callable or None"
-            )
 
 
 @dataclass(frozen=True, slots=True)
 class StepResult:
-    """One selected step's terminal workflow outcome and any deferred signal."""
+    """One dispatched step's terminal process or launch outcome."""
 
     name: str
     outcome: StepOutcome
@@ -346,7 +230,7 @@ class StepResult:
 
 @dataclass(frozen=True, slots=True)
 class DispatchResult:
-    """One terminal step result retained in global caller-selected order."""
+    """One step result retained in workflow dispatch order."""
 
     run_name: str
     step: StepResult
@@ -354,7 +238,7 @@ class DispatchResult:
 
 @dataclass(frozen=True, slots=True)
 class RunResult:
-    """One logical run attempt and its step outcomes."""
+    """One logical run attempt or one artifact-free blocked declaration."""
 
     run_name: str
     outcome: RunOutcome
@@ -365,51 +249,121 @@ class RunResult:
 
 @dataclass(frozen=True, slots=True)
 class WorkflowResult:
-    """Complete result for the selected runs in one workflow invocation."""
+    """Structured terminal outcome for one :meth:`Workflow.run` invocation."""
 
     runs: tuple[RunResult, ...]
-    plans: tuple[CommandPlan, ...] = ()
-    dispatch: tuple[DispatchResult, ...] = ()
+    dispatch: tuple[DispatchResult, ...]
+    exit_code: int
 
     @property
     def successful(self) -> bool:
-        """Return whether every selected run completed or was only planned."""
-        return all(run.outcome in {"completed", "dry-run"} for run in self.runs)
+        """Return whether the entire workflow completed successfully."""
+        return self.exit_code == 0
 
     def run(self, name: str) -> RunResult:
-        """Return one run result by its stable logical run name."""
+        """Return one result by stable logical run name."""
         for result in self.runs:
             if result.run_name == name:
                 return result
         raise KeyError(f"Workflow result has no run {name!r}")
 
     def step(self, run_name: str, step_name: str) -> StepResult:
-        """Return one globally dispatched result by run and step identity."""
+        """Return one dispatched result by run and step identity."""
         for result in self.dispatch:
             if result.run_name == run_name and result.step.name == step_name:
                 return result.step
         raise KeyError(f"Workflow result has no dispatched step {run_name!r}/{step_name!r}")
 
 
+@dataclass(frozen=True, slots=True)
+class Workflow:
+    """One validated programmatic workflow with two explicit serial orders."""
+
+    runs: Sequence[Run]
+    root: Path = Path("runs")
+    order: WorkflowOrder = "run-major"
+    step_order: Sequence[str] | None = None
+
+    def __post_init__(self) -> None:
+        """Detach top-level collections without touching the filesystem."""
+        if isinstance(self.runs, Run) or not isinstance(self.runs, Sequence):
+            raise ValueError("Workflow runs must be a sequence of Run values")
+        runs = tuple(self.runs)
+        if not runs or any(not isinstance(run, Run) for run in runs):
+            raise ValueError("Workflow must contain Run values")
+        object.__setattr__(self, "runs", runs)
+        try:
+            object.__setattr__(self, "root", Path(self.root))
+        except TypeError as error:
+            raise ValueError("Workflow root must be path-like") from error
+        if self.order not in {"run-major", "step-major"}:
+            raise ValueError("Workflow order must be 'run-major' or 'step-major'")
+        if self.step_order is not None:
+            if isinstance(self.step_order, str) or not isinstance(self.step_order, Sequence):
+                raise ValueError("Workflow step_order must be a sequence of phase names")
+            order = tuple(self.step_order)
+            if any(not isinstance(name, str) or not name for name in order):
+                raise ValueError("Workflow step_order must contain non-empty phase names")
+            object.__setattr__(self, "step_order", order)
+
+    def plan(self) -> tuple[CommandPlan, ...]:
+        """Validate and return the complete dispatch plan without side effects."""
+        return _plan_workflow(self)
+
+    def run(
+        self,
+        *,
+        base_environment: Mapping[str, str] | None = None,
+    ) -> WorkflowResult:
+        """Execute the validated plan with owned attempts, children, and cleanup."""
+        return _run_workflow(self, base_environment=base_environment)
+
+
 @dataclass(slots=True)
 class _ActiveRun:
-    """Executor-owned resources retained while interleaved steps are active."""
+    """Executor-owned resources for one started logical run."""
 
-    run: ProgrammaticRun
+    run: Run
+    layout: RunLayout
+    spec: Execution
     lease: LogicalRunLease
     context: ExecutionContext
     observer: RunObserver
-    lifecycle_field_provider: LifecycleEventFieldProvider | None
-    lifecycle_provider_failed: bool = False
-    startup_failure: str | None = None
+    event_writer: ExecutionEventWriter
+    before_first_step_done: bool = False
+    failure_reason: str | None = None
+    terminal_result: RunResult | None = None
+    terminal_event_attempts: int = 0
+    terminal_event_failed: bool = False
+    observer_closed: bool = False
+    observer_close_attempts: int = 0
+    observer_close_failed: bool = False
+    lease_closed: bool = False
+    lease_close_attempts: int = 0
+    lease_close_failed: bool = False
 
 
 @dataclass(slots=True)
-class _PendingDispatch:
-    """One dispatch whose terminal step result may precede ledger publication."""
+class _PendingStep:
+    """Lifecycle state for a step interrupted between paired records."""
 
-    dispatch: DispatchEntry
+    active: _ActiveRun
+    step: Step
+    phase_started: bool = False
+    task_started: bool = False
     result: StepResult | None = None
+    registered: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _Failure:
+    """The first ordinary or interruption failure that stops dispatch."""
+
+    reason: str
+    exit_code: int
+    signal: int | None = None
+    precedence: int = 3
+    workflow_interruption: bool = False
 
 
 class _WorkflowInterrupted(BaseException):
@@ -419,17 +373,9 @@ class _WorkflowInterrupted(BaseException):
         self.signal_number = signal_number
 
 
-class _LifecycleFieldProviderError(RuntimeError):
-    """Mark one dynamic enrichment failure after disabling its provider."""
-
-
-class _ChildEnvironmentProviderError(RuntimeError):
-    """Translate an invalid dynamic child environment into a launch failure."""
-
-
 @dataclass(slots=True)
 class _InterruptionState:
-    """Track signals deferred while the executor mutates owned resources."""
+    """Track signals deferred across owned resource transitions."""
 
     critical_depth: int = 0
     deferred_signal: int | None = None
@@ -442,1265 +388,840 @@ _INTERRUPTION_STATE: ContextVar[_InterruptionState | None] = ContextVar(
 )
 
 
-def validate_programmatic_workflow(workflow: ProgrammaticWorkflow) -> None:
-    """Validate a complete compiled plan without creating workflow artifacts.
-
-    Callers and :func:`run_programmatic_workflow` use this exact preflight so
-    unknown references, duplicate or omitted dispatches, invalid dependency
-    order, layouts, environments, and execution metadata fail before leases or
-    execution directories exist.
-    """
-    _validate_programmatic_workflow(workflow, validate_layout_paths=True)
-
-
-def _validate_programmatic_workflow(
-    workflow: ProgrammaticWorkflow,
-    *,
-    validate_layout_paths: bool,
-) -> None:
-    """Validate a compiled plan, optionally skipping synthetic planning layouts."""
-    if not isinstance(workflow, ProgrammaticWorkflow):
-        raise ValueError("workflow must be a ProgrammaticWorkflow")
-    run_names = [run.name for run in workflow.runs]
-    if len(run_names) != len(set(run_names)):
-        raise ValueError("Programmatic workflow run names must be unique")
-    by_name = {run.name: run for run in workflow.runs}
-    if validate_layout_paths:
-        _validate_programmatic_layouts(workflow.runs)
-    expected = {(run.name, step.name) for run in workflow.runs for step in run.steps}
-    if len(expected) != sum(len(run.steps) for run in workflow.runs):
-        raise ValueError("Programmatic workflow step names must be unique within each run")
-
-    seen: set[tuple[str, str]] = set()
-    for entry in workflow.dispatch:
-        if not isinstance(entry, DispatchEntry):
-            raise ValueError("Programmatic workflow dispatch entries must be DispatchEntry values")
-        run = by_name.get(entry.run_name)
-        if run is None:
-            raise ValueError(
-                f"Programmatic workflow dispatch references unknown run {entry.run_name!r}"
-            )
-        try:
-            step = run.step(entry.step_name)
-        except KeyError as error:
-            raise ValueError(
-                f"Programmatic workflow dispatch references unknown step "
-                f"{entry.run_name!r}/{entry.step_name!r}"
-            ) from error
-        key = (entry.run_name, entry.step_name)
-        if key in seen:
-            raise ValueError(
-                f"Programmatic workflow dispatch duplicates {entry.run_name!r}/{entry.step_name!r}"
-            )
-        missing_dependencies = [
-            dependency for dependency in step.needs if (entry.run_name, dependency) not in seen
-        ]
-        if missing_dependencies:
-            raise ValueError(
-                f"Programmatic workflow dispatch places {entry.run_name!r}/{entry.step_name!r} "
-                f"before dependencies: {', '.join(missing_dependencies)}"
-            )
-        seen.add(key)
-    omitted = sorted(expected.difference(seen))
-    if omitted:
-        rendered = ", ".join(f"{run_name}/{step_name}" for run_name, step_name in omitted)
-        raise ValueError(f"Programmatic workflow dispatch omits selected steps: {rendered}")
-    _validate_execution_inputs_for_runs(workflow.runs)
-
-
-def plan_programmatic_workflow(workflow: ProgrammaticWorkflow) -> tuple[CommandPlan, ...]:
-    """Return a fully resolved global dispatch plan without side effects."""
-    validate_programmatic_workflow(workflow)
-    return _command_plans(workflow)
-
-
-def _command_plans(workflow: ProgrammaticWorkflow) -> tuple[CommandPlan, ...]:
-    """Build command plans after the caller selected the applicable preflight."""
-    by_name = {run.name: run for run in workflow.runs}
+def _plan_workflow(workflow: Workflow) -> tuple[CommandPlan, ...]:
+    """Validate identities/order and derive layouts without filesystem access."""
+    names = [run.name for run in workflow.runs]
+    if len(names) != len(set(names)):
+        raise ValueError("Workflow run names must be unique")
+    dispatch = _dispatch_order(workflow)
     return tuple(
         CommandPlan(
-            run_name=entry.run_name,
-            step_name=entry.step_name,
-            command=command_for_step(by_name[entry.run_name].step(entry.step_name)),
-            cwd=by_name[entry.run_name].step(entry.step_name).cwd,
-            timeout_seconds=by_name[entry.run_name].step(entry.step_name).timeout_seconds,
+            run_name=run.name,
+            step_name=step.name,
+            command=tuple(step.command),
+            cwd=step.cwd,
+            timeout_seconds=step.timeout_seconds,
+            run_dir=_layout_for(workflow, run).run_dir,
         )
-        for entry in workflow.dispatch
+        for run, step in dispatch
     )
 
 
-def compile_workflow(
-    workflow: WorkflowConfig,
-    *,
-    entry: Path,
-    selected_runs: Sequence[str] | None = None,
-    selected_steps: Sequence[str] | None = None,
-    invocation_command: Sequence[str] | None = None,
-    resolve_previous_executions: bool = False,
-) -> ProgrammaticWorkflow:
-    """Compile schema-v1 YAML values into the public programmatic plan model.
+def _dispatch_order(workflow: Workflow) -> tuple[tuple[Run, Step], ...]:
+    """Return the exact run-major or canonical-name step-major sequence."""
+    if workflow.order == "run-major":
+        if workflow.step_order is not None:
+            raise ValueError("run-major workflows must omit step_order")
+        return tuple((run, step) for run in workflow.runs for step in run.steps)
 
-    Schema-v1 preserves its historical run-major dispatch and per-step failure
-    behavior by using workflow-level ``continue`` policy.  Programmatic callers
-    may instead provide any validated serial global order directly.
-    """
-    command = tuple(invocation_command or (sys.executable, "-m", "mammoth", "workflow", "run"))
-    selected = workflow.select_runs(selected_runs)
-    compiled_runs: list[ProgrammaticRun] = []
-    dispatch: list[DispatchEntry] = []
-    for run in selected:
-        steps = run.ordered_steps(selected_steps)
-        layout = RunLayout(Path(entry), run.name)
-        compiled_runs.append(
-            ProgrammaticRun(
-                name=run.name,
-                layout=layout,
-                steps=steps,
-                execution=ExecutionInputs(
-                    invocation_kind="workflow",
-                    command=command,
-                    config_reference=workflow.source,
-                ),
-                environment=run.environment,
-                resolve_previous_execution=resolve_previous_executions,
+    if workflow.step_order is None or not workflow.step_order:
+        raise ValueError("step-major workflows require a non-empty step_order")
+    canonical = tuple(workflow.step_order)
+    if len(canonical) != len(set(canonical)):
+        raise ValueError("Workflow step_order must not contain duplicates")
+    positions = {name: index for index, name in enumerate(canonical)}
+    for run in workflow.runs:
+        run_names = tuple(step.name for step in run.steps)
+        missing = [name for name in run_names if name not in positions]
+        if missing:
+            raise ValueError(
+                f"Run {run.name!r} has steps absent from step_order: {', '.join(missing)}"
             )
-        )
-        dispatch.extend(DispatchEntry(run.name, step.name) for step in steps)
-    return ProgrammaticWorkflow(
-        runs=tuple(compiled_runs),
-        dispatch=tuple(dispatch),
-        failure_policy="continue",
+        run_positions = tuple(positions[name] for name in run_names)
+        if run_positions != tuple(sorted(run_positions)):
+            raise ValueError(
+                f"Run {run.name!r} steps must be a subsequence of step_order"
+            )
+    by_phase = {run.name: {step.name: step for step in run.steps} for run in workflow.runs}
+    return tuple(
+        (run, by_phase[run.name][phase])
+        for phase in canonical
+        for run in workflow.runs
+        if phase in by_phase[run.name]
     )
 
 
-def plan_workflow(
-    workflow: WorkflowConfig,
+def _run_workflow(
+    workflow: Workflow,
     *,
-    selected_runs: Sequence[str] | None = None,
-    selected_steps: Sequence[str] | None = None,
-) -> tuple[CommandPlan, ...]:
-    """Resolve schema-v1 commands through the shared programmatic preflight."""
-    selected = workflow.select_runs(selected_runs)
-    if not selected:
-        return ()
-    if selected_steps is not None and not tuple(selected_steps):
-        return ()
-    compiled = compile_workflow(
-        workflow,
-        entry=Path("."),
-        selected_runs=selected_runs,
-        selected_steps=selected_steps,
-    )
-    _validate_programmatic_workflow(compiled, validate_layout_paths=False)
-    return _command_plans(compiled)
-
-
-def run_programmatic_workflow(
-    workflow: ProgrammaticWorkflow,
-    *,
-    dry_run: bool = False,
-    base_environment: Mapping[str, str] | None = None,
+    base_environment: Mapping[str, str] | None,
 ) -> WorkflowResult:
-    """Execute one validated caller-compiled plan in its explicit serial order.
-
-    All validation and dry-run planning finish before layouts, leases, contexts,
-    observers, or event streams are created.  Non-dry execution starts each
-    run lazily at its first dispatch, then retains its independently leased
-    attempt while later entries may target other runs.
-    """
-    plans = plan_programmatic_workflow(workflow)
-    if dry_run:
-        return WorkflowResult(
-            runs=tuple(
-                RunResult(run.name, "dry-run", execution_id=None, steps=()) for run in workflow.runs
-            ),
-            plans=plans,
-        )
-
-    environment = _validate_environment(
-        os.environ if base_environment is None else base_environment
-    )
+    """Own serial dispatch and preserve the first failure through cleanup."""
+    workflow.plan()
+    environment = _base_environment(base_environment)
+    invocation_command = tuple(sys.argv)
+    dispatch = _dispatch_order(workflow)
     active: dict[str, _ActiveRun] = {}
-    result_by_key: dict[tuple[str, str], StepResult] = {}
+    results_by_run: dict[str, list[StepResult]] = {run.name: [] for run in workflow.runs}
     dispatch_results: list[DispatchResult] = []
-    stopped_runs: set[str] = set()
-    workflow_failure: DispatchEntry | None = None
-    interrupted_signal: int | None = None
-    executor_failed = False
-    pending: _PendingDispatch | None = None
+    first_failure: _Failure | None = None
+    pending: _PendingStep | None = None
+    transition_result: StepResult | None = None
+    original_error: BaseException | None = None
+    cleanup_error: BaseException | None = None
+    finalization_errors: list[tuple[str, BaseException]] = []
+    run_results: tuple[RunResult, ...] = ()
 
-    runs: tuple[RunResult, ...] = ()
-    by_name = {run.name: run for run in workflow.runs}
     with _interruption_signals() as interruption_state:
         try:
             _release_initial_interrupt_guard(interruption_state)
-            for entry in workflow.dispatch:
-                current = active.get(entry.run_name)
+            for run, step in dispatch:
+                transition_result = None
+                current = active.get(run.name)
                 if current is None:
                     current = _start_run(
-                        by_name[entry.run_name],
+                        workflow,
+                        run,
                         active,
-                        workflow.lifecycle_field_provider,
-                        workflow.execution_input_resolver,
+                        invocation_command=invocation_command,
                     )
-                step = current.run.step(entry.step_name)
-                pending = _PendingDispatch(entry)
-                if current.startup_failure is not None:
-                    result = _record_startup_provider_failure(current, step, pending)
-                elif workflow_failure is not None:
-                    result = _skip_step(
-                        current,
-                        step,
-                        "blocked after workflow failure "
-                        f"{workflow_failure.run_name}/{workflow_failure.step_name}",
-                        pending,
-                    )
-                elif entry.run_name in stopped_runs:
-                    result = _skip_step(
-                        current,
-                        step,
-                        "stopped after an earlier step failure",
-                        pending,
-                    )
-                elif (
-                    step.dependency_failure == "skip"
-                    and any(
-                        result_by_key[(entry.run_name, dependency)].outcome != "completed"
-                        for dependency in step.needs
-                    )
-                ):
-                    result = _skip_step(
-                        current,
-                        step,
-                        "dependency did not complete successfully",
-                        pending,
-                    )
-                else:
-                    result = _execute_step(
-                        current,
-                        entry,
-                        step,
-                        workflow.pre_dispatch,
-                        workflow.child_environment_provider,
-                        environment,
-                        pending,
-                    )
-                with _blocked_interruption_signals():
-                    _record_pending_result(pending, result_by_key, dispatch_results)
-                    pending = None
-
-                if result.signal is not None and result.outcome != "interrupted":
-                    interrupted_signal = result.signal
+                hook_failure = _run_before_first_step(current)
+                if hook_failure is not None:
+                    first_failure = hook_failure
                     break
-
-                if result.outcome == "interrupted":
-                    stopped_runs.add(entry.run_name)
-                    if workflow.failure_policy == "stop":
-                        workflow_failure = entry
-                elif result.outcome == "failed":
-                    if step.on_failure == "stop":
-                        stopped_runs.add(entry.run_name)
-                    if workflow.failure_policy == "stop":
-                        workflow_failure = entry
-        except _WorkflowInterrupted as error:
-            with _blocked_interruption_signals(deliver_deferred=False):
-                if pending is not None and pending.result is not None:
-                    _record_pending_result(pending, result_by_key, dispatch_results)
+                pending = _PendingStep(current, step)
+                result = _execute_step(current, step, environment, pending)
+                with _blocked_interruption_signals():
+                    _record_pending_result(pending, results_by_run, dispatch_results)
+                    transition_result = result
                     pending = None
-                interrupted_signal = error.signal_number
-        except BaseException:
-            executor_failed = True
-            raise
+                if result.outcome != "completed":
+                    first_failure = _failure_from_step(result)
+                    break
+        except _WorkflowInterrupted as error:
+            first_failure = _failure_for_workflow_interruption(
+                error.signal_number,
+                pending=pending,
+                transition_result=transition_result,
+                results_by_run=results_by_run,
+                dispatch_results=dispatch_results,
+            )
+            pending = None
+        except KeyboardInterrupt:
+            first_failure = _failure_for_workflow_interruption(
+                signal.SIGINT,
+                pending=pending,
+                transition_result=transition_result,
+                results_by_run=results_by_run,
+                dispatch_results=dispatch_results,
+            )
+            pending = None
+        except BaseException as error:
+            original_error = error
         finally:
-            with _blocked_interruption_signals(deliver_deferred=False):
-                runs = _finalize_active_runs(
-                    workflow,
-                    active,
-                    result_by_key,
-                    interrupted_signal=interrupted_signal,
-                    executor_failed=executor_failed,
-                )
-                runs = _complete_run_results(
-                    workflow,
-                    runs,
-                    interrupted_signal=interrupted_signal,
-                )
+            while True:
+                try:
+                    run_results = _finalize_runs(
+                        workflow,
+                        active,
+                        results_by_run,
+                        failure=first_failure,
+                        executor_failed=original_error is not None,
+                        cleanup_errors=finalization_errors,
+                    )
+                except _WorkflowInterrupted as error:
+                    if original_error is not None:
+                        original_error.add_note(
+                            "Workflow interrupted during resolver cleanup by signal "
+                            f"{error.signal_number}"
+                        )
+                    else:
+                        first_failure = _prefer_failure(
+                            first_failure,
+                            _signal_failure(error.signal_number),
+                        )
+                    continue
+                except KeyboardInterrupt:
+                    if original_error is not None:
+                        original_error.add_note(
+                            "Workflow interrupted during resolver cleanup by signal 2"
+                        )
+                    else:
+                        first_failure = _prefer_failure(
+                            first_failure,
+                            _signal_failure(signal.SIGINT),
+                        )
+                    continue
+                except BaseException as error:
+                    cleanup_error = error
+                break
 
-    return WorkflowResult(runs=runs, plans=plans, dispatch=tuple(dispatch_results))
-
-
-def run_workflow(
-    workflow: WorkflowConfig,
-    *,
-    entry: Path,
-    selected_runs: Sequence[str] | None = None,
-    selected_steps: Sequence[str] | None = None,
-    dry_run: bool = False,
-    invocation_command: Sequence[str] | None = None,
-    base_environment: Mapping[str, str] | None = None,
-) -> WorkflowResult:
-    """Run schema-v1 YAML through the same public programmatic executor."""
-    selected = workflow.select_runs(selected_runs)
-    if not selected:
-        return WorkflowResult(runs=(), plans=())
-    if dry_run and selected_steps is not None and not tuple(selected_steps):
-        return WorkflowResult(
-            runs=tuple(
-                RunResult(run.name, "dry-run", execution_id=None, steps=()) for run in selected
-            ),
-            plans=(),
-        )
-    compiled = compile_workflow(
-        workflow,
-        entry=Path(entry),
-        selected_runs=selected_runs,
-        selected_steps=selected_steps,
-        invocation_command=invocation_command,
-        resolve_previous_executions=not dry_run,
+    if original_error is not None:
+        if cleanup_error is not None:
+            original_error.add_note(
+                "Workflow cleanup failure: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        raise original_error
+    if cleanup_error is not None:
+        raise cleanup_error
+    return WorkflowResult(
+        runs=run_results,
+        dispatch=tuple(dispatch_results),
+        exit_code=0 if first_failure is None else first_failure.exit_code,
     )
-    return run_programmatic_workflow(
-        compiled,
-        dry_run=dry_run,
-        base_environment=base_environment,
-    )
-
-
-def child_environment(
-    base: Mapping[str, str],
-    *,
-    run_environment: Mapping[str, str],
-    step_environment: Mapping[str, str],
-    additional_environment: Mapping[str, str] | None = None,
-    run_name: str,
-    execution_id: str,
-    invocation_kind: str,
-    phase: str,
-) -> dict[str, str]:
-    """Build inherited child environment plus documented execution join hooks."""
-    environment = dict(base)
-    environment.update(run_environment)
-    environment.update(step_environment)
-    if additional_environment is not None:
-        environment.update(additional_environment)
-    environment.update(
-        {
-            EXECUTION_ID_ENV: execution_id,
-            RUN_NAME_ENV: run_name,
-            INVOCATION_KIND_ENV: invocation_kind,
-            PHASE_ENV: phase,
-        }
-    )
-    return environment
-
-
-def _child_environment_fields(
-    provider: ChildEnvironmentProvider | None,
-    context: PreDispatchContext,
-) -> Mapping[str, str]:
-    """Return validated provider fields without exposing the base environment."""
-    if provider is None:
-        return MappingProxyType({})
-    try:
-        provided = provider(context)
-        fields = _validate_environment({} if provided is None else provided)
-    except _WorkflowInterrupted:
-        raise
-    except BaseException as error:
-        raise _ChildEnvironmentProviderError(str(error)) from error
-    collisions = sorted(
-        name for name in fields if name.startswith(_MAMMOTH_CHILD_ENVIRONMENT_PREFIX)
-    )
-    if collisions:
-        raise _ChildEnvironmentProviderError(
-            "child environment provider cannot override Mammoth-owned variables"
-        )
-    return MappingProxyType(fields)
 
 
 def _start_run(
-    run: ProgrammaticRun,
+    workflow: Workflow,
+    run: Run,
     active: dict[str, _ActiveRun],
-    lifecycle_field_provider: LifecycleEventFieldProvider | None,
-    execution_input_resolver: ExecutionInputResolver | None,
+    *,
+    invocation_command: tuple[str, ...],
 ) -> _ActiveRun:
-    """Prepare one independently owned layout, lease, context, and observer."""
+    """Prepare layout/lease, resolve execution, and publish immutable metadata."""
     current: _ActiveRun | None = None
     lease: LogicalRunLease | None = None
     try:
-        if execution_input_resolver is None:
-            with _blocked_interruption_signals():
-                layout = run.layout.prepare()
-                lease = claim_logical_run_lease(layout.run_dir)
-                current = _create_active_run(
-                    run,
-                    layout,
-                    lease,
-                    run.execution,
-                    active,
-                    lifecycle_field_provider,
-                )
-                _emit_execution_started(current)
-            return current
-
         with _blocked_interruption_signals():
-            layout = run.layout.prepare()
+            layout = _layout_for(workflow, run).prepare()
             lease = claim_logical_run_lease(layout.run_dir)
-
-        inputs = execution_input_resolver(
-            ExecutionInputResolutionContext(run=run, layout=layout)
-        )
-        if not isinstance(inputs, ExecutionInputs):
-            raise ValueError(
-                "Programmatic workflow execution_input_resolver must return "
-                "ExecutionInputs"
-            )
-        _validate_execution_inputs(inputs)
-
+            previous_execution_id = latest_execution_id(layout.run_dir)
+        spec = run.execution
+        if run.resolve_execution is not None:
+            try:
+                spec = run.resolve_execution(
+                    ExecutionResolutionContext(
+                        run=run,
+                        layout=layout,
+                        previous_execution_id=previous_execution_id,
+                    )
+                )
+            except _WorkflowInterrupted:
+                raise
+            except KeyboardInterrupt as error:
+                raise _WorkflowInterrupted(signal.SIGINT) from error
+            if not isinstance(spec, Execution):
+                raise ValueError(
+                    f"Run {run.name!r} resolve_execution must return an Execution"
+                )
         with _blocked_interruption_signals():
-            current = _create_active_run(
+            context = create_execution_context(
+                layout.run_dir,
+                run_name=run.name,
+                invocation_kind=spec.invocation_kind,
+                intended_phases=tuple(step.name for step in run.steps),
+                world_size=spec.world_size,
+                execution_mode=spec.execution_mode,
+                command=invocation_command,
+                config_reference=spec.config_reference,
+                previous_execution_id=previous_execution_id,
+                resume_checkpoint=spec.resume_checkpoint,
+                resume_checkpoint_sha256=spec.resume_checkpoint_sha256,
+                parent_execution_id=spec.parent_execution_id,
+                starting_epoch=spec.starting_epoch,
+                starting_global_step=spec.starting_global_step,
+                runtime=_thaw_runtime_mapping(spec.runtime),
+            )
+            event_writer = ExecutionEventWriter.for_runner(context)
+            observer = RunObserver((JsonlEventSink(event_writer),))
+            current = _ActiveRun(
                 run,
                 layout,
+                spec,
                 lease,
-                inputs,
-                active,
-                lifecycle_field_provider,
+                context,
+                observer,
+                event_writer,
             )
-            _emit_execution_started(current)
+            active[run.name] = current
+            observer.emit("execution_started")
         return current
-    except BaseException:
+    except BaseException as original_error:
         if current is None and lease is not None:
-            lease.close()
+            try:
+                with _blocked_interruption_signals(deliver_deferred=False):
+                    lease.close()
+            except BaseException as cleanup_error:
+                original_error.add_note(
+                    "Workflow untransferred lease cleanup failure: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
         raise
 
 
-def _create_active_run(
-    run: ProgrammaticRun,
-    layout: RunLayout,
-    lease: LogicalRunLease,
-    inputs: ExecutionInputs,
-    active: dict[str, _ActiveRun],
-    lifecycle_field_provider: LifecycleEventFieldProvider | None,
-) -> _ActiveRun:
-    """Publish and register one context while its caller blocks interruptions."""
-    previous_execution_id = inputs.previous_execution_id
-    if run.resolve_previous_execution:
-        previous_execution_id = latest_execution_id(layout.run_dir)
-    context = create_execution_context(
-        layout.run_dir,
-        run_name=run.name,
-        invocation_kind=inputs.invocation_kind,
-        intended_phases=(
-            inputs.intended_phases
-            if inputs.intended_phases is not None
-            else tuple(step.name for step in run.steps)
-        ),
-        world_size=inputs.world_size,
-        execution_mode=inputs.execution_mode,
-        command=inputs.command,
-        config_reference=inputs.config_reference,
-        previous_execution_id=previous_execution_id,
-        resume_checkpoint=inputs.resume_checkpoint,
-        resume_checkpoint_sha256=inputs.resume_checkpoint_sha256,
-        parent_execution_id=inputs.parent_execution_id,
-        starting_epoch=inputs.starting_epoch,
-        starting_global_step=inputs.starting_global_step,
-        runtime=_thaw_runtime_metadata(inputs.runtime),
-    )
-    observer = RunObserver((JsonlEventSink(ExecutionEventWriter.for_runner(context)),))
-    current = _ActiveRun(run, lease, context, observer, lifecycle_field_provider)
-    active[run.name] = current
-    return current
-
-
-def _emit_execution_started(active: _ActiveRun) -> None:
-    """Emit the registered attempt start or retain its provider failure."""
+def _run_before_first_step(active: _ActiveRun) -> _Failure | None:
+    """Call the run-local hook exactly once before any phase starts."""
+    if active.before_first_step_done:
+        return None
+    active.before_first_step_done = True
+    hook = active.run.before_first_step
+    if hook is None:
+        return None
     try:
-        _emit_started_lifecycle_event(
-            active,
-            "execution_started",
-            fields={},
+        hook(
+            BeforeFirstStepContext(
+                run=active.run,
+                layout=active.layout,
+                spec=active.spec,
+                execution=active.context,
+            )
         )
-    except _LifecycleFieldProviderError as error:
-        active.startup_failure = f"lifecycle event field provider failed: {error}"
+    except _WorkflowInterrupted:
+        raise
+    except KeyboardInterrupt as error:
+        raise _WorkflowInterrupted(signal.SIGINT) from error
+    except BaseException as error:
+        reason = f"before_first_step failed: {type(error).__name__}: {error}"
+        active.failure_reason = reason
+        return _Failure(reason=reason, exit_code=1)
+    return None
 
 
 def _execute_step(
     active: _ActiveRun,
-    dispatch: DispatchEntry,
-    step: StepConfig,
-    hook: PreDispatchHook | None,
-    child_environment_provider: ChildEnvironmentProvider | None,
+    step: Step,
     base_environment: Mapping[str, str],
-    pending: _PendingDispatch,
+    pending: _PendingStep,
 ) -> StepResult:
-    """Run one child while emitting paired phase and task lifecycle records."""
-    task_id = step.name
-    command = sanitize_command(command_for_step(step))
-    enrichment_enabled = _lifecycle_enrichment_enabled(active)
-    task_start_requires_child = enrichment_enabled or child_environment_provider is not None
-    phase_started = False
-    task_started = False
-    running_hook = hook is not None
+    """Launch one final argv while emitting paired phase/task lifecycle records."""
+    command = sanitize_command(step.command)
+    with _blocked_interruption_signals():
+        active.observer.emit("phase_started", phase=step.name)
+        pending.phase_started = True
+        active.observer.emit(
+            "task_started",
+            phase=step.name,
+            task_id=step.name,
+            command=command,
+        )
+        pending.task_started = True
+    environment = _child_environment(active, step, base_environment)
     try:
-        with _blocked_interruption_signals():
-            try:
-                _emit_started_lifecycle_event(
-                    active,
-                    "phase_started",
-                    step=step,
-                    command=command,
-                    fields={"phase": step.name},
-                )
-            except _LifecycleFieldProviderError:
-                phase_started = True
-                raise
-            else:
-                phase_started = True
-            if not task_start_requires_child:
-                _emit_lifecycle_event(
-                    active,
-                    "task_started",
-                    step=step,
-                    command=command,
-                    fields={"phase": step.name, "task_id": task_id},
-                    include_provider=False,
-                )
-                task_started = True
-        pre_dispatch_context = PreDispatchContext(dispatch, active.run, step, active.context)
-        if hook is not None:
-            hook(pre_dispatch_context)
-        running_hook = False
-        additional_environment = _child_environment_fields(
-            child_environment_provider,
-            pre_dispatch_context,
-        )
-
-        def record_task_started(child_pid: int) -> None:
-            nonlocal task_started
-            task_fields: dict[str, Any] = {
-                "phase": step.name,
-                "task_id": task_id,
-            }
-            task_fields["child_pid"] = child_pid
-            with _blocked_interruption_signals():
-                try:
-                    _emit_started_lifecycle_event(
-                        active,
-                        "task_started",
-                        step=step,
-                        command=command,
-                        child_pid=child_pid,
-                        fields=task_fields,
-                    )
-                except _LifecycleFieldProviderError:
-                    task_started = True
-                    raise
-                else:
-                    task_started = True
-
         process = launch_process(
-            command_for_step(step),
+            tuple(step.command),
             cwd=step.cwd,
-            environment=child_environment(
-                base_environment,
-                run_environment=active.run.environment,
-                step_environment=step.environment,
-                additional_environment=additional_environment,
-                run_name=active.run.name,
-                execution_id=active.context.metadata.execution_id,
-                invocation_kind=active.context.metadata.invocation_kind,
-                phase=step.name,
-            ),
+            environment=environment,
             timeout_seconds=step.timeout_seconds,
-            on_started=record_task_started if task_start_requires_child else None,
         )
-        return _finish_process_step(active, step, command, task_id, process, pending)
-    except _LifecycleFieldProviderError as error:
-        reason = f"lifecycle event field provider failed: {error}"
-        return _emit_step_terminal(
-            active,
-            step,
-            command,
-            pending,
-            StepResult(step.name, "failed", reason=reason),
-            task_event="task_failed" if task_started else None,
-            task_fields={"phase": step.name, "task_id": task_id, "message": reason},
-            phase_event="phase_failed" if phase_started else None,
-            phase_fields={"phase": step.name, "message": reason},
-        )
-    except _WorkflowInterrupted as error:
-        if pending.result is not None:
-            pending.result = _with_step_signal(pending.result, error.signal_number)
-            return pending.result
-        reason = "interrupted"
-        return _emit_step_terminal(
-            active,
-            step,
-            command,
-            pending,
-            StepResult(step.name, "interrupted", reason=reason, signal=error.signal_number),
-            task_event="task_failed" if task_started else None,
-            task_fields={"phase": step.name, "task_id": task_id, "message": reason},
-            phase_event="phase_failed" if phase_started else None,
-            phase_fields={"phase": step.name, "message": reason},
-        )
-    except KeyboardInterrupt:
-        if pending.result is not None:
-            pending.result = _with_step_signal(pending.result, signal.SIGINT)
-            return pending.result
-        reason = "interrupted"
-        return _emit_step_terminal(
-            active,
-            step,
-            command,
-            pending,
-            StepResult(step.name, "interrupted", reason=reason, signal=signal.SIGINT),
-            task_event="task_failed" if task_started else None,
-            task_fields={"phase": step.name, "task_id": task_id, "message": reason},
-            phase_event="phase_failed" if phase_started else None,
-            phase_fields={"phase": step.name, "message": reason},
-        )
-    except OSError as error:
-        reason = f"could not launch: {error}"
-        return _emit_step_terminal(
-            active,
-            step,
-            command,
-            pending,
-            StepResult(step.name, "failed", reason=reason),
-            task_event="task_failed" if task_started else None,
-            task_fields={
-                "phase": step.name,
-                "task_id": task_id,
-                "message": reason,
-                "exit_code": 127,
-            },
-            phase_event="phase_failed",
-            phase_fields={"phase": step.name, "message": reason, "exit_code": 127},
-        )
-    except Exception as error:
-        if isinstance(error, _ChildEnvironmentProviderError):
-            prefix = "child environment provider failed"
+    except _WorkflowInterrupted:
+        raise
+    except BaseException as error:
+        reason = f"launch failed: {type(error).__name__}: {error}"
+        result = StepResult(step.name, "failed", reason=reason)
+    else:
+        if process.interrupted and process.signal is not None:
+            raise _WorkflowInterrupted(process.signal)
+        result = _step_result(step, process)
+    with _blocked_interruption_signals():
+        _emit_step_terminal(active, step, result)
+        pending.result = result
+    return result
+
+
+def _record_pending_result(
+    pending: _PendingStep,
+    results_by_run: Mapping[str, list[StepResult]],
+    dispatch_results: list[DispatchResult],
+) -> None:
+    """Register one terminal step result exactly once in both public result views."""
+    if pending.registered:
+        return
+    if pending.result is None:
+        raise RuntimeError("Cannot register a step before its terminal result exists")
+    results_by_run[pending.active.run.name].append(pending.result)
+    dispatch_results.append(DispatchResult(pending.active.run.name, pending.result))
+    pending.registered = True
+
+
+def _failure_for_workflow_interruption(
+    signal_number: int,
+    *,
+    pending: _PendingStep | None,
+    transition_result: StepResult | None,
+    results_by_run: Mapping[str, list[StepResult]],
+    dispatch_results: list[DispatchResult],
+) -> _Failure:
+    """Preserve any recorded step result before applying workflow-signal precedence."""
+    result = transition_result
+    if pending is not None:
+        if pending.result is None:
+            result = _finish_pending_interruption(pending, signal_number)
         else:
-            prefix = "pre-dispatch hook failed" if running_hook else "workflow execution failed"
-        reason = f"{prefix}: {error}"
-        return _emit_step_terminal(
-            active,
-            step,
-            command,
-            pending,
-            StepResult(step.name, "failed", reason=reason),
-            task_event="task_failed" if task_started else None,
-            task_fields={"phase": step.name, "task_id": task_id, "message": reason},
-            phase_event="phase_failed",
-            phase_fields={"phase": step.name, "message": reason},
-        )
+            result = pending.result
+        with _blocked_interruption_signals(deliver_deferred=False):
+            _record_pending_result(pending, results_by_run, dispatch_results)
+    step_failure = (
+        _failure_from_step(result)
+        if result is not None and result.outcome != "completed"
+        else None
+    )
+    return _prefer_failure(step_failure, _signal_failure(signal_number))
 
 
-def _finish_process_step(
-    active: _ActiveRun,
-    step: StepConfig,
-    command: tuple[str, ...],
-    task_id: str,
-    process: ProcessResult,
-    pending: _PendingDispatch,
-) -> StepResult:
-    """Publish one supervised process outcome as an indivisible terminal pair."""
-    if process.interrupted:
-        reason = "interrupted"
-        return _emit_step_terminal(
-            active,
-            step,
-            command,
-            pending,
-            StepResult(step.name, "interrupted", process, reason, process.signal),
-            task_event="task_failed",
-            task_fields={"phase": step.name, "task_id": task_id, "message": reason},
-            phase_event="phase_failed",
-            phase_fields={
-                "phase": step.name,
-                "exit_code": process.return_code,
-                "duration_seconds": process.duration_seconds,
-                "message": reason,
-            },
-        )
-    if process.return_code == 0 and not process.timed_out:
-        return _emit_step_terminal(
-            active,
-            step,
-            command,
-            pending,
-            StepResult(step.name, "completed", process),
-            task_event="task_completed",
-            task_fields={"phase": step.name, "task_id": task_id, "exit_code": 0},
-            phase_event="phase_completed",
-            phase_fields={
-                "phase": step.name,
-                "exit_code": 0,
-                "duration_seconds": process.duration_seconds,
-            },
-        )
-    reason = "timed out" if process.timed_out else f"exit code {process.return_code}"
-    return _emit_step_terminal(
-        active,
-        step,
-        command,
-        pending,
-        StepResult(step.name, "failed", process, reason),
-        task_event="task_failed",
-        task_fields={
-            "phase": step.name,
-            "task_id": task_id,
-            "exit_code": process.return_code,
-            "message": reason,
-        },
-        phase_event="phase_failed",
-        phase_fields={
-            "phase": step.name,
-            "exit_code": process.return_code,
-            "duration_seconds": process.duration_seconds,
-            "message": reason,
-        },
+def _signal_failure(signal_number: int) -> _Failure:
+    """Return the structured failure for one workflow interruption signal."""
+    return _Failure(
+        reason=f"workflow interrupted by signal {signal_number}",
+        exit_code=128 + signal_number,
+        signal=signal_number,
+        precedence=1,
+        workflow_interruption=True,
     )
 
 
-def _skip_step(
-    active: _ActiveRun,
-    step: StepConfig,
-    reason: str,
-    pending: _PendingDispatch,
-) -> StepResult:
-    """Record a terminal skip without launching a child process."""
-    return _emit_step_terminal(
-        active,
-        step,
-        sanitize_command(command_for_step(step)),
-        pending,
-        StepResult(step.name, "skipped", reason=reason),
-        task_event="task_skipped",
-        task_fields={"phase": step.name, "task_id": step.name, "message": reason},
-        phase_event="phase_skipped",
-        phase_fields={"phase": step.name, "message": reason},
+def _prefer_failure(*failures: _Failure | None) -> _Failure:
+    """Choose timeout, signal, child-code, then generic failure stably."""
+    present = tuple(failure for failure in failures if failure is not None)
+    if not present:
+        raise RuntimeError("At least one workflow failure is required")
+    return min(
+        present,
+        key=lambda failure: (
+            failure.precedence,
+            not failure.workflow_interruption,
+        ),
     )
 
 
-def _record_startup_provider_failure(
-    active: _ActiveRun,
-    step: StepConfig,
-    pending: _PendingDispatch,
-) -> StepResult:
-    """Fail the first selected step without a child after execution-start enrichment fails."""
-    reason = active.startup_failure
-    if reason is None:
-        raise RuntimeError("missing startup lifecycle provider failure")
-    active.startup_failure = None
-    result = StepResult(step.name, "failed", reason=reason)
+def _step_result(step: Step, process: ProcessResult) -> StepResult:
+    """Classify one process result without losing timeout or signal precedence."""
+    if process.timed_out:
+        return StepResult(
+            step.name,
+            "failed",
+            process=process,
+            reason=f"timed out after {step.timeout_seconds} seconds",
+            signal=process.signal,
+        )
+    child_signal = process.signal
+    if child_signal is None and process.return_code < 0:
+        child_signal = -process.return_code
+    if process.interrupted or child_signal is not None:
+        return StepResult(
+            step.name,
+            "interrupted",
+            process=process,
+            reason=f"child interrupted by signal {child_signal or signal.SIGINT}",
+            signal=child_signal or signal.SIGINT,
+        )
+    if process.return_code != 0:
+        return StepResult(
+            step.name,
+            "failed",
+            process=process,
+            reason=f"child exited with code {process.return_code}",
+        )
+    return StepResult(step.name, "completed", process=process)
+
+
+def _emit_step_terminal(active: _ActiveRun, step: Step, result: StepResult) -> None:
+    """Close the task and phase scopes for one ordinary terminal outcome."""
+    duration = result.process.duration_seconds if result.process is not None else None
+    if result.outcome == "completed":
+        active.observer.emit(
+            "task_completed",
+            phase=step.name,
+            task_id=step.name,
+            duration_seconds=duration,
+            exit_code=0,
+        )
+        active.observer.emit(
+            "phase_completed",
+            phase=step.name,
+            duration_seconds=duration,
+            exit_code=0,
+        )
+        return
+    fields: dict[str, Any] = {
+        "phase": step.name,
+        "duration_seconds": duration,
+        "exit_code": _step_exit_code(result),
+    }
+    if result.reason is not None:
+        fields["message"] = result.reason
+    active.observer.emit("task_failed", task_id=step.name, **fields)
+    active.observer.emit("phase_failed", **fields)
+
+
+def _finish_pending_interruption(pending: _PendingStep, signal_number: int) -> StepResult:
+    """Best-effort close phase/task scopes interrupted by the workflow signal."""
+    result = StepResult(
+        pending.step.name,
+        "interrupted",
+        reason=f"workflow interrupted by signal {signal_number}",
+        signal=signal_number,
+    )
+    fields: dict[str, Any] = {
+        "phase": pending.step.name,
+        "message": result.reason,
+        "exit_code": 128 + signal_number,
+    }
+    with _blocked_interruption_signals(deliver_deferred=False):
+        if pending.task_started:
+            pending.active.observer.emit(
+                "task_failed",
+                task_id=pending.step.name,
+                **fields,
+            )
+        if pending.phase_started:
+            pending.active.observer.emit("phase_failed", **fields)
     pending.result = result
     return result
 
 
-def _emit_step_terminal(
-    active: _ActiveRun,
-    step: StepConfig,
-    command: tuple[str, ...],
-    pending: _PendingDispatch,
-    result: StepResult,
-    *,
-    task_event: EventName | None,
-    task_fields: Mapping[str, Any],
-    phase_event: EventName | None,
-    phase_fields: Mapping[str, Any],
-) -> StepResult:
-    """Publish a step's terminal task/phase pair without splitting its lifecycle."""
-    try:
-        prepared_task_fields = (
-            _lifecycle_event_fields(
-                active,
-                task_event,
-                step=step,
-                command=command,
-                result=result,
-                fields=task_fields,
-            )
-            if task_event is not None
-            else None
+def _failure_from_step(result: StepResult) -> _Failure:
+    """Apply the required timeout, signal, child-code, then generic precedence."""
+    if result.process is not None and result.process.timed_out:
+        return _Failure(result.reason or "step timed out", exit_code=1, precedence=0)
+    if result.signal is not None:
+        return _Failure(
+            result.reason or f"step interrupted by signal {result.signal}",
+            exit_code=128 + result.signal,
+            signal=result.signal,
+            precedence=1,
         )
-        prepared_phase_fields = (
-            _lifecycle_event_fields(
-                active,
-                phase_event,
-                step=step,
-                command=command,
-                result=result,
-                fields=phase_fields,
-            )
-            if phase_event is not None
-            else None
+    if result.process is not None and result.process.return_code != 0:
+        return _Failure(
+            result.reason or "child failed",
+            exit_code=result.process.return_code,
+            precedence=2,
         )
-    except _LifecycleFieldProviderError as error:
-        reason = f"lifecycle event field provider failed: {error}"
-        failure = StepResult(step.name, "failed", process=result.process, reason=reason)
-        return _emit_step_terminal(
-            active,
-            step,
-            command,
-            pending,
-            failure,
-            task_event="task_failed" if task_event is not None else None,
-            task_fields={"phase": step.name, "task_id": step.name, "message": reason},
-            phase_event="phase_failed" if phase_event is not None else None,
-            phase_fields={"phase": step.name, "message": reason},
-        )
-
-    deferred_signals: list[int] = []
-    with _blocked_interruption_signals(
-        deliver_deferred=False,
-        deferred_signals=deferred_signals,
-    ):
-        pending.result = result
-        if task_event is not None and prepared_task_fields is not None:
-            active.observer.emit(task_event, **prepared_task_fields)
-        if phase_event is not None and prepared_phase_fields is not None:
-            active.observer.emit(phase_event, **prepared_phase_fields)
-    if deferred_signals:
-        pending.result = _with_step_signal(result, deferred_signals[0])
-    return _terminal_step_result(pending)
+    return _Failure(result.reason or "step failed", exit_code=1)
 
 
-def _emit_started_lifecycle_event(
-    active: _ActiveRun,
-    event: EventName,
-    *,
-    step: StepConfig | None = None,
-    command: tuple[str, ...] | None = None,
-    fields: Mapping[str, Any],
-    child_pid: int | None = None,
-) -> None:
-    """Emit one start record or preserve its pair before reporting provider failure."""
-    try:
-        _emit_lifecycle_event(
-            active,
-            event,
-            step=step,
-            command=command,
-            child_pid=child_pid,
-            fields=fields,
-        )
-    except _LifecycleFieldProviderError:
-        _emit_lifecycle_event(
-            active,
-            event,
-            step=step,
-            command=command,
-            child_pid=child_pid,
-            fields=fields,
-            include_provider=False,
-        )
-        raise
+def _step_exit_code(result: StepResult) -> int:
+    """Return the terminal lifecycle code for one step result."""
+    return _failure_from_step(result).exit_code if result.outcome != "completed" else 0
 
 
-def _lifecycle_enrichment_enabled(active: _ActiveRun) -> bool:
-    """Return whether a caller selected the programmatic enrichment contract."""
-    return active.lifecycle_field_provider is not None or bool(active.run.lifecycle_fields)
-
-
-def _emit_lifecycle_event(
-    active: _ActiveRun,
-    event: EventName,
-    *,
-    step: StepConfig | None = None,
-    command: tuple[str, ...] | None = None,
-    child_pid: int | None = None,
-    result: StepResult | None = None,
-    fields: Mapping[str, Any] = MappingProxyType({}),
-    include_provider: bool = True,
-) -> None:
-    """Append one Mammoth-owned event after safely composing caller extensions."""
-    prepared_fields = _lifecycle_event_fields(
-        active,
-        event,
-        step=step,
-        command=command,
-        child_pid=child_pid,
-        result=result,
-        fields=fields,
-        include_provider=include_provider,
-    )
-    active.observer.emit(event, **prepared_fields)
-
-
-def _lifecycle_event_fields(
-    active: _ActiveRun,
-    event: EventName,
-    *,
-    step: StepConfig | None,
-    command: tuple[str, ...] | None,
-    child_pid: int | None = None,
-    result: StepResult | None,
-    fields: Mapping[str, Any],
-    include_provider: bool = True,
-) -> dict[str, Any]:
-    """Combine immutable static fields with one provider response and runner facts."""
-    static_fields = dict(_thaw_runtime_metadata(active.run.lifecycle_fields) or {})
-    dynamic_fields: dict[str, Any] = {}
-    provider = active.lifecycle_field_provider
-    if include_provider and provider is not None and not active.lifecycle_provider_failed:
-        context = LifecycleEventContext(
-            event=event,
-            run=active.run,
-            step=step,
-            execution=active.context,
-            command=command,
-            child_pid=child_pid,
-            result=result,
-        )
-        try:
-            provided = provider(context)
-            if provided is not None:
-                dynamic_fields = dict(
-                    _thaw_runtime_metadata(_freeze_lifecycle_fields(provided)) or {}
-                )
-        except _WorkflowInterrupted:
-            raise
-        except BaseException as error:
-            active.lifecycle_provider_failed = True
-            raise _LifecycleFieldProviderError(str(error)) from error
-    overlap = set(static_fields).intersection(dynamic_fields)
-    if overlap:
-        active.lifecycle_provider_failed = True
-        raise _LifecycleFieldProviderError(
-            "provider fields duplicate static lifecycle fields: "
-            f"{', '.join(sorted(overlap))}"
-        )
-    caller_fields = {**static_fields, **dynamic_fields}
-    collision = set(caller_fields).intersection(fields)
-    if collision:
-        raise RuntimeError(
-            "caller lifecycle fields unexpectedly collide with Mammoth event fields: "
-            f"{', '.join(sorted(collision))}"
-        )
-    return {**caller_fields, **fields}
-
-
-def _terminal_step_result(pending: _PendingDispatch) -> StepResult:
-    """Return the terminal result published before its lifecycle pair was emitted."""
-    result = pending.result
-    if result is None:
-        raise RuntimeError("terminal workflow step result was not published")
-    return result
-
-
-def _with_step_signal(result: StepResult, signal_number: int) -> StepResult:
-    """Retain a completed terminal step while surfacing a subsequent interruption."""
-    return StepResult(
-        name=result.name,
-        outcome=result.outcome,
-        process=result.process,
-        reason=result.reason,
-        signal=result.signal if result.signal is not None else signal_number,
-    )
-
-
-def _record_pending_result(
-    pending: _PendingDispatch,
-    result_by_key: dict[tuple[str, str], StepResult],
-    dispatch_results: list[DispatchResult],
-) -> None:
-    """Commit a pre-published terminal step result to both workflow result views."""
-    result = _terminal_step_result(pending)
-    key = (pending.dispatch.run_name, pending.dispatch.step_name)
-    if key in result_by_key:
-        return
-    result_by_key[key] = result
-    dispatch_results.append(DispatchResult(pending.dispatch.run_name, result))
-
-
-def _finalize_active_runs(
-    workflow: ProgrammaticWorkflow,
+def _finalize_runs(
+    workflow: Workflow,
     active: Mapping[str, _ActiveRun],
-    results: Mapping[tuple[str, str], StepResult],
+    results_by_run: Mapping[str, list[StepResult]],
     *,
-    interrupted_signal: int | None,
+    failure: _Failure | None,
     executor_failed: bool,
+    cleanup_errors: list[tuple[str, BaseException]],
 ) -> tuple[RunResult, ...]:
-    """Emit one deterministic execution terminal event and release every resource."""
-    finalized: list[RunResult] = []
-    for run in workflow.runs:
-        current = active.get(run.name)
-        if current is None:
-            continue
-        step_results = tuple(
-            results[(run.name, step.name)]
-            for step in run.steps
-            if (run.name, step.name) in results
-        )
-        outcome = _run_outcome(
-            step_results,
-            expected_step_count=len(run.steps),
-            interrupted_signal=interrupted_signal,
-            executor_failed=executor_failed,
-        )
-        reason: str | None = None
-        try:
-            event, fields = _execution_terminal_event(
-                outcome,
-                interrupted_signal=interrupted_signal,
-                step_results=step_results,
-            )
-            try:
-                _emit_lifecycle_event(current, event, fields=fields)
-            except _LifecycleFieldProviderError as error:
-                reason = f"lifecycle event field provider failed: {error}"
-                if outcome == "completed":
-                    outcome = "failed"
-                event, fields = _execution_terminal_event(
-                    outcome,
-                    interrupted_signal=interrupted_signal,
-                    step_results=step_results,
+    """Emit execution terminals and release resources through resumable stages."""
+    while True:
+        finalized: dict[str, RunResult] = {}
+        retry_pending = False
+        for run in workflow.runs:
+            current = active.get(run.name)
+            if current is None:
+                continue
+            if current.terminal_result is None:
+                step_results = tuple(results_by_run[run.name])
+                outcome, reason = _run_outcome(
+                    current,
+                    step_results,
+                    failure=failure,
+                    executor_failed=executor_failed,
+                )
+                terminal_result = RunResult(
+                    run_name=run.name,
+                    outcome=outcome,
+                    execution_id=current.context.metadata.execution_id,
+                    steps=step_results,
                     reason=reason,
                 )
-                _emit_lifecycle_event(current, event, fields=fields, include_provider=False)
-        finally:
-            try:
-                current.observer.close()
-            finally:
-                current.lease.close()
-        finalized.append(
-            RunResult(
-                run_name=run.name,
-                outcome=outcome,
-                execution_id=current.context.metadata.execution_id,
-                steps=step_results,
-                reason=reason,
+                sequence_before = current.event_writer.sequence
+                try:
+                    _emit_execution_terminal(
+                        current,
+                        outcome=outcome,
+                        reason=reason,
+                        failure=failure,
+                    )
+                    current.terminal_result = terminal_result
+                except _WorkflowInterrupted:
+                    if current.event_writer.sequence > sequence_before:
+                        current.terminal_result = terminal_result
+                    raise
+                except KeyboardInterrupt as error:
+                    if current.event_writer.sequence > sequence_before:
+                        current.terminal_result = terminal_result
+                    raise _WorkflowInterrupted(signal.SIGINT) from error
+                except BaseException as error:
+                    _record_finalization_error(
+                        cleanup_errors,
+                        f"run {run.name!r} terminal event",
+                        error,
+                    )
+                    if current.event_writer.sequence > sequence_before:
+                        current.terminal_result = terminal_result
+                    else:
+                        current.terminal_event_attempts += 1
+                        if (
+                            current.terminal_event_attempts
+                            < _FINALIZATION_STAGE_ATTEMPTS
+                        ):
+                            retry_pending = True
+                        else:
+                            current.terminal_event_failed = True
+                            current.terminal_result = terminal_result
+            if current.terminal_result is None:
+                continue
+            if not current.observer_closed and not current.observer_close_failed:
+                stage_error: BaseException | None = None
+                try:
+                    with _blocked_interruption_signals():
+                        try:
+                            current.observer.close()
+                        except BaseException as error:
+                            stage_error = error
+                            current.observer_close_attempts += 1
+                            _record_finalization_error(
+                                cleanup_errors,
+                                f"run {run.name!r} observer",
+                                error,
+                            )
+                        else:
+                            current.observer_closed = True
+                except _WorkflowInterrupted:
+                    raise
+                except KeyboardInterrupt as error:
+                    raise _WorkflowInterrupted(signal.SIGINT) from error
+                if stage_error is not None:
+                    if current.observer_close_attempts < _FINALIZATION_STAGE_ATTEMPTS:
+                        retry_pending = True
+                    else:
+                        current.observer_close_failed = True
+            if not current.observer_closed and not current.observer_close_failed:
+                continue
+            if not current.lease_closed and not current.lease_close_failed:
+                stage_error = None
+                try:
+                    with _blocked_interruption_signals():
+                        try:
+                            current.lease.close()
+                        except BaseException as error:
+                            stage_error = error
+                            current.lease_close_attempts += 1
+                            _record_finalization_error(
+                                cleanup_errors,
+                                f"run {run.name!r} lease",
+                                error,
+                            )
+                        else:
+                            current.lease_closed = True
+                except _WorkflowInterrupted:
+                    raise
+                except KeyboardInterrupt as error:
+                    raise _WorkflowInterrupted(signal.SIGINT) from error
+                if stage_error is not None:
+                    if current.lease_close_attempts < _FINALIZATION_STAGE_ATTEMPTS:
+                        retry_pending = True
+                    else:
+                        current.lease_close_failed = True
+            if not current.lease_closed and not current.lease_close_failed:
+                continue
+            finalized[run.name] = current.terminal_result
+        if not retry_pending:
+            break
+    if cleanup_errors:
+        first_label, first_error = cleanup_errors[0]
+        first_error.add_note(f"Workflow cleanup stage: {first_label}")
+        for label, cleanup_failure in cleanup_errors[1:]:
+            first_error.add_note(
+                f"Later workflow cleanup failure ({label}): "
+                f"{type(cleanup_failure).__name__}: {cleanup_failure}"
             )
-        )
-    return tuple(finalized)
-
-
-def _execution_terminal_event(
-    outcome: RunOutcome,
-    *,
-    interrupted_signal: int | None,
-    step_results: Sequence[StepResult],
-    reason: str | None = None,
-) -> tuple[EventName, dict[str, int | str]]:
-    """Return one runner-owned execution terminal event and its fixed fields."""
-    if outcome == "completed":
-        return "execution_completed", {"exit_code": 0}
-    if outcome == "interrupted":
-        interrupted_fields: dict[str, int | str] = {
-            "signal": interrupted_signal or _step_interruption_signal(step_results),
-        }
-        if reason is not None:
-            interrupted_fields["message"] = reason
-        return "execution_interrupted", interrupted_fields
-    fields: dict[str, int | str] = {"exit_code": 1}
-    if reason is not None:
-        fields["message"] = reason
-    return "execution_failed", fields
-
-
-def _run_outcome(
-    results: Sequence[StepResult],
-    *,
-    expected_step_count: int,
-    interrupted_signal: int | None,
-    executor_failed: bool,
-) -> RunOutcome:
-    """Classify direct failure, cross-run blocking, and interruption distinctly."""
-    if interrupted_signal is not None or any(result.outcome == "interrupted" for result in results):
-        return "interrupted"
-    if executor_failed and len(results) < expected_step_count:
-        return "failed"
-    if any(result.outcome == "failed" for result in results):
-        return "failed"
-    if any(result.outcome == "skipped" for result in results):
-        return "blocked"
-    return "completed"
-
-
-def _complete_run_results(
-    workflow: ProgrammaticWorkflow,
-    finalized: Sequence[RunResult],
-    *,
-    interrupted_signal: int | None,
-) -> tuple[RunResult, ...]:
-    """Return one result for every selected run, including unstarted interruptions."""
-    finalized_by_name = {result.run_name: result for result in finalized}
+        raise first_error
     return tuple(
-        finalized_by_name.get(
+        finalized.get(
             run.name,
             RunResult(
                 run_name=run.name,
-                outcome="interrupted" if interrupted_signal is not None else "blocked",
+                outcome="blocked",
                 execution_id=None,
                 steps=(),
+                reason=None if failure is None else failure.reason,
             ),
         )
         for run in workflow.runs
     )
 
 
-def _step_interruption_signal(results: Sequence[StepResult]) -> int:
-    """Return a run-local interruption signal for its execution terminal event."""
-    for result in results:
-        if result.outcome == "interrupted":
-            if result.signal is not None:
-                return result.signal
-            if result.process is not None and result.process.signal is not None:
-                return result.process.signal
-    return signal.SIGINT
+def _emit_execution_terminal(
+    current: _ActiveRun,
+    *,
+    outcome: RunOutcome,
+    reason: str | None,
+    failure: _Failure | None,
+) -> None:
+    """Emit one run terminal; the caller reconciles durable writes on interruption."""
+    if outcome == "completed":
+        current.observer.emit("execution_completed", exit_code=0)
+        return
+    if outcome == "interrupted":
+        interrupted_signal = failure.signal if failure is not None else signal.SIGINT
+        current.observer.emit(
+            "execution_interrupted",
+            signal=interrupted_signal,
+            message=reason,
+        )
+        return
+    current.observer.emit(
+        "execution_failed",
+        exit_code=1 if failure is None else failure.exit_code,
+        message=reason,
+    )
 
 
-def _validate_execution_inputs_for_runs(runs: Sequence[ProgrammaticRun]) -> None:
-    """Preflight every immutable execution input using core metadata contracts."""
-    for run in runs:
-        _validate_execution_inputs(run.execution)
-        _validate_environment(run.environment)
-        for step in run.steps:
-            _validate_environment(step.environment)
+def _record_finalization_error(
+    errors: list[tuple[str, BaseException]],
+    label: str,
+    error: BaseException,
+) -> None:
+    """Retain one cleanup failure across signal-driven finalization retries."""
+    if any(existing_label == label and existing is error for existing_label, existing in errors):
+        return
+    errors.append((label, error))
 
 
-def _validate_execution_inputs(inputs: ExecutionInputs) -> None:
-    """Validate one baseline or lease-resolved execution-input value."""
-    if not isinstance(inputs.invocation_kind, str) or not inputs.invocation_kind:
-        raise ValueError("execution invocation_kind must be a non-empty string")
-    sanitize_command(inputs.command)
-    if inputs.intended_phases is not None:
-        _freeze_intended_phases(inputs.intended_phases)
-    if inputs.config_reference != "":
-        sanitize_reference(inputs.config_reference)
-    if inputs.resume_checkpoint is not None:
-        sanitize_reference(inputs.resume_checkpoint)
-    if inputs.resume_checkpoint_sha256 is not None:
-        validate_resume_checkpoint_sha256(inputs.resume_checkpoint_sha256)
-    if inputs.runtime is not None:
-        runtime = _thaw_runtime_metadata(inputs.runtime)
-        if runtime is None:
-            raise RuntimeError("frozen execution runtime metadata was unexpectedly absent")
-        sanitize_metadata_fields(runtime)
-    if (
-        not isinstance(inputs.world_size, int)
-        or isinstance(inputs.world_size, bool)
-        or inputs.world_size < 1
+def _run_outcome(
+    active: _ActiveRun,
+    results: tuple[StepResult, ...],
+    *,
+    failure: _Failure | None,
+    executor_failed: bool,
+) -> tuple[RunOutcome, str | None]:
+    """Classify completed, direct failure, cross-run blocking, and interruption."""
+    if failure is not None and failure.workflow_interruption:
+        return "interrupted", failure.reason
+    if active.failure_reason is not None:
+        return "failed", active.failure_reason
+    if any(result.outcome == "failed" for result in results):
+        failed = next(result for result in results if result.outcome == "failed")
+        return "failed", failed.reason
+    if any(result.outcome == "interrupted" for result in results):
+        interrupted = next(result for result in results if result.outcome == "interrupted")
+        return "interrupted", interrupted.reason
+    if len(results) == len(active.run.steps):
+        return "completed", None
+    if executor_failed:
+        return "failed", "workflow aborted by execution-resolution failure"
+    return "blocked", None if failure is None else failure.reason
+
+
+def _layout_for(workflow: Workflow, run: Run) -> RunLayout:
+    """Derive one run layout from its override or the workflow default root."""
+    return RunLayout(workflow.root if run.root is None else run.root, run.name)
+
+
+def _child_environment(
+    active: _ActiveRun,
+    step: Step,
+    base: Mapping[str, str],
+) -> dict[str, str]:
+    """Compose caller fields and overwrite them with exactly four canonical values."""
+    environment = {
+        name: value
+        for name, value in base.items()
+        if not name.startswith(_MAMMOTH_ENVIRONMENT_PREFIX)
+    }
+    environment.update(active.run.environment)
+    environment.update(step.environment)
+    environment.update(
+        {
+            EXECUTION_ID_ENV: active.context.metadata.execution_id,
+            RUN_NAME_ENV: active.run.name,
+            INVOCATION_KIND_ENV: active.spec.invocation_kind,
+            PHASE_ENV: step.name,
+        }
+    )
+    return environment
+
+
+def _base_environment(environment: Mapping[str, str] | None) -> Mapping[str, str]:
+    """Copy the inherited environment without retaining caller-owned state."""
+    values = os.environ if environment is None else environment
+    return MappingProxyType(
+        _validate_environment(values, scope="base environment", allow_mammoth=True)
+    )
+
+
+def _validate_environment(
+    environment: Mapping[str, str],
+    *,
+    scope: str,
+    allow_mammoth: bool = False,
+) -> dict[str, str]:
+    """Validate one explicit environment and reserve Mammoth child variables."""
+    if not isinstance(environment, Mapping):
+        raise ValueError(f"{scope} environment must be a mapping")
+    validated: dict[str, str] = {}
+    for name, value in environment.items():
+        if not isinstance(name, str) or not name or "=" in name or "\x00" in name:
+            raise ValueError(f"{scope} environment has an invalid variable name")
+        if not isinstance(value, str) or "\x00" in value:
+            raise ValueError(f"{scope} environment values must be strings")
+        if not allow_mammoth and name.startswith(_MAMMOTH_ENVIRONMENT_PREFIX):
+            raise ValueError(f"{scope} cannot define Mammoth-owned environment {name!r}")
+        validated[name] = value
+    return validated
+
+
+def _validate_phase_name(name: str) -> None:
+    """Accept opaque non-empty project phase names."""
+    if not isinstance(name, str) or not name:
+        raise ValueError("Step names must be non-empty phase strings")
+
+
+def _validate_resume_coordinate(name: str, value: int | None) -> None:
+    """Reject negative, boolean, and non-integral resume coordinates."""
+    if value is not None and (
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
     ):
-        raise ValueError("execution world_size must be a positive integer")
-    if inputs.execution_mode not in {"single", "distributed"}:
-        raise ValueError("execution execution_mode must be 'single' or 'distributed'")
-    if (inputs.execution_mode == "single") != (inputs.world_size == 1):
-        raise ValueError("execution execution_mode and world_size disagree")
-    for field_name in ("starting_epoch", "starting_global_step"):
-        value = getattr(inputs, field_name)
-        if value is not None and (
-            not isinstance(value, int) or isinstance(value, bool) or value < 0
-        ):
-            raise ValueError(f"execution {field_name} must be a non-negative integer or None")
-    for field_name in ("previous_execution_id", "parent_execution_id"):
-        value = getattr(inputs, field_name)
-        if value is not None:
-            validate_execution_id(value)
+        raise ValueError(f"Execution {name} must be a non-negative integer or None")
 
 
-def _validate_programmatic_layouts(runs: Sequence[ProgrammaticRun]) -> None:
-    """Reject existing non-directory layout paths before any run is prepared."""
-    for run in runs:
-        layout = run.layout
-        for path in (layout.entry, layout.run_dir):
-            if path.exists() and not path.is_dir():
-                raise ValueError(f"Programmatic run layout path must be a directory: {path}")
-        parent = layout.entry
-        while not parent.exists() and parent != parent.parent:
-            parent = parent.parent
-        if parent.exists() and not parent.is_dir():
-            raise ValueError(f"Programmatic run layout parent must be a directory: {parent}")
+def _validate_resume_facts(execution: Execution) -> None:
+    """Require absent resume metadata to be wholly null and validate resumed facts."""
+    if execution.resume_checkpoint is None:
+        populated = {
+            "resume_checkpoint_sha256": execution.resume_checkpoint_sha256,
+            "parent_execution_id": execution.parent_execution_id,
+            "starting_epoch": execution.starting_epoch,
+            "starting_global_step": execution.starting_global_step,
+        }
+        unexpected = sorted(name for name, value in populated.items() if value is not None)
+        if unexpected:
+            raise ValueError(
+                "Execution resume facts require resume_checkpoint: " + ", ".join(unexpected)
+            )
+        return
+    sanitize_reference(execution.resume_checkpoint)
+    if execution.resume_checkpoint_sha256 is None:
+        raise ValueError("Execution resume_checkpoint requires resume_checkpoint_sha256")
+    validate_resume_checkpoint_sha256(execution.resume_checkpoint_sha256)
+    if execution.starting_epoch is None:
+        raise ValueError("Execution resume_checkpoint requires starting_epoch")
+    if execution.parent_execution_id is not None:
+        validate_execution_id(execution.parent_execution_id)
 
 
-def _freeze_runtime_metadata(runtime: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Recursively detach immutable execution metadata from caller-owned values."""
+def _freeze_runtime_mapping(runtime: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Recursively freeze sanitized JSON-compatible runtime metadata."""
     return MappingProxyType(
         {name: _freeze_runtime_value(value) for name, value in runtime.items()}
     )
 
 
-def _freeze_intended_phases(phases: Sequence[str]) -> tuple[str, ...]:
-    """Detach explicit execution metadata phase names before plan validation."""
-    if isinstance(phases, str) or not isinstance(phases, Sequence):
-        raise ValueError("execution intended_phases must be a sequence of phase strings")
-    frozen = tuple(phases)
-    if not frozen or any(not isinstance(phase, str) or not phase for phase in frozen):
-        raise ValueError("execution intended_phases must contain non-empty strings")
-    sanitized = sanitize_metadata_fields({"intended_phases": frozen})["intended_phases"]
-    if sanitized != list(frozen):
-        raise ValueError(
-            "execution intended_phases must not contain credentials or unsafe references"
-        )
-    return frozen
-
-
-def _freeze_lifecycle_fields(fields: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Validate, redact-check, and detach caller extensions before dispatch."""
-    if not isinstance(fields, Mapping):
-        raise ValueError("lifecycle fields must be a mapping")
-    collisions = _LIFECYCLE_RESERVED_FIELDS.intersection(fields)
-    if collisions:
-        raise ValueError(
-            "lifecycle fields collide with Mammoth-owned event fields: "
-            f"{', '.join(sorted(collisions))}"
-        )
-    sanitized = sanitize_metadata_fields(fields)
-    if _normalised_lifecycle_value(fields) != _normalised_lifecycle_value(sanitized):
-        raise ValueError("lifecycle fields must not contain credentials or unsafe references")
-    return _freeze_runtime_metadata(sanitized)
-
-
-def _normalised_lifecycle_value(value: Any) -> Any:
-    """Normalize JSON-shaped values solely to detect sanitizer redaction changes."""
-    if isinstance(value, Mapping):
-        return {key: _normalised_lifecycle_value(item) for key, item in value.items()}
-    if isinstance(value, list | tuple):
-        return [_normalised_lifecycle_value(item) for item in value]
-    return value
-
-
 def _freeze_runtime_value(value: Any) -> Any:
-    """Freeze mappings and sequences retained by :class:`ExecutionInputs`."""
+    """Freeze one nested mapping or sequence value."""
     if isinstance(value, Mapping):
-        return MappingProxyType(
-            {name: _freeze_runtime_value(item) for name, item in value.items()}
-        )
-    if isinstance(value, list | tuple):
+        return _freeze_runtime_mapping(value)
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | os.PathLike):
         return tuple(_freeze_runtime_value(item) for item in value)
     return value
 
 
-def _thaw_runtime_metadata(runtime: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
-    """Copy frozen runtime metadata into JSON-compatible values for core validation."""
-    if runtime is None:
-        return None
+def _thaw_runtime_mapping(runtime: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a detached JSON-compatible runtime mapping for metadata publication."""
     return {name: _thaw_runtime_value(value) for name, value in runtime.items()}
 
 
 def _thaw_runtime_value(value: Any) -> Any:
-    """Return one mutable JSON-compatible copy of a frozen metadata value."""
+    """Thaw one frozen runtime metadata value."""
     if isinstance(value, Mapping):
         return {name: _thaw_runtime_value(item) for name, item in value.items()}
     if isinstance(value, tuple):
         return [_thaw_runtime_value(item) for item in value]
     return value
-
-
-def _validate_environment(environment: Mapping[str, str]) -> dict[str, str]:
-    """Validate explicit child overrides without reading or persisting secrets."""
-    if not isinstance(environment, Mapping):
-        raise ValueError("workflow environment must be a mapping")
-    validated: dict[str, str] = {}
-    for name, value in environment.items():
-        if not isinstance(name, str) or not name or "=" in name or "\x00" in name:
-            raise ValueError("workflow environment has an invalid variable name")
-        if not isinstance(value, str) or "\x00" in value:
-            raise ValueError("workflow environment values must be strings")
-        validated[name] = value
-    return validated
 
 
 @contextmanager
@@ -1710,10 +1231,8 @@ def _interruption_signals() -> Iterator[_InterruptionState | None]:
         yield None
         return
     signals = (signal.SIGINT, signal.SIGTERM)
-    state = _InterruptionState()
-    state.critical_depth = 1
-    state.initial_guard_active = True
-    state_token = _INTERRUPTION_STATE.set(state)
+    state = _InterruptionState(critical_depth=1, initial_guard_active=True)
+    token = _INTERRUPTION_STATE.set(state)
     previous: dict[signal.Signals, Any] = {}
     installed: list[signal.Signals] = []
 
@@ -1731,9 +1250,6 @@ def _interruption_signals() -> Iterator[_InterruptionState | None]:
                 signal.signal(signal_number, interrupt)
                 installed.append(signal_number)
         except ValueError:
-            # Python allows signal registration only on the main thread.
-            # Direct callers on another thread still retain child cleanup from
-            # launch.py and do not receive this main-thread translation layer.
             state.critical_depth = 0
             state.initial_guard_active = False
             yield None
@@ -1744,11 +1260,11 @@ def _interruption_signals() -> Iterator[_InterruptionState | None]:
             for signal_number in reversed(installed):
                 signal.signal(signal_number, previous[signal_number])
         finally:
-            _INTERRUPTION_STATE.reset(state_token)
+            _INTERRUPTION_STATE.reset(token)
 
 
 def _release_initial_interrupt_guard(state: _InterruptionState | None) -> None:
-    """Deliver an install-window signal only after the executor enters its handler."""
+    """Deliver an install-window signal after entering the managed executor."""
     if state is None or not state.initial_guard_active:
         return
     state.initial_guard_active = False
@@ -1763,9 +1279,8 @@ def _release_initial_interrupt_guard(state: _InterruptionState | None) -> None:
 def _blocked_interruption_signals(
     *,
     deliver_deferred: bool = True,
-    deferred_signals: list[int] | None = None,
 ) -> Iterator[None]:
-    """Defer SIGINT/SIGTERM across resource-registration and release boundaries."""
+    """Defer SIGINT/SIGTERM across registration and cleanup boundaries."""
     state = _INTERRUPTION_STATE.get()
     if state is not None:
         state.critical_depth += 1
@@ -1774,10 +1289,11 @@ def _blocked_interruption_signals(
     finally:
         if state is not None:
             state.critical_depth -= 1
-            if state.critical_depth == 0 and state.deferred_signal is not None:
+            if (
+                deliver_deferred
+                and state.critical_depth == 0
+                and state.deferred_signal is not None
+            ):
                 signal_number = state.deferred_signal
                 state.deferred_signal = None
-                if deferred_signals is not None:
-                    deferred_signals.append(signal_number)
-                elif deliver_deferred:
-                    raise _WorkflowInterrupted(signal_number)
+                raise _WorkflowInterrupted(signal_number)

@@ -44,7 +44,6 @@ from mammoth.torch import (
     CheckpointPublication,
     CheckpointSavePolicy,
     EarlyStopping,
-    ExecutionRequest,
     ExecutionSpec,
     MetricAccumulator,
     MetricRoute,
@@ -81,6 +80,12 @@ from mammoth.torch import (
 )
 from mammoth.torch.batch import CudaPrefetchingBatchIterator, batch_is_cuda_prefetch_eligible
 from mammoth.torch.metrics import compute_stateful_metrics, scalar_metrics
+
+
+def start_created_execution(runtime: Any, spec: ExecutionSpec) -> Any:
+    """Create one strict execution and then open its rank-local logging."""
+    runtime.create_execution(spec)
+    return runtime.start_execution_logging()
 
 
 def build_warmup_linear_stack(
@@ -761,15 +766,15 @@ def _torch_runtime_worker(
                     raise PermissionError("rank log unavailable")
 
                 torch_runtime_module.create_execution_logging = fail_logging
-            bundle = runtime.start_execution(
-                ExecutionRequest(
+            bundle = start_created_execution(
+                runtime,
+                ExecutionSpec(
                     run_dir=Path(run_dir),
                     run_name="ddp-run",
                     invocation_kind="test",
                     intended_phases=("train",),
-                    command=("python", "train.py"),
                     execution_id="ddp-attempt",
-                )
+                ),
             )
             broadcast = runtime.broadcast_object("ready" if rank == 0 else None)
             gathered = runtime.all_gather_object(rank)
@@ -888,6 +893,11 @@ def _resume_join_mismatch_worker(
                     parent_execution_id="producer",
                     starting_epoch=4,
                     starting_global_step=12,
+                    runtime={
+                        "caller": (
+                            "other" if mismatch == "runtime" and rank == 1 else "shared"
+                        )
+                    },
                 )
             )
         result_queue.put((rank, None))
@@ -916,6 +926,7 @@ def run_two_process_resume_join_mismatch(
         parent_execution_id="producer",
         starting_epoch=4,
         starting_global_step=12,
+        runtime={"caller": "shared"},
     )
     process_context = multiprocessing.get_context("spawn")
     result_queue = process_context.Queue()
@@ -6805,16 +6816,16 @@ def test_single_runtime_establishes_execution_and_supplies_trainer_observer(
     model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
-        bundle = runtime.start_execution(
-            ExecutionRequest(
+        bundle = start_created_execution(
+            runtime,
+            ExecutionSpec(
                 run_dir=run_dir,
                 run_name="single-run",
                 invocation_kind="test",
                 intended_phases=("train",),
-                command=("python", "train.py"),
                 execution_id="single-attempt",
                 runtime={"credentials": {"api_token": "secret"}},
-            )
+            ),
         )
         bundle.observer.emit("process_started", phase="train")
         with Trainer(
@@ -6854,16 +6865,15 @@ def test_single_runtime_establishes_execution_and_supplies_trainer_observer(
 
 
 def test_runtime_preserves_caller_supplied_parent_execution_id(tmp_path: Path) -> None:
-    """The PyTorch request forwards explicit lineage without inspecting artifacts."""
+    """Strict creation forwards explicit lineage without inspecting artifacts."""
     run_dir = tmp_path / "explicit-parent"
     with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
-        context = runtime.establish_execution(
-            ExecutionRequest(
+        context = runtime.create_execution(
+            ExecutionSpec(
                 run_dir=run_dir,
                 run_name="explicit-parent",
                 invocation_kind="train",
                 intended_phases=("train",),
-                command=("python", "train.py"),
                 execution_id="child",
                 resume_checkpoint=run_dir / "checkpoint-copy.pt",
                 resume_checkpoint_sha256="a" * 64,
@@ -7202,26 +7212,6 @@ def test_closed_runtime_rejects_strict_execution_operations(tmp_path: Path) -> N
         runtime.attach_execution(spec)
     with pytest.raises(RuntimeError, match="runtime is closed"):
         runtime.start_execution_logging()
-    with pytest.raises(RuntimeError, match="runtime is closed"):
-        runtime.establish_execution(
-            ExecutionRequest(
-                run_dir=spec.run_dir,
-                run_name=spec.run_name,
-                invocation_kind="train",
-                intended_phases=("train",),
-                command=("python", "train.py"),
-            )
-        )
-    with pytest.raises(RuntimeError, match="runtime is closed"):
-        runtime.start_execution(
-            ExecutionRequest(
-                run_dir=spec.run_dir,
-                run_name=spec.run_name,
-                invocation_kind="train",
-                intended_phases=("train",),
-                command=("python", "train.py"),
-            )
-        )
     assert not spec.run_dir.exists()
 
     session_runtime = initialize_runtime(RuntimeConfig(device="cpu"))
@@ -7287,6 +7277,7 @@ def test_strict_create_and_attach_accept_opaque_phase_names(
                 run_name="opaque-phase",
                 invocation_kind="workflow",
                 intended_phases=(phase,),
+                runtime=context.metadata.runtime,
             )
         )
     assert attached == context
@@ -7322,6 +7313,90 @@ def test_runtime_attach_execution_validates_canonical_environment_without_lease(
         assert context.metadata.execution_id == "workflow-attempt"
         with claim_logical_run_lease(run_dir):
             pass
+
+
+@pytest.mark.parametrize(
+    ("field_name", "overrides"),
+    (
+        ("config reference", {"config_reference": "other-config.json"}),
+        ("runtime metadata", {"runtime": {"caller": "other"}}),
+    ),
+)
+def test_runtime_attach_execution_rejects_config_and_runtime_mismatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    overrides: dict[str, Any],
+) -> None:
+    """Strict attachment compares every caller-declared immutable metadata field."""
+    run_dir = tmp_path / "strict-attach-metadata"
+    create_execution_context(
+        run_dir,
+        run_name="strict-attach",
+        invocation_kind="workflow",
+        intended_phases=("train",),
+        world_size=1,
+        execution_mode="single",
+        command=("python", "workflow.py"),
+        config_reference="workflow-config.json",
+        execution_id="workflow-attempt",
+        runtime={"caller": "workflow"},
+    )
+    _set_canonical_attachment_environment(monkeypatch)
+    values: dict[str, Any] = {
+        "run_dir": run_dir,
+        "run_name": "strict-attach",
+        "invocation_kind": "workflow",
+        "intended_phases": ("train",),
+        "config_reference": "workflow-config.json",
+        "runtime": {"caller": "workflow"},
+    }
+    values.update(overrides)
+
+    with (
+        initialize_runtime(RuntimeConfig(device="cpu")) as runtime,
+        pytest.raises(RuntimeError, match=field_name),
+    ):
+        runtime.attach_execution(ExecutionSpec(**values))
+
+
+def test_runtime_attach_execution_accepts_equivalent_nested_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Frozen metadata sequences compare equal to caller-owned JSON lists."""
+    run_dir = tmp_path / "strict-attach-nested-runtime"
+    nested_runtime = {
+        "dataset": {
+            "devices": ["cpu"],
+            "transforms": [{"name": "normalize", "arguments": [1, 2]}],
+        }
+    }
+    create_execution_context(
+        run_dir,
+        run_name="strict-attach",
+        invocation_kind="workflow",
+        intended_phases=("train",),
+        world_size=1,
+        execution_mode="single",
+        command=("python", "workflow.py"),
+        execution_id="workflow-attempt",
+        runtime=nested_runtime,
+    )
+    _set_canonical_attachment_environment(monkeypatch)
+
+    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
+        context = runtime.attach_execution(
+            ExecutionSpec(
+                run_dir=run_dir,
+                run_name="strict-attach",
+                invocation_kind="workflow",
+                intended_phases=("train",),
+                runtime=nested_runtime,
+            )
+        )
+
+    assert context.metadata.to_dict()["runtime"] == nested_runtime
 
 
 @pytest.mark.parametrize(
@@ -7422,192 +7497,6 @@ def test_runtime_attach_execution_rejects_resume_metadata_for_fresh_expectation(
         )
 
 
-def _create_resumed_execution_context(
-    tmp_path: Path,
-    *,
-    resume_checkpoint: str = "checkpoints/resume.pt",
-    resume_checkpoint_sha256: str = "a" * 64,
-    parent_execution_id: str | None = "producer",
-    starting_epoch: int = 4,
-    starting_global_step: int | None = 12,
-) -> Path:
-    """Create immutable runner metadata used by resumed execution-join tests."""
-    run_dir = tmp_path / "resumed-join"
-    create_execution_context(
-        run_dir,
-        run_name="resumed-join",
-        invocation_kind="workflow",
-        intended_phases=("train",),
-        world_size=1,
-        execution_mode="single",
-        command=("mammoth", "workflow", "run"),
-        execution_id="runner-attempt",
-        resume_checkpoint=resume_checkpoint,
-        resume_checkpoint_sha256=resume_checkpoint_sha256,
-        parent_execution_id=parent_execution_id,
-        starting_epoch=starting_epoch,
-        starting_global_step=starting_global_step,
-    )
-    return run_dir
-
-
-def _resumed_join_request(run_dir: Path, **overrides: Any) -> ExecutionRequest:
-    """Return a matching child request with one optional resume-fact override."""
-    facts: dict[str, Any] = {
-        "resume_checkpoint": "checkpoints/resume.pt",
-        "resume_checkpoint_sha256": "a" * 64,
-        "parent_execution_id": "producer",
-        "starting_epoch": 4,
-        "starting_global_step": 12,
-    }
-    facts.update(overrides)
-    return ExecutionRequest(
-        run_dir=run_dir,
-        run_name="resumed-join",
-        invocation_kind="train",
-        intended_phases=("train",),
-        command=("python", "train.py"),
-        **facts,
-    )
-
-
-def test_runtime_joins_matching_resume_facts(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A resuming child joins only metadata that attests its exact resume state."""
-    run_dir = _create_resumed_execution_context(tmp_path)
-    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
-
-    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
-        context = runtime.establish_execution(_resumed_join_request(run_dir))
-
-    assert context.metadata.execution_id == "runner-attempt"
-
-
-@pytest.mark.parametrize(
-    ("field_name", "override"),
-    (
-        ("resume_checkpoint", "checkpoints/other.pt"),
-        ("resume_checkpoint_sha256", "b" * 64),
-        ("parent_execution_id", "other-producer"),
-        ("starting_epoch", 5),
-        ("starting_global_step", 13),
-    ),
-)
-def test_runtime_rejects_each_mismatched_resume_fact_before_logging(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    field_name: str,
-    override: object,
-) -> None:
-    """Every declared resume fact must agree before the child opens logging."""
-    run_dir = _create_resumed_execution_context(tmp_path)
-    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
-
-    with (
-        initialize_runtime(RuntimeConfig(device="cpu")) as runtime,
-        pytest.raises(RuntimeError, match=field_name),
-    ):
-        runtime.establish_execution(_resumed_join_request(run_dir, **{field_name: override}))
-
-    execution_dir = run_dir / "logs" / "executions" / "runner-attempt"
-    assert not (execution_dir / "rank-0.log").exists()
-    assert not (execution_dir / "rank-0.jsonl").exists()
-
-
-def test_runtime_compares_sanitized_resume_checkpoint_references(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Equivalent credential-bearing checkpoint URLs join through canonical sanitization."""
-    run_dir = _create_resumed_execution_context(
-        tmp_path,
-        resume_checkpoint="https://first:secret@example.test/checkpoints/resume.pt?token=one",
-    )
-    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
-
-    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
-        runtime.establish_execution(
-            _resumed_join_request(
-                run_dir,
-                resume_checkpoint="https://second:secret@example.test/checkpoints/resume.pt?token=two",
-            )
-        )
-
-
-def test_runtime_allows_external_resume_without_parent_or_global_step(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Unknown external lineage and global-step coordinates remain explicit ``None`` facts."""
-    run_dir = _create_resumed_execution_context(
-        tmp_path,
-        parent_execution_id=None,
-        starting_global_step=None,
-    )
-    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
-
-    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
-        runtime.establish_execution(
-            _resumed_join_request(
-                run_dir,
-                parent_execution_id=None,
-                starting_global_step=None,
-            )
-        )
-
-
-def test_execution_request_requires_resume_digest_and_starting_epoch(tmp_path: Path) -> None:
-    """Resume requests cannot defer their immutable attestation facts."""
-    common = {
-        "run_dir": tmp_path,
-        "run_name": "resume-request",
-        "invocation_kind": "train",
-        "intended_phases": ("train",),
-        "command": ("python", "train.py"),
-        "resume_checkpoint": "checkpoint.pt",
-    }
-    with pytest.raises(ValueError, match="resume_checkpoint_sha256"):
-        ExecutionRequest(**common)
-    with pytest.raises(ValueError, match="starting_epoch"):
-        ExecutionRequest(**common, resume_checkpoint_sha256="a" * 64)
-
-
-@pytest.mark.parametrize(
-    ("field_name", "value"),
-    (
-        ("starting_epoch", 4.0),
-        ("starting_epoch", True),
-        ("starting_epoch", -1),
-        ("starting_global_step", 12.0),
-        ("starting_global_step", True),
-        ("starting_global_step", -1),
-    ),
-)
-def test_execution_request_rejects_non_integral_resume_coordinates(
-    tmp_path: Path,
-    field_name: str,
-    value: object,
-) -> None:
-    """Resume coordinate equality cannot be bypassed by Python numeric coercion."""
-    request = {
-        "run_dir": tmp_path,
-        "run_name": "resume-coordinate",
-        "invocation_kind": "train",
-        "intended_phases": ("train",),
-        "command": ("python", "train.py"),
-        "resume_checkpoint": "checkpoint.pt",
-        "resume_checkpoint_sha256": "a" * 64,
-        "starting_epoch": 4,
-        "starting_global_step": 12,
-    }
-    request[field_name] = value
-
-    with pytest.raises(ValueError, match=field_name):
-        ExecutionRequest(**request)
-
-
 def test_single_runtime_owns_weighted_helpers_and_execution_lifecycle(
     tmp_path: Path,
 ) -> None:
@@ -7615,15 +7504,15 @@ def test_single_runtime_owns_weighted_helpers_and_execution_lifecycle(
     runtime = initialize_runtime(
         RuntimeConfig(device="cpu", workload_weights=(2,))
     )
-    runtime.start_execution(
-        ExecutionRequest(
+    start_created_execution(
+        runtime,
+        ExecutionSpec(
             run_dir=run_dir,
             run_name="runtime-session",
             invocation_kind="test",
             intended_phases=("validate",),
-            command=("python", "validate.py"),
             execution_id="runtime-session-attempt",
-        )
+        ),
     )
     session = runtime.create_execution_session()
 
@@ -7674,15 +7563,15 @@ def _create_test_execution_session(
 ) -> tuple[Any, Any]:
     """Create one started single-process runtime/session test fixture."""
     runtime = initialize_runtime(RuntimeConfig(device="cpu"))
-    runtime.start_execution(
-        ExecutionRequest(
+    start_created_execution(
+        runtime,
+        ExecutionSpec(
             run_dir=tmp_path / name,
             run_name=name,
             invocation_kind="test",
             intended_phases=("train",),
-            command=("python", "train.py"),
             execution_id=f"{name}-attempt",
-        )
+        ),
     )
     return runtime, runtime.create_execution_session()
 
@@ -8299,15 +8188,15 @@ def test_execution_session_scope_derives_terminal_process_state(
 ) -> None:
     run_dir = tmp_path / f"session-{type(error).__name__}"
     runtime = initialize_runtime(RuntimeConfig(device="cpu"))
-    runtime.start_execution(
-        ExecutionRequest(
+    start_created_execution(
+        runtime,
+        ExecutionSpec(
             run_dir=run_dir,
             run_name="runtime-session",
             invocation_kind="test",
             intended_phases=("validate",),
-            command=("python", "validate.py"),
             execution_id=f"session-{type(error).__name__.lower()}",
-        )
+        ),
     )
     session = runtime.create_execution_session()
 
@@ -8336,15 +8225,15 @@ def test_execution_session_scope_derives_terminal_process_state(
 def test_execution_session_cannot_report_failed_phase_as_success(tmp_path: Path) -> None:
     run_dir = tmp_path / "failed-session"
     runtime = initialize_runtime(RuntimeConfig(device="cpu"))
-    runtime.start_execution(
-        ExecutionRequest(
+    start_created_execution(
+        runtime,
+        ExecutionSpec(
             run_dir=run_dir,
             run_name="failed-session",
             invocation_kind="test",
             intended_phases=("validate",),
-            command=("python", "validate.py"),
             execution_id="failed-session-attempt",
-        )
+        ),
     )
     session = runtime.create_execution_session()
     session.start_phase("validate")
@@ -8363,15 +8252,15 @@ def test_execution_session_reraises_late_runtime_cleanup_failure(
 ) -> None:
     run_dir = tmp_path / "cleanup-failed-session"
     runtime = initialize_runtime(RuntimeConfig(device="cpu"))
-    runtime.start_execution(
-        ExecutionRequest(
+    start_created_execution(
+        runtime,
+        ExecutionSpec(
             run_dir=run_dir,
             run_name="cleanup-failed-session",
             invocation_kind="test",
             intended_phases=("validate",),
-            command=("python", "validate.py"),
             execution_id="cleanup-failed-session-attempt",
-        )
+        ),
     )
     session = runtime.create_execution_session()
     session.start_phase("validate")
@@ -8400,15 +8289,15 @@ def test_execution_session_derives_interrupt_from_presentation_cleanup(
 ) -> None:
     run_dir = tmp_path / "cleanup-interrupted-session"
     runtime = initialize_runtime(RuntimeConfig(device="cpu"))
-    runtime.start_execution(
-        ExecutionRequest(
+    start_created_execution(
+        runtime,
+        ExecutionSpec(
             run_dir=run_dir,
             run_name="cleanup-interrupted-session",
             invocation_kind="test",
             intended_phases=("validate",),
-            command=("python", "validate.py"),
             execution_id="cleanup-interrupted-session-attempt",
-        )
+        ),
     )
     session = runtime.create_execution_session()
     session.start_phase("validate")
@@ -8467,97 +8356,15 @@ def test_runtime_validates_launch_and_weight_topology(
         )
 
 
-def test_single_runtime_joins_runner_execution_from_environment(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    run_dir = tmp_path / "joined-run"
-    create_execution_context(
-        run_dir,
-        run_name="joined-run",
-        invocation_kind="workflow",
-        intended_phases=("train", "validate"),
-        world_size=1,
-        execution_mode="single",
-        command=("mammoth", "workflow", "run"),
-        execution_id="runner-attempt",
-        resume_checkpoint="checkpoints/runner-resume.pt",
-        resume_checkpoint_sha256="a" * 64,
-        parent_execution_id="previous-runner-attempt",
-        starting_epoch=3,
-        starting_global_step=9,
-    )
-    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
-
-    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
-        bundle = runtime.start_execution(
-            ExecutionRequest(
-                run_dir=run_dir,
-                run_name="joined-run",
-                invocation_kind="train",
-                intended_phases=("train",),
-                command=("python", "train.py"),
-            )
-        )
-        bundle.observer.emit("process_completed", phase="train", exit_code=0)
-        assert runtime.execution_context is not None
-        assert runtime.execution_context.metadata.execution_id == "runner-attempt"
-
-
-def test_single_runtime_joins_execution_from_request_owned_alias(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    run_dir = tmp_path / "joined-run"
-    create_execution_context(
-        run_dir,
-        run_name="joined-run",
-        invocation_kind="workflow",
-        intended_phases=("train",),
-        world_size=1,
-        execution_mode="single",
-        command=("mammoth", "workflow", "run"),
-        execution_id="runner-attempt",
-    )
-    monkeypatch.setenv("CALLER_EXECUTION_ID", "runner-attempt")
-
-    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
-        runtime.start_execution(
-            ExecutionRequest(
-                run_dir=run_dir,
-                run_name="joined-run",
-                invocation_kind="train",
-                intended_phases=("train",),
-                command=("python", "train.py"),
-                execution_id_environment_aliases=("CALLER_EXECUTION_ID",),
-            )
-        )
-        assert runtime.execution_context is not None
-        assert runtime.execution_context.metadata.execution_id == "runner-attempt"
-
-
-def test_execution_request_rejects_invalid_alias_declarations(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="not a string"):
-        ExecutionRequest(
-            run_dir=tmp_path,
-            run_name="alias-validation",
-            invocation_kind="test",
-            intended_phases=("test",),
-            command=("python", "test.py"),
-            execution_id_environment_aliases="CALLER_EXECUTION_ID",  # type: ignore[arg-type]
-        )
-
-
-def test_execution_establishment_can_be_used_without_mammoth_logging(tmp_path: Path) -> None:
+def test_execution_creation_can_be_used_without_mammoth_logging(tmp_path: Path) -> None:
     run_dir = tmp_path / "adapter-run"
     runtime = initialize_runtime(RuntimeConfig(device="cpu"))
-    context = runtime.establish_execution(
-        ExecutionRequest(
+    context = runtime.create_execution(
+        ExecutionSpec(
             run_dir=run_dir,
             run_name="adapter-run",
             invocation_kind="test",
             intended_phases=("custom",),
-            command=("python", "custom.py"),
             execution_id="adapter-attempt",
         )
     )
@@ -8638,6 +8445,20 @@ def test_two_process_runtime_rejects_rank_local_attachment_expectation(
     execution_dir = tmp_path / "resume-ddp" / "logs" / "executions" / "resume-attempt"
     assert not (execution_dir / "rank-0.log").exists()
     assert not (execution_dir / "rank-1.log").exists()
+
+
+def test_two_process_runtime_rejects_rank_local_attachment_runtime(
+    tmp_path: Path,
+) -> None:
+    """Different rank-local runtime expectations fail before metadata is joined."""
+    results = run_two_process_resume_join_mismatch(tmp_path, mismatch="runtime")
+
+    errors = {error for _, error in results}
+    assert len(errors) == 1
+    error = errors.pop()
+    assert error is not None
+    assert "attachment expectations are inconsistent across ranks" in error
+    assert "rank 1: runtime" in error
 
 
 def test_two_process_runtime_propagates_attachment_intent_preparation_failure(
