@@ -1,6 +1,6 @@
-"""Generic local and torchrun subprocess construction and supervision.
+"""Generic subprocess construction and supervision for programmatic workflows.
 
-The workflow runner delegates one command at a time here. Start-new-session
+The workflow runner delegates each caller-complete argv here. Start-new-session
 process groups ensure timeout or interruption reaches descendants as a group.
 """
 
@@ -9,15 +9,12 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
-import sys
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
-
-from mammoth.workflow.config import StepConfig
+from typing import Any, Never
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +26,7 @@ class CommandPlan:
     command: tuple[str, ...]
     cwd: Path | None
     timeout_seconds: float | None
+    run_dir: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +50,14 @@ class CapturedProcessResult:
     duration_seconds: float
     timed_out: bool = False
     signal: int | None = None
+
+
+class _DeferredProcessSignal(BaseException):
+    """One termination signal deferred until child ownership is registered."""
+
+    def __init__(self, signal_number: int, previous_handler: Any) -> None:
+        self.signal_number = signal_number
+        self.previous_handler = previous_handler
 
 
 @dataclass(slots=True)
@@ -129,22 +135,6 @@ class SupervisedProcess:
         )
 
 
-def command_for_step(step: StepConfig) -> tuple[str, ...]:
-    """Return a local command or standard ``torch.distributed.run`` command."""
-    if step.launcher == "local":
-        return tuple(step.command)
-    return (
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nproc-per-node",
-        str(step.processes),
-        *step.torchrun_args,
-        *step.command,
-    )
-
-
 def launch_process(
     command: tuple[str, ...],
     *,
@@ -167,12 +157,33 @@ def launch_process(
         cwd=cwd,
         environment=environment,
         terminate_grace_seconds=terminate_grace_seconds,
-    ).start()
+    )
+    process_started = False
     try:
+        with _defer_process_start_signals():
+            process.start()
+            process_started = True
         if on_started is not None:
             on_started(process.pid)
-        remaining_timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+        remaining_timeout = (
+            None if deadline is None else max(0.0, deadline - time.monotonic())
+        )
         return_code = process.wait(timeout=remaining_timeout)
+    except _DeferredProcessSignal as interruption:
+        if _supervisor_started(process, acknowledged=process_started):
+            with _defer_termination_signals():
+                process.stop()
+        return ProcessResult(
+            return_code=(
+                process.returncode
+                if _supervisor_started(process, acknowledged=process_started)
+                and process.returncode is not None
+                else -interruption.signal_number
+            ),
+            duration_seconds=time.monotonic() - started,
+            interrupted=True,
+            signal=interruption.signal_number,
+        )
     except subprocess.TimeoutExpired:
         with _defer_termination_signals():
             process.stop()
@@ -195,8 +206,9 @@ def launch_process(
         # Programmatic workflow runners translate termination signals into a
         # caller-owned interruption type.  Reap the owned child before that
         # type reaches their attempt/lease cleanup path.
-        with _defer_termination_signals():
-            process.stop()
+        if _supervisor_started(process, acknowledged=process_started):
+            with _defer_termination_signals():
+                process.stop()
         raise
     timed_out = deadline is not None and time.monotonic() > deadline
     return ProcessResult(
@@ -232,12 +244,22 @@ def run_captured_process(
         terminate_grace_seconds=terminate_grace_seconds,
         descendant_grace_seconds=descendant_grace_seconds,
     )
-    process = supervisor._start(capture_output=True).process
+    process: subprocess.Popen[str] | None = None
+    process_started = False
     try:
+        with _defer_process_start_signals():
+            process = supervisor._start(capture_output=True).process
+            process_started = True
         stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except _DeferredProcessSignal as interruption:
+        if _supervisor_started(supervisor, acknowledged=process_started):
+            with _defer_termination_signals():
+                supervisor.stop()
+        _redeliver_deferred_process_signal(interruption)
     except subprocess.TimeoutExpired:
         with _defer_termination_signals():
             supervisor.stop()
+        assert process is not None
         # A second communicate returns the complete stream contents. Do not combine
         # TimeoutExpired.output with it: subprocess may expose overlapping data.
         stdout, stderr = process.communicate()
@@ -251,8 +273,9 @@ def run_captured_process(
             signal=-return_code if return_code < 0 else None,
         )
     except BaseException:
-        with _defer_termination_signals():
-            supervisor.stop()
+        if _supervisor_started(supervisor, acknowledged=process_started):
+            with _defer_termination_signals():
+                supervisor.stop()
         raise
 
     return_code = process.returncode if process.returncode is not None else -signal.SIGKILL
@@ -263,6 +286,82 @@ def run_captured_process(
         duration_seconds=time.monotonic() - started,
         signal=-return_code if return_code < 0 else None,
     )
+
+
+def _supervisor_started(
+    supervisor: SupervisedProcess,
+    *,
+    acknowledged: bool,
+) -> bool:
+    """Detect a child assigned by ``_start`` before that method raised."""
+    return acknowledged or getattr(supervisor, "_process", None) is not None
+
+
+@contextmanager
+def _defer_process_start_signals() -> Iterator[None]:
+    """Record SIGINT/SIGTERM until a newly launched child is safely owned."""
+    if not hasattr(signal, "SIGTERM"):
+        yield
+        return
+    signals = (signal.SIGINT, signal.SIGTERM)
+    previous: dict[signal.Signals, Any] = {}
+    installed: list[signal.Signals] = []
+    deferred_signal: int | None = None
+    body_error: BaseException | None = None
+    restore_error: BaseException | None = None
+
+    def defer(signal_number: int, _frame: object) -> None:
+        nonlocal deferred_signal
+        previous_handler = previous.get(signal.Signals(signal_number))
+        if previous_handler == signal.SIG_IGN:
+            return
+        if deferred_signal is None:
+            deferred_signal = signal_number
+
+    try:
+        for signal_number in signals:
+            previous[signal_number] = signal.getsignal(signal_number)
+            signal.signal(signal_number, defer)
+            installed.append(signal_number)
+    except ValueError:
+        pass
+    try:
+        yield
+    except BaseException as error:
+        body_error = error
+    finally:
+        for signal_number in reversed(installed):
+            try:
+                signal.signal(signal_number, previous[signal_number])
+            except BaseException as error:
+                if restore_error is None:
+                    restore_error = error
+    if deferred_signal is not None:
+        deferred = _DeferredProcessSignal(
+            deferred_signal,
+            previous.get(signal.Signals(deferred_signal), signal.SIG_DFL),
+        )
+        if body_error is not None:
+            raise deferred from body_error
+        if restore_error is not None:
+            raise deferred from restore_error
+        raise deferred
+    if restore_error is not None:
+        if body_error is not None:
+            raise restore_error from body_error
+        raise restore_error
+    if body_error is not None:
+        raise body_error
+
+
+def _redeliver_deferred_process_signal(interruption: _DeferredProcessSignal) -> Never:
+    """Deliver a captured parent signal after the owned child has been reaped."""
+    handler = interruption.previous_handler
+    if callable(handler):
+        handler(interruption.signal_number, None)
+    else:
+        signal.raise_signal(interruption.signal_number)
+    raise interruption
 
 
 @contextmanager

@@ -270,41 +270,12 @@ def test_schema_v1_metadata_from_originating_project_remains_readable(tmp_path: 
     assert context.metadata.resume_checkpoint_sha256 is None
 
 
-def test_environment_hook_accepts_canonical_and_explicit_alias_names() -> None:
+def test_environment_hook_accepts_only_the_canonical_name() -> None:
     assert execution_id_from_environment({"MAMMOTH_EXECUTION_ID": "one"}) == "one"
-    assert execution_id_from_environment(
-        {"CALLER_EXECUTION_ID": "two"}, aliases=("CALLER_EXECUTION_ID",)
-    ) == "two"
-    assert execution_id_from_environment(
-        {"MAMMOTH_EXECUTION_ID": "one", "CALLER_EXECUTION_ID": "one"},
-        aliases=("CALLER_EXECUTION_ID",),
-    ) == "one"
+    assert execution_id_from_environment({"CALLER_EXECUTION_ID": "two"}) is None
     assert execution_id_from_environment({}) is None
-    with pytest.raises(ValueError, match="disagree"):
-        execution_id_from_environment(
-            {"MAMMOTH_EXECUTION_ID": "one", "CALLER_EXECUTION_ID": "two"},
-            aliases=("CALLER_EXECUTION_ID",),
-        )
-
-
-def test_environment_hook_validates_multiple_aliases_and_declarations() -> None:
-    with pytest.raises(ValueError, match="disagree"):
-        execution_id_from_environment(
-            {"FIRST_EXECUTION_ID": "one", "SECOND_EXECUTION_ID": "two"},
-            aliases=("FIRST_EXECUTION_ID", "SECOND_EXECUTION_ID"),
-        )
     with pytest.raises(ValueError, match="Execution IDs"):
-        execution_id_from_environment(
-            {"CALLER_EXECUTION_ID": "not/an-id"}, aliases=("CALLER_EXECUTION_ID",)
-        )
-    with pytest.raises(ValueError, match="duplicate"):
-        execution_id_from_environment(aliases=("CALLER_EXECUTION_ID", "CALLER_EXECUTION_ID"))
-    with pytest.raises(ValueError, match="Invalid"):
-        execution_id_from_environment(aliases=("",))
-    with pytest.raises(ValueError, match="canonical"):
-        execution_id_from_environment(aliases=("MAMMOTH_EXECUTION_ID",))
-    with pytest.raises(ValueError, match="Invalid"):
-        execution_id_from_environment(aliases=([],))  # type: ignore[arg-type]
+        execution_id_from_environment({"MAMMOTH_EXECUTION_ID": "not/an-id"})
 
 
 def test_logical_run_lease_rejects_a_second_producer(tmp_path: Path) -> None:

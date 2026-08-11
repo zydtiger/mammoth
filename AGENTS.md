@@ -74,10 +74,9 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/monitor/rich_ui.py` | Compatibility route from the former Rich helper to the Textual application. | Legacy interactive-helper compatibility changes. |
 | `src/mammoth/monitor/telemetry.py` | Standard-library viewer-host telemetry with explicit provenance labels. | Base local telemetry changes. |
 | `src/mammoth/monitor/textual_ui.py` | Optional Textual application lifecycle, refresh worker, navigation, and resize handling. | Interactive monitor lifecycle, bindings, or polling behavior changes. |
-| `src/mammoth/workflow/__init__.py` | Public workflow configuration, planning, launch, and result exports. | A stable workflow symbol is added, removed, or renamed. |
-| `src/mammoth/workflow/config.py` | Strict schema-v1 YAML values, defaults, selection, and DAG validation. | Workflow configuration syntax or selection changes. |
-| `src/mammoth/workflow/launch.py` | Local and torchrun command construction plus reusable launcher/descendant supervision. | Launch, timeout, signal, or descendant handling changes. |
-| `src/mammoth/workflow/runner.py` | Dry-run planning, per-run attempts, policies, environment hooks, and lifecycle events. | Workflow orchestration behavior changes. |
+| `src/mammoth/workflow/__init__.py` | Public programmatic workflow planning, supervision, and result exports. | A stable workflow symbol is added, removed, or renamed. |
+| `src/mammoth/workflow/launch.py` | Final-argv subprocess launch plus reusable launcher/descendant supervision. | Launch, timeout, signal, or descendant handling changes. |
+| `src/mammoth/workflow/runner.py` | Side-effect-free planning, serial run/step attempts, narrow hooks, canonical child environments, and lifecycle ownership. | Workflow orchestration behavior changes. |
 | `src/mammoth/torch/__init__.py` | Public optional runtime, trainer, profiler, callback, metric, batch, and checkpoint exports. | A stable PyTorch integration symbol is added, removed, or renamed. |
 | `src/mammoth/torch/backend.py` | Generic process-global PyTorch numerical backend configuration, state capture, reversible overrides, and RNG seed policy. | TF32, matmul precision, cuDNN, deterministic-algorithm, or seed behavior changes. |
 | `src/mammoth/torch/device.py` | Shared explicit and automatic PyTorch device resolution. | Generic device-string resolution or availability validation changes. |
@@ -96,9 +95,9 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `tests/test_layout.py` | Run identity and artifact-layout unit coverage. | Layout or run-name validation changes. |
 | `tests/test_pipeline.py` | Ordered background execution, backpressure, attribution, interruption, and cleanup coverage. | Generic background pipeline behavior changes. |
 | `tests/test_logging.py` | Observer, sink isolation, JSONL routing, text, and TensorBoard unit coverage. | Logging behavior changes. |
-| `tests/test_cli.py` | Typer version, help, usage-error, validation, and repeatable-selector CLI coverage. | Root CLI behavior, command composition, validation, or selectors change. |
+| `tests/test_cli.py` | Typer version, monitor help, usage-error, and removed-workflow-route coverage. | Root or monitor CLI behavior changes. |
 | `tests/test_monitor.py` | Discovery, lineage, folding, rendering, telemetry, malformed streams, and CLI unit coverage. | Monitor or monitor CLI behavior changes. |
-| `tests/test_workflow.py` | YAML validation, DAGs, selection, dry runs, launches, policies, environment, timeout, and CLI unit coverage. | Workflow behavior changes. |
+| `tests/test_workflow.py` | Programmatic models, both serial orders, lifecycle boundaries, failure results, canonical environments, and subprocess supervision coverage. | Workflow behavior changes. |
 | `tests/test_torch.py` | Multi-task trainer, device movement, precision, accumulation, metrics, callbacks, checkpoints, and DDP unit coverage. | Optional trainer behavior changes. |
 | `tests/test_backend.py` | Generic PyTorch backend configuration, restoration, and seed-policy coverage. | Backend or seed configuration behavior changes. |
 | `tests/test_profiling.py` | Callable profiling, output summaries, component ranges, runtime restoration, report, and CUDA-conditional coverage. | Generic PyTorch profiling behavior changes. |

@@ -8,7 +8,6 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "PyYAML>=6.0.2",
     "typer-slim>=0.21.2,<0.22",
 ]
 
@@ -37,7 +36,6 @@ dev = [
     "rich>=14.3.2",
     "ruff>=0.9",
     "textual>=8.2.8",
-    "types-PyYAML>=6.0.12.20241230",
 ]
 
 [build-system]
