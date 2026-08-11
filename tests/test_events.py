@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import mammoth.core.events as events_module
 from mammoth.core import RunLayout, create_execution_context
 from mammoth.core.events import (
     ExecutionEvent,
@@ -27,6 +28,36 @@ def execution_context(tmp_path: Path):
         command=("python", "worker.py"),
         execution_id="attempt",
     )
+
+
+def test_event_stream_closes_descriptor_after_base_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interrupted event-stream validation cannot leak its newly opened descriptor."""
+    context = execution_context(tmp_path)
+    opened: list[int] = []
+    original_open = events_module.os.open
+    original_fstat = events_module.os.fstat
+
+    def track_open(*args: object, **kwargs: object) -> int:
+        descriptor = original_open(*args, **kwargs)  # type: ignore[arg-type]
+        opened.append(descriptor)
+        return descriptor
+
+    def interrupt_fstat(descriptor: int) -> object:
+        original_fstat(descriptor)
+        raise KeyboardInterrupt("event stream validation interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(events_module.os, "open", track_open)
+        patch.setattr(events_module.os, "fstat", interrupt_fstat)
+        with pytest.raises(KeyboardInterrupt, match="event stream validation interrupted"):
+            ExecutionEventWriter.for_process(context, rank=0)
+
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        original_fstat(opened[0])
 
 
 def test_process_writer_round_trips_lifecycle_progress_and_coordinates(tmp_path: Path) -> None:
