@@ -88,28 +88,29 @@ Build monitoring above immutable metadata and event readers:
 Exit condition: the monitor can read both Mammoth-generated runs and existing
 compatible runs without importing project code.
 
-## Phase 5: Declarative workflow runner
+## Phase 5: Programmatic workflow runner
 
 Status: complete.
 
-Generalize the existing experiment-runner ideas into arbitrary steps:
+Generalize the existing experiment-runner ideas into arbitrary Python-defined
+serial steps:
 
-- YAML workflow parsing with defaults and strict validation;
-- safe run and step selection;
-- ordered dependencies, initially a directed acyclic graph;
-- local subprocess launcher;
-- optional `torchrun` launcher;
-- environment inheritance and secret-safe provenance;
-- dry runs that create no execution artifacts;
+- immutable `Workflow`, `Run`, `Step`, and `Execution` inputs;
+- side-effect-free planning with run-major and canonical step-major order;
+- final opaque argv supplied by callers, including caller-built `torchrun`;
+- workflow-root defaults with per-run root overrides;
+- post-lease execution resolution and one before-first-step boundary;
+- canonical child join variables without aliases or provider frameworks;
 - signal, timeout, descendant, and process-group supervision;
-- stop, skip, and failure policies; and
-- runner-owned lifecycle events.
+- first-failure blocking without artifacts for unstarted runs; and
+- runner-owned lifecycle events and structured `WorkflowResult` outcomes.
 
 Phase names and command arguments remain entirely project-defined.
 
-Exit condition: two unrelated command-line projects can use the same workflow
-schema and monitor without Mammoth-specific code in their commands beyond the
-execution join environment.
+Exit condition: two unrelated projects can construct the same programmatic
+workflow surface and monitor its artifacts without Mammoth-specific code in
+their commands beyond strict execution attachment through the canonical join
+environment.
 
 ## Phase 6: Generic PyTorch trainer
 

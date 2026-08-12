@@ -1,8 +1,8 @@
 """Own generic single-process and standard PyTorch DDP execution state.
 
 CLI entrypoints construct this runtime before project code. The generic trainer
-consumes its device and rank identity, while execution logging uses it to create
-or join one immutable attempt and open one process-owned stream per rank.
+consumes its device and rank identity, while execution logging uses an explicitly
+created or attached immutable attempt and opens one process-owned stream per rank.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import signal as signal_module
+import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from threading import RLock
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import Any, Literal, cast
 
 import torch
@@ -33,9 +34,19 @@ from mammoth.core import (
     create_execution_context,
     execution_id_from_environment,
     join_execution_context,
-    normalize_execution_id_environment_aliases,
+    latest_execution_id,
+    sanitize_command,
+    sanitize_metadata_fields,
     sanitize_reference,
+    validate_execution_id,
     validate_resume_checkpoint_sha256,
+    validate_run_name,
+)
+from mammoth.core.execution import (
+    EXECUTION_ID_ENV,
+    INVOCATION_KIND_ENV,
+    PHASE_ENV,
+    RUN_NAME_ENV,
 )
 from mammoth.logging import (
     ExecutionLogging,
@@ -116,47 +127,54 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class ExecutionRequest:
-    """Project-neutral facts needed to establish one immutable execution.
+class ExecutionSpec:
+    """Immutable expected execution facts for strict create or attach operations.
 
-    Consumers may declare temporary execution-ID environment aliases here; the
-    runtime passes them to Mammoth's generic resolver without persisting them.
+    :class:`Runtime` derives the invocation command and previous-attempt lineage
+    when it creates an execution.  Attachment uses the same value as an exact
+    expectation for canonical workflow-child metadata and resume provenance.
     """
 
     run_dir: Path
     run_name: str
     invocation_kind: str
     intended_phases: tuple[str, ...]
-    command: tuple[str, ...]
     config_reference: str | Path = ""
     execution_id: str | None = None
-    previous_execution_id: str | None = None
     resume_checkpoint: str | Path | None = None
     resume_checkpoint_sha256: str | None = None
     parent_execution_id: str | None = None
     starting_epoch: int | None = None
     starting_global_step: int | None = None
     runtime: Mapping[str, Any] = field(default_factory=dict)
-    execution_id_environment_aliases: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        """Detach mutable inputs and validate the complete resume-fact group."""
         object.__setattr__(self, "run_dir", Path(self.run_dir))
-        object.__setattr__(self, "intended_phases", tuple(self.intended_phases))
-        object.__setattr__(self, "command", tuple(self.command))
-        object.__setattr__(self, "runtime", dict(self.runtime))
+        validate_run_name(self.run_name)
+        if not isinstance(self.invocation_kind, str) or not self.invocation_kind:
+            raise ValueError("invocation_kind must be a non-empty string")
+        if isinstance(self.intended_phases, str) or not isinstance(
+            self.intended_phases, Sequence
+        ):
+            raise ValueError("intended_phases must be a sequence of phase names")
+        phases = tuple(self.intended_phases)
+        if not phases or any(not isinstance(phase, str) or not phase for phase in phases):
+            raise ValueError("intended_phases must contain non-empty phase names")
+        if len(set(phases)) != len(phases):
+            raise ValueError("intended_phases must not contain duplicate phase names")
+        object.__setattr__(self, "intended_phases", phases)
+        if not isinstance(self.runtime, Mapping):
+            raise ValueError("runtime must be a mapping")
+        object.__setattr__(self, "runtime", _freeze_runtime_mapping(self.runtime))
         _validate_resume_coordinate("starting_epoch", self.starting_epoch)
         _validate_resume_coordinate("starting_global_step", self.starting_global_step)
-        if self.resume_checkpoint is not None:
-            if self.resume_checkpoint_sha256 is None:
-                raise ValueError("resume_checkpoint requires resume_checkpoint_sha256.")
-            if self.starting_epoch is None:
-                raise ValueError("resume_checkpoint requires starting_epoch.")
-        if self.resume_checkpoint_sha256 is not None:
-            validate_resume_checkpoint_sha256(self.resume_checkpoint_sha256)
-        object.__setattr__(
-            self,
-            "execution_id_environment_aliases",
-            normalize_execution_id_environment_aliases(self.execution_id_environment_aliases),
+        _validate_resume_facts(
+            resume_checkpoint=self.resume_checkpoint,
+            resume_checkpoint_sha256=self.resume_checkpoint_sha256,
+            parent_execution_id=self.parent_execution_id,
+            starting_epoch=self.starting_epoch,
+            starting_global_step=self.starting_global_step,
         )
 
 
@@ -166,6 +184,59 @@ def _validate_resume_coordinate(name: str, value: int | None) -> None:
         not isinstance(value, int) or isinstance(value, bool) or value < 0
     ):
         raise ValueError(f"{name} must be a non-negative integer or None, got {value!r}.")
+
+
+def _validate_resume_facts(
+    *,
+    resume_checkpoint: str | Path | None,
+    resume_checkpoint_sha256: str | None,
+    parent_execution_id: str | None,
+    starting_epoch: int | None,
+    starting_global_step: int | None,
+) -> None:
+    """Require resume provenance to be either wholly absent or fully attestable."""
+    if resume_checkpoint is None:
+        populated = {
+            "resume_checkpoint_sha256": resume_checkpoint_sha256,
+            "parent_execution_id": parent_execution_id,
+            "starting_epoch": starting_epoch,
+            "starting_global_step": starting_global_step,
+        }
+        unexpected = sorted(name for name, value in populated.items() if value is not None)
+        if unexpected:
+            raise ValueError(
+                "resume facts require resume_checkpoint: " + ", ".join(unexpected)
+            )
+        return
+    try:
+        checkpoint_reference = os.fspath(resume_checkpoint)
+    except TypeError as error:
+        raise ValueError("resume_checkpoint must be a non-empty path or reference") from error
+    if not isinstance(checkpoint_reference, str) or not checkpoint_reference:
+        raise ValueError("resume_checkpoint must be a non-empty path or reference")
+    if resume_checkpoint_sha256 is None:
+        raise ValueError("resume_checkpoint requires resume_checkpoint_sha256.")
+    validate_resume_checkpoint_sha256(resume_checkpoint_sha256)
+    if starting_epoch is None:
+        raise ValueError("resume_checkpoint requires starting_epoch.")
+    if parent_execution_id is not None:
+        validate_execution_id(parent_execution_id)
+
+
+def _freeze_runtime_mapping(runtime: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Recursively detach JSON-shaped runtime metadata from caller-owned values."""
+    return MappingProxyType(
+        {name: _freeze_runtime_value(value) for name, value in runtime.items()}
+    )
+
+
+def _freeze_runtime_value(value: Any) -> Any:
+    """Freeze nested mappings and sequences retained by :class:`ExecutionSpec`."""
+    if isinstance(value, Mapping):
+        return _freeze_runtime_mapping(value)
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes | os.PathLike):
+        return tuple(_freeze_runtime_value(item) for item in value)
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +257,54 @@ class _StartupStatus:
     error: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _JoinEnvironment:
+    """Canonical workflow-child environment shared by every attaching rank."""
+
+    execution_id: str
+    run_name: str
+    invocation_kind: str
+    phase: str
+
+
+@dataclass(frozen=True, slots=True)
+class _AttachmentIntent:
+    """Rank-local strict attachment inputs that must agree before validation."""
+
+    environment: _JoinEnvironment
+    run_dir: str
+    run_name: str
+    invocation_kind: str
+    intended_phases: tuple[str, ...]
+    config_reference: str
+    execution_id: str | None
+    resume_checkpoint: str | None
+    resume_checkpoint_sha256: str | None
+    parent_execution_id: str | None
+    starting_epoch: int | None
+    starting_global_step: int | None
+    runtime: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _CreationIntent:
+    """Normalized strict-creation inputs that must agree before publication."""
+
+    run_dir: str
+    run_name: str
+    invocation_kind: str
+    intended_phases: tuple[str, ...]
+    command: tuple[str, ...]
+    config_reference: str
+    execution_id: str | None
+    resume_checkpoint: str | None
+    resume_checkpoint_sha256: str | None
+    parent_execution_id: str | None
+    starting_epoch: int | None
+    starting_global_step: int | None
+    runtime: dict[str, Any]
+
+
 class Runtime:
     """Own one process's generic PyTorch identity, collectives, and execution IO."""
 
@@ -197,6 +316,7 @@ class Runtime:
         self.execution_logging: ExecutionLogging | None = None
         self.execution_context: ExecutionContext | None = None
         self._execution_session: ExecutionSession | None = None
+        self._state_lock = RLock()
         self._closed = False
 
         if self.strategy == "single":
@@ -391,22 +511,6 @@ class Runtime:
             details = "; ".join(f"rank {status.rank}: {status.error}" for status in failures)
             raise RuntimeError(f"Distributed startup stage {stage!r} failed: {details}")
 
-    def start_execution(
-        self,
-        request: ExecutionRequest,
-        *,
-        additional_sinks: Sequence[ObservationSink] = (),
-        text_level: int = logging.INFO,
-    ) -> ExecutionLogging:
-        """Create or join one attempt and establish rank-local logging by consensus."""
-        if self.execution_logging is not None:
-            raise RuntimeError("This torch runtime has already started an execution")
-        self.establish_execution(request)
-        return self.start_execution_logging(
-            additional_sinks=additional_sinks,
-            text_level=text_level,
-        )
-
     def start_execution_logging(
         self,
         *,
@@ -414,6 +518,20 @@ class Runtime:
         text_level: int = logging.INFO,
     ) -> ExecutionLogging:
         """Open rank-local logging after execution establishment and validation."""
+        with self._state_lock:
+            return self._start_execution_logging(
+                additional_sinks=additional_sinks,
+                text_level=text_level,
+            )
+
+    def _start_execution_logging(
+        self,
+        *,
+        additional_sinks: Sequence[ObservationSink],
+        text_level: int,
+    ) -> ExecutionLogging:
+        """Open logging while the runtime terminal-state lock is held."""
+        self._require_open()
         if self.execution_logging is not None:
             raise RuntimeError("This torch runtime has already started execution logging")
         context = self.execution_context
@@ -433,35 +551,59 @@ class Runtime:
             local_error = error
         try:
             self.startup_consensus("execution logging", local_error)
-        except BaseException:
-            if logging_bundle is not None:
-                logging_bundle.close()
-            self._release_logical_run_lease()
+        except BaseException as startup_error:
+            self._terminate_failed_logging_startup(logging_bundle, startup_error)
             raise
         if logging_bundle is None:
-            self._release_logical_run_lease()
-            raise RuntimeError("Execution logging startup succeeded without a local bundle")
+            missing_bundle_error = RuntimeError(
+                "Execution logging startup succeeded without a local bundle"
+            )
+            self._terminate_failed_logging_startup(None, missing_bundle_error)
+            raise missing_bundle_error
         self.execution_context = context
         self.execution_logging = logging_bundle
         return logging_bundle
 
     def create_execution_session(self) -> ExecutionSession:
         """Create the generic process/phase lifecycle owner for this runtime."""
-        if self._execution_session is not None:
-            raise RuntimeError("This torch runtime already has an execution session")
-        if self.execution_logging is None:
-            raise RuntimeError("Start execution logging before creating a session")
-        session = ExecutionSession(self)
-        self._execution_session = session
-        return session
+        with self._state_lock:
+            self._require_open()
+            if self._execution_session is not None:
+                raise RuntimeError("This torch runtime already has an execution session")
+            if self.execution_logging is None:
+                raise RuntimeError("Start execution logging before creating a session")
+            session = ExecutionSession(self)
+            self._execution_session = session
+            return session
 
-    def establish_execution(self, request: ExecutionRequest) -> ExecutionContext:
-        """Create or join and validate one immutable execution across all ranks."""
-        if self.execution_context is not None:
-            raise RuntimeError("This torch runtime has already established an execution")
-        context = self._establish_execution(request)
-        self.execution_context = context
-        return context
+    def create_execution(self, spec: ExecutionSpec) -> ExecutionContext:
+        """Create a new execution and never attach to an inherited attempt.
+
+        Rank zero claims the logical-run lease, resolves adjacency while that
+        lease is held, publishes immutable metadata, and shares the new ID.
+        Every rank then joins and validates the published attempt by consensus.
+        """
+        with self._state_lock:
+            self._require_open()
+            if not isinstance(spec, ExecutionSpec):
+                raise TypeError("spec must be an ExecutionSpec")
+            if self.execution_context is not None:
+                raise RuntimeError("This torch runtime has already established an execution")
+            context = self._create_execution(spec)
+            self.execution_context = context
+            return context
+
+    def attach_execution(self, expected: ExecutionSpec) -> ExecutionContext:
+        """Attach to exactly one canonical workflow execution without leasing it."""
+        with self._state_lock:
+            self._require_open()
+            if not isinstance(expected, ExecutionSpec):
+                raise TypeError("expected must be an ExecutionSpec")
+            if self.execution_context is not None:
+                raise RuntimeError("This torch runtime has already established an execution")
+            context = self._attach_execution(expected)
+            self.execution_context = context
+            return context
 
     def close_process_group(self) -> None:
         """Destroy the default process group only when this runtime created it."""
@@ -475,27 +617,31 @@ class Runtime:
 
     def close(self) -> None:
         """Close logging, release the primary lease, and destroy an owned group."""
-        if self._closed:
-            return
-        self._closed = True
-        first_error: BaseException | None = None
-        if self.execution_logging is not None:
+        with self._state_lock:
+            if self._closed:
+                return
+            if self._execution_session is not None:
+                self._execution_session.close()
+                return
+            self._closed = True
+            first_error: BaseException | None = None
+            if self.execution_logging is not None:
+                try:
+                    self.execution_logging.close()
+                except BaseException as error:
+                    first_error = error
             try:
-                self.execution_logging.close()
+                self._release_logical_run_lease()
             except BaseException as error:
-                first_error = error
-        try:
-            self._release_logical_run_lease()
-        except BaseException as error:
-            if first_error is None:
-                first_error = error
-        try:
-            self.close_process_group()
-        except BaseException as error:
-            if first_error is None:
-                first_error = error
-        if first_error is not None:
-            raise first_error
+                if first_error is None:
+                    first_error = error
+            try:
+                self.close_process_group()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+            if first_error is not None:
+                raise first_error
 
     def __enter__(self) -> Runtime:
         return self
@@ -503,58 +649,159 @@ class Runtime:
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         self.close()
 
-    def _establish_execution(self, request: ExecutionRequest) -> ExecutionContext:
-        """Publish on rank zero, then make every rank join and validate one attempt."""
+    def _require_open(self) -> None:
+        """Reject new runtime resources after terminal cleanup."""
+        if self._closed:
+            raise RuntimeError("This torch runtime is closed")
+
+    def _terminate_failed_logging_startup(
+        self,
+        logging_bundle: ExecutionLogging | None,
+        startup_error: BaseException,
+    ) -> None:
+        """Make a failed logging transition terminal without hiding its cause."""
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        if logging_bundle is not None:
+            try:
+                logging_bundle.close()
+            except BaseException as error:
+                cleanup_errors.append(("execution logging", error))
+        try:
+            self._release_logical_run_lease()
+        except BaseException as error:
+            cleanup_errors.append(("logical-run lease", error))
+        try:
+            self.close_process_group()
+        except BaseException as error:
+            cleanup_errors.append(("process group", error))
+        self._closed = True
+        for resource, cleanup_failure in cleanup_errors:
+            startup_error.add_note(
+                f"Later {resource} cleanup failure: {_error_text(cleanup_failure)}"
+            )
+
+    def _create_execution(self, spec: ExecutionSpec) -> ExecutionContext:
+        """Coordinate strict creation while retaining the primary producer lease."""
+        inherited_id = os.environ.get(EXECUTION_ID_ENV)
+        self.startup_consensus(
+            "execution creation preflight",
+            None
+            if inherited_id is None
+            else ValueError(f"{EXECUTION_ID_ENV} must not be set when creating an execution"),
+        )
+
+        intent: _CreationIntent | None = None
+        intent_error: BaseException | None = None
+        try:
+            intent = _CreationIntent(
+                run_dir=str(spec.run_dir.resolve()),
+                run_name=spec.run_name,
+                invocation_kind=spec.invocation_kind,
+                intended_phases=spec.intended_phases,
+                command=sanitize_command(tuple(sys.argv)),
+                config_reference=(
+                    ""
+                    if spec.config_reference == ""
+                    else sanitize_reference(spec.config_reference)
+                ),
+                execution_id=spec.execution_id,
+                resume_checkpoint=(
+                    sanitize_reference(spec.resume_checkpoint)
+                    if spec.resume_checkpoint is not None
+                    else None
+                ),
+                resume_checkpoint_sha256=spec.resume_checkpoint_sha256,
+                parent_execution_id=spec.parent_execution_id,
+                starting_epoch=spec.starting_epoch,
+                starting_global_step=spec.starting_global_step,
+                runtime=self._expected_runtime_metadata(spec),
+            )
+        except BaseException as error:
+            intent_error = error
+        self.startup_consensus("execution creation intent", intent_error)
+        if intent is None:
+            raise RuntimeError("Execution creation intent validation lost its result")
+        gathered_intents = self.all_gather_object(intent)
+        if any(item != intent for item in gathered_intents):
+            baseline = gathered_intents[0]
+            field_names = (
+                "run_dir",
+                "run_name",
+                "invocation_kind",
+                "intended_phases",
+                "command",
+                "config_reference",
+                "execution_id",
+                "resume_checkpoint",
+                "resume_checkpoint_sha256",
+                "parent_execution_id",
+                "starting_epoch",
+                "starting_global_step",
+                "runtime",
+            )
+            differences = [
+                f"rank {rank}: "
+                + ", ".join(
+                    name
+                    for name in field_names
+                    if getattr(rank_intent, name) != getattr(baseline, name)
+                )
+                for rank, rank_intent in enumerate(gathered_intents)
+                if rank_intent != baseline
+            ]
+            raise RuntimeError(
+                "execution creation expectations are inconsistent across ranks; "
+                + "; ".join(differences)
+            )
+
         primary_result: _PrimaryResult | None = None
         if self.is_primary:
             try:
-                provided_execution_id = execution_id_from_environment(
-                    aliases=request.execution_id_environment_aliases
+                run_dir = Path(intent.run_dir)
+                self._logical_run_lease = claim_logical_run_lease(run_dir)
+                previous_execution_id = latest_execution_id(run_dir)
+                primary_context = create_execution_context(
+                    run_dir,
+                    run_name=intent.run_name,
+                    invocation_kind=intent.invocation_kind,
+                    intended_phases=intent.intended_phases,
+                    world_size=self.world_size,
+                    execution_mode="distributed" if self.enabled else "single",
+                    command=intent.command,
+                    config_reference=intent.config_reference,
+                    execution_id=intent.execution_id,
+                    previous_execution_id=previous_execution_id,
+                    resume_checkpoint=intent.resume_checkpoint,
+                    resume_checkpoint_sha256=intent.resume_checkpoint_sha256,
+                    parent_execution_id=intent.parent_execution_id,
+                    starting_epoch=intent.starting_epoch,
+                    starting_global_step=intent.starting_global_step,
+                    runtime=intent.runtime,
                 )
-                if provided_execution_id is not None:
-                    primary_context = join_execution_context(
-                        request.run_dir,
-                        provided_execution_id,
-                        expected_run_name=request.run_name,
-                    )
-                else:
-                    self._logical_run_lease = claim_logical_run_lease(request.run_dir)
-                    runtime_metadata = dict(request.runtime)
-                    runtime_metadata.update(self.provenance())
-                    primary_context = create_execution_context(
-                        request.run_dir,
-                        run_name=request.run_name,
-                        invocation_kind=request.invocation_kind,
-                        intended_phases=request.intended_phases,
-                        world_size=self.world_size,
-                        execution_mode="distributed" if self.enabled else "single",
-                        command=request.command,
-                        config_reference=request.config_reference,
-                        execution_id=request.execution_id,
-                        previous_execution_id=request.previous_execution_id,
-                        resume_checkpoint=request.resume_checkpoint,
-                        resume_checkpoint_sha256=request.resume_checkpoint_sha256,
-                        parent_execution_id=request.parent_execution_id,
-                        starting_epoch=request.starting_epoch,
-                        starting_global_step=request.starting_global_step,
-                        runtime=runtime_metadata,
-                    )
                 primary_result = _PrimaryResult(
                     execution_id=primary_context.metadata.execution_id,
                     error=None,
                 )
-            except Exception as error:
-                self._release_logical_run_lease()
-                primary_result = _PrimaryResult(execution_id=None, error=_error_text(error))
+            except BaseException as error:
+                error_text = _error_text(error)
+                try:
+                    self._release_logical_run_lease()
+                except BaseException as cleanup_error:
+                    error_text += f"; lease cleanup failed: {_error_text(cleanup_error)}"
+                primary_result = _PrimaryResult(execution_id=None, error=error_text)
 
-        primary_result = self.broadcast_object(primary_result)
+        try:
+            primary_result = self.broadcast_object(primary_result)
+        except BaseException:
+            self._release_logical_run_lease()
+            raise
         if not isinstance(primary_result, _PrimaryResult):
             self._release_logical_run_lease()
-            raise RuntimeError("Execution startup returned invalid primary data")
+            raise RuntimeError("Execution creation returned invalid primary data")
         if primary_result.error is not None or primary_result.execution_id is None:
             self._release_logical_run_lease()
             raise RuntimeError(
-                "Execution initialization failed on rank 0: "
+                "Execution creation failed on rank 0: "
                 f"{primary_result.error or 'missing execution ID'}"
             )
 
@@ -562,62 +809,267 @@ class Runtime:
         local_error: BaseException | None = None
         try:
             context = join_execution_context(
-                request.run_dir,
+                spec.run_dir,
                 primary_result.execution_id,
-                expected_run_name=request.run_name,
+                expected_run_name=spec.run_name,
             )
-            self._validate_context(context, request)
+            self._validate_created_context(context, spec, intent)
         except BaseException as error:
             local_error = error
         try:
-            self.startup_consensus("execution join", local_error)
+            self.startup_consensus("execution creation validation", local_error)
         except BaseException:
             self._release_logical_run_lease()
             raise
         if context is None:
             self._release_logical_run_lease()
-            raise RuntimeError("Execution join succeeded without a local context")
+            raise RuntimeError("Execution creation succeeded without a local context")
         return context
 
-    def _validate_context(
+    def _attach_execution(self, expected: ExecutionSpec) -> ExecutionContext:
+        """Join and exactly validate one canonical environment-selected attempt."""
+        environment = self._canonical_join_environment(expected)
+        context: ExecutionContext | None = None
+        local_error: BaseException | None = None
+        try:
+            context = join_execution_context(
+                expected.run_dir,
+                environment.execution_id,
+                expected_run_name=expected.run_name,
+            )
+            self._validate_attached_context(context, expected, environment)
+        except BaseException as error:
+            local_error = error
+        self.startup_consensus("execution attachment", local_error)
+        if context is None:
+            raise RuntimeError("Execution attachment succeeded without a local context")
+        return context
+
+    def _canonical_join_environment(self, expected: ExecutionSpec) -> _JoinEnvironment:
+        """Validate required canonical variables and their cross-rank consistency."""
+        local_environment: _JoinEnvironment | None = None
+        local_error: BaseException | None = None
+        try:
+            execution_id = execution_id_from_environment()
+            if execution_id is None:
+                raise ValueError(f"{EXECUTION_ID_ENV} is required when attaching an execution")
+            values: dict[str, str] = {}
+            for name in (RUN_NAME_ENV, INVOCATION_KIND_ENV, PHASE_ENV):
+                value = os.environ.get(name)
+                if not isinstance(value, str) or not value:
+                    raise ValueError(f"{name} is required when attaching an execution")
+                values[name] = value
+            local_environment = _JoinEnvironment(
+                execution_id=execution_id,
+                run_name=values[RUN_NAME_ENV],
+                invocation_kind=values[INVOCATION_KIND_ENV],
+                phase=values[PHASE_ENV],
+            )
+        except BaseException as error:
+            local_error = error
+        self.startup_consensus("execution attachment environment", local_error)
+        if local_environment is None:
+            raise RuntimeError("Execution attachment environment validation lost its result")
+
+        gathered = self.all_gather_object(local_environment)
+        if any(item != local_environment for item in gathered):
+            raise RuntimeError(
+                "Canonical MAMMOTH execution environment is inconsistent across ranks"
+            )
+        intent: _AttachmentIntent | None = None
+        intent_error: BaseException | None = None
+        try:
+            intent = _AttachmentIntent(
+                environment=local_environment,
+                run_dir=str(expected.run_dir.resolve()),
+                run_name=expected.run_name,
+                invocation_kind=expected.invocation_kind,
+                intended_phases=expected.intended_phases,
+                config_reference=(
+                    ""
+                    if expected.config_reference == ""
+                    else sanitize_reference(expected.config_reference)
+                ),
+                execution_id=expected.execution_id,
+                resume_checkpoint=(
+                    sanitize_reference(expected.resume_checkpoint)
+                    if expected.resume_checkpoint is not None
+                    else None
+                ),
+                resume_checkpoint_sha256=expected.resume_checkpoint_sha256,
+                parent_execution_id=expected.parent_execution_id,
+                starting_epoch=expected.starting_epoch,
+                starting_global_step=expected.starting_global_step,
+                runtime=sanitize_metadata_fields(dict(expected.runtime)),
+            )
+        except BaseException as error:
+            intent_error = error
+        self.startup_consensus("execution attachment intent", intent_error)
+        if intent is None:
+            raise RuntimeError("Execution attachment intent validation lost its result")
+        gathered_intents = self.all_gather_object(intent)
+        if any(item != intent for item in gathered_intents):
+            baseline = gathered_intents[0]
+            field_names = (
+                "environment",
+                "run_dir",
+                "run_name",
+                "invocation_kind",
+                "intended_phases",
+                "config_reference",
+                "execution_id",
+                "resume_checkpoint",
+                "resume_checkpoint_sha256",
+                "parent_execution_id",
+                "starting_epoch",
+                "starting_global_step",
+                "runtime",
+            )
+            differences = [
+                f"rank {rank}: "
+                + ", ".join(
+                    name
+                    for name in field_names
+                    if getattr(rank_intent, name) != getattr(baseline, name)
+                )
+                for rank, rank_intent in enumerate(gathered_intents)
+                if rank_intent != baseline
+            ]
+            raise RuntimeError(
+                "execution attachment expectations are inconsistent across ranks; "
+                + "; ".join(differences)
+            )
+        if local_environment.run_name != expected.run_name:
+            raise ValueError(
+                f"{RUN_NAME_ENV}={local_environment.run_name!r} does not match "
+                f"expected run {expected.run_name!r}"
+            )
+        if local_environment.invocation_kind != expected.invocation_kind:
+            raise ValueError(
+                f"{INVOCATION_KIND_ENV}={local_environment.invocation_kind!r} does not "
+                f"match expected invocation {expected.invocation_kind!r}"
+            )
+        if local_environment.phase not in expected.intended_phases:
+            raise ValueError(
+                f"{PHASE_ENV}={local_environment.phase!r} is not one of the expected phases"
+            )
+        if expected.execution_id is not None and (
+            local_environment.execution_id != expected.execution_id
+        ):
+            raise ValueError(
+                f"{EXECUTION_ID_ENV}={local_environment.execution_id!r} does not match "
+                f"expected execution {expected.execution_id!r}"
+            )
+        return local_environment
+
+    def _validate_created_context(
         self,
         context: ExecutionContext,
-        request: ExecutionRequest,
+        spec: ExecutionSpec,
+        intent: _CreationIntent,
     ) -> None:
+        """Verify metadata published by strict creation against local intent."""
         metadata = context.metadata
         expected_mode = "distributed" if self.enabled else "single"
-        workflow_child = metadata.invocation_kind == "workflow"
-        if not workflow_child and metadata.world_size != self.world_size:
+        if context.run_dir.resolve() != spec.run_dir.resolve():
+            raise ValueError("Created execution resolved to an unexpected run directory")
+        if metadata.run_name != spec.run_name:
+            raise ValueError("Created execution has an unexpected run name")
+        if metadata.invocation_kind != spec.invocation_kind:
+            raise ValueError("Created execution has an unexpected invocation kind")
+        if metadata.intended_phases != spec.intended_phases:
+            raise ValueError("Created execution has unexpected intended phases")
+        if metadata.world_size != self.world_size or metadata.execution_mode != expected_mode:
+            raise ValueError("Created execution topology does not match the torch runtime")
+        if metadata.command != intent.command:
+            raise ValueError("Created execution did not record the agreed invocation command")
+        if metadata.config_reference != intent.config_reference:
+            raise ValueError("Created execution has an unexpected config reference")
+        if metadata.to_dict()["runtime"] != intent.runtime:
+            raise ValueError("Created execution has unexpected runtime provenance")
+        if spec.execution_id is not None and metadata.execution_id != spec.execution_id:
+            raise ValueError("Created execution has an unexpected execution ID")
+        self._validate_resume_metadata(metadata, spec)
+
+    def _validate_attached_context(
+        self,
+        context: ExecutionContext,
+        expected: ExecutionSpec,
+        environment: _JoinEnvironment,
+    ) -> None:
+        """Require exact topology, identity, phase, invocation, and resume facts."""
+        metadata = context.metadata
+        expected_mode = "distributed" if self.enabled else "single"
+        if context.run_dir.resolve() != expected.run_dir.resolve():
+            raise ValueError("Attached execution resolved to an unexpected run directory")
+        if metadata.execution_id != environment.execution_id:
+            raise ValueError("Canonical execution ID does not match immutable metadata")
+        if metadata.run_name != expected.run_name or metadata.run_name != environment.run_name:
+            raise ValueError("Canonical run name does not match immutable metadata")
+        if (
+            metadata.invocation_kind != expected.invocation_kind
+            or metadata.invocation_kind != environment.invocation_kind
+        ):
+            raise ValueError("Canonical invocation kind does not match immutable metadata")
+        if metadata.world_size != self.world_size:
             raise ValueError(
                 f"Execution {metadata.execution_id!r} has world_size={metadata.world_size}, "
                 f"but this runtime has world_size={self.world_size}"
             )
-        if not workflow_child and metadata.execution_mode != expected_mode:
+        if metadata.execution_mode != expected_mode:
             raise ValueError(
                 f"Execution {metadata.execution_id!r} uses {metadata.execution_mode!r}, "
                 f"but this runtime uses {expected_mode!r}"
             )
-        missing_phases = set(request.intended_phases).difference(metadata.intended_phases)
+        missing_phases = set(expected.intended_phases).difference(metadata.intended_phases)
         if missing_phases:
             raise ValueError(
                 f"Execution {metadata.execution_id!r} omits phases: "
                 f"{', '.join(sorted(missing_phases))}"
             )
-        if request.resume_checkpoint is None:
-            return
+        if environment.phase not in metadata.intended_phases:
+            raise ValueError(
+                f"Canonical phase {environment.phase!r} is absent from immutable metadata"
+            )
+        expected_config_reference = (
+            ""
+            if expected.config_reference == ""
+            else sanitize_reference(expected.config_reference)
+        )
+        if metadata.config_reference != expected_config_reference:
+            raise ValueError("Attached execution has an unexpected config reference")
+        expected_runtime = sanitize_metadata_fields(dict(expected.runtime))
+        actual_runtime = sanitize_metadata_fields(dict(metadata.runtime or {}))
+        if actual_runtime != expected_runtime:
+            raise ValueError("Attached execution has unexpected runtime metadata")
+        self._validate_resume_metadata(metadata, expected)
+
+    def _expected_runtime_metadata(self, spec: ExecutionSpec) -> dict[str, Any]:
+        """Return the sanitized caller and framework provenance stored at creation."""
+        runtime_metadata = dict(spec.runtime)
+        runtime_metadata.update(self.provenance())
+        return sanitize_metadata_fields(runtime_metadata)
+
+    @staticmethod
+    def _validate_resume_metadata(metadata: Any, expected: ExecutionSpec) -> None:
+        """Compare all nullable resume facts without a fresh-execution shortcut."""
         expected_facts = {
-            "resume_checkpoint": sanitize_reference(request.resume_checkpoint),
-            "resume_checkpoint_sha256": request.resume_checkpoint_sha256,
-            "parent_execution_id": request.parent_execution_id,
-            "starting_epoch": request.starting_epoch,
-            "starting_global_step": request.starting_global_step,
+            "resume_checkpoint": (
+                sanitize_reference(expected.resume_checkpoint)
+                if expected.resume_checkpoint is not None
+                else None
+            ),
+            "resume_checkpoint_sha256": expected.resume_checkpoint_sha256,
+            "parent_execution_id": expected.parent_execution_id,
+            "starting_epoch": expected.starting_epoch,
+            "starting_global_step": expected.starting_global_step,
         }
         for field_name, expected_value in expected_facts.items():
             actual_value = getattr(metadata, field_name)
             if actual_value != expected_value:
                 raise ValueError(
                     f"Execution {metadata.execution_id!r} resume field {field_name!r} "
-                    f"does not match: metadata={actual_value!r}, request={expected_value!r}."
+                    f"does not match: metadata={actual_value!r}, expected={expected_value!r}."
                 )
 
     def _validate_initialized_group(self) -> None:
@@ -705,17 +1157,19 @@ class ExecutionSession:
         sinks: Sequence[ObservationSink] = (),
     ) -> RunObserver:
         """Create and own one sink-neutral observer for project training output."""
-        self._require_open()
-        observer = RunObserver(sinks)
-        self._register_owned_resource(self._owned_observers, "observer", observer.close)
-        return observer
+        with self.runtime._state_lock, self._resource_lock:
+            self._require_open()
+            observer = RunObserver(sinks)
+            self._register_owned_resource(self._owned_observers, "observer", observer.close)
+            return observer
 
     def create_trainer(self, **kwargs: Any) -> Trainer:
         """Create and own one generic Trainer while borrowing all supplied inputs."""
-        self._require_open()
-        trainer = Trainer(**kwargs)
-        self._register_owned_resource(self._owned_trainers, "trainer", trainer.close)
-        return trainer
+        with self.runtime._state_lock, self._resource_lock:
+            self._require_open()
+            trainer = Trainer(**kwargs)
+            self._register_owned_resource(self._owned_trainers, "trainer", trainer.close)
+            return trainer
 
     def create_background_pipeline[InputT, ResultT](
         self,
@@ -763,7 +1217,7 @@ class ExecutionSession:
                 raise first_error
 
         try:
-            with self._resource_lock:
+            with self.runtime._state_lock, self._resource_lock:
                 self._require_open()
                 self._register_owned_resource(
                     self._owned_pipelines,
@@ -787,21 +1241,21 @@ class ExecutionSession:
 
     def start_phase(self, phase: str) -> None:
         """Start one phase and, on first use, this process lifecycle."""
-        if self._closed:
-            raise RuntimeError("Cannot start a phase after execution-session closure")
-        if not isinstance(phase, str) or not phase:
-            raise ValueError("phase must be a non-empty string")
-        if self._phase is not None and not self._phase_terminal:
-            raise RuntimeError(f"Execution phase {self._phase!r} is still active")
-        now = time.monotonic()
-        if self._process_started_at is None:
-            self._process_started_at = now
-            self.observer.emit("process_started", phase=phase)
-        self._phase = phase
-        self._phase_terminal = False
-        self._phase_outcome = None
-        self._phase_started_at = now
-        self.observer.emit("phase_started", phase=phase)
+        with self.runtime._state_lock, self._resource_lock:
+            self._require_open()
+            if not isinstance(phase, str) or not phase:
+                raise ValueError("phase must be a non-empty string")
+            if self._phase is not None and not self._phase_terminal:
+                raise RuntimeError(f"Execution phase {self._phase!r} is still active")
+            now = time.monotonic()
+            if self._process_started_at is None:
+                self._process_started_at = now
+                self.observer.emit("process_started", phase=phase)
+            self._phase = phase
+            self._phase_terminal = False
+            self._phase_outcome = None
+            self._phase_started_at = now
+            self.observer.emit("phase_started", phase=phase)
 
     @contextmanager
     def phase_scope(self, phase: str) -> Iterator[ExecutionSession]:
@@ -817,19 +1271,27 @@ class ExecutionSession:
 
     def complete_phase(self, *, message: str | None = None) -> None:
         """Mark the active phase successful."""
-        phase = self._active_phase()
-        fields: dict[str, Any] = {
-            "phase": phase,
-            "duration_seconds": self._phase_duration(),
-        }
-        if message is not None:
-            fields["message"] = message
-        self.observer.emit("phase_completed", **fields)
-        self._phase_terminal = True
-        self._phase_outcome = "completed"
+        with self.runtime._state_lock, self._resource_lock:
+            self._require_open()
+            phase = self._active_phase()
+            fields: dict[str, Any] = {
+                "phase": phase,
+                "duration_seconds": self._phase_duration(),
+            }
+            if message is not None:
+                fields["message"] = message
+            self.observer.emit("phase_completed", **fields)
+            self._phase_terminal = True
+            self._phase_outcome = "completed"
 
     def fail_phase(self, error: BaseException, *, interrupted: bool = False) -> None:
         """Mark the active phase failed or interrupted."""
+        with self.runtime._state_lock, self._resource_lock:
+            self._require_open()
+            self._fail_phase(error, interrupted=interrupted)
+
+    def _fail_phase(self, error: BaseException, *, interrupted: bool) -> None:
+        """Record phase failure while the caller owns terminal-state locks."""
         phase = self._active_phase()
         self.observer.emit(
             "phase_failed",
@@ -844,15 +1306,17 @@ class ExecutionSession:
 
     def skip_phase(self, message: str) -> None:
         """Mark the active phase skipped."""
-        phase = self._active_phase()
-        self.observer.emit(
-            "phase_skipped",
-            phase=phase,
-            duration_seconds=self._phase_duration(),
-            message=message,
-        )
-        self._phase_terminal = True
-        self._phase_outcome = "skipped"
+        with self.runtime._state_lock, self._resource_lock:
+            self._require_open()
+            phase = self._active_phase()
+            self.observer.emit(
+                "phase_skipped",
+                phase=phase,
+                duration_seconds=self._phase_duration(),
+                message=message,
+            )
+            self._phase_terminal = True
+            self._phase_outcome = "skipped"
 
     def close(
         self,
@@ -864,6 +1328,25 @@ class ExecutionSession:
         before_close: Callable[[], None] | None = None,
     ) -> None:
         """Close owned resources, lifecycle logging, leases, and owned runtime state."""
+        with self.runtime._state_lock:
+            self._close(
+                error=error,
+                exit_code=exit_code,
+                signal=signal,
+                message=message,
+                before_close=before_close,
+            )
+
+    def _close(
+        self,
+        *,
+        error: BaseException | None,
+        exit_code: int | None,
+        signal: int | str | None,
+        message: str | None,
+        before_close: Callable[[], None] | None,
+    ) -> None:
+        """Implement session closure while the runtime state lock is held."""
         with self._resource_lock:
             if self._closed:
                 return
@@ -883,7 +1366,7 @@ class ExecutionSession:
                     lifecycle_error = terminal_error or RuntimeError(
                         "Execution session closed before recording a phase outcome"
                     )
-                    self.fail_phase(
+                    self._fail_phase(
                         lifecycle_error,
                         interrupted=isinstance(lifecycle_error, KeyboardInterrupt),
                     )
@@ -964,7 +1447,7 @@ class ExecutionSession:
             self._owned_resource_errors.append((label, error))
 
     def _require_open(self) -> None:
-        if self._closed:
+        if self._closed or self.runtime._closed:
             raise RuntimeError("Execution session is already closed")
 
     def _active_phase(self) -> str:

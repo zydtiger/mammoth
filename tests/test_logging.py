@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+import mammoth.logging.text as text_module
 from mammoth.core import RunLayout, create_execution_context, read_execution_events
 from mammoth.core.events import ExecutionEventWriter
 from mammoth.logging import (
@@ -537,6 +538,66 @@ def test_process_text_log_lease_rejects_concurrent_owner(tmp_path: Path) -> None
     with claim_process_text_log(path):
         pass
     assert path.is_file()
+
+
+def test_process_text_log_closes_descriptor_after_lock_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``BaseException`` after flock succeeds cannot retain text-log ownership."""
+    path = tmp_path / "interrupted-rank.log"
+    original_flock = text_module.fcntl.flock
+
+    def interrupt_after_lock(descriptor: int, operation: int) -> None:
+        original_flock(descriptor, operation)
+        if operation == text_module.fcntl.LOCK_EX | text_module.fcntl.LOCK_NB:
+            raise KeyboardInterrupt("text-log acquisition interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(text_module.fcntl, "flock", interrupt_after_lock)
+        with pytest.raises(KeyboardInterrupt, match="text-log acquisition interrupted"):
+            claim_process_text_log(path)
+
+    with claim_process_text_log(path):
+        pass
+
+
+def test_process_text_handler_closes_descriptors_after_base_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interrupted handler validation closes both the stream and lease descriptors."""
+    context = execution_context(tmp_path)
+    opened: list[int] = []
+    original_open = text_module.os.open
+    original_fstat = text_module.os.fstat
+    fstat_calls = 0
+
+    def track_open(*args: object, **kwargs: object) -> int:
+        descriptor = original_open(*args, **kwargs)  # type: ignore[arg-type]
+        opened.append(descriptor)
+        return descriptor
+
+    def interrupt_second_fstat(descriptor: int) -> object:
+        nonlocal fstat_calls
+        descriptor_stat = original_fstat(descriptor)
+        fstat_calls += 1
+        if fstat_calls == 2:
+            raise KeyboardInterrupt("text stream validation interrupted")
+        return descriptor_stat
+
+    with monkeypatch.context() as patch:
+        patch.setattr(text_module.os, "open", track_open)
+        patch.setattr(text_module.os, "fstat", interrupt_second_fstat)
+        with pytest.raises(KeyboardInterrupt, match="text stream validation interrupted"):
+            create_process_text_handler(context, rank=0)
+
+    assert len(opened) == 2
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            original_fstat(descriptor)
+    with claim_process_text_log(context.rank_log_path(0)):
+        pass
 
 
 def test_process_text_handler_close_is_idempotent(tmp_path: Path) -> None:

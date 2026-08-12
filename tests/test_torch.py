@@ -5,8 +5,10 @@ import hashlib
 import multiprocessing
 import os
 import stat
+import sys
 import threading
 import time
+from collections import UserList
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext, suppress
@@ -42,7 +44,7 @@ from mammoth.torch import (
     CheckpointPublication,
     CheckpointSavePolicy,
     EarlyStopping,
-    ExecutionRequest,
+    ExecutionSpec,
     MetricAccumulator,
     MetricRoute,
     MetricSpec,
@@ -78,6 +80,12 @@ from mammoth.torch import (
 )
 from mammoth.torch.batch import CudaPrefetchingBatchIterator, batch_is_cuda_prefetch_eligible
 from mammoth.torch.metrics import compute_stateful_metrics, scalar_metrics
+
+
+def start_created_execution(runtime: Any, spec: ExecutionSpec) -> Any:
+    """Create one strict execution and then open its rank-local logging."""
+    runtime.create_execution(spec)
+    return runtime.start_execution_logging()
 
 
 def build_warmup_linear_stack(
@@ -758,15 +766,15 @@ def _torch_runtime_worker(
                     raise PermissionError("rank log unavailable")
 
                 torch_runtime_module.create_execution_logging = fail_logging
-            bundle = runtime.start_execution(
-                ExecutionRequest(
+            bundle = start_created_execution(
+                runtime,
+                ExecutionSpec(
                     run_dir=Path(run_dir),
                     run_name="ddp-run",
                     invocation_kind="test",
                     intended_phases=("train",),
-                    command=("python", "train.py"),
                     execution_id="ddp-attempt",
-                )
+                ),
             )
             broadcast = runtime.broadcast_object("ready" if rank == 0 else None)
             gathered = runtime.all_gather_object(rank)
@@ -843,10 +851,20 @@ def _resume_join_mismatch_worker(
     rendezvous: str,
     run_dir: str,
     result_queue: Any,
+    mismatch: str,
 ) -> None:
-    """Report the startup-consensus result when one DDP rank has a bad resume fact."""
+    """Report strict attachment consensus when one DDP rank has different intent."""
     try:
         os.environ["MAMMOTH_EXECUTION_ID"] = "resume-attempt"
+        os.environ["MAMMOTH_RUN_NAME"] = "resume-ddp"
+        os.environ["MAMMOTH_INVOCATION_KIND"] = "workflow"
+        os.environ["MAMMOTH_PHASE"] = "train"
+        if mismatch == "normalization" and rank == 1:
+
+            def fail_normalization(_: str | Path) -> str:
+                raise PermissionError("resume normalization unavailable")
+
+            torch_runtime_module.sanitize_reference = fail_normalization
         with initialize_runtime(
             RuntimeConfig(
                 strategy="ddp",
@@ -859,18 +877,27 @@ def _resume_join_mismatch_worker(
                 world_size=2,
             )
         ) as runtime:
-            runtime.establish_execution(
-                ExecutionRequest(
+            expected_run_name = (
+                "other-run" if mismatch == "run_name" and rank == 1 else "resume-ddp"
+            )
+            runtime.attach_execution(
+                ExecutionSpec(
                     run_dir=Path(run_dir),
-                    run_name="resume-ddp",
-                    invocation_kind="train",
+                    run_name=expected_run_name,
+                    invocation_kind="workflow",
                     intended_phases=("train",),
-                    command=("python", "train.py"),
                     resume_checkpoint="checkpoints/resume.pt",
-                    resume_checkpoint_sha256="b" * 64 if rank == 1 else "a" * 64,
+                    resume_checkpoint_sha256=(
+                        "b" * 64 if mismatch == "resume" and rank == 1 else "a" * 64
+                    ),
                     parent_execution_id="producer",
                     starting_epoch=4,
                     starting_global_step=12,
+                    runtime={
+                        "caller": (
+                            "other" if mismatch == "runtime" and rank == 1 else "shared"
+                        )
+                    },
                 )
             )
         result_queue.put((rank, None))
@@ -878,16 +905,20 @@ def _resume_join_mismatch_worker(
         result_queue.put((rank, str(error)))
 
 
-def run_two_process_resume_join_mismatch(tmp_path: Path) -> list[tuple[int, str | None]]:
-    """Launch a CPU DDP join where only rank one declares a mismatched digest."""
+def run_two_process_resume_join_mismatch(
+    tmp_path: Path,
+    *,
+    mismatch: str = "resume",
+) -> list[tuple[int, str | None]]:
+    """Launch a CPU DDP attach where only rank one declares different intent."""
     run_dir = tmp_path / "resume-ddp"
     create_execution_context(
         run_dir,
         run_name="resume-ddp",
         invocation_kind="workflow",
         intended_phases=("train",),
-        world_size=1,
-        execution_mode="single",
+        world_size=2,
+        execution_mode="distributed",
         command=("mammoth", "workflow", "run"),
         execution_id="resume-attempt",
         resume_checkpoint="checkpoints/resume.pt",
@@ -895,6 +926,7 @@ def run_two_process_resume_join_mismatch(tmp_path: Path) -> list[tuple[int, str 
         parent_execution_id="producer",
         starting_epoch=4,
         starting_global_step=12,
+        runtime={"caller": "shared"},
     )
     process_context = multiprocessing.get_context("spawn")
     result_queue = process_context.Queue()
@@ -902,7 +934,7 @@ def run_two_process_resume_join_mismatch(tmp_path: Path) -> list[tuple[int, str 
     processes = [
         process_context.Process(
             target=_resume_join_mismatch_worker,
-            args=(rank, rendezvous, str(run_dir), result_queue),
+            args=(rank, rendezvous, str(run_dir), result_queue, mismatch),
         )
         for rank in range(2)
     ]
@@ -922,6 +954,145 @@ def run_two_process_resume_join_mismatch(tmp_path: Path) -> list[tuple[int, str 
         except Empty:
             pytest.fail("CPU DDP resumed-join worker returned no result")
     return sorted(results)
+
+
+def _strict_creation_failure_worker(
+    rank: int,
+    rendezvous: str,
+    run_dir: str,
+    result_queue: Any,
+) -> None:
+    """Inject a rank-zero ``BaseException`` after strict creation claims its lease."""
+    try:
+        if rank == 0:
+
+            def interrupt_lineage(_: Path) -> str | None:
+                raise KeyboardInterrupt("lineage interrupted")
+
+            torch_runtime_module.latest_execution_id = interrupt_lineage
+        with initialize_runtime(
+            RuntimeConfig(
+                strategy="ddp",
+                device="cpu",
+                backend="gloo",
+                init_method=rendezvous,
+                timeout_seconds=30,
+                rank=rank,
+                local_rank=rank,
+                world_size=2,
+            )
+        ) as runtime:
+            runtime.create_execution(
+                ExecutionSpec(
+                    run_dir=Path(run_dir),
+                    run_name="strict-create-ddp",
+                    invocation_kind="train",
+                    intended_phases=("train",),
+                )
+            )
+        result_queue.put((rank, None))
+    except BaseException as error:
+        result_queue.put((rank, str(error)))
+
+
+def run_two_process_strict_creation_failure(
+    tmp_path: Path,
+) -> tuple[Path, list[tuple[int, str | None]]]:
+    """Launch strict DDP creation with a rank-zero post-lease interruption."""
+    process_context = multiprocessing.get_context("spawn")
+    result_queue = process_context.Queue()
+    rendezvous = f"file://{tmp_path / 'strict-create-rendezvous'}"
+    run_dir = tmp_path / "strict-create-ddp"
+    processes = [
+        process_context.Process(
+            target=_strict_creation_failure_worker,
+            args=(rank, rendezvous, str(run_dir), result_queue),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=40)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            pytest.fail("CPU DDP strict-creation worker did not shut down coherently")
+        assert process.exitcode == 0
+    results: list[tuple[int, str | None]] = []
+    for _ in processes:
+        try:
+            results.append(result_queue.get(timeout=5))
+        except Empty:
+            pytest.fail("CPU DDP strict-creation worker returned no result")
+    return run_dir, sorted(results)
+
+
+def _strict_creation_intent_mismatch_worker(
+    rank: int,
+    rendezvous: str,
+    run_dir: str,
+    result_queue: Any,
+) -> None:
+    """Report strict creation when one DDP rank supplies different provenance."""
+    try:
+        with initialize_runtime(
+            RuntimeConfig(
+                strategy="ddp",
+                device="cpu",
+                backend="gloo",
+                init_method=rendezvous,
+                timeout_seconds=30,
+                rank=rank,
+                local_rank=rank,
+                world_size=2,
+            )
+        ) as runtime:
+            runtime.create_execution(
+                ExecutionSpec(
+                    run_dir=Path(run_dir),
+                    run_name="strict-create-intent",
+                    invocation_kind="train",
+                    intended_phases=("train",),
+                    runtime={"caller": "different" if rank == 1 else "shared"},
+                )
+            )
+        result_queue.put((rank, None))
+    except BaseException as error:
+        result_queue.put((rank, str(error)))
+
+
+def run_two_process_strict_creation_intent_mismatch(
+    tmp_path: Path,
+) -> tuple[Path, list[tuple[int, str | None]]]:
+    """Launch strict DDP creation with inconsistent rank-local provenance."""
+    process_context = multiprocessing.get_context("spawn")
+    result_queue = process_context.Queue()
+    rendezvous = f"file://{tmp_path / 'strict-create-intent-rendezvous'}"
+    run_dir = tmp_path / "strict-create-intent"
+    processes = [
+        process_context.Process(
+            target=_strict_creation_intent_mismatch_worker,
+            args=(rank, rendezvous, str(run_dir), result_queue),
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=40)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            pytest.fail("CPU DDP strict-creation intent worker did not shut down coherently")
+        assert process.exitcode == 0
+    results: list[tuple[int, str | None]] = []
+    for _ in processes:
+        try:
+            results.append(result_queue.get(timeout=5))
+        except Empty:
+            pytest.fail("CPU DDP strict-creation intent worker returned no result")
+    return run_dir, sorted(results)
 
 
 def _distributed_interrupt_worker(
@@ -6645,16 +6816,16 @@ def test_single_runtime_establishes_execution_and_supplies_trainer_observer(
     model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
     with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
-        bundle = runtime.start_execution(
-            ExecutionRequest(
+        bundle = start_created_execution(
+            runtime,
+            ExecutionSpec(
                 run_dir=run_dir,
                 run_name="single-run",
                 invocation_kind="test",
                 intended_phases=("train",),
-                command=("python", "train.py"),
                 execution_id="single-attempt",
                 runtime={"credentials": {"api_token": "secret"}},
-            )
+            ),
         )
         bundle.observer.emit("process_started", phase="train")
         with Trainer(
@@ -6694,16 +6865,15 @@ def test_single_runtime_establishes_execution_and_supplies_trainer_observer(
 
 
 def test_runtime_preserves_caller_supplied_parent_execution_id(tmp_path: Path) -> None:
-    """The PyTorch request forwards explicit lineage without inspecting artifacts."""
+    """Strict creation forwards explicit lineage without inspecting artifacts."""
     run_dir = tmp_path / "explicit-parent"
     with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
-        context = runtime.establish_execution(
-            ExecutionRequest(
+        context = runtime.create_execution(
+            ExecutionSpec(
                 run_dir=run_dir,
                 run_name="explicit-parent",
                 invocation_kind="train",
                 intended_phases=("train",),
-                command=("python", "train.py"),
                 execution_id="child",
                 resume_checkpoint=run_dir / "checkpoint-copy.pt",
                 resume_checkpoint_sha256="a" * 64,
@@ -6718,190 +6888,613 @@ def test_runtime_preserves_caller_supplied_parent_execution_id(tmp_path: Path) -
     assert context.metadata.starting_epoch == 4
 
 
-def _create_resumed_execution_context(
+def test_execution_spec_freezes_inputs_and_requires_complete_resume_facts(
     tmp_path: Path,
+) -> None:
+    """Strict execution intent detaches mutable values and rejects partial resume state."""
+    phases = ["train"]
+    runtime_fields = {"dataset": {"names": UserList(["example"])}}
+    spec = ExecutionSpec(
+        run_dir=tmp_path,
+        run_name="frozen-spec",
+        invocation_kind="train",
+        intended_phases=cast(Any, phases),
+        runtime=runtime_fields,
+    )
+    phases.append("validate")
+    cast(dict[str, UserList[str]], runtime_fields["dataset"])["names"].append("changed")
+
+    assert spec.intended_phases == ("train",)
+    assert spec.runtime["dataset"]["names"] == ("example",)
+    with pytest.raises(TypeError):
+        spec.runtime["dataset"]["names"] += ("forbidden",)  # type: ignore[index, operator]
+    with pytest.raises(ValueError, match="resume facts require resume_checkpoint"):
+        ExecutionSpec(
+            run_dir=tmp_path,
+            run_name="partial-resume",
+            invocation_kind="train",
+            intended_phases=("train",),
+            starting_epoch=2,
+        )
+    with pytest.raises(ValueError, match="non-empty path or reference"):
+        ExecutionSpec(
+            run_dir=tmp_path,
+            run_name="empty-checkpoint",
+            invocation_kind="train",
+            intended_phases=("train",),
+            resume_checkpoint="",
+            resume_checkpoint_sha256="a" * 64,
+            starting_epoch=2,
+        )
+    with pytest.raises(ValueError, match="Execution IDs must"):
+        ExecutionSpec(
+            run_dir=tmp_path,
+            run_name="invalid-parent",
+            invocation_kind="train",
+            intended_phases=("train",),
+            resume_checkpoint="checkpoint.pt",
+            resume_checkpoint_sha256="a" * 64,
+            parent_execution_id="../invalid",
+            starting_epoch=2,
+        )
+
+
+def test_runtime_create_execution_records_invocation_and_lease_bound_adjacency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strict creation owns the lease while deriving command and previous attempt."""
+    run_dir = tmp_path / "strict-create"
+    monkeypatch.setattr(sys, "argv", ["python", "train.py", "--epochs", "3"])
+    first_runtime = initialize_runtime(RuntimeConfig(device="cpu"))
+    first = first_runtime.create_execution(
+        ExecutionSpec(
+            run_dir=run_dir,
+            run_name="strict-create",
+            invocation_kind="train",
+            intended_phases=("train",),
+            config_reference="https://user:secret@example.test/config.json?token=x",
+            execution_id="first-attempt",
+            runtime={"caller": "api", "credentials": {"token": "secret"}},
+        )
+    )
+    assert first.metadata.command == ("python", "train.py", "--epochs", "3")
+    assert first.metadata.config_reference == "https://<redacted>@example.test/config.json"
+    assert first.metadata.runtime is not None
+    assert first.metadata.runtime["caller"] == "api"
+    assert first.metadata.runtime["credentials"] == "<redacted>"
+    assert first.metadata.previous_execution_id is None
+    with pytest.raises(RuntimeError, match="already active"):
+        claim_logical_run_lease(run_dir)
+    first_runtime.close()
+
+    second_runtime = initialize_runtime(RuntimeConfig(device="cpu"))
+    second = second_runtime.create_execution(
+        ExecutionSpec(
+            run_dir=run_dir,
+            run_name="strict-create",
+            invocation_kind="train",
+            intended_phases=("train",),
+            execution_id="second-attempt",
+        )
+    )
+    assert second.metadata.previous_execution_id == "first-attempt"
+    second_runtime.close()
+
+
+def test_runtime_create_execution_publishes_agreed_command_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later ``sys.argv`` mutation cannot replace the consensus command."""
+    before = ["python", "before.py", "--mode", "before"]
+    before_snapshot = tuple(before)
+    after = ["python", "after.py", "--mode", "after"]
+    monkeypatch.setattr(sys, "argv", before)
+    runtime = initialize_runtime(RuntimeConfig(device="cpu"))
+    original_all_gather = runtime.all_gather_object
+
+    def mutate_after_intent(value: Any) -> tuple[Any, ...]:
+        gathered = original_all_gather(value)
+        if type(value).__name__ == "_CreationIntent":
+            sys.argv[:] = after
+        return gathered
+
+    monkeypatch.setattr(runtime, "all_gather_object", mutate_after_intent)
+    context = runtime.create_execution(
+        ExecutionSpec(
+            run_dir=tmp_path / "command-snapshot",
+            run_name="command-snapshot",
+            invocation_kind="train",
+            intended_phases=("train",),
+        )
+    )
+
+    assert context.metadata.command == before_snapshot
+    assert sys.argv == after
+    runtime.close()
+
+
+def test_runtime_create_execution_rejects_inherited_execution_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strict creation never turns an inherited workflow ID into attachment."""
+    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "existing-attempt")
+    with (
+        initialize_runtime(RuntimeConfig(device="cpu")) as runtime,
+        pytest.raises(RuntimeError, match="MAMMOTH_EXECUTION_ID must not be set"),
+    ):
+        runtime.create_execution(
+            ExecutionSpec(
+                run_dir=tmp_path / "strict-create",
+                run_name="strict-create",
+                invocation_kind="train",
+                intended_phases=("train",),
+            )
+        )
+    assert not (tmp_path / "strict-create").exists()
+
+
+def test_runtime_create_execution_releases_lease_after_base_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-lease interruption becomes a coordinated failure without retained ownership."""
+    run_dir = tmp_path / "interrupted-create"
+
+    def interrupt_lineage(_: Path) -> str | None:
+        raise KeyboardInterrupt("lineage interrupted")
+
+    monkeypatch.setattr(torch_runtime_module, "latest_execution_id", interrupt_lineage)
+    with (
+        initialize_runtime(RuntimeConfig(device="cpu")) as runtime,
+        pytest.raises(RuntimeError, match="KeyboardInterrupt: lineage interrupted"),
+    ):
+        runtime.create_execution(
+            ExecutionSpec(
+                run_dir=run_dir,
+                run_name="interrupted-create",
+                invocation_kind="train",
+                intended_phases=("train",),
+            )
+        )
+    with claim_logical_run_lease(run_dir):
+        pass
+
+
+def test_runtime_create_execution_releases_lease_after_broadcast_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-publication collective interruption cannot retain producer ownership."""
+    run_dir = tmp_path / "broadcast-interrupted-create"
+    runtime = initialize_runtime(RuntimeConfig(device="cpu"))
+
+    def interrupt_broadcast(value: Any, *, source_rank: int = 0) -> Any:
+        del value, source_rank
+        raise KeyboardInterrupt("broadcast interrupted")
+
+    monkeypatch.setattr(runtime, "broadcast_object", interrupt_broadcast)
+    with pytest.raises(KeyboardInterrupt, match="broadcast interrupted"):
+        runtime.create_execution(
+            ExecutionSpec(
+                run_dir=run_dir,
+                run_name="broadcast-interrupted-create",
+                invocation_kind="train",
+                intended_phases=("train",),
+            )
+        )
+    with claim_logical_run_lease(run_dir):
+        pass
+    runtime.close()
+
+
+def test_runtime_close_serializes_with_execution_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent close either precedes creation or releases its completed lease."""
+    run_dir = tmp_path / "close-create-race"
+    runtime = initialize_runtime(RuntimeConfig(device="cpu"))
+    claim_entered = threading.Event()
+    allow_claim = threading.Event()
+    close_reached_cleanup = threading.Event()
+    creation_errors: list[BaseException] = []
+    close_errors: list[BaseException] = []
+    original_claim = torch_runtime_module.claim_logical_run_lease
+    original_release = runtime._release_logical_run_lease
+
+    def pause_before_claim(path: Path) -> Any:
+        claim_entered.set()
+        assert allow_claim.wait(timeout=5.0)
+        return original_claim(path)
+
+    def record_release() -> None:
+        close_reached_cleanup.set()
+        original_release()
+
+    def create_execution() -> None:
+        try:
+            runtime.create_execution(
+                ExecutionSpec(
+                    run_dir=run_dir,
+                    run_name="close-create-race",
+                    invocation_kind="train",
+                    intended_phases=("train",),
+                )
+            )
+        except BaseException as error:
+            creation_errors.append(error)
+
+    def close_runtime() -> None:
+        try:
+            runtime.close()
+        except BaseException as error:
+            close_errors.append(error)
+
+    monkeypatch.setattr(torch_runtime_module, "claim_logical_run_lease", pause_before_claim)
+    monkeypatch.setattr(runtime, "_release_logical_run_lease", record_release)
+    creator = threading.Thread(target=create_execution)
+    closer = threading.Thread(target=close_runtime)
+    creator.start()
+    assert claim_entered.wait(timeout=5.0)
+    closer.start()
+    close_reached_cleanup.wait(timeout=0.1)
+    allow_claim.set()
+    creator.join(timeout=5.0)
+    closer.join(timeout=5.0)
+
+    assert not creator.is_alive()
+    assert not closer.is_alive()
+    assert creation_errors == []
+    assert close_errors == []
+    assert runtime._closed is True
+    with claim_logical_run_lease(run_dir):
+        pass
+
+
+def test_runtime_logging_failure_preserves_error_and_releases_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Logging cleanup failure is noted without replacing consensus or lease cleanup."""
+    run_dir = tmp_path / "logging-cleanup"
+    runtime = initialize_runtime(RuntimeConfig(device="cpu"))
+    runtime.create_execution(
+        ExecutionSpec(
+            run_dir=run_dir,
+            run_name="logging-cleanup",
+            invocation_kind="train",
+            intended_phases=("train",),
+        )
+    )
+
+    class FailingLoggingBundle:
+        def close(self) -> None:
+            raise KeyboardInterrupt("logging close interrupted")
+
+    def create_failing_logging(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        return FailingLoggingBundle()
+
+    def fail_logging_consensus(stage: str, local_error: Any) -> None:
+        del local_error
+        assert stage == "execution logging"
+        raise RuntimeError("peer logging failed")
+
+    monkeypatch.setattr(torch_runtime_module, "create_execution_logging", create_failing_logging)
+    monkeypatch.setattr(runtime, "startup_consensus", fail_logging_consensus)
+    with pytest.raises(RuntimeError, match="peer logging failed") as raised:
+        runtime.start_execution_logging()
+    assert any("logging close interrupted" in note for note in raised.value.__notes__)
+    assert runtime._closed is True
+    with pytest.raises(RuntimeError, match="runtime is closed"):
+        runtime.start_execution_logging()
+    with claim_logical_run_lease(run_dir):
+        pass
+    runtime.close()
+
+
+def test_closed_runtime_rejects_strict_execution_operations(tmp_path: Path) -> None:
+    """Terminal runtime cleanup cannot be followed by resource acquisition."""
+    runtime = initialize_runtime(RuntimeConfig(device="cpu"))
+    runtime.close()
+    spec = ExecutionSpec(
+        run_dir=tmp_path / "closed-runtime",
+        run_name="closed-runtime",
+        invocation_kind="train",
+        intended_phases=("train",),
+    )
+    with pytest.raises(RuntimeError, match="runtime is closed"):
+        runtime.create_execution(spec)
+    with pytest.raises(RuntimeError, match="runtime is closed"):
+        runtime.attach_execution(spec)
+    with pytest.raises(RuntimeError, match="runtime is closed"):
+        runtime.start_execution_logging()
+    assert not spec.run_dir.exists()
+
+    session_runtime = initialize_runtime(RuntimeConfig(device="cpu"))
+    session_runtime.create_execution(
+        ExecutionSpec(
+            run_dir=tmp_path / "closed-session",
+            run_name="closed-session",
+            invocation_kind="train",
+            intended_phases=("train",),
+        )
+    )
+    session_runtime.start_execution_logging()
+    session_runtime.close()
+    with pytest.raises(RuntimeError, match="runtime is closed"):
+        session_runtime.create_execution_session()
+
+
+def _set_canonical_attachment_environment(
+    monkeypatch: pytest.MonkeyPatch,
     *,
-    resume_checkpoint: str = "checkpoints/resume.pt",
-    resume_checkpoint_sha256: str = "a" * 64,
-    parent_execution_id: str | None = "producer",
-    starting_epoch: int = 4,
-    starting_global_step: int | None = 12,
-) -> Path:
-    """Create immutable runner metadata used by resumed execution-join tests."""
-    run_dir = tmp_path / "resumed-join"
+    execution_id: str = "workflow-attempt",
+    run_name: str = "strict-attach",
+    invocation_kind: str = "workflow",
+    phase: str = "train",
+) -> None:
+    """Set the four canonical variables required by strict attachment."""
+    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", execution_id)
+    monkeypatch.setenv("MAMMOTH_RUN_NAME", run_name)
+    monkeypatch.setenv("MAMMOTH_INVOCATION_KIND", invocation_kind)
+    monkeypatch.setenv("MAMMOTH_PHASE", phase)
+
+
+def test_strict_create_and_attach_accept_opaque_phase_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Workflow phase identity is an opaque non-empty string, not a run name."""
+    run_dir = tmp_path / "opaque-phase"
+    phase = "validation fold 1"
+    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
+        context = runtime.create_execution(
+            ExecutionSpec(
+                run_dir=run_dir,
+                run_name="opaque-phase",
+                invocation_kind="workflow",
+                intended_phases=(phase,),
+                execution_id="opaque-phase-attempt",
+            )
+        )
+    assert context.metadata.intended_phases == (phase,)
+
+    _set_canonical_attachment_environment(
+        monkeypatch,
+        execution_id="opaque-phase-attempt",
+        run_name="opaque-phase",
+        invocation_kind="workflow",
+        phase=phase,
+    )
+    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
+        attached = runtime.attach_execution(
+            ExecutionSpec(
+                run_dir=run_dir,
+                run_name="opaque-phase",
+                invocation_kind="workflow",
+                intended_phases=(phase,),
+                runtime=context.metadata.runtime,
+            )
+        )
+    assert attached == context
+
+
+def test_runtime_attach_execution_validates_canonical_environment_without_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A matching workflow child joins without claiming producer ownership."""
+    run_dir = tmp_path / "strict-attach"
     create_execution_context(
         run_dir,
-        run_name="resumed-join",
+        run_name="strict-attach",
+        invocation_kind="workflow",
+        intended_phases=("train", "validate"),
+        world_size=1,
+        execution_mode="single",
+        command=("python", "workflow.py"),
+        execution_id="workflow-attempt",
+    )
+    _set_canonical_attachment_environment(monkeypatch)
+
+    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
+        context = runtime.attach_execution(
+            ExecutionSpec(
+                run_dir=run_dir,
+                run_name="strict-attach",
+                invocation_kind="workflow",
+                intended_phases=("train",),
+            )
+        )
+        assert context.metadata.execution_id == "workflow-attempt"
+        with claim_logical_run_lease(run_dir):
+            pass
+
+
+@pytest.mark.parametrize(
+    ("field_name", "overrides"),
+    (
+        ("config reference", {"config_reference": "other-config.json"}),
+        ("runtime metadata", {"runtime": {"caller": "other"}}),
+    ),
+)
+def test_runtime_attach_execution_rejects_config_and_runtime_mismatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field_name: str,
+    overrides: dict[str, Any],
+) -> None:
+    """Strict attachment compares every caller-declared immutable metadata field."""
+    run_dir = tmp_path / "strict-attach-metadata"
+    create_execution_context(
+        run_dir,
+        run_name="strict-attach",
         invocation_kind="workflow",
         intended_phases=("train",),
         world_size=1,
         execution_mode="single",
-        command=("mammoth", "workflow", "run"),
-        execution_id="runner-attempt",
-        resume_checkpoint=resume_checkpoint,
-        resume_checkpoint_sha256=resume_checkpoint_sha256,
-        parent_execution_id=parent_execution_id,
-        starting_epoch=starting_epoch,
-        starting_global_step=starting_global_step,
+        command=("python", "workflow.py"),
+        config_reference="workflow-config.json",
+        execution_id="workflow-attempt",
+        runtime={"caller": "workflow"},
     )
-    return run_dir
-
-
-def _resumed_join_request(run_dir: Path, **overrides: Any) -> ExecutionRequest:
-    """Return a matching child request with one optional resume-fact override."""
-    facts: dict[str, Any] = {
-        "resume_checkpoint": "checkpoints/resume.pt",
-        "resume_checkpoint_sha256": "a" * 64,
-        "parent_execution_id": "producer",
-        "starting_epoch": 4,
-        "starting_global_step": 12,
+    _set_canonical_attachment_environment(monkeypatch)
+    values: dict[str, Any] = {
+        "run_dir": run_dir,
+        "run_name": "strict-attach",
+        "invocation_kind": "workflow",
+        "intended_phases": ("train",),
+        "config_reference": "workflow-config.json",
+        "runtime": {"caller": "workflow"},
     }
-    facts.update(overrides)
-    return ExecutionRequest(
-        run_dir=run_dir,
-        run_name="resumed-join",
-        invocation_kind="train",
-        intended_phases=("train",),
-        command=("python", "train.py"),
-        **facts,
-    )
-
-
-def test_runtime_joins_matching_resume_facts(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A resuming child joins only metadata that attests its exact resume state."""
-    run_dir = _create_resumed_execution_context(tmp_path)
-    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
-
-    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
-        context = runtime.establish_execution(_resumed_join_request(run_dir))
-
-    assert context.metadata.execution_id == "runner-attempt"
-
-
-@pytest.mark.parametrize(
-    ("field_name", "override"),
-    (
-        ("resume_checkpoint", "checkpoints/other.pt"),
-        ("resume_checkpoint_sha256", "b" * 64),
-        ("parent_execution_id", "other-producer"),
-        ("starting_epoch", 5),
-        ("starting_global_step", 13),
-    ),
-)
-def test_runtime_rejects_each_mismatched_resume_fact_before_logging(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    field_name: str,
-    override: object,
-) -> None:
-    """Every declared resume fact must agree before the child opens logging."""
-    run_dir = _create_resumed_execution_context(tmp_path)
-    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
+    values.update(overrides)
 
     with (
         initialize_runtime(RuntimeConfig(device="cpu")) as runtime,
         pytest.raises(RuntimeError, match=field_name),
     ):
-        runtime.establish_execution(_resumed_join_request(run_dir, **{field_name: override}))
-
-    execution_dir = run_dir / "logs" / "executions" / "runner-attempt"
-    assert not (execution_dir / "rank-0.log").exists()
-    assert not (execution_dir / "rank-0.jsonl").exists()
+        runtime.attach_execution(ExecutionSpec(**values))
 
 
-def test_runtime_compares_sanitized_resume_checkpoint_references(
+def test_runtime_attach_execution_accepts_equivalent_nested_runtime(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Equivalent credential-bearing checkpoint URLs join through canonical sanitization."""
-    run_dir = _create_resumed_execution_context(
-        tmp_path,
-        resume_checkpoint="https://first:secret@example.test/checkpoints/resume.pt?token=one",
-    )
-    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
-
-    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
-        runtime.establish_execution(
-            _resumed_join_request(
-                run_dir,
-                resume_checkpoint="https://second:secret@example.test/checkpoints/resume.pt?token=two",
-            )
-        )
-
-
-def test_runtime_allows_external_resume_without_parent_or_global_step(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Unknown external lineage and global-step coordinates remain explicit ``None`` facts."""
-    run_dir = _create_resumed_execution_context(
-        tmp_path,
-        parent_execution_id=None,
-        starting_global_step=None,
-    )
-    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
-
-    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
-        runtime.establish_execution(
-            _resumed_join_request(
-                run_dir,
-                parent_execution_id=None,
-                starting_global_step=None,
-            )
-        )
-
-
-def test_execution_request_requires_resume_digest_and_starting_epoch(tmp_path: Path) -> None:
-    """Resume requests cannot defer their immutable attestation facts."""
-    common = {
-        "run_dir": tmp_path,
-        "run_name": "resume-request",
-        "invocation_kind": "train",
-        "intended_phases": ("train",),
-        "command": ("python", "train.py"),
-        "resume_checkpoint": "checkpoint.pt",
+    """Frozen metadata sequences compare equal to caller-owned JSON lists."""
+    run_dir = tmp_path / "strict-attach-nested-runtime"
+    nested_runtime = {
+        "dataset": {
+            "devices": ["cpu"],
+            "transforms": [{"name": "normalize", "arguments": [1, 2]}],
+        }
     }
-    with pytest.raises(ValueError, match="resume_checkpoint_sha256"):
-        ExecutionRequest(**common)
-    with pytest.raises(ValueError, match="starting_epoch"):
-        ExecutionRequest(**common, resume_checkpoint_sha256="a" * 64)
+    create_execution_context(
+        run_dir,
+        run_name="strict-attach",
+        invocation_kind="workflow",
+        intended_phases=("train",),
+        world_size=1,
+        execution_mode="single",
+        command=("python", "workflow.py"),
+        execution_id="workflow-attempt",
+        runtime=nested_runtime,
+    )
+    _set_canonical_attachment_environment(monkeypatch)
+
+    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
+        context = runtime.attach_execution(
+            ExecutionSpec(
+                run_dir=run_dir,
+                run_name="strict-attach",
+                invocation_kind="workflow",
+                intended_phases=("train",),
+                runtime=nested_runtime,
+            )
+        )
+
+    assert context.metadata.to_dict()["runtime"] == nested_runtime
 
 
 @pytest.mark.parametrize(
-    ("field_name", "value"),
+    "missing_name",
     (
-        ("starting_epoch", 4.0),
-        ("starting_epoch", True),
-        ("starting_epoch", -1),
-        ("starting_global_step", 12.0),
-        ("starting_global_step", True),
-        ("starting_global_step", -1),
+        "MAMMOTH_EXECUTION_ID",
+        "MAMMOTH_RUN_NAME",
+        "MAMMOTH_INVOCATION_KIND",
+        "MAMMOTH_PHASE",
     ),
 )
-def test_execution_request_rejects_non_integral_resume_coordinates(
+def test_runtime_attach_execution_requires_every_canonical_variable(
     tmp_path: Path,
-    field_name: str,
-    value: object,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_name: str,
 ) -> None:
-    """Resume coordinate equality cannot be bypassed by Python numeric coercion."""
-    request = {
-        "run_dir": tmp_path,
-        "run_name": "resume-coordinate",
-        "invocation_kind": "train",
-        "intended_phases": ("train",),
-        "command": ("python", "train.py"),
-        "resume_checkpoint": "checkpoint.pt",
-        "resume_checkpoint_sha256": "a" * 64,
-        "starting_epoch": 4,
-        "starting_global_step": 12,
-    }
-    request[field_name] = value
+    """Attachment fails before context loading when a canonical join fact is absent."""
+    _set_canonical_attachment_environment(monkeypatch)
+    monkeypatch.delenv(missing_name)
+    with (
+        initialize_runtime(RuntimeConfig(device="cpu")) as runtime,
+        pytest.raises(RuntimeError, match=missing_name),
+    ):
+        runtime.attach_execution(
+            ExecutionSpec(
+                run_dir=tmp_path / "strict-attach",
+                run_name="strict-attach",
+                invocation_kind="workflow",
+                intended_phases=("train",),
+            )
+        )
 
-    with pytest.raises(ValueError, match=field_name):
-        ExecutionRequest(**request)
+
+@pytest.mark.parametrize(
+    ("environment_name", "environment_value"),
+    (
+        ("MAMMOTH_RUN_NAME", "other-run"),
+        ("MAMMOTH_INVOCATION_KIND", "other-invocation"),
+        ("MAMMOTH_PHASE", "other-phase"),
+    ),
+)
+def test_runtime_attach_execution_rejects_canonical_environment_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    environment_name: str,
+    environment_value: str,
+) -> None:
+    """Canonical environment identity is checked before immutable metadata is joined."""
+    _set_canonical_attachment_environment(monkeypatch)
+    monkeypatch.setenv(environment_name, environment_value)
+    with (
+        initialize_runtime(RuntimeConfig(device="cpu")) as runtime,
+        pytest.raises(ValueError, match=environment_name),
+    ):
+        runtime.attach_execution(
+            ExecutionSpec(
+                run_dir=tmp_path / "strict-attach",
+                run_name="strict-attach",
+                invocation_kind="workflow",
+                intended_phases=("train",),
+            )
+        )
+
+
+def test_runtime_attach_execution_rejects_resume_metadata_for_fresh_expectation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh attach expectation requires all five stored resume facts to be null."""
+    run_dir = tmp_path / "strict-attach"
+    create_execution_context(
+        run_dir,
+        run_name="strict-attach",
+        invocation_kind="workflow",
+        intended_phases=("train",),
+        world_size=1,
+        execution_mode="single",
+        command=("python", "workflow.py"),
+        execution_id="workflow-attempt",
+        resume_checkpoint="checkpoints/resume.pt",
+        resume_checkpoint_sha256="a" * 64,
+        parent_execution_id="producer-attempt",
+        starting_epoch=3,
+        starting_global_step=9,
+    )
+    _set_canonical_attachment_environment(monkeypatch)
+    with (
+        initialize_runtime(RuntimeConfig(device="cpu")) as runtime,
+        pytest.raises(RuntimeError, match="resume_checkpoint"),
+    ):
+        runtime.attach_execution(
+            ExecutionSpec(
+                run_dir=run_dir,
+                run_name="strict-attach",
+                invocation_kind="workflow",
+                intended_phases=("train",),
+            )
+        )
 
 
 def test_single_runtime_owns_weighted_helpers_and_execution_lifecycle(
@@ -6911,15 +7504,15 @@ def test_single_runtime_owns_weighted_helpers_and_execution_lifecycle(
     runtime = initialize_runtime(
         RuntimeConfig(device="cpu", workload_weights=(2,))
     )
-    runtime.start_execution(
-        ExecutionRequest(
+    start_created_execution(
+        runtime,
+        ExecutionSpec(
             run_dir=run_dir,
             run_name="runtime-session",
             invocation_kind="test",
             intended_phases=("validate",),
-            command=("python", "validate.py"),
             execution_id="runtime-session-attempt",
-        )
+        ),
     )
     session = runtime.create_execution_session()
 
@@ -6970,17 +7563,51 @@ def _create_test_execution_session(
 ) -> tuple[Any, Any]:
     """Create one started single-process runtime/session test fixture."""
     runtime = initialize_runtime(RuntimeConfig(device="cpu"))
-    runtime.start_execution(
-        ExecutionRequest(
+    start_created_execution(
+        runtime,
+        ExecutionSpec(
             run_dir=tmp_path / name,
             run_name=name,
             invocation_kind="test",
             intended_phases=("train",),
-            command=("python", "train.py"),
             execution_id=f"{name}-attempt",
-        )
+        ),
     )
     return runtime, runtime.create_execution_session()
+
+
+def test_execution_session_rejects_new_resources_after_runtime_closure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An existing session shares its runtime's terminal resource boundary."""
+    runtime = initialize_runtime(RuntimeConfig(device="cpu"))
+    runtime.create_execution(
+        ExecutionSpec(
+            run_dir=tmp_path / "runtime-closed-session",
+            run_name="runtime-closed-session",
+            invocation_kind="train",
+            intended_phases=("train",),
+        )
+    )
+    runtime.start_execution_logging()
+    session = runtime.create_execution_session()
+    runtime.close()
+
+    def reject_construction(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        pytest.fail("resource construction ran after runtime closure")
+
+    monkeypatch.setattr(torch_runtime_module, "RunObserver", reject_construction)
+    monkeypatch.setattr(torch_runtime_module, "Trainer", reject_construction)
+    monkeypatch.setattr(torch_runtime_module, "BoundedBackgroundPipeline", reject_construction)
+
+    with pytest.raises(RuntimeError, match="session is already closed"):
+        session.create_observer()
+    with pytest.raises(RuntimeError, match="session is already closed"):
+        session.create_trainer()
+    with pytest.raises(RuntimeError, match="session is already closed"):
+        session.create_background_pipeline(lambda value: value)
 
 
 def test_execution_session_closes_owned_resources_before_runtime_in_reverse_order(
@@ -7193,6 +7820,204 @@ def test_execution_session_pipeline_factory_cannot_cross_concurrent_close(
     assert created[0].close() == ()
 
 
+@pytest.mark.parametrize("factory_name", ("observer", "trainer"))
+def test_execution_session_resource_factory_cannot_cross_concurrent_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factory_name: str,
+) -> None:
+    """Session close owns observers and trainers whose construction already began."""
+    _, session = _create_test_execution_session(tmp_path, f"{factory_name}-close-race")
+    constructed = threading.Event()
+    allow_construction = threading.Event()
+    created: list[Any] = []
+    factory_errors: list[BaseException] = []
+
+    class BlockingResource:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            self.closed = False
+            created.append(self)
+            constructed.set()
+            assert allow_construction.wait(timeout=5.0)
+
+        def close(self) -> None:
+            self.closed = True
+
+    def create_resource() -> None:
+        try:
+            if factory_name == "observer":
+                session.create_observer()
+            else:
+                session.create_trainer()
+        except BaseException as error:
+            factory_errors.append(error)
+
+    monkeypatch.setattr(
+        torch_runtime_module,
+        "RunObserver" if factory_name == "observer" else "Trainer",
+        BlockingResource,
+    )
+    factory = threading.Thread(target=create_resource)
+    closer = threading.Thread(target=session.close)
+    factory.start()
+    assert constructed.wait(timeout=5.0)
+    closer.start()
+    closer.join(timeout=0.1)
+    allow_construction.set()
+    factory.join(timeout=5.0)
+    closer.join(timeout=5.0)
+
+    assert not factory.is_alive()
+    assert not closer.is_alive()
+    assert factory_errors == []
+    assert len(created) == 1
+    assert created[0].closed is True
+
+
+def test_runtime_and_session_concurrent_close_share_one_cleanup_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runtime and session closure serialize every shared terminal resource."""
+    runtime, session = _create_test_execution_session(tmp_path, "shared-close-race")
+    logging_entered = threading.Event()
+    allow_logging_close = threading.Event()
+    calls = {"logging": 0, "lease": 0, "process_group": 0}
+    errors: list[BaseException] = []
+    original_logging_close = runtime.execution_logging.close
+    original_release = runtime._release_logical_run_lease
+
+    def close_logging() -> None:
+        calls["logging"] += 1
+        if calls["logging"] == 1:
+            logging_entered.set()
+            assert allow_logging_close.wait(timeout=5.0)
+        original_logging_close()
+
+    def release_lease() -> None:
+        calls["lease"] += 1
+        original_release()
+
+    def close_process_group() -> None:
+        calls["process_group"] += 1
+
+    def close_resource(close: Callable[[], None]) -> None:
+        try:
+            close()
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(runtime.execution_logging, "close", close_logging)
+    monkeypatch.setattr(runtime, "_release_logical_run_lease", release_lease)
+    monkeypatch.setattr(runtime, "close_process_group", close_process_group)
+    runtime_closer = threading.Thread(target=close_resource, args=(runtime.close,))
+    session_closer = threading.Thread(target=close_resource, args=(session.close,))
+    runtime_closer.start()
+    assert logging_entered.wait(timeout=5.0)
+    session_closer.start()
+    session_closer.join(timeout=0.1)
+    allow_logging_close.set()
+    runtime_closer.join(timeout=5.0)
+    session_closer.join(timeout=5.0)
+
+    assert not runtime_closer.is_alive()
+    assert not session_closer.is_alive()
+    assert errors == []
+    assert calls == {"logging": 1, "lease": 1, "process_group": 1}
+    assert runtime._closed is True
+    assert session._closed is True
+
+
+def test_execution_session_start_phase_serializes_with_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A phase that begins before close finishes before terminal cleanup starts."""
+    _, session = _create_test_execution_session(tmp_path, "phase-start-close-race")
+    process_started = threading.Event()
+    allow_process_started = threading.Event()
+    errors: list[BaseException] = []
+    original_emit = session.observer.emit
+
+    def pause_process_started(event: str, **fields: Any) -> None:
+        if event == "process_started":
+            process_started.set()
+            assert allow_process_started.wait(timeout=5.0)
+        original_emit(event, **fields)
+
+    def start_phase() -> None:
+        try:
+            session.start_phase("train")
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(session.observer, "emit", pause_process_started)
+    starter = threading.Thread(target=start_phase)
+    closer = threading.Thread(target=session.close)
+    starter.start()
+    assert process_started.wait(timeout=5.0)
+    closer.start()
+    closer.join(timeout=0.1)
+    allow_process_started.set()
+    starter.join(timeout=5.0)
+    closer.join(timeout=5.0)
+
+    assert not starter.is_alive()
+    assert not closer.is_alive()
+    assert errors == []
+    assert session._closed is True
+    assert session._phase_terminal is True
+
+
+def test_execution_session_serializes_concurrent_phase_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only one concurrent caller can publish an active phase's terminal event."""
+    _, session = _create_test_execution_session(tmp_path, "phase-complete-race")
+    session.start_phase("train")
+    first_completion = threading.Event()
+    allow_completion = threading.Event()
+    completion_calls = 0
+    errors: list[BaseException] = []
+    original_emit = session.observer.emit
+
+    def pause_first_completion(event: str, **fields: Any) -> None:
+        nonlocal completion_calls
+        if event == "phase_completed":
+            completion_calls += 1
+            if completion_calls == 1:
+                first_completion.set()
+                assert allow_completion.wait(timeout=5.0)
+        original_emit(event, **fields)
+
+    def complete_phase() -> None:
+        try:
+            session.complete_phase()
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(session.observer, "emit", pause_first_completion)
+    first = threading.Thread(target=complete_phase)
+    second = threading.Thread(target=complete_phase)
+    first.start()
+    assert first_completion.wait(timeout=5.0)
+    second.start()
+    second.join(timeout=0.1)
+    allow_completion.set()
+    first.join(timeout=5.0)
+    second.join(timeout=5.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert completion_calls == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "already terminal" in str(errors[0])
+    session.close()
+
+
 def test_execution_session_preserves_every_pipeline_cleanup_failure(
     tmp_path: Path,
 ) -> None:
@@ -7363,15 +8188,15 @@ def test_execution_session_scope_derives_terminal_process_state(
 ) -> None:
     run_dir = tmp_path / f"session-{type(error).__name__}"
     runtime = initialize_runtime(RuntimeConfig(device="cpu"))
-    runtime.start_execution(
-        ExecutionRequest(
+    start_created_execution(
+        runtime,
+        ExecutionSpec(
             run_dir=run_dir,
             run_name="runtime-session",
             invocation_kind="test",
             intended_phases=("validate",),
-            command=("python", "validate.py"),
             execution_id=f"session-{type(error).__name__.lower()}",
-        )
+        ),
     )
     session = runtime.create_execution_session()
 
@@ -7400,15 +8225,15 @@ def test_execution_session_scope_derives_terminal_process_state(
 def test_execution_session_cannot_report_failed_phase_as_success(tmp_path: Path) -> None:
     run_dir = tmp_path / "failed-session"
     runtime = initialize_runtime(RuntimeConfig(device="cpu"))
-    runtime.start_execution(
-        ExecutionRequest(
+    start_created_execution(
+        runtime,
+        ExecutionSpec(
             run_dir=run_dir,
             run_name="failed-session",
             invocation_kind="test",
             intended_phases=("validate",),
-            command=("python", "validate.py"),
             execution_id="failed-session-attempt",
-        )
+        ),
     )
     session = runtime.create_execution_session()
     session.start_phase("validate")
@@ -7427,15 +8252,15 @@ def test_execution_session_reraises_late_runtime_cleanup_failure(
 ) -> None:
     run_dir = tmp_path / "cleanup-failed-session"
     runtime = initialize_runtime(RuntimeConfig(device="cpu"))
-    runtime.start_execution(
-        ExecutionRequest(
+    start_created_execution(
+        runtime,
+        ExecutionSpec(
             run_dir=run_dir,
             run_name="cleanup-failed-session",
             invocation_kind="test",
             intended_phases=("validate",),
-            command=("python", "validate.py"),
             execution_id="cleanup-failed-session-attempt",
-        )
+        ),
     )
     session = runtime.create_execution_session()
     session.start_phase("validate")
@@ -7464,15 +8289,15 @@ def test_execution_session_derives_interrupt_from_presentation_cleanup(
 ) -> None:
     run_dir = tmp_path / "cleanup-interrupted-session"
     runtime = initialize_runtime(RuntimeConfig(device="cpu"))
-    runtime.start_execution(
-        ExecutionRequest(
+    start_created_execution(
+        runtime,
+        ExecutionSpec(
             run_dir=run_dir,
             run_name="cleanup-interrupted-session",
             invocation_kind="test",
             intended_phases=("validate",),
-            command=("python", "validate.py"),
             execution_id="cleanup-interrupted-session-attempt",
-        )
+        ),
     )
     session = runtime.create_execution_session()
     session.start_phase("validate")
@@ -7531,97 +8356,15 @@ def test_runtime_validates_launch_and_weight_topology(
         )
 
 
-def test_single_runtime_joins_runner_execution_from_environment(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    run_dir = tmp_path / "joined-run"
-    create_execution_context(
-        run_dir,
-        run_name="joined-run",
-        invocation_kind="workflow",
-        intended_phases=("train", "validate"),
-        world_size=1,
-        execution_mode="single",
-        command=("mammoth", "workflow", "run"),
-        execution_id="runner-attempt",
-        resume_checkpoint="checkpoints/runner-resume.pt",
-        resume_checkpoint_sha256="a" * 64,
-        parent_execution_id="previous-runner-attempt",
-        starting_epoch=3,
-        starting_global_step=9,
-    )
-    monkeypatch.setenv("MAMMOTH_EXECUTION_ID", "runner-attempt")
-
-    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
-        bundle = runtime.start_execution(
-            ExecutionRequest(
-                run_dir=run_dir,
-                run_name="joined-run",
-                invocation_kind="train",
-                intended_phases=("train",),
-                command=("python", "train.py"),
-            )
-        )
-        bundle.observer.emit("process_completed", phase="train", exit_code=0)
-        assert runtime.execution_context is not None
-        assert runtime.execution_context.metadata.execution_id == "runner-attempt"
-
-
-def test_single_runtime_joins_execution_from_request_owned_alias(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    run_dir = tmp_path / "joined-run"
-    create_execution_context(
-        run_dir,
-        run_name="joined-run",
-        invocation_kind="workflow",
-        intended_phases=("train",),
-        world_size=1,
-        execution_mode="single",
-        command=("mammoth", "workflow", "run"),
-        execution_id="runner-attempt",
-    )
-    monkeypatch.setenv("CALLER_EXECUTION_ID", "runner-attempt")
-
-    with initialize_runtime(RuntimeConfig(device="cpu")) as runtime:
-        runtime.start_execution(
-            ExecutionRequest(
-                run_dir=run_dir,
-                run_name="joined-run",
-                invocation_kind="train",
-                intended_phases=("train",),
-                command=("python", "train.py"),
-                execution_id_environment_aliases=("CALLER_EXECUTION_ID",),
-            )
-        )
-        assert runtime.execution_context is not None
-        assert runtime.execution_context.metadata.execution_id == "runner-attempt"
-
-
-def test_execution_request_rejects_invalid_alias_declarations(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="not a string"):
-        ExecutionRequest(
-            run_dir=tmp_path,
-            run_name="alias-validation",
-            invocation_kind="test",
-            intended_phases=("test",),
-            command=("python", "test.py"),
-            execution_id_environment_aliases="CALLER_EXECUTION_ID",  # type: ignore[arg-type]
-        )
-
-
-def test_execution_establishment_can_be_used_without_mammoth_logging(tmp_path: Path) -> None:
+def test_execution_creation_can_be_used_without_mammoth_logging(tmp_path: Path) -> None:
     run_dir = tmp_path / "adapter-run"
     runtime = initialize_runtime(RuntimeConfig(device="cpu"))
-    context = runtime.establish_execution(
-        ExecutionRequest(
+    context = runtime.create_execution(
+        ExecutionSpec(
             run_dir=run_dir,
             run_name="adapter-run",
             invocation_kind="test",
             intended_phases=("custom",),
-            command=("python", "custom.py"),
             execution_id="adapter-attempt",
         )
     )
@@ -7679,9 +8422,90 @@ def test_two_process_runtime_reaches_consensus_on_resume_join_mismatch(
     assert len(errors) == 1
     error = errors.pop()
     assert error is not None
-    assert "execution join" in error
+    assert "execution attachment" in error
     assert "rank 1" in error
     assert "resume_checkpoint_sha256" in error
     execution_dir = tmp_path / "resume-ddp" / "logs" / "executions" / "resume-attempt"
     assert not (execution_dir / "rank-0.log").exists()
     assert not (execution_dir / "rank-1.log").exists()
+
+
+def test_two_process_runtime_rejects_rank_local_attachment_expectation(
+    tmp_path: Path,
+) -> None:
+    """Different rank-local expected identity fails coherently before metadata join."""
+    results = run_two_process_resume_join_mismatch(tmp_path, mismatch="run_name")
+
+    assert [rank for rank, _ in results] == [0, 1]
+    errors = {error for _, error in results}
+    assert len(errors) == 1
+    error = errors.pop()
+    assert error is not None
+    assert "attachment expectations are inconsistent across ranks" in error
+    execution_dir = tmp_path / "resume-ddp" / "logs" / "executions" / "resume-attempt"
+    assert not (execution_dir / "rank-0.log").exists()
+    assert not (execution_dir / "rank-1.log").exists()
+
+
+def test_two_process_runtime_rejects_rank_local_attachment_runtime(
+    tmp_path: Path,
+) -> None:
+    """Different rank-local runtime expectations fail before metadata is joined."""
+    results = run_two_process_resume_join_mismatch(tmp_path, mismatch="runtime")
+
+    errors = {error for _, error in results}
+    assert len(errors) == 1
+    error = errors.pop()
+    assert error is not None
+    assert "attachment expectations are inconsistent across ranks" in error
+    assert "rank 1: runtime" in error
+
+
+def test_two_process_runtime_propagates_attachment_intent_preparation_failure(
+    tmp_path: Path,
+) -> None:
+    """Rank-local intent normalization failure reaches every rank before gathering."""
+    results = run_two_process_resume_join_mismatch(tmp_path, mismatch="normalization")
+
+    assert [rank for rank, _ in results] == [0, 1]
+    errors = {error for _, error in results}
+    assert len(errors) == 1
+    error = errors.pop()
+    assert error is not None
+    assert "execution attachment intent" in error
+    assert "rank 1" in error
+    assert "resume normalization unavailable" in error
+
+
+def test_two_process_runtime_releases_creation_lease_after_base_exception(
+    tmp_path: Path,
+) -> None:
+    """Rank-zero interruption is broadcast and leaves no producer lease behind."""
+    run_dir, results = run_two_process_strict_creation_failure(tmp_path)
+
+    assert [rank for rank, _ in results] == [0, 1]
+    errors = {error for _, error in results}
+    assert len(errors) == 1
+    error = errors.pop()
+    assert error is not None
+    assert "KeyboardInterrupt: lineage interrupted" in error
+    with claim_logical_run_lease(run_dir):
+        pass
+
+
+def test_two_process_runtime_rejects_rank_local_creation_intent(
+    tmp_path: Path,
+) -> None:
+    """Different caller provenance fails every rank before artifacts or a lease exist."""
+    run_dir, results = run_two_process_strict_creation_intent_mismatch(tmp_path)
+
+    assert [rank for rank, _ in results] == [0, 1]
+    errors = {error for _, error in results}
+    assert len(errors) == 1
+    error = errors.pop()
+    assert error is not None
+    assert "creation expectations are inconsistent across ranks" in error
+    assert "rank 1: runtime" in error
+    assert not run_dir.exists()
+    with claim_logical_run_lease(run_dir):
+        pass
