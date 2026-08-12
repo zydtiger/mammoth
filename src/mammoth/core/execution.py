@@ -1,9 +1,9 @@
 """Immutable execution-attempt identities and metadata for Mammoth run artifacts.
 
-Direct CLI commands and the experiment runner create or join contexts from this
-module before framework-specific work begins. CLI logging uses the returned
-rank-log paths, while later dashboard/event layers may consume the same atomic
-``execution.json`` without introducing a dependency on PyTorch or PrettyTerm.
+Workflow and framework runtimes create or join contexts from this module before
+framework-specific work begins. Logging uses the returned rank-log paths, while
+later dashboard/event layers may consume the same atomic ``execution.json``
+without introducing a dependency on PyTorch or PrettyTerm.
 """
 
 from __future__ import annotations
@@ -201,7 +201,7 @@ def claim_logical_run_lease(run_dir: Path) -> LogicalRunLease:
             raise RuntimeError(
                 f"Another execution is already active for logical run {run_dir.name!r}: {path}"
             ) from error
-    except Exception:
+    except BaseException:
         os.close(descriptor)
         raise
     return LogicalRunLease(path=path, _descriptor=descriptor)
@@ -359,45 +359,13 @@ def generate_execution_id() -> str:
 
 def execution_id_from_environment(
     environ: Mapping[str, str] | None = None,
-    *,
-    aliases: Sequence[str] = (),
 ) -> str | None:
-    """Resolve the canonical execution ID and explicit caller-owned aliases.
-
-    Callers may supply aliases only for their own compatibility policy. Aliases
-    must be distinct, non-empty POSIX environment-variable names other than
-    :data:`EXECUTION_ID_ENV`; malformed declarations fail deterministically.
-    Every populated configured name must carry the same valid execution ID.
-    """
+    """Resolve and validate the canonical execution ID when it is populated."""
     source = os.environ if environ is None else environ
-    alias_names = normalize_execution_id_environment_aliases(aliases)
-    configured_names = (EXECUTION_ID_ENV, *alias_names)
-    values = tuple(
-        (name, validate_execution_id(value))
-        for name in configured_names
-        if (value := source.get(name)) is not None
-    )
-    if not values:
+    value = source.get(EXECUTION_ID_ENV)
+    if value is None:
         return None
-    if len({value for _, value in values}) != 1:
-        names = ", ".join(name for name, _ in values)
-        raise ValueError(f"Configured execution ID environment variables disagree: {names}.")
-    return values[0][1]
-
-
-def normalize_execution_id_environment_aliases(aliases: Sequence[str]) -> tuple[str, ...]:
-    """Validate and freeze caller-owned execution-ID alias declarations."""
-    if not isinstance(aliases, Sequence) or isinstance(aliases, str):
-        raise ValueError("aliases must be a sequence of environment variable names, not a string.")
-    alias_names = tuple(aliases)
-    for alias in alias_names:
-        if not isinstance(alias, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", alias):
-            raise ValueError(f"Invalid execution ID environment alias: {alias!r}.")
-        if alias == EXECUTION_ID_ENV:
-            raise ValueError(f"aliases must not repeat canonical name {EXECUTION_ID_ENV}.")
-    if len(set(alias_names)) != len(alias_names):
-        raise ValueError("aliases must not contain duplicate environment variable names.")
-    return alias_names
+    return validate_execution_id(value)
 
 
 def sanitize_reference(reference: str | os.PathLike[str]) -> str:
