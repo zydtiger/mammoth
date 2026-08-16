@@ -106,16 +106,26 @@ The workflow layer owns project-neutral local process supervision and serial
 multi-run orchestration through Python values only. `Workflow`, `Run`, `Step`,
 and `Execution` are immutable caller inputs; step commands are already-final
 argv, step names are canonical phases, and workflow/run roots derive each
-`RunLayout`. `Workflow.plan()` validates the complete model and returns command
-plans without touching the filesystem, claiming a lease, resolving execution
-inputs, or emitting lifecycle records. Run-major order preserves declared runs
-and steps. Step-major order interleaves runs through one explicit canonical
-`step_order`; each run must declare a duplicate-free subsequence and may omit
-canonical phases.
+`RunLayout`. `Workflow` freezes inputs, validates every workflow-wide identity
+and ordering invariant, and derives one immutable canonical dispatch during
+construction without touching the filesystem, claiming a lease, resolving
+execution inputs, or emitting lifecycle records. `Workflow.plan()` is a
+side-effect-free projection of that dispatch to command plans. Run-major order
+preserves declared runs and steps. Step-major order interleaves runs through
+one explicit canonical `step_order`; each run must declare a duplicate-free
+subsequence and may omit canonical phases.
 
-`Workflow.run()` owns prepared layouts, logical-run leases, immutable execution
-contexts, observers, lifecycle transitions, child supervision, interruption,
-and cleanup. For each activated run, `resolve_execution()` may replace the
+`Workflow.run()` requires the Python main thread and POSIX
+`pthread_sigmask` support because it owns process signal handlers. Unsupported
+invocations fail before creating artifacts or children. Mammoth blocks SIGINT
+and SIGTERM while replacing or restoring both handlers, so a signal in either
+transition remains pending until the complete new or restored handler set
+exists. After handler installation, it owns setup and execution interruption,
+prepared layouts, logical-run leases, immutable execution contexts, observers,
+lifecycle transitions, child supervision, and cleanup. SIGINT and SIGTERM
+received under Mammoth's installed handlers before any run activates return a
+structured interruption result with all runs blocked and no artifacts. For each activated run,
+`resolve_execution()` may replace the
 baseline `Execution` after layout preparation and lease acquisition but before
 metadata publication. Mammoth records the workflow invocation from `sys.argv`,
 derives intended phases from the run's steps, and resolves the previous attempt

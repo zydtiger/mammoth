@@ -7,8 +7,10 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import UserList
+from collections.abc import Mapping
 from dataclasses import fields
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,7 @@ from mammoth.workflow import (
     Step,
     SupervisedProcess,
     Workflow,
+    WorkflowResult,
     run_captured_process,
 )
 from mammoth.workflow.launch import launch_process
@@ -79,6 +82,32 @@ def test_models_freeze_caller_inputs_and_step_has_only_final_argv_policy(
     }
     assert Step("default-environment", ("true",)).environment == {}
     assert not tmp_path.exists() or tuple(tmp_path.iterdir()) == ()
+
+
+def test_workflow_freezes_caller_collections_and_canonical_dispatch(tmp_path: Path) -> None:
+    """Workflow construction detaches its ordering inputs before planning or execution."""
+    root = tmp_path / "runs"
+    runs = UserList(
+        [Run("run", (Step("prepare", ("prepare",)), Step("train", ("train",))))]
+    )
+    step_order = UserList(["prepare", "train"])
+
+    workflow = Workflow(
+        root=root,
+        runs=runs,
+        order="step-major",
+        step_order=step_order,
+    )
+    runs.clear()
+    step_order.reverse()
+
+    assert workflow.runs[0].name == "run"
+    assert workflow.step_order == ("prepare", "train")
+    assert [(plan.run_name, plan.step_name) for plan in workflow.plan()] == [
+        ("run", "prepare"),
+        ("run", "train"),
+    ]
+    assert not root.exists()
 
 
 @pytest.mark.parametrize(
@@ -151,10 +180,10 @@ def test_step_major_order_uses_canonical_names_and_allows_missing_steps(tmp_path
 
 
 @pytest.mark.parametrize(
-    ("workflow", "message"),
+    ("build", "message"),
     (
         (
-            Workflow(
+            lambda: Workflow(
                 runs=(Run("run", (Step("train", ("x",)), Step("prepare", ("y",)))),),
                 order="step-major",
                 step_order=("prepare", "train"),
@@ -162,7 +191,7 @@ def test_step_major_order_uses_canonical_names_and_allows_missing_steps(tmp_path
             "subsequence",
         ),
         (
-            Workflow(
+            lambda: Workflow(
                 runs=(Run("run", (Step("prepare", ("x",)), Step("train", ("y",)))),),
                 order="step-major",
                 step_order=("prepare",),
@@ -170,7 +199,7 @@ def test_step_major_order_uses_canonical_names_and_allows_missing_steps(tmp_path
             "absent from step_order",
         ),
         (
-            Workflow(
+            lambda: Workflow(
                 runs=(Run("run", (Step("prepare", ("x",)),)),),
                 order="step-major",
                 step_order=("prepare", "prepare"),
@@ -178,26 +207,71 @@ def test_step_major_order_uses_canonical_names_and_allows_missing_steps(tmp_path
             "must not contain duplicates",
         ),
         (
-            Workflow(
+            lambda: Workflow(
                 runs=(Run("run", (Step("prepare", ("x",)),)),),
                 step_order=("prepare",),
             ),
             "must omit step_order",
         ),
+        (
+            lambda: Workflow(
+                runs=(Run("run", (Step("prepare", ("x",)),)),),
+                order="step-major",
+            ),
+            "require a non-empty step_order",
+        ),
     ),
 )
-def test_plan_rejects_invalid_order_contract(workflow: Workflow, message: str) -> None:
+def test_construction_rejects_invalid_order_contract(build: Any, message: str) -> None:
     with pytest.raises(ValueError, match=message):
-        workflow.plan()
+        build()
 
 
-def test_plan_rejects_duplicate_runs_and_run_rejects_duplicate_steps() -> None:
+def test_construction_rejects_duplicate_runs_and_run_rejects_duplicate_steps() -> None:
     first = Run("duplicate", (Step("step", ("one",)),))
     second = Run("duplicate", (Step("other", ("two",)),))
     with pytest.raises(ValueError, match="run names must be unique"):
-        Workflow(runs=(first, second)).plan()
+        Workflow(runs=(first, second))
     with pytest.raises(ValueError, match="step names must be unique"):
         Run("run", (Step("same", ("one",)), Step("same", ("two",))))
+
+
+def test_plan_and_run_reuse_the_construction_derived_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Planning and execution consume one immutable dispatch without re-derivation."""
+    workflow = Workflow(
+        root=tmp_path,
+        order="step-major",
+        step_order=("prepare", "train"),
+        runs=(
+            Run("alpha", (Step("prepare", ("a-p",)), Step("train", ("a-t",)))),
+            Run("beta", (Step("prepare", ("b-p",)),)),
+        ),
+    )
+    expected = (("alpha", "prepare"), ("beta", "prepare"), ("alpha", "train"))
+
+    monkeypatch.setattr(
+        workflow_runner,
+        "_derive_dispatch",
+        lambda _workflow: pytest.fail("dispatch must only be derived during construction"),
+    )
+    assert tuple((plan.run_name, plan.step_name) for plan in workflow.plan()) == expected
+    monkeypatch.setattr(
+        Workflow,
+        "plan",
+        lambda _workflow: pytest.fail("run must not re-plan the workflow"),
+    )
+    monkeypatch.setattr(
+        workflow_runner,
+        "launch_process",
+        lambda *args, **kwargs: ProcessResult(0, 0.0),
+    )
+
+    result = workflow.run(base_environment={})
+
+    assert tuple((item.run_name, item.step.name) for item in result.dispatch) == expected
 
 
 def test_resolver_and_hook_observe_lease_bound_lifecycle_order(
@@ -511,6 +585,148 @@ def test_launch_failure_returns_structured_result(
     assert result.exit_code == 1
     assert result.run("run").outcome == "failed"
     assert "launcher missing" in (result.step("run", "step").reason or "")
+
+
+@pytest.mark.parametrize("signal_number", (signal.SIGINT, signal.SIGTERM))
+def test_pre_activation_signal_returns_blocked_artifact_free_result_and_restores_handlers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    signal_number: signal.Signals,
+) -> None:
+    """Signals during run-owned setup return before layouts, leases, or children exist."""
+    root = tmp_path / "runs"
+    handlers = {
+        signal.SIGINT: signal.getsignal(signal.SIGINT),
+        signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+    }
+    launched = False
+
+    def interrupt_base_environment(_environment: Any) -> Mapping[str, str]:
+        signal.raise_signal(signal_number)
+        raise AssertionError("workflow interruption must leave base setup immediately")
+
+    def record_launch(*args: Any, **kwargs: Any) -> ProcessResult:
+        nonlocal launched
+        del args, kwargs
+        launched = True
+        return ProcessResult(0, 0.0)
+
+    monkeypatch.setattr(workflow_runner, "_base_environment", interrupt_base_environment)
+    monkeypatch.setattr(workflow_runner, "launch_process", record_launch)
+    workflow = Workflow(
+        root=root,
+        runs=(
+            Run("alpha", (Step("step", ("ignored",)),)),
+            Run("beta", (Step("step", ("ignored",)),)),
+        ),
+    )
+
+    result = workflow.run(base_environment={})
+
+    assert result.exit_code == 128 + signal_number
+    assert all(run.outcome == "blocked" for run in result.runs)
+    assert all(run.execution_id is None and run.steps == () for run in result.runs)
+    assert result.dispatch == ()
+    assert not launched
+    assert not root.exists()
+    assert {number: signal.getsignal(number) for number in handlers} == handlers
+
+
+def test_invalid_base_environment_raises_and_restores_signal_handlers(tmp_path: Path) -> None:
+    """Ordinary setup errors remain exceptions despite the full run signal boundary."""
+    root = tmp_path / "runs"
+    handlers = {
+        signal.SIGINT: signal.getsignal(signal.SIGINT),
+        signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+    }
+    workflow = Workflow(root=root, runs=(Run("run", (Step("step", ("ignored",)),)),))
+
+    with pytest.raises(ValueError, match="environment values must be strings"):
+        workflow.run(base_environment={"INVALID": 1})  # type: ignore[dict-item]
+
+    assert {number: signal.getsignal(number) for number in handlers} == handlers
+    assert not root.exists()
+
+
+@pytest.mark.skipif(
+    not hasattr(signal, "pthread_sigmask"),
+    reason="POSIX signal masking is unavailable",
+)
+def test_signal_handler_installation_masks_sigterm_until_workflow_owns_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A SIGTERM between handler replacements is deferred to Mammoth's completed set."""
+    original_signal = signal.signal
+    injected = False
+
+    class Marker(BaseException):
+        pass
+
+    def old_sigterm_handler(signal_number: int, _frame: object) -> None:
+        raise Marker(f"old SIGTERM handler received {signal_number}")
+
+    def signal_with_install_window(signal_number: signal.Signals, handler: Any) -> Any:
+        nonlocal injected
+        if signal_number == signal.SIGTERM and not injected:
+            injected = True
+            signal.raise_signal(signal.SIGTERM)
+        return original_signal(signal_number, handler)
+
+    previous_sigterm = original_signal(signal.SIGTERM, old_sigterm_handler)
+    monkeypatch.setattr(workflow_runner.signal, "signal", signal_with_install_window)
+    try:
+        result = Workflow(
+            root=tmp_path / "runs",
+            runs=(Run("run", (Step("step", ("ignored",)),)),),
+        ).run(base_environment={})
+        assert signal.getsignal(signal.SIGTERM) is old_sigterm_handler
+    finally:
+        original_signal(signal.SIGTERM, previous_sigterm)
+
+    assert injected
+    assert result.exit_code == 128 + signal.SIGTERM
+    assert result.run("run").outcome == "blocked"
+    assert not (tmp_path / "runs").exists()
+
+
+def test_workflow_run_rejects_worker_thread_before_artifacts_or_children(tmp_path: Path) -> None:
+    """Workflow execution cannot silently continue without main-thread signal ownership."""
+    root = tmp_path / "runs"
+    workflow = Workflow(root=root, runs=(Run("run", (Step("step", ("ignored",)),)),))
+    results: list[WorkflowResult] = []
+    errors: list[BaseException] = []
+
+    def run_workflow() -> None:
+        try:
+            results.append(workflow.run(base_environment={}))
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=run_workflow)
+    worker.start()
+    worker.join()
+
+    assert results == []
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert str(errors[0]) == "Workflow.run() requires the main thread to own process signals"
+    assert not root.exists()
+
+
+def test_workflow_run_rejects_missing_signal_masking_before_artifacts_or_children(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Workflow execution does not weaken the signal contract without POSIX masking."""
+    root = tmp_path / "runs"
+    workflow = Workflow(root=root, runs=(Run("run", (Step("step", ("ignored",)),)),))
+    monkeypatch.delattr(workflow_runner.signal, "pthread_sigmask", raising=False)
+
+    with pytest.raises(RuntimeError, match="requires POSIX pthread_sigmask signal masking"):
+        workflow.run(base_environment={})
+
+    assert not root.exists()
 
 
 def test_workflow_interruption_returns_signal_exit_and_closes_lifecycle(
