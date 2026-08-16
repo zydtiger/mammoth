@@ -78,8 +78,10 @@ mammoth.cli.app (Typer)
 
 caller-owned Python
     └── mammoth.workflow.Workflow
-        ├── plan → validate roots, names, and run-major/step-major order
-        └── run → prepare layout + claim lease
+        ├── construction → freeze inputs + validate names/order + derive canonical dispatch
+        ├── plan → project the canonical dispatch to side-effect-free command plans
+        └── run (main thread + POSIX pthread_sigmask) → mask handler transitions + own setup/execution signals
+            + prepare layout + claim lease
             └── optional resolve_execution → immutable execution context
                 └── execution lifecycle → optional before_first_step
                     └── serial supervised step dispatch + structured result
