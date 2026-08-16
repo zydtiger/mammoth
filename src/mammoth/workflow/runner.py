@@ -13,6 +13,7 @@ import math
 import os
 import signal
 import sys
+import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -283,14 +284,18 @@ class Workflow:
     root: Path = Path("runs")
     order: WorkflowOrder = "run-major"
     step_order: Sequence[str] | None = None
+    _dispatch: tuple[tuple[Run, Step], ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        """Detach top-level collections without touching the filesystem."""
+        """Freeze and validate the complete dispatch model without side effects."""
         if isinstance(self.runs, Run) or not isinstance(self.runs, Sequence):
             raise ValueError("Workflow runs must be a sequence of Run values")
         runs = tuple(self.runs)
         if not runs or any(not isinstance(run, Run) for run in runs):
             raise ValueError("Workflow must contain Run values")
+        names = [run.name for run in runs]
+        if len(names) != len(set(names)):
+            raise ValueError("Workflow run names must be unique")
         object.__setattr__(self, "runs", runs)
         try:
             object.__setattr__(self, "root", Path(self.root))
@@ -305,10 +310,21 @@ class Workflow:
             if any(not isinstance(name, str) or not name for name in order):
                 raise ValueError("Workflow step_order must contain non-empty phase names")
             object.__setattr__(self, "step_order", order)
+        object.__setattr__(self, "_dispatch", _derive_dispatch(self))
 
     def plan(self) -> tuple[CommandPlan, ...]:
-        """Validate and return the complete dispatch plan without side effects."""
-        return _plan_workflow(self)
+        """Project the canonical dispatch to public command plans without side effects."""
+        return tuple(
+            CommandPlan(
+                run_name=run.name,
+                step_name=step.name,
+                command=tuple(step.command),
+                cwd=step.cwd,
+                timeout_seconds=step.timeout_seconds,
+                run_dir=_layout_for(self, run).run_dir,
+            )
+            for run, step in self._dispatch
+        )
 
     def run(
         self,
@@ -316,6 +332,10 @@ class Workflow:
         base_environment: Mapping[str, str] | None = None,
     ) -> WorkflowResult:
         """Execute the validated plan with owned attempts, children, and cleanup."""
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError("Workflow.run() requires the main thread to own process signals")
+        if not hasattr(signal, "pthread_sigmask"):
+            raise RuntimeError("Workflow.run() requires POSIX pthread_sigmask signal masking")
         return _run_workflow(self, base_environment=base_environment)
 
 
@@ -388,27 +408,8 @@ _INTERRUPTION_STATE: ContextVar[_InterruptionState | None] = ContextVar(
 )
 
 
-def _plan_workflow(workflow: Workflow) -> tuple[CommandPlan, ...]:
-    """Validate identities/order and derive layouts without filesystem access."""
-    names = [run.name for run in workflow.runs]
-    if len(names) != len(set(names)):
-        raise ValueError("Workflow run names must be unique")
-    dispatch = _dispatch_order(workflow)
-    return tuple(
-        CommandPlan(
-            run_name=run.name,
-            step_name=step.name,
-            command=tuple(step.command),
-            cwd=step.cwd,
-            timeout_seconds=step.timeout_seconds,
-            run_dir=_layout_for(workflow, run).run_dir,
-        )
-        for run, step in dispatch
-    )
-
-
-def _dispatch_order(workflow: Workflow) -> tuple[tuple[Run, Step], ...]:
-    """Return the exact run-major or canonical-name step-major sequence."""
+def _derive_dispatch(workflow: Workflow) -> tuple[tuple[Run, Step], ...]:
+    """Validate ordering and retain the exact immutable serial dispatch sequence."""
     if workflow.order == "run-major":
         if workflow.step_order is not None:
             raise ValueError("run-major workflows must omit step_order")
@@ -447,10 +448,6 @@ def _run_workflow(
     base_environment: Mapping[str, str] | None,
 ) -> WorkflowResult:
     """Own serial dispatch and preserve the first failure through cleanup."""
-    workflow.plan()
-    environment = _base_environment(base_environment)
-    invocation_command = tuple(sys.argv)
-    dispatch = _dispatch_order(workflow)
     active: dict[str, _ActiveRun] = {}
     results_by_run: dict[str, list[StepResult]] = {run.name: [] for run in workflow.runs}
     dispatch_results: list[DispatchResult] = []
@@ -465,7 +462,9 @@ def _run_workflow(
     with _interruption_signals() as interruption_state:
         try:
             _release_initial_interrupt_guard(interruption_state)
-            for run, step in dispatch:
+            environment = _base_environment(base_environment)
+            invocation_command = tuple(sys.argv)
+            for run, step in workflow._dispatch:
                 transition_result = None
                 current = active.get(run.name)
                 if current is None:
@@ -1244,23 +1243,29 @@ def _interruption_signals() -> Iterator[_InterruptionState | None]:
         raise _WorkflowInterrupted(signal_number)
 
     try:
-        try:
+        with _masked_process_signals(signals):
             for signal_number in signals:
                 previous[signal_number] = signal.getsignal(signal_number)
                 signal.signal(signal_number, interrupt)
                 installed.append(signal_number)
-        except ValueError:
-            state.critical_depth = 0
-            state.initial_guard_active = False
-            yield None
-        else:
-            yield state
+        yield state
     finally:
         try:
-            for signal_number in reversed(installed):
-                signal.signal(signal_number, previous[signal_number])
+            with _masked_process_signals(signals):
+                for signal_number in reversed(installed):
+                    signal.signal(signal_number, previous[signal_number])
         finally:
             _INTERRUPTION_STATE.reset(token)
+
+
+@contextmanager
+def _masked_process_signals(signals: tuple[signal.Signals, ...]) -> Iterator[None]:
+    """Block transition signals while replacing the complete process-handler set."""
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, signals)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def _release_initial_interrupt_guard(state: _InterruptionState | None) -> None:
