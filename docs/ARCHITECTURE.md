@@ -49,9 +49,28 @@ that bytes remain unchanged after verification. The default rejects final-path
 symlinks, directories, and special files; missing paths retain
 `FileNotFoundError`, observed replacement or mutation raises
 `ArtifactChangedError`, and a stable but different regular file raises
-`ArtifactVerificationError`. Lower layers may create the same generic receipt
-from a publication descriptor before atomic rename, while callers own any
-portable path serialization.
+`ArtifactVerificationError`.
+
+When a caller must parse one artifact, `open_artifact_session(path)` creates a
+one-use `ArtifactReadSession`. Session entry records the receipt on a private
+no-follow descriptor. Callers obtain binary readers only through nested,
+serial `session.open_reader()` contexts: every reader starts at offset zero,
+may seek or rewind freely, and is closed by its context. Mammoth never exposes a file
+descriptor or transient filesystem identity. It validates the descriptor and
+visible path before and after each successful reader, and on a successful outer
+exit rechecks the exact bytes and receipt. Readers cannot nest or run
+concurrently because they share the session's file object. Parser exceptions
+propagate unchanged after cleanup, so callers must discard parse results unless
+the outer session exits successfully. This establishes entry/exit exact-byte
+identity and visible-path binding, not an immutable snapshot for arbitrary
+seek-heavy parsing or a guarantee against a hostile writer changing bytes
+between checks. Ancestor symlinks and root containment remain caller policy;
+the core default rejects only a final-component symlink. Lower layers may
+create the same generic receipt from a publication descriptor before atomic
+rename, while callers own portable path serialization and all payload meaning.
+After a reader context closes, its binary handle is closed; after the one-use
+session closes, its immutable receipt remains available but opening another
+reader raises `RuntimeError`.
 
 For one logical result that spans several local paths, `mammoth.core` owns a
 separate `ArtifactTransactionPlan` protocol. A caller supplies at least two

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from mammoth.core.artifacts import (
     ArtifactChangedError,
+    ArtifactReadSession,
     ArtifactReceipt,
     ArtifactVerificationError,
     PreparedArtifact,
@@ -17,6 +18,7 @@ from mammoth.core.artifacts import (
     atomic_write_text,
     discard_prepared_artifact,
     inspect_artifact,
+    open_artifact_session,
     prepare_artifact,
     publish_prepared_artifact,
     verify_artifact,
@@ -80,6 +82,7 @@ __all__ = [
     "BackgroundPipelineSubmission",
     "BoundedBackgroundPipeline",
     "ArtifactChangedError",
+    "ArtifactReadSession",
     "ArtifactKind",
     "ArtifactReceipt",
     "ArtifactVerificationError",
@@ -118,6 +121,7 @@ __all__ = [
     "iter_execution_events",
     "join_execution_context",
     "latest_execution_id",
+    "open_artifact_session",
     "prepare_artifact",
     "publish_prepared_artifact",
     "publish_artifact_transaction",
