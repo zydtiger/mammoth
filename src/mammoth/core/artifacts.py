@@ -1,6 +1,7 @@
-"""Atomic local-filesystem publication helpers used by Mammoth producers.
+"""Local artifact publication and descriptor-bound parser access for Mammoth.
 
-Core metadata and optional trainer checkpoints call these helpers. Payload
+Core metadata and optional trainer checkpoints call publication helpers, while
+consuming projects use read sessions to parse verified opaque bytes. Payload
 meaning and serialization remain the responsibility of the caller.
 """
 
@@ -13,11 +14,13 @@ import json
 import os
 import stat
 import uuid
-from collections.abc import Callable, Mapping
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from types import TracebackType
+from typing import Any, BinaryIO, Self
 
 _DEFAULT_ARTIFACT_CHUNK_SIZE = 1024 * 1024
 
@@ -53,6 +56,203 @@ class ArtifactReceipt:
             raise ValueError("artifact receipt sha256 must be lowercase hexadecimal")
 
 
+class ArtifactReadSession:
+    """Context-managed parser access bound to one inspected regular artifact.
+
+    ``open_artifact_session()`` constructs this value for callers that need to
+    parse opaque bytes while Mammoth retains the local-file identity boundary.
+    Entering the session creates an exact-byte receipt on a private descriptor.
+    Each ``open_reader()`` context yields one binary reader over that same file
+    object, starting at offset zero.  Readers may seek freely, but only one can
+    be active and every reader must close before the outer session exits.
+
+    A successful outer exit rechecks the visible path and exact bytes.  The
+    session therefore detects changes at its boundaries, rather than promising
+    an immutable snapshot to a seek-heavy parser.  Callers retain all payload
+    interpretation and must discard parse results when the session raises.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        chunk_size: int = _DEFAULT_ARTIFACT_CHUNK_SIZE,
+    ) -> None:
+        self._path = Path(path)
+        validate_artifact_chunk_size(chunk_size)
+        self._chunk_size = chunk_size
+        self._anchor_descriptor: int | None = None
+        self._anchor_stat: os.stat_result | None = None
+        self._receipt: ArtifactReceipt | None = None
+        self._active_reader: BinaryIO | None = None
+        self._entered = False
+        self._closed = False
+        self._state_lock = Lock()
+
+    @property
+    def receipt(self) -> ArtifactReceipt:
+        """Return the entry receipt once this session has entered successfully."""
+        with self._state_lock:
+            if self._receipt is None:
+                raise RuntimeError("artifact read session has not entered successfully")
+            return self._receipt
+
+    def __enter__(self) -> Self:
+        """Open and inspect the private descriptor before parser access begins."""
+        with self._state_lock:
+            if self._entered:
+                raise RuntimeError("artifact read session may only be entered once")
+            self._entered = True
+            try:
+                descriptor, descriptor_stat = _open_artifact_descriptor(self._path)
+            except BaseException:
+                self._closed = True
+                raise
+            try:
+                receipt = inspect_artifact_descriptor(
+                    descriptor,
+                    path=self._path,
+                    chunk_size=self._chunk_size,
+                    verify_stable_reads=True,
+                )
+                _validate_artifact_session_binding(
+                    descriptor,
+                    path=self._path,
+                    expected_stat=descriptor_stat,
+                )
+            except BaseException:
+                self._closed = True
+                os.close(descriptor)
+                raise
+            self._anchor_descriptor = descriptor
+            self._anchor_stat = descriptor_stat
+            self._receipt = receipt
+            return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """Verify successful sessions and release all session-owned descriptors."""
+        del exception, traceback
+        with self._state_lock:
+            descriptor = self._anchor_descriptor
+            expected_stat = self._anchor_stat
+            reader = self._active_reader
+            self._closed = True
+            self._active_reader = None
+            self._anchor_descriptor = None
+            self._anchor_stat = None
+
+        if descriptor is None or expected_stat is None:
+            return
+        try:
+            if reader is not None:
+                with suppress(OSError, ValueError):
+                    reader.close()
+                if exception_type is None:
+                    raise RuntimeError(
+                        "artifact read session cannot exit while a reader is active"
+                    )
+                return
+            if exception_type is None:
+                _validate_artifact_session_binding(
+                    descriptor,
+                    path=self._path,
+                    expected_stat=expected_stat,
+                )
+                final_receipt = inspect_artifact_descriptor(
+                    descriptor,
+                    path=self._path,
+                    chunk_size=self._chunk_size,
+                    verify_stable_reads=True,
+                )
+                _validate_artifact_session_binding(
+                    descriptor,
+                    path=self._path,
+                    expected_stat=expected_stat,
+                )
+                if final_receipt != self.receipt:
+                    raise ArtifactChangedError(
+                        f"artifact changed while being read: {self._path}"
+                    )
+        finally:
+            if exception_type is None:
+                os.close(descriptor)
+            else:
+                with suppress(OSError):
+                    os.close(descriptor)
+
+    @contextmanager
+    def open_reader(self) -> Iterator[BinaryIO]:
+        """Yield one offset-zero binary reader bound to this session's anchor FD.
+
+        The reader is session-owned and must be used through this nested context.
+        A parser exception is propagated unchanged after reader cleanup; the
+        post-reader binding check runs only when that nested context succeeds.
+        """
+        with self._state_lock:
+            descriptor, expected_stat = self._active_anchor()
+            if self._active_reader is not None:
+                raise RuntimeError("artifact read session permits only one active reader")
+            _validate_artifact_session_binding(
+                descriptor,
+                path=self._path,
+                expected_stat=expected_stat,
+            )
+            reader_descriptor = os.dup(descriptor)
+            try:
+                os.lseek(reader_descriptor, 0, os.SEEK_SET)
+                reader = os.fdopen(reader_descriptor, "rb")
+            except BaseException:
+                os.close(reader_descriptor)
+                raise
+            self._active_reader = reader
+
+        parser_succeeded = False
+        try:
+            yield reader
+            parser_succeeded = True
+        finally:
+            try:
+                if parser_succeeded:
+                    reader.close()
+                else:
+                    with suppress(OSError, ValueError):
+                        reader.close()
+            finally:
+                with self._state_lock:
+                    if self._active_reader is reader:
+                        self._active_reader = None
+            if parser_succeeded:
+                with self._state_lock:
+                    descriptor, expected_stat = self._active_anchor()
+                    _validate_artifact_session_binding(
+                        descriptor,
+                        path=self._path,
+                        expected_stat=expected_stat,
+                    )
+
+    def _active_anchor(self) -> tuple[int, os.stat_result]:
+        """Return the private descriptor only while the outer session is active."""
+        if not self._entered or self._closed:
+            raise RuntimeError("artifact read session is not active")
+        if self._anchor_descriptor is None or self._anchor_stat is None:
+            raise RuntimeError("artifact read session is not active")
+        return self._anchor_descriptor, self._anchor_stat
+
+
+def open_artifact_session(
+    path: Path,
+    *,
+    chunk_size: int = _DEFAULT_ARTIFACT_CHUNK_SIZE,
+) -> ArtifactReadSession:
+    """Create a one-use descriptor-bound parser session for one local artifact."""
+    return ArtifactReadSession(path, chunk_size=chunk_size)
+
+
 def inspect_artifact(
     path: Path,
     *,
@@ -68,33 +268,8 @@ def inspect_artifact(
     """
     artifact_path = Path(path)
     validate_artifact_chunk_size(chunk_size)
-    initial_path_stat = os.lstat(artifact_path)
-    validate_regular_artifact_stat(initial_path_stat, artifact_path)
+    descriptor, descriptor_stat = _open_artifact_descriptor(artifact_path)
     try:
-        descriptor = os.open(artifact_path, artifact_open_flags())
-    except OSError as error:
-        if error.errno == errno.ELOOP:
-            raise ArtifactChangedError(
-                f"artifact changed before inspection: {artifact_path}"
-            ) from error
-        try:
-            after_open_failure = os.lstat(artifact_path)
-        except OSError:
-            raise ArtifactChangedError(
-                f"artifact changed before inspection: {artifact_path}"
-            ) from error
-        if not artifact_stats_match(initial_path_stat, after_open_failure):
-            raise ArtifactChangedError(
-                f"artifact changed before inspection: {artifact_path}"
-            ) from error
-        raise
-    try:
-        descriptor_stat = os.fstat(descriptor)
-        if not artifact_stats_match(initial_path_stat, descriptor_stat):
-            raise ArtifactChangedError(
-                f"artifact changed before inspection: {artifact_path}"
-            )
-        validate_regular_artifact_stat(descriptor_stat, artifact_path)
         receipt = inspect_artifact_descriptor(
             descriptor,
             path=artifact_path,
@@ -109,6 +284,54 @@ def inspect_artifact(
         return receipt
     finally:
         os.close(descriptor)
+
+
+def _open_artifact_descriptor(path: Path) -> tuple[int, os.stat_result]:
+    """Open one regular artifact and bind its descriptor to its visible path."""
+    initial_path_stat = os.lstat(path)
+    validate_regular_artifact_stat(initial_path_stat, path)
+    try:
+        descriptor = os.open(path, artifact_open_flags())
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ArtifactChangedError(f"artifact changed before inspection: {path}") from error
+        try:
+            after_open_failure = os.lstat(path)
+        except OSError:
+            raise ArtifactChangedError(f"artifact changed before inspection: {path}") from error
+        if not artifact_stats_match(initial_path_stat, after_open_failure):
+            raise ArtifactChangedError(f"artifact changed before inspection: {path}") from error
+        raise
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        if not artifact_stats_match(initial_path_stat, descriptor_stat):
+            raise ArtifactChangedError(f"artifact changed before inspection: {path}")
+        validate_regular_artifact_stat(descriptor_stat, path)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, descriptor_stat
+
+
+def _validate_artifact_session_binding(
+    descriptor: int,
+    *,
+    path: Path,
+    expected_stat: os.stat_result,
+) -> None:
+    """Require a session descriptor and visible path to remain the entry artifact."""
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        path_stat = os.lstat(path)
+    except OSError as error:
+        raise ArtifactChangedError(f"artifact changed while being read: {path}") from error
+    if (
+        not stat.S_ISREG(descriptor_stat.st_mode)
+        or not stat.S_ISREG(path_stat.st_mode)
+        or not artifact_stats_match(expected_stat, descriptor_stat)
+        or not artifact_stats_match(expected_stat, path_stat)
+    ):
+        raise ArtifactChangedError(f"artifact changed while being read: {path}")
 
 
 def verify_artifact(
