@@ -155,6 +155,34 @@ are rejected; missing paths raise `FileNotFoundError`. A receipt identifies only
 the bytes observed during inspection, so verify it again immediately before an
 operation that depends on those bytes.
 
+When parsing must consume those bytes, use a descriptor-bound read session
+instead of reopening the path yourself:
+
+```python
+from pathlib import Path
+
+from mammoth.core import open_artifact_session
+
+with open_artifact_session(Path("metadata.json")) as session:
+    receipt = session.receipt
+    with session.open_reader() as reader:
+        raw_metadata = reader.read()
+        # Parse raw_metadata with project-owned logic.
+
+# Use parsed results only after the outer context exits successfully.
+# receipt is the exact-byte identity for the parsed artifact.
+```
+
+Each nested reader starts at offset zero and supports normal binary `read`,
+`seek` (including rewind), and `tell` operations. Readers are serial: do not nest or share them
+between threads. Mammoth keeps the descriptor and transient filesystem state
+private, rejects a final-component symlink but leaves ancestor-symlink and
+containment policy to the caller, and verifies the visible path and exact bytes
+again on successful session exit. A session detects changes at these boundaries;
+it is not an immutable snapshot for a parser that reads while an external writer
+changes the file. A reader is closed when its nested context ends; a completed
+session keeps its receipt but rejects new readers with `RuntimeError`.
+
 ## Control workflow ordering and execution metadata
 
 `run-major` is the default: Mammoth dispatches runs in declaration order and

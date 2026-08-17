@@ -4,12 +4,15 @@ import errno
 import json
 import os
 import stat
+import threading
 from pathlib import Path
+from typing import BinaryIO
 
 import pytest
 
 from mammoth.core import (
     ArtifactChangedError,
+    ArtifactReadSession,
     ArtifactReceipt,
     ArtifactVerificationError,
     artifacts,
@@ -19,10 +22,40 @@ from mammoth.core import (
     atomic_write_text,
     discard_prepared_artifact,
     inspect_artifact,
+    open_artifact_session,
     prepare_artifact,
     publish_prepared_artifact,
     verify_artifact,
 )
+
+
+def _mutate_session_artifact(artifact: Path, mutation: str) -> None:
+    """Replace one test artifact with the named mutation shape."""
+    if mutation == "same-size rewrite":
+        artifact.write_bytes(b"rewrote!")
+    elif mutation == "truncation":
+        artifact.write_bytes(b"tiny")
+    elif mutation == "append":
+        artifact.write_bytes(b"original+")
+    elif mutation == "replacement":
+        replacement = artifact.with_name("replacement.bin")
+        replacement.write_bytes(b"replaced")
+        os.replace(replacement, artifact)
+    elif mutation == "deletion":
+        artifact.unlink()
+    elif mutation == "symlink substitution":
+        target = artifact.with_name("target.bin")
+        target.write_bytes(b"target")
+        artifact.unlink()
+        artifact.symlink_to(target)
+    elif mutation == "directory substitution":
+        artifact.unlink()
+        artifact.mkdir()
+    elif mutation == "fifo substitution":
+        artifact.unlink()
+        os.mkfifo(artifact)
+    else:
+        raise AssertionError(f"unknown artifact mutation: {mutation}")
 
 
 @pytest.mark.parametrize(
@@ -42,6 +75,213 @@ def test_artifact_receipt_validates_canonical_fields(
 ) -> None:
     with pytest.raises(error):
         ArtifactReceipt(path=path, size_bytes=size_bytes, sha256=sha256)  # type: ignore[arg-type]
+
+
+def test_artifact_read_session_binds_receipt_to_serial_seekable_readers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = tmp_path / "artifact.bin"
+    payload = b"abcdefgh"
+    artifact.write_bytes(payload)
+    expected = inspect_artifact(artifact, chunk_size=3)
+    calls = 0
+    original_inspect_descriptor = artifacts.inspect_artifact_descriptor
+
+    def count_descriptor_inspections(
+        descriptor: int,
+        *,
+        path: Path,
+        chunk_size: int,
+        verify_stable_reads: bool,
+    ) -> ArtifactReceipt:
+        nonlocal calls
+        calls += 1
+        return original_inspect_descriptor(
+            descriptor,
+            path=path,
+            chunk_size=chunk_size,
+            verify_stable_reads=verify_stable_reads,
+        )
+
+    monkeypatch.setattr(
+        artifacts,
+        "inspect_artifact_descriptor",
+        count_descriptor_inspections,
+    )
+    session = open_artifact_session(artifact, chunk_size=3)
+
+    assert isinstance(session, ArtifactReadSession)
+    with pytest.raises(RuntimeError, match="has not entered successfully"):
+        _ = session.receipt
+    with session:
+        assert session.receipt == expected
+        with session.open_reader() as first_reader:
+            assert first_reader.read(2) == b"ab"
+            assert first_reader.tell() == 2
+            assert first_reader.seek(4) == 4
+            assert first_reader.read(2) == b"ef"
+        assert first_reader.closed
+        with session.open_reader() as second_reader:
+            assert second_reader.tell() == 0
+            assert second_reader.read(3) == b"abc"
+
+    assert calls == 2
+    with pytest.raises(ValueError, match="closed file"):
+        first_reader.read(1)
+    with pytest.raises(RuntimeError, match="not active"), session.open_reader():
+        pass
+    with pytest.raises(RuntimeError, match="only be entered once"), session:
+        pass
+
+
+def test_artifact_read_session_rejects_nested_and_threaded_readers(tmp_path: Path) -> None:
+    artifact = tmp_path / "artifact.bin"
+    artifact.write_bytes(b"artifact")
+    threaded_errors: list[BaseException] = []
+
+    with open_artifact_session(artifact) as session, session.open_reader() as first_reader:
+        assert first_reader.read(1) == b"a"
+        with pytest.raises(RuntimeError, match="one active reader"), session.open_reader():
+            pass
+
+        def open_in_thread() -> None:
+            try:
+                with session.open_reader():
+                    pass
+            except BaseException as error:
+                threaded_errors.append(error)
+
+        thread = threading.Thread(target=open_in_thread)
+        thread.start()
+        thread.join()
+
+    assert len(threaded_errors) == 1
+    assert isinstance(threaded_errors[0], RuntimeError)
+    assert str(threaded_errors[0]) == "artifact read session permits only one active reader"
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ("before first reader", "during reader", "between readers", "after reader"),
+)
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "same-size rewrite",
+        "truncation",
+        "append",
+        "replacement",
+        "deletion",
+        "symlink substitution",
+        "directory substitution",
+        "fifo substitution",
+    ),
+)
+def test_artifact_read_session_rejects_changes_at_every_reader_boundary(
+    tmp_path: Path,
+    boundary: str,
+    mutation: str,
+) -> None:
+    artifact = tmp_path / "artifact.bin"
+    artifact.write_bytes(b"original")
+
+    with pytest.raises(  # noqa: SIM117 - assertion must cover outer-session exit.
+        ArtifactChangedError, match="changed while being read"
+    ):
+        with open_artifact_session(artifact) as session:
+            if boundary == "before first reader":
+                _mutate_session_artifact(artifact, mutation)
+                with session.open_reader():
+                    pass
+            elif boundary == "during reader":
+                with session.open_reader() as reader:
+                    assert reader.read(1) == b"o"
+                    _mutate_session_artifact(artifact, mutation)
+            elif boundary == "between readers":
+                with session.open_reader() as reader:
+                    assert reader.read(1) == b"o"
+                _mutate_session_artifact(artifact, mutation)
+                with session.open_reader():
+                    pass
+            else:
+                with session.open_reader() as reader:
+                    assert reader.read(1) == b"o"
+                _mutate_session_artifact(artifact, mutation)
+
+
+def test_artifact_read_session_preserves_initial_input_errors(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.bin"
+    with pytest.raises(FileNotFoundError), open_artifact_session(missing):
+        pass
+
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    with pytest.raises(ValueError, match="regular file"), open_artifact_session(directory):
+        pass
+
+    fifo = tmp_path / "stream"
+    os.mkfifo(fifo)
+    with pytest.raises(ValueError, match="regular file"), open_artifact_session(fifo):
+        pass
+
+    target = tmp_path / "target.bin"
+    target.write_bytes(b"target")
+    symlink = tmp_path / "link.bin"
+    symlink.symlink_to(target)
+    with pytest.raises(
+        ValueError, match="must not be a symlink"
+    ), open_artifact_session(symlink):
+        pass
+
+
+def test_artifact_read_session_propagates_parser_errors_and_closes_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ParserError(Exception):
+        """Test-only parser failure."""
+
+    artifact = tmp_path / "artifact.bin"
+    artifact.write_bytes(b"artifact")
+    opened: list[int] = []
+    closed: list[int] = []
+    original_open = artifacts.os.open
+    original_close = artifacts.os.close
+
+    def track_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        opened.append(descriptor)
+        return descriptor
+
+    def track_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(artifacts.os, "open", track_open)
+    monkeypatch.setattr(artifacts.os, "close", track_close)
+    session = open_artifact_session(artifact)
+    reader: BinaryIO | None = None
+
+    with (
+        pytest.raises(ParserError, match="parser failed"),
+        session,
+        session.open_reader() as active_reader,
+    ):
+        reader = active_reader
+        raise ParserError("parser failed")
+
+    assert reader is not None
+    assert reader.closed is True
+    assert opened == closed
+    with pytest.raises(RuntimeError, match="not active"), session.open_reader():
+        pass
 
 
 def test_inspect_artifact_records_empty_small_and_multi_chunk_files(tmp_path: Path) -> None:
