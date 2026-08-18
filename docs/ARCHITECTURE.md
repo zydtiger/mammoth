@@ -75,15 +75,29 @@ reader raises `RuntimeError`.
 For one logical result that spans several local paths, `mammoth.core` owns a
 separate `ArtifactTransactionPlan` protocol. A caller supplies at least two
 prepared `TransactionArtifact` values and a pre-existing coordinator
-`lease_root`, which owns the journal. By default every artifact stays below that
-root. A plan may instead declare non-overlapping `artifact_roots`; every target and
-its reserved sibling stage must belong to exactly one declared root, and that
-root owns the artifact's backups and retired cleanup objects. Files are
-identified through `ArtifactReceipt`; ordinary directory trees are sealed,
-synchronized, and recorded with a transaction-local tree identity. Callers may
-add validators that authenticate their own marker or payload semantics, while
-Mammoth never interprets them. The plan explicitly selects `create_only` plus
-roll-forward recovery or `replace` plus rollback-before-commit recovery.
+`lease_root`, which owns the journal. This low-level contract remains stable
+for existing callers and journals. Consumers that only know artifact keys,
+targets, kinds, validators, a namespace, and create-or-replace intent use
+`TransactionArtifactSpec` with `build_artifact_transaction_plan()`. The planner
+derives the established deterministic transaction ID, sibling stage names,
+coordinator root, non-overlapping artifact roots, and recovery policy. Its only
+filesystem side effect is safely provisioning missing target-parent directories
+through no-follow descriptor walks; it never creates a target, stage, or
+journal. The namespace identifies the logical publication and must distinguish
+otherwise identical create and replacement operations.
+
+By default every artifact stays below one root. A plan may instead declare
+non-overlapping `artifact_roots`; every target and its reserved sibling stage
+must belong to exactly one declared root, and that root owns the artifact's
+backups and retired cleanup objects. `stage_transaction_file()` exclusively
+creates, writes, and synchronizes one file stage. `move_directory_into_transaction_stage()`
+exclusively reserves a directory stage, atomically adopts a rendered local tree,
+and preserves stage/source evidence on ambiguous failure. Files are identified
+through `ArtifactReceipt`; ordinary directory trees are sealed, synchronized,
+and recorded with a transaction-local tree identity. Callers may add validators
+that authenticate their own marker or payload semantics, while Mammoth never
+interprets them. The plan explicitly selects `create_only` plus roll-forward
+recovery or `replace` plus rollback-before-commit recovery.
 
 Publication first acquires deterministic advisory leases for all target paths
 and their ancestors within their individual roots, anchors the coordinator and
@@ -102,8 +116,13 @@ random quarantine name; it also retires the coordinator journal at a
 deterministic name before its final removal. `recover_artifact_transaction()`
 binds either journal name back to the complete caller-supplied plan; it rejects
 target substitution, malformed state, identities that no longer match,
-symlinks, and special files without speculative cleanup. Existing journals
-always require that explicit recovery call.
+symlinks, and special files without speculative cleanup. Before any uncommitted
+recovery path can rename a stage to a target or restore a replacement target,
+it authenticates and runs the current-plan validator for every still-visible
+stage. A visible target is never mistaken for a stage: an old replacement
+generation and a target-only new generation retain their normal state-specific
+recovery handling. Existing journals always require that explicit recovery
+call.
 
 This is a Linux local-filesystem protocol: it requires no-follow opens,
 advisory `flock`, `renameat2(RENAME_NOREPLACE | RENAME_EXCHANGE)`,

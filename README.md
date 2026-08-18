@@ -552,6 +552,42 @@ An active `ExecutionSession` can create and own the same pipeline through
 `session.create_background_pipeline(...)`, ensuring accepted work closes before
 observers and runtime resources.
 
+For a framework-neutral result spanning several local files or directories,
+build a core transaction from stable consumer specifications, stage every
+payload, then publish it. Planning safely creates only missing target-parent
+directories; callers still render payloads and define their semantic
+validators. Use a namespace that identifies the logical publication, including
+its create or replacement intent.
+
+```python
+from pathlib import Path
+
+from mammoth.core import (
+    TransactionArtifactSpec,
+    build_artifact_transaction_plan,
+    move_directory_into_transaction_stage,
+    publish_artifact_transaction,
+    stage_transaction_file,
+)
+
+plan = build_artifact_transaction_plan(
+    namespace="reports-create",
+    artifacts=(
+        TransactionArtifactSpec("report", Path("reports/current.json"), "file"),
+        TransactionArtifactSpec("payload", Path("reports/current-data"), "directory"),
+    ),
+    replace=False,
+)
+move_directory_into_transaction_stage(plan, "payload", rendered_directory)
+stage_transaction_file(plan, "report", rendered_json_bytes)
+publish_artifact_transaction(plan)
+```
+
+The lower-level `TransactionArtifact` and `ArtifactTransactionPlan` APIs
+remain available when a caller already owns a complete plan. Recovery always
+requires the expected plan explicitly so Mammoth can bind an interrupted
+journal to the caller's current topology and validators.
+
 The lower-level bounded publisher remains available outside the trainer. A
 plan stages every artifact before committing its destinations in the declared
 order:
