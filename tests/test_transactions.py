@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import tempfile
@@ -18,11 +19,16 @@ from mammoth.core import (
     ArtifactTransactionRecoveryRequired,
     ArtifactTransactionValidationError,
     TransactionArtifact,
+    TransactionArtifactSpec,
+    build_artifact_transaction_plan,
     claim_artifact_transaction_leases,
+    move_directory_into_transaction_stage,
     publish_artifact_transaction,
     recover_artifact_transaction,
     seal_artifact_transaction,
+    stage_transaction_file,
     transaction_journal_path,
+    transaction_stage_path,
     transactions,
 )
 
@@ -62,6 +68,485 @@ def create_plan(
         mode=mode,  # type: ignore[arg-type]
         recovery_policy=("roll_forward" if mode == "create_only" else "rollback_before_commit"),
     )
+
+
+def test_consumer_planner_provisions_parents_and_preserves_stable_identity(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "new" / "publication-root"
+    report_target = root / "report.json"
+    payload_target = root / "payload"
+    artifacts = (
+        TransactionArtifactSpec("report", report_target, "file"),
+        TransactionArtifactSpec("payload", payload_target, "directory"),
+    )
+
+    plan = build_artifact_transaction_plan(
+        namespace="consumer-plan",
+        artifacts=artifacts,
+        replace=False,
+    )
+    replacement = build_artifact_transaction_plan(
+        namespace="consumer-plan",
+        artifacts=artifacts,
+        replace=True,
+    )
+
+    topology = "\0".join(
+        f"{artifact.key}\0{artifact.kind}\0{artifact.target}"
+        for artifact in sorted(artifacts, key=lambda artifact: artifact.key)
+    )
+    expected_id = f"consumer-plan-{hashlib.sha256(topology.encode()).hexdigest()[:16]}"
+    assert root.is_dir()
+    assert not report_target.exists()
+    assert not payload_target.exists()
+    assert plan.transaction_id == expected_id
+    assert plan.lease_root == root
+    assert plan.artifact_roots == (root,)
+    assert tuple(artifact.key for artifact in plan.artifacts) == ("report", "payload")
+    assert plan.artifacts[0].stage == root / f".mammoth-txn-{expected_id}-report.stage"
+    assert plan.mode == "create_only"
+    assert plan.recovery_policy == "roll_forward"
+    assert replacement.transaction_id == expected_id
+    assert replacement.mode == "replace"
+    assert replacement.recovery_policy == "rollback_before_commit"
+
+
+def test_consumer_planner_derives_multiple_roots_without_reordering_artifacts(
+    tmp_path: Path,
+) -> None:
+    shared_memory = Path("/dev/shm")
+    if not shared_memory.is_dir() or shared_memory.stat().st_dev == tmp_path.stat().st_dev:
+        pytest.skip("the host has no separate shared-memory filesystem")
+    memory_root = Path(tempfile.mkdtemp(prefix="mammoth-consumer-plan-", dir=shared_memory))
+    local_root = tmp_path / "local-root"
+    try:
+        artifacts = (
+            TransactionArtifactSpec("payload", memory_root / "payload", "directory"),
+            TransactionArtifactSpec("report", local_root / "report.json", "file"),
+        )
+
+        plan = build_artifact_transaction_plan(
+            namespace="consumer-multi-root",
+            artifacts=artifacts,
+            replace=False,
+        )
+
+        assert plan.artifact_roots == tuple(sorted((local_root, memory_root), key=str))
+        assert plan.lease_root == plan.artifact_roots[0]
+        assert tuple(artifact.key for artifact in plan.artifacts) == ("payload", "report")
+        assert all(
+            artifact.stage
+            == artifact.target.parent / f".mammoth-txn-{plan.transaction_id}-{artifact.key}.stage"
+            for artifact in plan.artifacts
+        )
+    finally:
+        shutil.rmtree(memory_root)
+
+
+def test_consumer_planner_rejects_invalid_specs_and_unsafe_topology(tmp_path: Path) -> None:
+    root = tmp_path / "publication-root"
+    report = root / "report.json"
+    payload = root / "payload"
+    valid = (
+        TransactionArtifactSpec("report", report, "file"),
+        TransactionArtifactSpec("payload", payload, "directory"),
+    )
+
+    with pytest.raises(ArtifactTransactionValidationError, match="namespace"):
+        build_artifact_transaction_plan(namespace="Unsafe", artifacts=valid, replace=False)
+    with pytest.raises(ArtifactTransactionValidationError, match="keys must be unique"):
+        build_artifact_transaction_plan(
+            namespace="consumer-invalid",
+            artifacts=(
+                TransactionArtifactSpec("report", report, "file"),
+                TransactionArtifactSpec("report", payload, "directory"),
+            ),
+            replace=False,
+        )
+    with pytest.raises(ArtifactTransactionValidationError, match="targets must be unique"):
+        build_artifact_transaction_plan(
+            namespace="consumer-invalid",
+            artifacts=(
+                TransactionArtifactSpec("report", report, "file"),
+                TransactionArtifactSpec("payload", report, "file"),
+            ),
+            replace=False,
+        )
+    with pytest.raises(ArtifactTransactionValidationError, match="must not overlap"):
+        build_artifact_transaction_plan(
+            namespace="consumer-invalid",
+            artifacts=(
+                TransactionArtifactSpec("payload", root / "payload", "directory"),
+                TransactionArtifactSpec("report", root / "payload" / "report.json", "file"),
+            ),
+            replace=False,
+        )
+    assert not (root / "payload").exists()
+
+    external = tmp_path / "external"
+    external.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(external, target_is_directory=True)
+    with pytest.raises(ArtifactTransactionValidationError, match="symlink"):
+        build_artifact_transaction_plan(
+            namespace="consumer-invalid",
+            artifacts=(
+                TransactionArtifactSpec("report", alias / "report.json", "file"),
+                TransactionArtifactSpec("payload", payload, "directory"),
+            ),
+            replace=False,
+        )
+
+    root.mkdir()
+    special = root / "special"
+    os.mkfifo(special)
+    with pytest.raises(ArtifactTransactionValidationError, match="kind does not match"):
+        build_artifact_transaction_plan(
+            namespace="consumer-invalid",
+            artifacts=(
+                TransactionArtifactSpec("report", special, "file"),
+                TransactionArtifactSpec("payload", payload, "directory"),
+            ),
+            replace=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("reserved_name", "kind", "message"),
+    (
+        (".mammoth-txn-foreign-payload.stage", "file", "reserved Mammoth object"),
+        (".mammoth-txn-foreign-payload.backup", "directory", "reserved Mammoth object"),
+        (".mammoth-transactions/foreign", "file", "Mammoth metadata"),
+    ),
+)
+def test_consumer_planner_rejects_reserved_targets_before_parent_provisioning(
+    tmp_path: Path,
+    reserved_name: str,
+    kind: str,
+    message: str,
+) -> None:
+    root = tmp_path / "unprovisioned-root"
+    with pytest.raises(ArtifactTransactionValidationError, match=message):
+        build_artifact_transaction_plan(
+            namespace="consumer-reserved",
+            artifacts=(
+                TransactionArtifactSpec("reserved", root / reserved_name, kind),  # type: ignore[arg-type]
+                TransactionArtifactSpec("normal", root / "normal.txt", "file"),
+            ),
+            replace=False,
+        )
+
+    assert not root.exists()
+
+
+def create_consumer_plan(tmp_path: Path, *, replace: bool = False) -> ArtifactTransactionPlan:
+    """Build one high-level mixed transaction plan for staging tests."""
+    root = tmp_path / "consumer-root"
+    return build_artifact_transaction_plan(
+        namespace="consumer-stage",
+        artifacts=(
+            TransactionArtifactSpec("report", root / "report.json", "file"),
+            TransactionArtifactSpec("payload", root / "payload", "directory"),
+        ),
+        replace=replace,
+    )
+
+
+def test_stage_transaction_file_is_exclusive_and_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = create_consumer_plan(tmp_path)
+    synchronized: list[int] = []
+    original_fsync = transactions.os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        synchronized.append(descriptor)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(transactions.os, "fsync", record_fsync)
+    stage = stage_transaction_file(plan, "report", b'{"complete":true}\n')
+
+    assert stage == transaction_stage_path(plan, "report")
+    assert stage.read_bytes() == b'{"complete":true}\n'
+    assert len(synchronized) >= 2
+    with pytest.raises(FileExistsError, match="already exists"):
+        stage_transaction_file(plan, "report", b"replacement")
+    with pytest.raises(ArtifactTransactionValidationError, match="not a file"):
+        stage_transaction_file(plan, "payload", b"not a directory")
+
+
+def test_stage_transaction_file_removes_only_its_incomplete_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = create_consumer_plan(tmp_path)
+
+    def fail_write(_descriptor: int, _payload: bytes) -> int:
+        raise OSError("synthetic write failure")
+
+    monkeypatch.setattr(transactions.os, "write", fail_write)
+    with pytest.raises(OSError, match="synthetic write failure"):
+        stage_transaction_file(plan, "report", b"incomplete")
+    assert not transaction_stage_path(plan, "report").exists()
+
+    occupied = transaction_stage_path(plan, "report")
+    occupied.write_text("other publisher")
+    with pytest.raises(FileExistsError, match="already exists"):
+        stage_transaction_file(plan, "report", b"must not remove occupied stage")
+    assert occupied.read_text() == "other publisher"
+
+
+def test_stage_transaction_file_rejects_a_post_sync_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = create_consumer_plan(tmp_path)
+    stage = transaction_stage_path(plan, "report")
+    replacement = stage.parent / "replacement.txt"
+    replacement.write_text("substituted")
+    original_sync = transactions.sync_directory_strict
+    replaced = False
+
+    def sync_then_replace(path: Path, *, lease_root: Path | None = None) -> None:
+        nonlocal replaced
+        original_sync(path, lease_root=lease_root)
+        if path == stage.parent and not replaced:
+            replaced = True
+            os.replace(replacement, stage)
+
+    monkeypatch.setattr(transactions, "sync_directory_strict", sync_then_replace)
+    with pytest.raises(ArtifactTransactionRecoveryError, match="changed after synchronization"):
+        stage_transaction_file(plan, "report", b"original")
+
+    assert stage.read_text() == "substituted"
+
+
+def test_move_directory_into_transaction_stage_adopts_one_safe_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = create_consumer_plan(tmp_path)
+    source = plan.lease_root / "rendered"
+    source.mkdir()
+    (source / "part.txt").write_text("payload")
+    synchronized: list[int] = []
+    original_fsync = transactions.os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        synchronized.append(descriptor)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(transactions.os, "fsync", record_fsync)
+    stage = move_directory_into_transaction_stage(plan, "payload", source)
+
+    assert stage == transaction_stage_path(plan, "payload")
+    assert (stage / "part.txt").read_text() == "payload"
+    assert not source.exists()
+    assert len(synchronized) >= 4
+
+
+def test_directory_staging_preserves_evidence_after_an_ambiguous_exchange(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = create_consumer_plan(tmp_path)
+    source = plan.lease_root / "rendered"
+    source.mkdir()
+    (source / "part.txt").write_text("payload")
+    original_exchange = transactions.rename_exchange
+
+    def exchange_then_interrupt(
+        first: Path, second: Path, *, lease_root: Path | None = None
+    ) -> None:
+        original_exchange(first, second, lease_root=lease_root)
+        raise InjectedInterruption("after directory exchange")
+
+    monkeypatch.setattr(transactions, "rename_exchange", exchange_then_interrupt)
+    with pytest.raises(InjectedInterruption, match="after directory exchange"):
+        move_directory_into_transaction_stage(plan, "payload", source)
+
+    stage = transaction_stage_path(plan, "payload")
+    assert (stage / "part.txt").read_text() == "payload"
+    assert source.is_dir()
+    assert not tuple(source.iterdir())
+
+
+def test_directory_staging_rejects_source_replaced_during_exchange(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = create_consumer_plan(tmp_path)
+    source = plan.lease_root / "rendered"
+    source.mkdir()
+    (source / "original.txt").write_text("original payload")
+    replacement = plan.lease_root / "replacement"
+    replacement.mkdir()
+    (replacement / "replacement.txt").write_text("replacement payload")
+    original_exchange = transactions.rename_exchange
+
+    def exchange_then_replace(
+        first: Path, second: Path, *, lease_root: Path | None = None
+    ) -> None:
+        original_exchange(first, second, lease_root=lease_root)
+        original_exchange(replacement, first, lease_root=lease_root)
+
+    monkeypatch.setattr(transactions, "rename_exchange", exchange_then_replace)
+    with pytest.raises(ArtifactTransactionRecoveryError, match="identity-mismatched"):
+        move_directory_into_transaction_stage(plan, "payload", source)
+
+    stage = transaction_stage_path(plan, "payload")
+    assert (stage / "replacement.txt").read_text() == "replacement payload"
+    assert (replacement / "original.txt").read_text() == "original payload"
+    assert source.is_dir()
+    assert not tuple(source.iterdir())
+
+
+def test_directory_staging_rejects_unsafe_sources_and_occupied_stage(tmp_path: Path) -> None:
+    plan = create_consumer_plan(tmp_path)
+    source = plan.lease_root / "rendered"
+    source.mkdir()
+    (source / "part.txt").write_text("payload")
+    alias = plan.lease_root / "rendered-alias"
+    alias.symlink_to(source, target_is_directory=True)
+    with pytest.raises(ArtifactTransactionValidationError, match="symlink"):
+        move_directory_into_transaction_stage(plan, "payload", alias)
+
+    stage = transaction_stage_path(plan, "payload")
+    stage.mkdir()
+    with pytest.raises(FileExistsError, match="already exists"):
+        move_directory_into_transaction_stage(plan, "payload", source)
+    assert source.exists()
+    assert stage.exists()
+
+    unsafe_plan = create_consumer_plan(tmp_path / "unsafe")
+    unsafe_source = unsafe_plan.lease_root / "unsafe-rendered"
+    unsafe_source.mkdir()
+    os.mkfifo(unsafe_source / "stream")
+    with pytest.raises(ArtifactTransactionValidationError, match="special"):
+        move_directory_into_transaction_stage(unsafe_plan, "payload", unsafe_source)
+
+
+def test_directory_staging_rejects_transaction_metadata_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "consumer-root"
+    plan = create_consumer_plan(tmp_path)
+    other_plan = build_artifact_transaction_plan(
+        namespace="other-journal",
+        artifacts=(
+            TransactionArtifactSpec("other-report", root / "other-report.json", "file"),
+            TransactionArtifactSpec("other-payload", root / "other-payload", "directory"),
+        ),
+        replace=False,
+    )
+    stage_transaction_file(other_plan, "other-report", b"other report")
+    rendered = root / "other-rendered"
+    rendered.mkdir()
+    (rendered / "part.txt").write_text("other payload")
+    move_directory_into_transaction_stage(other_plan, "other-payload", rendered)
+    original_create = transactions.create_transaction_journal
+
+    def create_then_interrupt(
+        path: Path, journal: dict[str, object]
+    ) -> transactions._JournalHandle:
+        original_create(path, journal)
+        raise InjectedInterruption("after durable journal creation")
+
+    monkeypatch.setattr(transactions, "create_transaction_journal", create_then_interrupt)
+    with pytest.raises(InjectedInterruption):
+        publish_artifact_transaction(other_plan)
+    monkeypatch.setattr(transactions, "create_transaction_journal", original_create)
+
+    metadata = root / ".mammoth-transactions"
+    stage = transaction_stage_path(plan, "payload")
+    with pytest.raises(ArtifactTransactionValidationError, match="metadata"):
+        move_directory_into_transaction_stage(plan, "payload", metadata)
+
+    assert transaction_journal_path(other_plan).is_file()
+    assert metadata.is_dir()
+    assert not stage.exists()
+
+
+def test_directory_staging_rejects_nested_transaction_metadata_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = create_consumer_plan(tmp_path)
+    source = plan.lease_root / "rendered"
+    other_plan = build_artifact_transaction_plan(
+        namespace="nested-journal",
+        artifacts=(
+            TransactionArtifactSpec("other-report", source / "other-report.json", "file"),
+            TransactionArtifactSpec("other-payload", source / "other-payload", "directory"),
+        ),
+        replace=False,
+    )
+    stage_transaction_file(other_plan, "other-report", b"other report")
+    nested_rendered = source / "other-rendered"
+    nested_rendered.mkdir()
+    (nested_rendered / "part.txt").write_text("other payload")
+    move_directory_into_transaction_stage(other_plan, "other-payload", nested_rendered)
+    original_create = transactions.create_transaction_journal
+
+    def create_then_interrupt(
+        path: Path, journal: dict[str, object]
+    ) -> transactions._JournalHandle:
+        original_create(path, journal)
+        raise InjectedInterruption("after durable journal creation")
+
+    monkeypatch.setattr(transactions, "create_transaction_journal", create_then_interrupt)
+    with pytest.raises(InjectedInterruption):
+        publish_artifact_transaction(other_plan)
+    monkeypatch.setattr(transactions, "create_transaction_journal", original_create)
+
+    stage = transaction_stage_path(plan, "payload")
+    with pytest.raises(ArtifactTransactionValidationError, match="contains Mammoth metadata"):
+        move_directory_into_transaction_stage(plan, "payload", source)
+
+    assert transaction_journal_path(other_plan).is_file()
+    assert (source / ".mammoth-transactions").is_dir()
+    assert not stage.exists()
+
+
+def test_directory_staging_rejects_foreign_reserved_stage_and_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "consumer-root"
+    plan = create_consumer_plan(tmp_path)
+    other_plan = build_artifact_transaction_plan(
+        namespace="foreign-transaction",
+        artifacts=(
+            TransactionArtifactSpec("other-report", root / "other-report.json", "file"),
+            TransactionArtifactSpec("other-payload", root / "other-payload", "directory"),
+        ),
+        replace=False,
+    )
+    stage_transaction_file(other_plan, "other-report", b"other report")
+    rendered = root / "other-rendered"
+    rendered.mkdir()
+    (rendered / "part.txt").write_text("other payload")
+    foreign_stage = move_directory_into_transaction_stage(other_plan, "other-payload", rendered)
+    original_create = transactions.create_transaction_journal
+
+    def create_then_interrupt(
+        path: Path, journal: dict[str, object]
+    ) -> transactions._JournalHandle:
+        original_create(path, journal)
+        raise InjectedInterruption("after durable journal creation")
+
+    monkeypatch.setattr(transactions, "create_transaction_journal", create_then_interrupt)
+    with pytest.raises(InjectedInterruption):
+        publish_artifact_transaction(other_plan)
+    monkeypatch.setattr(transactions, "create_transaction_journal", original_create)
+    foreign_backup = transactions.transaction_backup_path(other_plan, other_plan.artifacts[1])
+    foreign_backup.mkdir()
+    (foreign_backup / "original.txt").write_text("foreign original")
+
+    stage = transaction_stage_path(plan, "payload")
+    with pytest.raises(ArtifactTransactionValidationError, match="reserved Mammoth object"):
+        move_directory_into_transaction_stage(plan, "payload", foreign_stage)
+    with pytest.raises(ArtifactTransactionValidationError, match="reserved Mammoth object"):
+        move_directory_into_transaction_stage(plan, "payload", foreign_backup)
+
+    assert transaction_journal_path(other_plan).is_file()
+    assert (foreign_stage / "part.txt").read_text() == "other payload"
+    assert (foreign_backup / "original.txt").read_text() == "foreign original"
+    assert not stage.exists()
 
 
 def test_create_only_transaction_publishes_mixed_artifacts_and_cleans_state(
@@ -146,6 +631,185 @@ def test_existing_journal_requires_explicit_recovery_and_rolls_forward(
     assert plan.artifacts[0].target.read_text() == "new report"
     assert (plan.artifacts[1].target / "nested" / "part.txt").read_text() == "new payload"
     assert not transaction_journal_path(plan).exists()
+
+
+def create_validated_three_artifact_plan(
+    tmp_path: Path,
+    expected: dict[str, str],
+    *,
+    replace: bool = False,
+    observed_validation_paths: list[Path] | None = None,
+) -> ArtifactTransactionPlan:
+    """Build and stage a three-file plan whose validators read mutable expectations."""
+    root = tmp_path / "three-artifact-root"
+
+    def validator(key: str) -> transactions.ArtifactValidator:
+        def validate(path: Path) -> None:
+            if observed_validation_paths is not None:
+                observed_validation_paths.append(path)
+            assert path.read_text() == expected[key]
+
+        return validate
+
+    plan = build_artifact_transaction_plan(
+        namespace="recovery-preflight",
+        artifacts=tuple(
+            TransactionArtifactSpec(key, root / f"{key}.txt", "file", validator(key))
+            for key in ("first", "second", "third")
+        ),
+        replace=replace,
+    )
+    if replace:
+        for artifact in plan.artifacts:
+            artifact.target.write_text(f"old-{artifact.key}")
+    for artifact in plan.artifacts:
+        stage_transaction_file(plan, artifact.key, expected[artifact.key].encode())
+    return plan
+
+
+def test_recovery_preflights_every_visible_stage_before_first_target_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = {"first": "first", "second": "second", "third": "third"}
+    plan = create_validated_three_artifact_plan(tmp_path, expected)
+    original_create = transactions.create_transaction_journal
+
+    def create_then_interrupt(
+        path: Path, journal: dict[str, object]
+    ) -> transactions._JournalHandle:
+        original_create(path, journal)
+        raise InjectedInterruption("after durable journal creation")
+
+    monkeypatch.setattr(transactions, "create_transaction_journal", create_then_interrupt)
+    with pytest.raises(InjectedInterruption):
+        publish_artifact_transaction(plan)
+    monkeypatch.setattr(transactions, "create_transaction_journal", original_create)
+    expected["third"] = "semantic-stale"
+
+    with pytest.raises(ArtifactTransactionValidationError, match="third"):
+        recover_artifact_transaction(plan)
+
+    assert all(not artifact.target.exists() for artifact in plan.artifacts)
+    assert all(artifact.stage.exists() for artifact in plan.artifacts)
+    assert transaction_journal_path(plan).exists()
+
+
+def test_recovery_preflight_blocks_later_publication_after_a_partial_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = {"first": "first", "second": "second", "third": "third"}
+    plan = create_validated_three_artifact_plan(tmp_path, expected)
+    original_rename = transactions.rename_without_overwrite
+    interrupted = False
+
+    def publish_first_then_interrupt(
+        source: Path, destination: Path, *, lease_root: Path | None = None
+    ) -> None:
+        nonlocal interrupted
+        original_rename(source, destination, lease_root=lease_root)
+        if destination == plan.artifacts[0].target and not interrupted:
+            interrupted = True
+            raise InjectedInterruption("after first target rename")
+
+    monkeypatch.setattr(transactions, "rename_without_overwrite", publish_first_then_interrupt)
+    with pytest.raises(InjectedInterruption):
+        publish_artifact_transaction(plan)
+    monkeypatch.setattr(transactions, "rename_without_overwrite", original_rename)
+    expected["third"] = "semantic-stale"
+
+    with pytest.raises(ArtifactTransactionValidationError, match="third"):
+        recover_artifact_transaction(plan)
+
+    assert plan.artifacts[0].target.read_text() == "first"
+    assert not plan.artifacts[1].target.exists()
+    assert not plan.artifacts[2].target.exists()
+    assert plan.artifacts[1].stage.exists()
+    assert plan.artifacts[2].stage.exists()
+    assert transaction_journal_path(plan).exists()
+
+
+def test_recovery_reassociates_journal_records_when_specs_are_reordered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "reordered-root"
+    specs = (
+        TransactionArtifactSpec("first", root / "first.txt", "file"),
+        TransactionArtifactSpec("second", root / "second.txt", "file"),
+        TransactionArtifactSpec("third", root / "third.txt", "file"),
+    )
+    plan = build_artifact_transaction_plan(
+        namespace="reordered-recovery",
+        artifacts=specs,
+        replace=False,
+    )
+    for artifact in plan.artifacts:
+        stage_transaction_file(plan, artifact.key, artifact.key.encode())
+    original_create = transactions.create_transaction_journal
+
+    def create_then_interrupt(
+        path: Path, journal: dict[str, object]
+    ) -> transactions._JournalHandle:
+        original_create(path, journal)
+        raise InjectedInterruption("after durable journal creation")
+
+    monkeypatch.setattr(transactions, "create_transaction_journal", create_then_interrupt)
+    with pytest.raises(InjectedInterruption):
+        publish_artifact_transaction(plan)
+    monkeypatch.setattr(transactions, "create_transaction_journal", original_create)
+    rebuilt_plan = build_artifact_transaction_plan(
+        namespace="reordered-recovery",
+        artifacts=tuple(reversed(specs)),
+        replace=False,
+    )
+    published_targets: list[Path] = []
+    original_rename = transactions.rename_without_overwrite
+
+    def record_publication_order(
+        source: Path, destination: Path, *, lease_root: Path | None = None
+    ) -> None:
+        original_rename(source, destination, lease_root=lease_root)
+        if destination in {artifact.target for artifact in plan.artifacts}:
+            published_targets.append(destination)
+
+    monkeypatch.setattr(transactions, "rename_without_overwrite", record_publication_order)
+    result = recover_artifact_transaction(rebuilt_plan)
+
+    assert rebuilt_plan.transaction_id == plan.transaction_id
+    assert published_targets == [artifact.target for artifact in plan.artifacts]
+    assert result.committed_targets == tuple(artifact.target for artifact in rebuilt_plan.artifacts)
+    assert all(artifact.target.read_text() == artifact.key for artifact in plan.artifacts)
+    assert not transaction_journal_path(plan).exists()
+
+
+def test_replacement_recovery_never_preflights_a_visible_old_target_as_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = {"first": "first", "second": "second", "third": "third"}
+    observed: list[Path] = []
+    plan = create_validated_three_artifact_plan(
+        tmp_path,
+        expected,
+        replace=True,
+        observed_validation_paths=observed,
+    )
+    original_create = transactions.create_transaction_journal
+
+    def create_then_interrupt(
+        path: Path, journal: dict[str, object]
+    ) -> transactions._JournalHandle:
+        original_create(path, journal)
+        raise InjectedInterruption("after durable journal creation")
+
+    monkeypatch.setattr(transactions, "create_transaction_journal", create_then_interrupt)
+    with pytest.raises(InjectedInterruption):
+        publish_artifact_transaction(plan)
+    monkeypatch.setattr(transactions, "create_transaction_journal", original_create)
+
+    result = recover_artifact_transaction(plan)
+
+    assert result.cleanup_complete
+    assert all(artifact.target.read_text() == f"old-{artifact.key}" for artifact in plan.artifacts)
+    assert all(path.name.endswith(".stage") for path in observed)
 
 
 def test_replacement_recovery_restores_prior_generation_before_commit(
