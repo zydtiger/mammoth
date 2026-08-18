@@ -34,7 +34,12 @@ _JOURNAL_VERSION = 2
 _TRANSACTION_DIRECTORY_NAME = ".mammoth-transactions"
 _JOURNAL_DIRECTORY_NAME = "journals"
 _TRANSACTION_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+_TRANSACTION_NAMESPACE_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,43}")
 _ARTIFACT_KEY_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}")
+_RESERVED_TRANSACTION_OBJECT_PATTERN = re.compile(
+    r"\.mammoth-txn-[a-z0-9][a-z0-9-]{0,62}-[A-Za-z0-9][A-Za-z0-9_.-]{0,62}"
+    r"\.(?:stage|backup)"
+)
 _JOURNAL_STATES = frozenset({"prepared", "committed"})
 _ARTIFACT_STATES = frozenset(
     {"pending", "backup_moving", "backup_moved", "publishing", "published"}
@@ -77,6 +82,21 @@ class TransactionArtifact:
 
     key: str
     stage: Path
+    target: Path
+    kind: ArtifactKind
+    validator: ArtifactValidator | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionArtifactSpec:
+    """Describe one consumer artifact before Mammoth derives its transaction paths.
+
+    :func:`build_artifact_transaction_plan` converts these framework-neutral
+    values into the retained low-level :class:`TransactionArtifact` contract.
+    Callers keep artifact meaning and any semantic ``validator``.
+    """
+
+    key: str
     target: Path
     kind: ArtifactKind
     validator: ArtifactValidator | None = None
@@ -144,6 +164,89 @@ class _JournalHandle:
 
     path: Path
     receipt: ArtifactReceipt
+
+
+def build_artifact_transaction_plan(
+    *,
+    namespace: str,
+    artifacts: tuple[TransactionArtifactSpec, ...],
+    replace: bool,
+) -> ArtifactTransactionPlan:
+    """Derive a stable consumer transaction plan and safely provision parents.
+
+    Planning creates only any missing target-parent directories through
+    descriptor-anchored no-follow walks.  It never creates a target, stage, or
+    journal.  The transaction ID and root selection intentionally preserve the
+    established consumer convention so a restarted caller can rebuild plans for
+    compatible active journals.
+    """
+    if not isinstance(namespace, str):
+        raise TypeError("transaction namespace must be a string")
+    if _TRANSACTION_NAMESPACE_PATTERN.fullmatch(namespace) is None:
+        raise ArtifactTransactionValidationError("transaction namespace is unsafe")
+    if not isinstance(artifacts, tuple):
+        raise TypeError("transaction artifacts must be a tuple")
+    if not isinstance(replace, bool):
+        raise TypeError("transaction replace intent must be a bool")
+    if len(artifacts) < 2:
+        raise ArtifactTransactionValidationError(
+            "a transaction must contain at least two artifacts"
+        )
+
+    normalized_specs: list[TransactionArtifactSpec] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, TransactionArtifactSpec):
+            raise TypeError("transaction artifact specs must be TransactionArtifactSpec values")
+        _validate_transaction_artifact_spec(artifact)
+        target = normalize_transaction_path(artifact.target, "target")
+        _validate_planned_target_path(target)
+        normalized_specs.append(
+            TransactionArtifactSpec(
+                key=artifact.key,
+                target=target,
+                kind=artifact.kind,
+                validator=artifact.validator,
+            )
+        )
+    normalized = tuple(normalized_specs)
+    if len({artifact.key for artifact in normalized}) != len(normalized):
+        raise ArtifactTransactionValidationError("transaction artifact keys must be unique")
+    if len({artifact.target for artifact in normalized}) != len(normalized):
+        raise ArtifactTransactionValidationError("transaction artifact targets must be unique")
+    _validate_planned_target_topology(normalized)
+    for artifact in normalized:
+        _ensure_transaction_target_parent(artifact.target.parent)
+
+    artifact_roots = _planned_transaction_artifact_roots(normalized)
+    _revalidate_transaction_roots(artifact_roots)
+    topology = "\0".join(
+        f"{artifact.key}\0{artifact.kind}\0{artifact.target}"
+        for artifact in sorted(normalized, key=lambda artifact: artifact.key)
+    )
+    transaction_id = f"{namespace}-{hashlib.sha256(topology.encode()).hexdigest()[:16]}"
+    mode: PublicationMode = "replace" if replace else "create_only"
+    recovery_policy: RecoveryPolicy = "rollback_before_commit" if replace else "roll_forward"
+    plan = ArtifactTransactionPlan(
+        transaction_id=transaction_id,
+        lease_root=artifact_roots[0],
+        artifact_roots=artifact_roots,
+        artifacts=tuple(
+            TransactionArtifact(
+                key=artifact.key,
+                target=artifact.target,
+                stage=(
+                    artifact.target.parent
+                    / f".mammoth-txn-{transaction_id}-{artifact.key}.stage"
+                ),
+                kind=artifact.kind,
+                validator=artifact.validator,
+            )
+            for artifact in normalized
+        ),
+        mode=mode,
+        recovery_policy=recovery_policy,
+    )
+    return validate_artifact_transaction_plan(plan, allow_missing_stages=True)
 
 
 def transaction_stage_path(plan: ArtifactTransactionPlan, key: str) -> Path:
@@ -260,6 +363,7 @@ def recover_artifact_transaction(plan: ArtifactTransactionPlan) -> ArtifactTrans
         if journal["state"] == "committed":
             validate_committed_generation(validated, journal)
             return cleanup_committed_transaction(validated, journal_handle, journal)
+        preflight_recovery_stages(validated, journal)
         if validated.recovery_policy == "roll_forward":
             publish_journaled_transaction(validated, journal_handle, journal)
             return cleanup_committed_transaction(validated, journal_handle, journal)
@@ -410,6 +514,466 @@ def transaction_artifact_for_key(plan: ArtifactTransactionPlan, key: str) -> Tra
         if artifact.key == key:
             return artifact
     raise KeyError(f"transaction plan has no artifact key {key!r}")
+
+
+def stage_transaction_file(plan: ArtifactTransactionPlan, key: str, payload: bytes) -> Path:
+    """Exclusively write and synchronize one reserved regular-file stage.
+
+    Callers use this after :func:`build_artifact_transaction_plan` has derived
+    the stage path and before :func:`publish_artifact_transaction` seals it.
+    On a failed write, Mammoth removes only the same incomplete inode it just
+    created; any substituted or ambiguous object remains preserved as evidence.
+    """
+    if not isinstance(payload, bytes):
+        raise TypeError("transaction file payload must be bytes")
+    artifact, normalized = _transaction_staging_artifact(plan, key, "file")
+    root = transaction_artifact_root(normalized, artifact)
+    stage = artifact.stage
+    if object_exists(stage):
+        validate_existing_object(stage, "file", "stage")
+        raise FileExistsError(f"transaction stage already exists: {stage}")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise NotImplementedError("artifact transactions require os.O_NOFOLLOW")
+    descriptor: int | None = None
+    created_identity: tuple[int, int] | None = None
+    complete = False
+    try:
+        parent_descriptor, name = open_confined_parent(stage, lease_root=root)
+        try:
+            try:
+                descriptor = os.open(name, flags | os.O_NOFOLLOW, 0o600, dir_fd=parent_descriptor)
+            except FileExistsError:
+                validate_existing_object(stage, "file", "stage")
+                raise FileExistsError(f"transaction stage already exists: {stage}") from None
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ArtifactTransactionValidationError(
+                    f"transaction stage is not regular: {stage}"
+                )
+            created_identity = (file_stat.st_dev, file_stat.st_ino)
+            _write_transaction_payload(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+                descriptor = None
+            os.close(parent_descriptor)
+        sync_directory_strict(stage.parent, lease_root=root)
+        if created_identity is None:
+            raise ArtifactTransactionRecoveryError(
+                f"transaction stage identity is unavailable; preserving evidence: {stage}"
+            )
+        _require_owned_file_stage(stage, root, created_identity)
+        complete = True
+        return stage
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        if created_identity is not None and not complete:
+            _discard_owned_file_stage(stage, root, created_identity)
+        raise
+
+
+def move_directory_into_transaction_stage(
+    plan: ArtifactTransactionPlan,
+    key: str,
+    source: Path,
+) -> Path:
+    """Exclusively adopt one rendered directory at its transaction stage.
+
+    The source must be an ordinary same-filesystem directory inside the
+    artifact root.  Mammoth reserves the exact stage name, exchanges it with
+    the source atomically, synchronizes the adopted tree, and removes only its
+    known empty reservation.  An ambiguous interruption leaves both names as
+    evidence instead of attempting a speculative rollback.
+    """
+    artifact, normalized = _transaction_staging_artifact(plan, key, "directory")
+    if not isinstance(source, Path):
+        raise TypeError("transaction directory source must be a pathlib.Path")
+    root = transaction_artifact_root(normalized, artifact)
+    source = normalize_transaction_path(source, "directory source")
+    validate_existing_object(source, "directory", "directory source")
+    if source == root or not source.is_relative_to(root):
+        raise ArtifactTransactionValidationError(
+            f"transaction directory source escapes its artifact_root: {source}"
+        )
+    if source.stat().st_dev != root.stat().st_dev:
+        raise ArtifactTransactionValidationError(
+            "transaction directory source must share its artifact_root's filesystem"
+        )
+    _validate_directory_source_topology(normalized, source)
+    source_identity = inspect_transaction_object(source, "directory", synchronize=False)
+    _validate_directory_source_reserved_objects(source)
+    stage = artifact.stage
+    if object_exists(stage):
+        validate_existing_object(stage, "directory", "stage")
+        raise FileExistsError(f"transaction stage already exists: {stage}")
+
+    reservation: tuple[int, int] | None = None
+    exchanged = False
+    try:
+        reservation = _reserve_transaction_directory(stage, root)
+        rename_exchange(stage, source, lease_root=root)
+        exchanged = True
+        sync_directory_strict(stage.parent, lease_root=root)
+        if source.parent != stage.parent:
+            sync_directory_strict(source.parent, lease_root=root)
+        adopted_identity = inspect_transaction_object(stage, "directory", synchronize=True)
+        if adopted_identity != source_identity:
+            raise ArtifactTransactionRecoveryError(
+                "adopted directory stage is identity-mismatched; preserving evidence: "
+                f"{stage}"
+            )
+        _remove_owned_empty_directory(source, root, reservation)
+        return stage
+    except BaseException:
+        if reservation is not None and not exchanged:
+            _discard_owned_empty_directory(stage, root, reservation)
+        raise
+
+
+def _transaction_staging_artifact(
+    plan: ArtifactTransactionPlan,
+    key: str,
+    kind: ArtifactKind,
+) -> tuple[TransactionArtifact, ArtifactTransactionPlan]:
+    """Return one validated artifact only when its staging kind matches."""
+    if not isinstance(key, str):
+        raise TypeError("transaction artifact key must be a string")
+    normalized = validate_artifact_transaction_plan(plan, allow_missing_stages=True)
+    artifact = transaction_artifact_for_key(normalized, key)
+    if artifact.kind != kind:
+        raise ArtifactTransactionValidationError(
+            f"transaction artifact {key!r} is not a {kind} stage"
+        )
+    return artifact, normalized
+
+
+def _write_transaction_payload(descriptor: int, payload: bytes) -> None:
+    """Write every caller-owned byte through one exclusively created descriptor."""
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError(errno.EIO, "transaction stage write made no progress")
+        offset += written
+
+
+def _discard_owned_file_stage(
+    path: Path,
+    root: Path,
+    identity: tuple[int, int],
+) -> None:
+    """Unlink only an incomplete regular stage that still has Mammoth's inode."""
+    try:
+        parent_descriptor, name = open_confined_parent(path, lease_root=root)
+    except (ArtifactTransactionError, OSError):
+        return
+    try:
+        try:
+            observed = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(observed.st_mode) or (observed.st_dev, observed.st_ino) != identity:
+            return
+        os.unlink(name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    except OSError:
+        return
+    finally:
+        os.close(parent_descriptor)
+
+
+def _require_owned_file_stage(path: Path, root: Path, identity: tuple[int, int]) -> None:
+    """Re-open a synchronized file stage and bind its name to the created inode."""
+    try:
+        parent_descriptor, name = open_confined_parent(path, lease_root=root)
+    except OSError as error:
+        raise ArtifactTransactionRecoveryError(
+            f"transaction stage changed after synchronization; preserving evidence: {path}"
+        ) from error
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if not hasattr(os, "O_NOFOLLOW"):
+            raise NotImplementedError("artifact transactions require os.O_NOFOLLOW")
+        try:
+            descriptor = os.open(name, flags | os.O_NOFOLLOW, dir_fd=parent_descriptor)
+        except OSError as error:
+            raise ArtifactTransactionRecoveryError(
+                f"transaction stage changed after synchronization; preserving evidence: {path}"
+            ) from error
+        try:
+            observed = os.fstat(descriptor)
+            if not stat.S_ISREG(observed.st_mode) or (observed.st_dev, observed.st_ino) != identity:
+                raise ArtifactTransactionRecoveryError(
+                    f"transaction stage changed after synchronization; preserving evidence: {path}"
+                )
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _validate_directory_source_topology(plan: ArtifactTransactionPlan, source: Path) -> None:
+    """Prevent adoption from a transaction target, stage, backup, or metadata path."""
+    for candidate in plan.artifacts:
+        paths = (
+            (candidate.target, candidate.kind),
+            (candidate.stage, candidate.kind),
+            (transaction_backup_path(plan, candidate), candidate.kind),
+        )
+        if any(
+            transaction_paths_overlap(source, "directory", path, kind)
+            for path, kind in paths
+        ):
+            raise ArtifactTransactionValidationError(
+                f"transaction directory source overlaps a transaction path: {source}"
+            )
+    if any(
+        transaction_paths_overlap(
+            source,
+            "directory",
+            root / _TRANSACTION_DIRECTORY_NAME,
+            "directory",
+        )
+        for root in plan.artifact_roots
+    ):
+        raise ArtifactTransactionValidationError(
+            f"transaction directory source overlaps Mammoth metadata: {source}"
+        )
+    if _RESERVED_TRANSACTION_OBJECT_PATTERN.fullmatch(source.name) is not None:
+        raise ArtifactTransactionValidationError(
+            f"transaction directory source is a reserved Mammoth object: {source}"
+        )
+
+
+def _validate_directory_source_reserved_objects(source: Path) -> None:
+    """Reject a rendered tree that would carry another transaction's live object."""
+    for current, directories, files in os.walk(source, followlinks=False):
+        for name in (*directories, *files):
+            if name == _TRANSACTION_DIRECTORY_NAME:
+                raise ArtifactTransactionValidationError(
+                    "transaction directory source contains Mammoth metadata: "
+                    f"{Path(current) / name}"
+                )
+            if _RESERVED_TRANSACTION_OBJECT_PATTERN.fullmatch(name) is not None:
+                raise ArtifactTransactionValidationError(
+                    "transaction directory source contains a reserved Mammoth object: "
+                    f"{Path(current) / name}"
+                )
+
+
+def _reserve_transaction_directory(path: Path, root: Path) -> tuple[int, int]:
+    """Create and synchronize one exact empty stage directory without following links."""
+    try:
+        parent_descriptor, name = open_confined_parent(path, lease_root=root)
+    except OSError as error:
+        raise ArtifactTransactionValidationError(
+            f"transaction stage parent is unsafe: {path.parent}"
+        ) from error
+    try:
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+        except FileExistsError:
+            validate_existing_object(path, "directory", "stage")
+            raise FileExistsError(f"transaction stage already exists: {path}") from None
+        os.fsync(parent_descriptor)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        if not hasattr(os, "O_NOFOLLOW"):
+            raise NotImplementedError("artifact transactions require os.O_NOFOLLOW")
+        descriptor = os.open(name, flags | os.O_NOFOLLOW, dir_fd=parent_descriptor)
+        try:
+            directory_stat = os.fstat(descriptor)
+            if not stat.S_ISDIR(directory_stat.st_mode):
+                raise ArtifactTransactionValidationError(
+                    f"transaction stage is not a directory: {path}"
+                )
+            os.fsync(descriptor)
+            return directory_stat.st_dev, directory_stat.st_ino
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _discard_owned_empty_directory(
+    path: Path,
+    root: Path,
+    identity: tuple[int, int],
+) -> None:
+    """Remove only Mammoth's untouched empty directory reservation after failure."""
+    try:
+        _remove_owned_empty_directory(path, root, identity)
+    except (ArtifactTransactionError, OSError):
+        return
+
+
+def _remove_owned_empty_directory(
+    path: Path,
+    root: Path,
+    identity: tuple[int, int],
+) -> None:
+    """Remove a known empty directory through its root-anchored parent descriptor."""
+    parent_descriptor, name = open_confined_parent(path, lease_root=root)
+    try:
+        observed = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if not stat.S_ISDIR(observed.st_mode) or (observed.st_dev, observed.st_ino) != identity:
+            raise ArtifactTransactionRecoveryError(
+                f"transaction directory reservation changed; preserving evidence: {path}"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        if not hasattr(os, "O_NOFOLLOW"):
+            raise NotImplementedError("artifact transactions require os.O_NOFOLLOW")
+        descriptor = os.open(name, flags | os.O_NOFOLLOW, dir_fd=parent_descriptor)
+        try:
+            if os.listdir(descriptor):
+                raise ArtifactTransactionRecoveryError(
+                    f"transaction directory reservation is not empty; preserving evidence: {path}"
+                )
+        finally:
+            os.close(descriptor)
+        os.rmdir(name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _validate_transaction_artifact_spec(artifact: TransactionArtifactSpec) -> None:
+    """Reject invalid high-level inputs before they affect plan identity or paths."""
+    if not isinstance(artifact.key, str) or not _ARTIFACT_KEY_PATTERN.fullmatch(artifact.key):
+        raise ArtifactTransactionValidationError("transaction artifact key is unsafe")
+    if not isinstance(artifact.target, Path):
+        raise TypeError("transaction target must be a pathlib.Path")
+    if artifact.kind not in {"file", "directory"}:
+        raise ArtifactTransactionValidationError("transaction artifact kind is invalid")
+    if artifact.validator is not None and not callable(artifact.validator):
+        raise TypeError("transaction artifact validator must be callable or None")
+
+
+def _validate_planned_target_path(target: Path) -> None:
+    """Reserve Mammoth metadata and transaction-object names before provisioning."""
+    if _TRANSACTION_DIRECTORY_NAME in target.parts:
+        raise ArtifactTransactionValidationError(
+            f"transaction target overlaps Mammoth metadata: {target}"
+        )
+    if any(
+        _RESERVED_TRANSACTION_OBJECT_PATTERN.fullmatch(component) is not None
+        for component in target.parts
+    ):
+        raise ArtifactTransactionValidationError(
+            f"transaction target overlaps a reserved Mammoth object: {target}"
+        )
+
+
+def _validate_planned_target_topology(artifacts: tuple[TransactionArtifactSpec, ...]) -> None:
+    """Reject target nesting before safe parent provisioning could create a target."""
+    for index, first in enumerate(artifacts):
+        for second in artifacts[index + 1 :]:
+            if transaction_paths_overlap(first.target, first.kind, second.target, second.kind):
+                raise ArtifactTransactionValidationError(
+                    "transaction artifact targets must not overlap"
+                )
+
+
+def _ensure_transaction_target_parent(path: Path) -> Path:
+    """Safely create one target parent path without creating a transaction object.
+
+    The high-level planner owns this bounded directory-provisioning side effect.
+    Every existing or newly created component is opened through its predecessor
+    descriptor with ``O_NOFOLLOW`` before it becomes part of the returned path.
+    """
+    absolute = Path(os.path.abspath(path))
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise NotImplementedError("artifact transactions require os.O_NOFOLLOW")
+    try:
+        descriptor = os.open(absolute.anchor, flags | os.O_NOFOLLOW)
+    except OSError as error:
+        raise ArtifactTransactionValidationError(
+            f"transaction target parent is unsafe: {absolute}"
+        ) from error
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                next_descriptor = os.open(
+                    component,
+                    flags | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                with suppress(FileExistsError):
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                os.fsync(descriptor)
+                try:
+                    next_descriptor = os.open(
+                        component,
+                        flags | os.O_NOFOLLOW,
+                        dir_fd=descriptor,
+                    )
+                except OSError as error:
+                    raise ArtifactTransactionValidationError(
+                        f"transaction target parent is unsafe: {absolute}"
+                    ) from error
+                try:
+                    os.fsync(next_descriptor)
+                except BaseException:
+                    os.close(next_descriptor)
+                    raise
+            except OSError as error:
+                raise ArtifactTransactionValidationError(
+                    f"transaction target parent is unsafe: {absolute}"
+                ) from error
+            os.close(descriptor)
+            descriptor = next_descriptor
+    finally:
+        os.close(descriptor)
+    return absolute
+
+
+def _planned_transaction_artifact_roots(
+    artifacts: tuple[TransactionArtifactSpec, ...],
+) -> tuple[Path, ...]:
+    """Derive the established non-overlapping local roots from artifact parents."""
+    parents = sorted(
+        {
+            require_safe_directory(artifact.target.parent, "transaction target parent")
+            for artifact in artifacts
+        },
+        key=lambda path: (len(path.parts), str(path)),
+    )
+    roots: list[Path] = []
+    for parent in parents:
+        containing_root = next(
+            (root for root in roots if parent == root or parent.is_relative_to(root)),
+            None,
+        )
+        if containing_root is None:
+            roots.append(parent)
+            continue
+        if containing_root.stat().st_dev != parent.stat().st_dev:
+            raise ArtifactTransactionValidationError(
+                "nested transaction targets cross a filesystem boundary: "
+                f"{containing_root}, {parent}"
+            )
+    return tuple(sorted(roots, key=str))
+
+
+def _revalidate_transaction_roots(roots: tuple[Path, ...]) -> None:
+    """Anchor every derived root once more after parent provisioning completes."""
+    for root in roots:
+        try:
+            descriptor = open_absolute_directory_without_symlinks(root)
+        except OSError as error:
+            raise ArtifactTransactionValidationError(
+                f"transaction artifact_root is unsafe: {root}"
+            ) from error
+        os.close(descriptor)
 
 
 def require_safe_directory(path: Path, label: str) -> Path:
@@ -1295,8 +1859,7 @@ def publish_journaled_transaction(
     plan: ArtifactTransactionPlan, journal_handle: _JournalHandle, journal: dict[str, Any]
 ) -> None:
     """Complete a journaled publication in order and durably mark its commit point."""
-    records = journal_records(journal)
-    for artifact, record in zip(plan.artifacts, records, strict=True):
+    for artifact, record in journal_artifact_records(plan, journal):
         publish_journal_record(plan, journal_handle, journal, artifact, record)
     validate_committed_generation(plan, journal, allow_uncommitted=True)
     journal["state"] = "committed"
@@ -1304,11 +1867,54 @@ def publish_journaled_transaction(
 
 
 def journal_records(journal: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return schema-validated artifact records in caller-established plan order."""
+    """Return schema-validated artifact records in their original journal order."""
     records = journal["artifacts"]
     if not isinstance(records, list):
         raise ArtifactTransactionRecoveryError("journal artifact records are invalid")
     return [require_mapping(record, "journal artifact") for record in records]
+
+
+def journal_artifact_records(
+    plan: ArtifactTransactionPlan, journal: dict[str, Any]
+) -> tuple[tuple[TransactionArtifact, dict[str, Any]], ...]:
+    """Associate original journal order with plan artifacts by stable artifact key.
+
+    The consumer transaction ID intentionally hashes a key-sorted topology but
+    retains caller artifact order.  Rebuilt plans may therefore have a different
+    order while binding to the same compatible journal; recovery must preserve
+    the journal's publication order rather than pair records positionally.
+    """
+    artifacts_by_key = {artifact.key: artifact for artifact in plan.artifacts}
+    pairs: list[tuple[TransactionArtifact, dict[str, Any]]] = []
+    for record in journal_records(journal):
+        key = require_string(record["key"], "journal artifact key")
+        artifact = artifacts_by_key.get(key)
+        if artifact is None:
+            raise ArtifactTransactionRecoveryError(
+                "journal artifact topology does not match plan"
+            )
+        pairs.append((artifact, record))
+    if len(pairs) != len(plan.artifacts) or len({record["key"] for _, record in pairs}) != len(
+        pairs
+    ):
+        raise ArtifactTransactionRecoveryError("journal artifact topology does not match plan")
+    return tuple(pairs)
+
+
+def preflight_recovery_stages(plan: ArtifactTransactionPlan, journal: dict[str, Any]) -> None:
+    """Validate every still-visible stage before recovery can change a target.
+
+    A missing stage may be an already-published target generation, particularly
+    during replacement recovery, so this boundary intentionally examines only
+    the reserved stage paths.  Per-record publication checks remain necessary
+    to reject changes that arrive after this complete preflight pass.
+    """
+    for artifact, record in journal_artifact_records(plan, journal):
+        if not object_exists(artifact.stage):
+            continue
+        identity = identity_from_json(record["stage_identity"])
+        require_matching_object(artifact.stage, identity, "recovery stage")
+        run_artifact_validator(artifact, artifact.stage, "recovery staged")
 
 
 def publish_journal_record(
@@ -1422,7 +2028,7 @@ def validate_committed_generation(
     """Authenticate every visible target before and after the durable commit point."""
     if not allow_uncommitted and journal["state"] != "committed":
         raise ArtifactTransactionRecoveryError("journal has not reached its commit point")
-    for artifact, record in zip(plan.artifacts, journal_records(journal), strict=True):
+    for artifact, record in journal_artifact_records(plan, journal):
         identity = identity_from_json(record["stage_identity"])
         require_matching_object(artifact.target, identity, "committed target")
         run_artifact_validator(artifact, artifact.target, "committed")
@@ -1433,7 +2039,7 @@ def cleanup_committed_transaction(
 ) -> ArtifactTransactionResult:
     """Remove only authenticated remnants after validating the committed generation."""
     validate_committed_generation(plan, journal)
-    for artifact, record in zip(plan.artifacts, journal_records(journal), strict=True):
+    for artifact, record in journal_artifact_records(plan, journal):
         stage_identity = identity_from_json(record["stage_identity"])
         original_identity = (
             identity_from_json(record["original_identity"])
@@ -1479,7 +2085,7 @@ def rollback_journaled_transaction(
             "committed transactions must clean up, not roll back"
         )
     restored: list[Path] = []
-    for artifact, record in zip(plan.artifacts, journal_records(journal), strict=True):
+    for artifact, record in journal_artifact_records(plan, journal):
         root = transaction_artifact_root(plan, artifact)
         stage_identity = identity_from_json(record["stage_identity"])
         original_identity = (
