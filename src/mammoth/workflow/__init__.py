@@ -5,6 +5,7 @@ from __future__ import annotations
 from mammoth.workflow.launch import (
     CapturedProcessResult,
     CommandPlan,
+    Launcher,
     ProcessResult,
     SupervisedProcess,
     run_captured_process,
@@ -29,6 +30,7 @@ __all__ = [
     "DispatchResult",
     "Execution",
     "ExecutionResolutionContext",
+    "Launcher",
     "ProcessResult",
     "Run",
     "RunResult",
