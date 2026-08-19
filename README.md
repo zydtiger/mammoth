@@ -428,7 +428,39 @@ Set `TrainerConfig(emit_fit_phase_events=False, ...)` when a surrounding
 command already owns the outer training phase lifecycle. Mammoth continues to
 emit nested tasks, progress, validation phases, heartbeats, and metrics.
 
-For a standalone single-process or `torchrun` invocation, initialize Mammoth's
+## Direct execution sessions
+
+CPU-only and non-Torch programs can use the framework-neutral direct session
+without installing or importing `torch`. `ExecutionSession.create()` owns a
+single-process execution, its rank-zero logs, the logical-run lease, lifecycle
+events, and generic observer or background-pipeline cleanup:
+
+```python
+from pathlib import Path
+
+from mammoth.execution import ExecutionSession, ExecutionSpec
+
+with ExecutionSession.create(
+    ExecutionSpec(
+        run_dir=Path("runs/report"),
+        run_name="report",
+        invocation_kind="report",
+        intended_phases=("render",),
+    )
+) as session:
+    with session.phase_scope("render"):
+        render_report(session.observer)
+```
+
+Workflow children use `ExecutionSession.attach(expected)` instead. It requires
+the four canonical `MAMMOTH_*` join variables and exactly validates the run,
+invocation, phase, single-process topology, config reference, runtime metadata,
+and resume facts without claiming the producer lease. A direct session records
+phase success, failure, interruption, or skip and one terminal process outcome.
+
+### PyTorch runtime integration
+
+For a standalone single-process or `torchrun` invocation, initialize the Torch
 runtime before the trainer. Every rank calls strict `create_execution()` and
 then opens its rank-local logging stream; rank zero alone publishes metadata
 and retains the logical-run lease. A workflow child instead calls strict
@@ -451,8 +483,8 @@ work begins.
 ```python
 from pathlib import Path
 
+from mammoth.execution import ExecutionSpec
 from mammoth.torch import (
-    ExecutionSpec,
     RuntimeConfig,
     Trainer,
     TrainerConfig,
@@ -487,8 +519,10 @@ with initialize_runtime(runtime_config) as runtime:
 ```
 
 Use `strategy="single"` without `torchrun` for the corresponding local
-lifecycle. Project-specific GPU validation, concrete workload policy, and
-custom collectives stay in the consuming project.
+lifecycle. `mammoth.torch.ExecutionSpec` remains a compatibility re-export;
+its `ExecutionSession` compatibility adapter composes the neutral lifecycle and
+retains only Torch `Trainer` ownership. Device validation, concrete workload
+policy, DDP collectives, and checkpoint semantics stay in the Torch layer.
 
 Projects with custom checkpoint formats can pass a `TrainerCheckpointPolicy`
 that captures resumable and best-model writers, plus a
@@ -548,9 +582,10 @@ Callers resolving an interrupt at the return boundary may use
 acknowledgment removal is likewise deferred so the observed outcome is not
 lost.
 
-An active `ExecutionSession` can create and own the same pipeline through
-`session.create_background_pipeline(...)`, ensuring accepted work closes before
-observers and runtime resources.
+An active `mammoth.execution.ExecutionSession` can create and own the same
+pipeline through `session.create_background_pipeline(...)`, ensuring accepted
+work closes before observers, logging, and its finalizers. The Torch session
+adapter exposes the same factory while closing owned trainers first.
 
 For a framework-neutral result spanning several local files or directories,
 build a core transaction from stable consumer specifications, stage every

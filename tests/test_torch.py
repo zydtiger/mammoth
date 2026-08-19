@@ -33,6 +33,7 @@ from mammoth.core import (
     read_execution_events,
 )
 from mammoth.core.events import ExecutionEventWriter
+from mammoth.execution import ExecutionSpec as NeutralExecutionSpec
 from mammoth.logging import JsonlEventSink, Observation, RunObserver
 from mammoth.torch import (
     AccumulationPlan,
@@ -86,6 +87,11 @@ def start_created_execution(runtime: Any, spec: ExecutionSpec) -> Any:
     """Create one strict execution and then open its rank-local logging."""
     runtime.create_execution(spec)
     return runtime.start_execution_logging()
+
+
+def test_torch_execution_spec_reexports_neutral_public_value() -> None:
+    """Existing Torch imports retain the framework-neutral execution specification."""
+    assert ExecutionSpec is NeutralExecutionSpec
 
 
 def build_warmup_linear_stack(
@@ -7761,7 +7767,7 @@ def test_execution_session_closes_pipeline_after_interrupted_registration(
         raise KeyboardInterrupt("registration interrupted")
 
     monkeypatch.setattr(torch_runtime_module, "BoundedBackgroundPipeline", capture_pipeline)
-    monkeypatch.setattr(session, "_register_owned_resource", interrupt_registration)
+    monkeypatch.setattr(session._neutral, "_register_owned_resource", interrupt_registration)
 
     with pytest.raises(KeyboardInterrupt, match="registration interrupted"):
         session.create_background_pipeline(lambda value: value)

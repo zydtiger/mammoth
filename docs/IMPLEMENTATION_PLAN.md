@@ -276,6 +276,29 @@ Exit condition: a consuming project can measure dependent regions and preserve
 its own workload construction, profiler lifecycle, phase semantics, and report
 format without reimplementing generic PyTorch profiling mechanics.
 
+## Phase 14: Framework-neutral direct execution sessions
+
+Status: complete.
+
+Extract direct single-process execution lifecycle composition above the core
+and logging layers while retaining PyTorch runtime compatibility:
+
+- public immutable execution specifications and context-managed direct sessions
+  that do not import or require PyTorch;
+- strict direct creation and workflow-child attachment with unchanged immutable
+  metadata, canonical joins, artifact paths, sanitization, and lease rules;
+- neutral process and phase terminal events, observer and background-pipeline
+  ownership, heartbeat support, deterministic cleanup, and exception
+  precedence;
+- a Torch session adapter that composes the neutral session while retaining
+  device, DDP, collective, Trainer, checkpoint, and process-group ownership;
+  and
+- compatibility re-export of `ExecutionSpec` through `mammoth.torch`.
+
+Exit condition: CPU-only callers can establish and monitor a direct execution
+without importing Torch, while single-process and DDP Torch workflows preserve
+their existing lifecycle, consensus, cleanup, and public imports.
+
 ## Deferred capabilities
 
 Defer these until another real project supplies requirements:

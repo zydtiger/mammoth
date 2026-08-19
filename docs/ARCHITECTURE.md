@@ -31,6 +31,7 @@ consuming project
     ├── mammoth.torch       optional generic nn.Module/DataLoader training
     ├── mammoth.workflow    programmatic serial steps and supervision
     ├── mammoth.monitor     replay, terminal UI, and telemetry
+    ├── mammoth.execution   direct process lifecycle composition
     ├── mammoth.logging     JSONL, text, and TensorBoard sinks
     └── mammoth.core        identities, layout, events, artifacts, provenance
 ```
@@ -38,6 +39,11 @@ consuming project
 `mammoth.core` should use the Python standard library. TensorBoard, Rich,
 Textual, psutil, and PyTorch belong in optional dependency groups and must not
 be imported by the core package.
+
+`mammoth.execution` is the framework-neutral composition layer above core and
+logging. It may import both packages, while neither lower layer imports it.
+This keeps direct sessions available to CPU-only consumers without adding a
+core-to-logging dependency or importing an optional framework.
 
 `mammoth.core` also owns framework-neutral identity for raw local-file bytes.
 `inspect_artifact(path)` reads one regular file through a single open descriptor
@@ -350,7 +356,26 @@ labels it as viewer-host data, and isolates sampling failures. The monitor
 remains passive: neither rendering nor telemetry writes artifacts, contacts
 producers, or controls an execution.
 
-## PyTorch execution runtime
+## Direct execution sessions and PyTorch runtime
+
+`mammoth.execution` owns the public `ExecutionSpec` and context-managed
+`ExecutionSession` for one direct single-process execution. `create(spec)`
+rejects a canonical inherited execution ID, claims the logical-run lease,
+derives adjacency while it is held, publishes the immutable context, and opens
+rank-zero JSONL and text logging. `attach(expected)` instead requires the four
+canonical workflow-child variables, performs the same exact immutable identity,
+topology, configuration, runtime, and resume-fact checks, and never claims the
+lease. The session owns process and phase success, failure, interruption, and
+skip records; observers and background pipelines created through its factories;
+periodic heartbeats through the observer; deterministic cleanup; and one
+terminal process outcome. Its resource order is pipeline, observer, execution
+logging, then caller-supplied finalizers such as the direct lease. Cleanup is
+idempotent and retains cleanup failures as notes on an active workload error.
+
+`ExecutionSpec` deliberately remains outside `mammoth.core` because its direct
+session composition depends on logging. Core continues to own only immutable
+metadata, artifact paths, event schemas, leases, sanitization, and strict
+context join/publication primitives.
 
 `Runtime` owns framework-level single-process or standard DDP
 state. It resolves rank, local rank, world size, and device; initializes an
@@ -362,7 +387,7 @@ separately from rank-logging startup so projects can attach presentation sinks
 without recreating the runtime. The runtime does
 not encode GPU models, concrete workload weights, or project topology rules.
 
-Execution establishment is explicit and strict. `create_execution(spec)`
+Torch execution establishment is explicit and strict. `create_execution(spec)`
 rejects a populated canonical execution-ID environment, claims the logical-run
 lease on rank zero, resolves the previous attempt while holding that lease, and
 publishes a new immutable execution using the invocation snapshot agreed by all
@@ -374,19 +399,17 @@ runtime metadata, and all five nullable resume facts. Both operations propagate
 rank-local preparation or validation failures through distributed startup
 consensus before workload construction. After either operation succeeds, every
 rank may open its own JSONL and text streams. TensorBoard's rank-aware sink and
-trainer checkpoints default to rank zero.
+trainer checkpoints default to rank zero. `mammoth.torch.ExecutionSpec` remains
+a compatibility re-export of `mammoth.execution.ExecutionSpec`.
 
-`ExecutionSession` owns process and phase lifecycle events after logging
-starts. It is also the context-managed owner of observers, background
-pipelines, and trainers created through its factories. Factory inputs such as
-models, optimizers, schedulers, loaders, policies, serializers, metrics, and
-directly supplied observers remain borrowed. Owned trainers close before owned
-background pipelines, which close before owned observers regardless of
-construction order. This flushes artifact work before metric sinks. Mammoth then
-closes execution logging, releases leases, and destroys only a process group
-created by the runtime. Projects may attach presentation cleanup through the
-session close hook. Cleanup is idempotent, and cleanup failures are attached to
-an active workload exception instead of replacing it.
+`mammoth.torch.ExecutionSession` is a compatibility adapter that composes the
+neutral session and retains only Torch-specific trainer ownership. Factory
+inputs such as models, optimizers, schedulers, loaders, policies, serializers,
+metrics, and directly supplied observers remain borrowed. Owned trainers close
+before neutral pipelines and observers; the neutral session then closes
+execution logging and invokes the runtime lease and owned-process-group
+finalizers. Projects may attach presentation cleanup through the session close
+hook. No framework inheritance reaches from core back into PyTorch.
 
 A workflow execution is owned by its single runner. Projects are responsible
 for constructing any `torchrun` argv and for declaring execution topology that
