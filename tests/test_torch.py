@@ -69,6 +69,7 @@ from mammoth.torch import (
     WeightedDistributedBatchSampler,
     allocate_weighted_tasks,
     checkpoint_payload,
+    clone_checkpoint_value,
     discover_resumable_checkpoints,
     initialize_runtime,
     move_batch_to_device,
@@ -5196,6 +5197,53 @@ def test_cuda_snapshot_inspection_rejects_aliases_and_noncontiguous_tensors() ->
     assert checkpoint_module.inspect_cuda_snapshot({"first": shared, "second": shared}) is None
     assert checkpoint_module.inspect_cuda_snapshot({"value": shared[::2]}) is None
     assert checkpoint_module.inspect_cuda_snapshot({"value": shared, "custom": object()}) is None
+
+
+def test_clone_checkpoint_value_detaches_and_makes_contiguous_cpu_tensors() -> None:
+    source = torch.arange(6, dtype=torch.float32, requires_grad=True).reshape(2, 3)
+    transposed = source.detach().t()
+    assert not transposed.is_contiguous()
+
+    cloned = clone_checkpoint_value(transposed)
+
+    assert torch.equal(cloned, transposed)
+    assert cloned.device.type == "cpu"
+    assert cloned.is_contiguous()
+    assert cloned.requires_grad is False
+    assert cloned.data_ptr() != transposed.data_ptr()
+    cloned[0, 0] = 99.0
+    assert transposed[0, 0].item() != 99.0
+
+
+def test_clone_checkpoint_value_recurses_through_nested_containers() -> None:
+    tensor = torch.tensor([1.0, 2.0])
+    nested = {
+        "tensors": [tensor, (tensor, {"inner": tensor})],
+        "scalar": 3,
+        "text": "value",
+    }
+
+    cloned = clone_checkpoint_value(nested)
+
+    assert cloned["scalar"] == 3
+    assert cloned["text"] == "value"
+    assert isinstance(cloned["tensors"], list)
+    assert torch.equal(cloned["tensors"][0], tensor)
+    assert cloned["tensors"][0].data_ptr() != tensor.data_ptr()
+    assert isinstance(cloned["tensors"][1], tuple)
+    assert torch.equal(cloned["tensors"][1][0], tensor)
+    assert torch.equal(cloned["tensors"][1][1]["inner"], tensor)
+    assert cloned["tensors"][1][1]["inner"].data_ptr() != tensor.data_ptr()
+
+
+def test_clone_checkpoint_value_deep_copies_arbitrary_mutable_state() -> None:
+    mutable = [1, 2, 3]
+    payload = {"state": mutable}
+
+    cloned = clone_checkpoint_value(payload)
+    mutable.append(4)
+
+    assert cloned["state"] == [1, 2, 3]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

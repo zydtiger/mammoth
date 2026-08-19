@@ -6,18 +6,80 @@ caller-selected numerical backend settings without importing project policy.
 
 from __future__ import annotations
 
+import logging
 import random
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import torch
 
 type MatmulPrecision = Literal["highest", "high", "medium"]
+type TorchAutocastDtype = Literal["bf16", "fp16"]
+type TorchSDPABackend = Literal["default", "flash", "mem-efficient", "math", "cudnn"]
 
 _TORCH_MIN_SEED = -(2**63)
 _TORCH_MAX_SEED = 2**64 - 1
+
+TORCH_LOG_COMPONENTS: frozenset[str] = frozenset(
+    {
+        "all",
+        "dynamo",
+        "aot",
+        "autograd",
+        "dynamic",
+        "inductor",
+        "distributed",
+        "c10d",
+        "ddp",
+        "fsdp",
+        "dtensor",
+        "onnx",
+        "export",
+    }
+)
+TORCH_LOG_ARTIFACTS: frozenset[str] = frozenset(
+    {
+        "bytecode",
+        "aot_graphs",
+        "aot_joint_graph",
+        "ddp_graphs",
+        "graph",
+        "graph_code",
+        "graph_code_verbose",
+        "graph_breaks",
+        "graph_sizes",
+        "guards",
+        "recompiles",
+        "recompiles_verbose",
+        "trace_source",
+        "trace_call",
+        "trace_bytecode",
+        "output_code",
+        "kernel_code",
+        "schedule",
+        "perf_hints",
+        "pre_grad_graphs",
+        "post_grad_graphs",
+        "ir_pre_fusion",
+        "ir_post_fusion",
+        "onnx_diagnostics",
+        "fusion",
+        "overlap",
+        "cudagraphs",
+        "sym_node",
+        "compiled_autograd",
+        "compiled_autograd_verbose",
+        "cudagraph_static_inputs",
+        "benchmarking",
+        "autotuning",
+        "graph_region_expansion",
+        "inductor_metrics",
+        "hierarchical_compile",
+        "compute_dependencies",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +161,84 @@ def apply_torch_seed_policy(policy: TorchSeedPolicy) -> None:
         torch.default_generator.manual_seed(policy.seed)
     if policy.torch_cuda and torch.cuda.is_available():
         torch.cuda.manual_seed_all(policy.seed)
+
+
+def parse_torch_logs(requested: str) -> tuple[dict[str, Any], list[str]]:
+    """Translate a small ``TORCH_LOGS``-style request into ``set_logs`` kwargs.
+
+    Recognized component tokens (optionally prefixed with ``+``/``-`` for
+    debug/error verbosity) map to ``logging`` levels; recognized artifact
+    tokens map to booleans. Unrecognized tokens are returned separately so
+    callers can decide how to report them. This function only parses; callers
+    apply the returned kwargs through ``torch._logging.set_logs`` themselves.
+    """
+    if not isinstance(requested, str):
+        raise TypeError("requested must be a string")
+    kwargs: dict[str, Any] = {}
+    unsupported: list[str] = []
+    for raw_token in requested.split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        prefix = token[0] if token[0] in {"+", "-"} else ""
+        name = token[1:] if prefix else token
+        name = name.replace("-", "_")
+        if name in TORCH_LOG_COMPONENTS:
+            if prefix == "+":
+                kwargs[name] = logging.DEBUG
+            elif prefix == "-":
+                kwargs[name] = logging.ERROR
+            else:
+                kwargs[name] = logging.INFO
+            continue
+        if name in TORCH_LOG_ARTIFACTS:
+            kwargs[name] = prefix != "-"
+            continue
+        unsupported.append(token)
+    return kwargs, unsupported
+
+
+def autocast_dtype_for_device(
+    device: str,
+    requested: TorchAutocastDtype | None,
+) -> torch.dtype:
+    """Resolve an autocast dtype for a device, defaulting by device type."""
+    if requested == "bf16":
+        return torch.bfloat16
+    if requested == "fp16":
+        return torch.float16
+    return torch.bfloat16 if torch.device(device).type == "cuda" else torch.float16
+
+
+@contextmanager
+def autocast_context(
+    device: str,
+    *,
+    enabled: bool,
+    dtype: TorchAutocastDtype | None,
+) -> Iterator[None]:
+    """Yield an autocast context for one device with an explicit dtype override."""
+    device_type = torch.device(device).type
+    resolved_dtype = autocast_dtype_for_device(device, dtype)
+    with torch.autocast(device_type=device_type, dtype=resolved_dtype, enabled=enabled):
+        yield
+
+
+@contextmanager
+def sdpa_backend_context(backend: TorchSDPABackend) -> Iterator[None]:
+    """Yield a scaled dot-product attention backend selection context."""
+    if backend == "default":
+        yield
+        return
+
+    backend_map: dict[TorchSDPABackend, Any] = {
+        "flash": torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+        "mem-efficient": torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+        "math": torch.nn.attention.SDPBackend.MATH,
+        "cudnn": torch.nn.attention.SDPBackend.CUDNN_ATTENTION,
+    }
+    with torch.nn.attention.sdpa_kernel(backend_map[backend]):
+        yield
 
 
 def apply_torch_backend_config(config: TorchBackendConfig) -> TorchBackendState:
