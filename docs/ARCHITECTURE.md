@@ -436,6 +436,20 @@ operational paths. The default contract is:
 The entry path is supplied by the caller. Mammoth does not assign semantic
 meaning to entry names.
 
+`mammoth.core.is_immutable_log_entry(log_dir, child)` classifies whether one
+child of a run's `logs/` directory is Mammoth-owned immutable state that a
+consumer log reset must preserve: the `executions/` container (and everything
+nested beneath it) and the `.logical-run.lock` lease file answer `True`; every
+other entry, including TensorBoard's own `logs/` contents, answers `False`.
+Classification is by `child`'s path identity relative to `log_dir`, derived
+from the same `EXECUTIONS_RELATIVE_DIR` and `LOGICAL_RUN_LEASE_FILENAME`
+constants the layout already uses, never by inspecting `child`'s content or
+filesystem state, so the answer is identical whether or not `child` exists and
+whether it is a file, directory, or symlink. `child` must resolve inside
+`log_dir`; a path that is `log_dir` itself or lies outside it raises
+`ValueError` instead of guessing. Extend this classification in the same
+change as any future addition to the immutable `logs/` layout.
+
 ## Logging responsibilities
 
 ### JSONL
