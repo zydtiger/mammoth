@@ -17,7 +17,13 @@ from mammoth.core import (
     create_execution_context,
     read_execution_events,
 )
-from mammoth.execution import ExecutionSession, ExecutionSpec
+from mammoth.execution import (
+    NULL_EXECUTION_OBSERVER,
+    ExecutionObserver,
+    ExecutionSession,
+    ExecutionSpec,
+    SessionExecutionObserver,
+)
 from mammoth.logging import Observation
 
 
@@ -246,3 +252,61 @@ def test_neutral_cleanup_failure_records_terminal_outcome(tmp_path: Path) -> Non
     assert events[-2].event == "phase_failed"
     assert events[-1].event == "process_completed"
     assert events[-1].exit_code == 1
+
+
+def test_null_execution_observer_never_creates_files_or_events(tmp_path: Path) -> None:
+    """The detached no-op observer performs no filesystem or event side effects."""
+    before = sorted(tmp_path.rglob("*"))
+
+    NULL_EXECUTION_OBSERVER.start_phase("prepare")
+    with NULL_EXECUTION_OBSERVER.task("unit"):
+        NULL_EXECUTION_OBSERVER.progress("unit", completed=1, total=2)
+    NULL_EXECUTION_OBSERVER.record_count("unit", completed=3)
+    with NULL_EXECUTION_OBSERVER.heartbeats(message="idle"):
+        pass
+    NULL_EXECUTION_OBSERVER.complete_phase()
+    NULL_EXECUTION_OBSERVER.skip_phase("not requested")
+
+    assert sorted(tmp_path.rglob("*")) == before
+    assert isinstance(NULL_EXECUTION_OBSERVER, ExecutionObserver)
+
+
+def test_session_execution_observer_forwards_onto_a_live_session(tmp_path: Path) -> None:
+    """The session-backed observer records the same events as direct session calls."""
+    spec = spec_for(tmp_path, "observer-run")
+    with ExecutionSession.create(spec) as session:
+        observer = SessionExecutionObserver(session)
+        observer.start_phase("train")
+        with observer.task("unit-a"):
+            observer.progress("unit-a", completed=1, total=2)
+            observer.progress("unit-a", completed=2, total=2, final=True)
+        observer.record_count("unit-b", completed=5)
+        with observer.heartbeats(message="working"):
+            pass
+        observer.complete_phase()
+
+    events = read_execution_events(
+        spec.run_dir / "logs" / "executions" / "observer-run-attempt" / "rank-0.jsonl"
+    )
+    assert [event.event for event in events] == [
+        "process_started",
+        "phase_started",
+        "task_started",
+        "progress",
+        "progress",
+        "task_completed",
+        "task_started",
+        "progress",
+        "task_completed",
+        "phase_completed",
+        "process_completed",
+    ]
+
+
+def test_session_execution_observer_requires_an_active_phase(tmp_path: Path) -> None:
+    """Forwarding a task/progress/heartbeat call before any phase starts fails clearly."""
+    spec = spec_for(tmp_path, "observer-no-phase")
+    with ExecutionSession.create(spec) as session:
+        observer = SessionExecutionObserver(session)
+        with pytest.raises(RuntimeError, match="active phase"):
+            observer.progress("unit", completed=1)

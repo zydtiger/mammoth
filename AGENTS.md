@@ -52,12 +52,12 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/__main__.py` | `python -m mammoth` forwarding entry point. | Module execution behavior changes. |
 | `src/mammoth/cli.py` | Public Typer application, typed commands, and console exit routing. | A public command, option, or exit behavior changes. |
 | `src/mammoth/py.typed` | PEP 561 marker declaring inline type information. | Keep present and empty while Mammoth ships typed source. |
-| `src/mammoth/execution.py` | Framework-neutral direct execution sessions: immutable specs, create/strict-attach lifecycle, phase and terminal events, logging and heartbeat-capable observer ownership, generic pipelines, leases, and deterministic cleanup. | Neutral direct-session lifecycle, spec fields, attach strictness, or cleanup ordering changes. |
+| `src/mammoth/execution.py` | Framework-neutral direct execution sessions: immutable specs, create/strict-attach lifecycle, phase and terminal events, logging and heartbeat-capable observer ownership, generic pipelines, leases, deterministic cleanup, and a detached no-op/session-backed observer call surface. | Neutral direct-session lifecycle, spec fields, attach strictness, cleanup ordering, or the no-op/session-backed observer call surface changes. |
 | `src/mammoth/core/__init__.py` | Public framework-neutral core exports. | A stable core symbol is added, removed, or renamed. |
 | `src/mammoth/core/artifacts.py` | Atomic local bytes, text, JSON, and opaque artifact publication. | Local publication durability or writer behavior changes. |
 | `src/mammoth/core/events.py` | Schema-v1 event values, append-only producer writers, replay, and active tailing. | Event validation, retention, compatibility, or stream behavior changes. |
 | `src/mammoth/core/execution.py` | Immutable execution metadata, lineage, sanitization, discovery, joins, and logical-run leases. | Attempt identity, provenance, compatibility, or lease behavior changes. |
-| `src/mammoth/core/identity.py` | Filesystem-safe run-name and execution-ID validation. | Identity syntax or length limits change. |
+| `src/mammoth/core/identity.py` | Filesystem-safe run-name and execution-ID validation, plus `derive_run_name` stable path-derived run-name construction. | Identity syntax, length limits, or derived-name construction changes. |
 | `src/mammoth/core/layout.py` | Stable caller-entry/run-name artifact path resolution. | The run-directory contract changes. |
 | `src/mammoth/core/pipeline.py` | Framework-neutral ordered background execution, bounded backpressure, ownership, result attribution, interruption recovery, and cleanup. | Generic background pipeline behavior or public values change. |
 | `src/mammoth/logging/__init__.py` | Public lightweight logging exports that do not require TensorBoard. | A stable logging symbol is added, removed, or renamed. |
@@ -93,13 +93,13 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `tests/test_artifacts.py` | Atomic artifact publication unit coverage. | Artifact publication behavior changes. |
 | `tests/test_events.py` | Event validation, writer, replay, tailing, and legacy-field unit coverage. | Event behavior changes. |
 | `tests/test_execution.py` | Execution metadata, lineage, sanitization, compatibility, and lease unit coverage. | Execution behavior changes. |
-| `tests/test_layout.py` | Run identity and artifact-layout unit coverage. | Layout or run-name validation changes. |
+| `tests/test_layout.py` | Run identity, `derive_run_name`, and artifact-layout unit coverage. | Layout, run-name validation, or derived-name construction changes. |
 | `tests/test_pipeline.py` | Ordered background execution, backpressure, attribution, interruption, and cleanup coverage. | Generic background pipeline behavior changes. |
 | `tests/test_logging.py` | Observer, sink isolation, JSONL routing, text, and TensorBoard unit coverage. | Logging behavior changes. |
 | `tests/test_cli.py` | Typer version, monitor help, usage-error, and removed-workflow-route coverage. | Root or monitor CLI behavior changes. |
 | `tests/test_monitor.py` | Discovery, lineage, folding, rendering, telemetry, malformed streams, and CLI unit coverage. | Monitor or monitor CLI behavior changes. |
 | `tests/test_workflow.py` | Programmatic models, both serial orders, lifecycle boundaries, failure results, canonical environments, and subprocess supervision coverage. | Workflow behavior changes. |
-| `tests/test_execution_session.py` | Neutral direct-session create/attach, lifecycle event, cleanup-ordering, and torch-free import coverage. | Neutral direct-session behavior changes. |
+| `tests/test_execution_session.py` | Neutral direct-session create/attach, lifecycle event, cleanup-ordering, torch-free import, and no-op/session-backed observer coverage. | Neutral direct-session behavior or the no-op/session-backed observer call surface changes. |
 | `tests/test_torch.py` | Multi-task trainer, device movement, precision, accumulation, metrics, callbacks, checkpoints, and DDP unit coverage. | Optional trainer behavior changes. |
 | `tests/test_backend.py` | Generic PyTorch backend configuration, restoration, and seed-policy coverage. | Backend or seed configuration behavior changes. |
 | `tests/test_profiling.py` | Callable profiling, output summaries, component ranges, runtime restoration, report, and CUDA-conditional coverage. | Generic PyTorch profiling behavior changes. |
