@@ -27,6 +27,7 @@ from mammoth.core import (
     recover_artifact_transaction,
     seal_artifact_transaction,
     stage_transaction_file,
+    transaction_journal_exists,
     transaction_journal_path,
     transaction_stage_path,
     transactions,
@@ -631,6 +632,61 @@ def test_existing_journal_requires_explicit_recovery_and_rolls_forward(
     assert plan.artifacts[0].target.read_text() == "new report"
     assert (plan.artifacts[1].target / "nested" / "part.txt").read_text() == "new payload"
     assert not transaction_journal_path(plan).exists()
+
+
+def test_transaction_journal_exists_reflects_missing_and_present_journal(
+    tmp_path: Path,
+) -> None:
+    plan = create_plan(tmp_path)
+
+    assert transaction_journal_exists(plan) is False
+
+    publish_artifact_transaction(plan)
+
+    assert transaction_journal_exists(plan) is False
+
+
+def test_recover_artifact_transaction_missing_ok_returns_none_without_journal(
+    tmp_path: Path,
+) -> None:
+    plan = create_plan(tmp_path)
+
+    assert transaction_journal_exists(plan) is False
+    assert recover_artifact_transaction(plan, missing_ok=True) is None
+    with pytest.raises(FileNotFoundError):
+        recover_artifact_transaction(plan)
+
+
+def test_recover_artifact_transaction_missing_ok_still_recovers_present_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = create_plan(tmp_path)
+    original_rename = transactions.rename_without_overwrite
+    interrupted = False
+
+    def rename_then_interrupt(
+        source: Path, destination: Path, *, lease_root: Path | None = None
+    ) -> None:
+        nonlocal interrupted
+        original_rename(source, destination, lease_root=lease_root)
+        if destination == plan.artifacts[0].target and not interrupted:
+            interrupted = True
+            raise InjectedInterruption("after first durable target rename")
+
+    monkeypatch.setattr(transactions, "rename_without_overwrite", rename_then_interrupt)
+    with pytest.raises(InjectedInterruption):
+        publish_artifact_transaction(plan)
+    monkeypatch.setattr(transactions, "rename_without_overwrite", original_rename)
+
+    assert transaction_journal_exists(plan) is True
+    result = recover_artifact_transaction(plan, missing_ok=True)
+
+    assert result is not None
+    assert result.cleanup_complete
+    assert plan.artifacts[0].target.read_text() == "new report"
+    assert (plan.artifacts[1].target / "nested" / "part.txt").read_text() == "new payload"
+    assert not transaction_journal_path(plan).exists()
+    assert transaction_journal_exists(plan) is False
 
 
 def create_validated_three_artifact_plan(
