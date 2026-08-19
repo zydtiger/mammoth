@@ -14,6 +14,7 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -1464,6 +1465,24 @@ def snapshot_to_cpu(value: Any) -> Any:
     if isinstance(value, list):
         return [snapshot_to_cpu(item) for item in value]
     return value
+
+
+def clone_checkpoint_value(value: Any) -> Any:
+    """Recursively clone nested checkpoint state to detached, contiguous CPU tensors.
+
+    Unlike :func:`snapshot_to_cpu`, non-tensor, non-container values are deep
+    copied rather than returned by reference, so a checkpoint policy can safely
+    retain the result alongside live, still-mutating training objects.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().contiguous().clone()
+    if isinstance(value, Mapping):
+        return {deepcopy(key): clone_checkpoint_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [clone_checkpoint_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(clone_checkpoint_value(item) for item in value)
+    return deepcopy(value)
 
 
 def inspect_cuda_snapshot(value: Any) -> tuple[int, torch.device] | None:

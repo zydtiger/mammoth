@@ -2,19 +2,26 @@
 
 from __future__ import annotations
 
+import logging
 import random
 
 import pytest
 import torch
 
 from mammoth.torch import (
+    TORCH_LOG_ARTIFACTS,
+    TORCH_LOG_COMPONENTS,
     TorchBackendConfig,
     TorchBackendState,
     TorchSeedPolicy,
     apply_torch_backend_config,
     apply_torch_seed_policy,
+    autocast_context,
+    autocast_dtype_for_device,
     configured_torch_backend,
     current_torch_backend_state,
+    parse_torch_logs,
+    sdpa_backend_context,
 )
 
 
@@ -189,3 +196,101 @@ def test_seed_policy_allows_arbitrary_python_only_seed() -> None:
         assert random.random() == first
     finally:
         random.setstate(python_state)
+
+
+def test_torch_log_component_and_artifact_tables_are_disjoint_frozensets() -> None:
+    assert isinstance(TORCH_LOG_COMPONENTS, frozenset)
+    assert isinstance(TORCH_LOG_ARTIFACTS, frozenset)
+    assert TORCH_LOG_COMPONENTS.isdisjoint(TORCH_LOG_ARTIFACTS)
+
+
+def test_parse_torch_logs_maps_known_components_and_artifacts_with_prefixes() -> None:
+    kwargs, unsupported = parse_torch_logs("+dynamo,-aot,inductor,graph_breaks,-recompiles")
+
+    assert kwargs == {
+        "dynamo": logging.DEBUG,
+        "aot": logging.ERROR,
+        "inductor": logging.INFO,
+        "graph_breaks": True,
+        "recompiles": False,
+    }
+    assert unsupported == []
+
+
+def test_parse_torch_logs_normalizes_hyphens_and_collects_unsupported_tokens() -> None:
+    kwargs, unsupported = parse_torch_logs("compiled-autograd, not_a_real_token, ,")
+
+    assert kwargs == {"compiled_autograd": True}
+    assert unsupported == ["not_a_real_token"]
+
+
+def test_parse_torch_logs_rejects_non_string_input() -> None:
+    with pytest.raises(TypeError, match="requested must be a string"):
+        parse_torch_logs(None)  # type: ignore[arg-type]
+
+
+def test_autocast_dtype_for_device_prefers_explicit_request() -> None:
+    assert autocast_dtype_for_device("cpu", "bf16") is torch.bfloat16
+    assert autocast_dtype_for_device("cpu", "fp16") is torch.float16
+
+
+def test_autocast_dtype_for_device_defaults_to_fp16_off_cuda() -> None:
+    assert autocast_dtype_for_device("cpu", None) is torch.float16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_autocast_dtype_for_device_defaults_to_bf16_on_cuda() -> None:
+    assert autocast_dtype_for_device("cuda", None) is torch.bfloat16
+
+
+def test_autocast_context_casts_cpu_matmul_to_requested_dtype() -> None:
+    left = torch.randn(4, 4, dtype=torch.float32)
+    right = torch.randn(4, 4, dtype=torch.float32)
+
+    with autocast_context("cpu", enabled=True, dtype="bf16"):
+        result = left @ right
+
+    assert result.dtype == torch.bfloat16
+
+
+def test_autocast_context_disabled_keeps_float32() -> None:
+    left = torch.randn(4, 4, dtype=torch.float32)
+    right = torch.randn(4, 4, dtype=torch.float32)
+
+    with autocast_context("cpu", enabled=False, dtype="bf16"):
+        result = left @ right
+
+    assert result.dtype == torch.float32
+
+
+def test_sdpa_backend_context_default_is_a_noop() -> None:
+    with sdpa_backend_context("default"):
+        pass
+
+
+def test_sdpa_backend_context_selects_math_backend_on_cpu() -> None:
+    query = torch.randn(1, 1, 4, 8)
+    key = torch.randn(1, 1, 4, 8)
+    value = torch.randn(1, 1, 4, 8)
+
+    with sdpa_backend_context("math"):
+        result = torch.nn.functional.scaled_dot_product_attention(query, key, value)
+
+    assert result.shape == (1, 1, 4, 8)
+
+
+def test_sdpa_backend_context_rejects_unrecognized_backend_name() -> None:
+    with pytest.raises(KeyError), sdpa_backend_context("bogus"):  # type: ignore[arg-type]
+        pass
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_sdpa_backend_context_selects_flash_backend_on_cuda() -> None:
+    query = torch.randn(1, 1, 4, 8, device="cuda", dtype=torch.float16)
+    key = torch.randn(1, 1, 4, 8, device="cuda", dtype=torch.float16)
+    value = torch.randn(1, 1, 4, 8, device="cuda", dtype=torch.float16)
+
+    with sdpa_backend_context("flash"):
+        result = torch.nn.functional.scaled_dot_product_attention(query, key, value)
+
+    assert result.shape == (1, 1, 4, 8)
