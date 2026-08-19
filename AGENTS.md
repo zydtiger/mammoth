@@ -48,6 +48,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `uv.lock` | Exact uv resolution generated from `pyproject.toml`. Never edit manually. | Regenerate with uv whenever dependency metadata changes. |
 | `.python-version` | uv/Python development baseline. | The supported development interpreter changes deliberately. |
 | `.gitignore` | Generated-file and local-environment exclusions. | A new reproducible build, cache, environment, or local artifact needs an exclusion. |
+| `.github/workflows/ci.yml` | GitHub Actions validation: lock consistency, Ruff, mypy, full pytest with coverage reporting, and `uv build` across the supported Python matrix. | CI triggers, jobs, the tested Python versions, or validation coverage change. |
 | `src/mammoth/__init__.py` | Lightweight root package metadata and intentionally small stable exports. | Package version or a truly root-level stable export changes. |
 | `src/mammoth/__main__.py` | `python -m mammoth` forwarding entry point. | Module execution behavior changes. |
 | `src/mammoth/cli.py` | Public Typer application, typed commands, and console exit routing. | A public command, option, or exit behavior changes. |
