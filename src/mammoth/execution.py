@@ -51,7 +51,13 @@ from mammoth.logging import (
     create_execution_logging,
 )
 
-__all__ = ["ExecutionSession", "ExecutionSpec"]
+__all__ = [
+    "ExecutionObserver",
+    "ExecutionSession",
+    "ExecutionSpec",
+    "NULL_EXECUTION_OBSERVER",
+    "SessionExecutionObserver",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -556,6 +562,151 @@ class ExecutionSession:
         if self._process_started_at is None:
             return 0.0
         return max(0.0, time.monotonic() - self._process_started_at)
+
+
+class ExecutionObserver:
+    """No-op phase/task/progress/heartbeat call surface for workflow code.
+
+    Callers accept this base class and invoke it unconditionally, so shared
+    workflow code stays free of "does a session exist" branches at every call
+    site. This base implementation never creates artifacts, files, or events;
+    it is safe to use on a nested or otherwise unmonitored code path.
+    :class:`SessionExecutionObserver` forwards the identical calls onto one
+    live :class:`ExecutionSession`, so a caller can be written once against
+    this shape and handed either object.
+
+    Phase failure and interruption are recorded by :class:`ExecutionSession`
+    itself when a workload exception reaches its context manager, so this
+    call surface intentionally has no failure method.
+    """
+
+    def start_phase(self, name: str) -> None:
+        """Mark the beginning of one sequential phase."""
+
+    def complete_phase(self, *, message: str | None = None) -> None:
+        """Mark the active phase successful."""
+
+    def skip_phase(self, message: str) -> None:
+        """Mark the active phase skipped."""
+
+    @contextmanager
+    def task(self, task_id: str) -> Iterator[None]:
+        """Emit balanced task lifecycle records around one unit-consistent loop."""
+        yield
+
+    def progress(
+        self,
+        task_id: str,
+        *,
+        completed: int,
+        total: int | None = None,
+        final: bool = False,
+        message: str | None = None,
+    ) -> None:
+        """Report unit-consistent completed/total counters for one task."""
+
+    def record_count(
+        self,
+        task_id: str,
+        *,
+        completed: int,
+        total: int | None = None,
+        message: str | None = None,
+    ) -> None:
+        """Record one final counted result as a complete task lifecycle."""
+
+    @contextmanager
+    def heartbeats(self, *, message: str | None = None) -> Iterator[None]:
+        """Emit periodic liveness heartbeats around long uncounted work."""
+        yield
+
+
+NULL_EXECUTION_OBSERVER = ExecutionObserver()
+"""Shared detached no-op observer for call sites without a live session."""
+
+
+class SessionExecutionObserver(ExecutionObserver):
+    """Forward phase/task/progress/heartbeat calls onto one live session.
+
+    The session's owner retains lifecycle ownership; this adapter only
+    forwards caller-facing semantic records onto :attr:`session` and its
+    :class:`~mammoth.logging.RunObserver`.
+    """
+
+    def __init__(self, session: ExecutionSession) -> None:
+        """Bind this observer to one already-created :class:`ExecutionSession`."""
+        self.session = session
+
+    def start_phase(self, name: str) -> None:
+        """Start one sequential phase (and the process on first use)."""
+        self.session.start_phase(name)
+
+    def complete_phase(self, *, message: str | None = None) -> None:
+        """Mark the active phase successful."""
+        self.session.complete_phase(message=message)
+
+    def skip_phase(self, message: str) -> None:
+        """Mark the active phase skipped."""
+        self.session.skip_phase(message)
+
+    @contextmanager
+    def task(self, task_id: str) -> Iterator[None]:
+        """Emit task_started/task_completed records in the active phase."""
+        with self.session.observer.task(self._active_phase(), task_id):
+            yield
+
+    def progress(
+        self,
+        task_id: str,
+        *,
+        completed: int,
+        total: int | None = None,
+        final: bool = False,
+        message: str | None = None,
+    ) -> None:
+        """Emit one unit-consistent progress record for the active phase."""
+        self.session.observer.progress(
+            phase=self._active_phase(),
+            task_id=task_id,
+            completed=completed,
+            total=total,
+            final=final,
+            message=message,
+        )
+
+    def record_count(
+        self,
+        task_id: str,
+        *,
+        completed: int,
+        total: int | None = None,
+        message: str | None = None,
+    ) -> None:
+        """Emit one complete task holding a single final counted result."""
+        with self.task(task_id):
+            self.progress(
+                task_id,
+                completed=completed,
+                total=total if total is not None else completed,
+                final=True,
+                message=message,
+            )
+
+    @contextmanager
+    def heartbeats(self, *, message: str | None = None) -> Iterator[None]:
+        """Emit periodic heartbeats for the active phase while work runs."""
+        with self.session.observer.periodic_heartbeats(
+            phase=self._active_phase(),
+            message=message,
+        ):
+            yield
+
+    def _active_phase(self) -> str:
+        """Return the active phase name or raise if none is active."""
+        phase = self.session.phase
+        if phase is None:
+            raise RuntimeError("Execution observer requires an active phase")
+        return phase
 
 
 def _canonical_join_environment(expected: ExecutionSpec) -> _JoinEnvironment:
