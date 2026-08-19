@@ -453,6 +453,43 @@ def executions_dir_for(run_dir: Path) -> Path:
     return run_dir / EXECUTIONS_RELATIVE_DIR
 
 
+def is_immutable_log_entry(log_dir: Path, child: Path) -> bool:
+    """Classify whether ``child`` is a Mammoth-owned entry a log reset must preserve.
+
+    ``log_dir`` is one run's Mammoth-owned log directory (``RunLayout.logs_dir``).
+    Returns ``True`` for the execution-attempt container (``EXECUTIONS_RELATIVE_DIR``'s
+    final component, plus everything nested beneath it) and for the logical-run
+    lease file (``LOGICAL_RUN_LEASE_FILENAME``); ``False`` for every other entry,
+    which is consumer-owned mutable content a log reset may delete.
+
+    Classification is purely by ``child``'s path identity relative to ``log_dir``
+    -- derived from the same constants :func:`executions_dir_for` and
+    :func:`claim_logical_run_lease` already use -- never by inspecting ``child``'s
+    content or filesystem state. Neither path is required to exist, and the
+    answer does not change whether ``child`` is a file, directory, or symlink,
+    so callers get the same classification before and after a reset runs.
+    Extend this function in the same change as any future immutable layout
+    addition so every consumer stays correct without its own edits.
+
+    Raises:
+        ValueError: if ``child`` does not resolve to ``log_dir`` itself or an
+            entry inside it. A log reset must fail closed on a path it does not
+            own rather than silently answer for it.
+
+    """
+    normalized_log_dir = Path(os.path.abspath(log_dir))
+    normalized_child = Path(os.path.abspath(child))
+    if normalized_child == normalized_log_dir or not normalized_child.is_relative_to(
+        normalized_log_dir
+    ):
+        raise ValueError(f"child {child!r} does not lie inside log_dir {log_dir!r}.")
+    executions_dir = normalized_log_dir / EXECUTIONS_RELATIVE_DIR.name
+    lease_path = normalized_log_dir / LOGICAL_RUN_LEASE_FILENAME
+    return normalized_child in (executions_dir, lease_path) or normalized_child.is_relative_to(
+        executions_dir
+    )
+
+
 def create_execution_context(
     run_dir: Path,
     *,
