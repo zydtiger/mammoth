@@ -57,7 +57,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/core/__init__.py` | Public framework-neutral core exports. | A stable core symbol is added, removed, or renamed. |
 | `src/mammoth/core/artifacts.py` | Atomic local bytes, text, JSON, and opaque artifact publication. | Local publication durability or writer behavior changes. |
 | `src/mammoth/core/events.py` | Schema-v1 event values, append-only producer writers, replay, and active tailing. | Event validation, retention, compatibility, or stream behavior changes. |
-| `src/mammoth/core/execution.py` | Immutable execution metadata, lineage, sanitization, discovery, joins, and logical-run leases. | Attempt identity, provenance, compatibility, or lease behavior changes. |
+| `src/mammoth/core/execution.py` | Immutable execution metadata, lineage, sanitization, discovery, joins, logical-run leases, and immutable-log-entry classification for consumer log resets. | Attempt identity, provenance, compatibility, lease, or immutable-log-entry classification behavior changes. |
 | `src/mammoth/core/identity.py` | Filesystem-safe run-name and execution-ID validation, plus `derive_run_name` stable path-derived run-name construction. | Identity syntax, length limits, or derived-name construction changes. |
 | `src/mammoth/core/layout.py` | Stable caller-entry/run-name artifact path resolution. | The run-directory contract changes. |
 | `src/mammoth/core/pipeline.py` | Framework-neutral ordered background execution, bounded backpressure, ownership, result attribution, interruption recovery, and cleanup. | Generic background pipeline behavior or public values change. |
@@ -94,7 +94,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/torch/trainer.py` | Constructed-object single/DDP loops, project policy integration, validation, observability, and checkpoint lifecycle. | Generic trainer behavior or policy integration changes. |
 | `tests/test_artifacts.py` | Atomic artifact publication unit coverage. | Artifact publication behavior changes. |
 | `tests/test_events.py` | Event validation, writer, replay, tailing, and legacy-field unit coverage. | Event behavior changes. |
-| `tests/test_execution.py` | Execution metadata, lineage, sanitization, compatibility, and lease unit coverage. | Execution behavior changes. |
+| `tests/test_execution.py` | Execution metadata, lineage, sanitization, compatibility, lease, and immutable-log-entry classification unit coverage. | Execution behavior changes. |
 | `tests/test_layout.py` | Run identity, `derive_run_name`, and artifact-layout unit coverage. | Layout, run-name validation, or derived-name construction changes. |
 | `tests/test_pipeline.py` | Ordered background execution, backpressure, attribution, interruption, and cleanup coverage. | Generic background pipeline behavior changes. |
 | `tests/test_workstore.py` | Work-store lease exclusivity, interruption-and-resume, journal tamper detection, prior-state classification, durability, and cleanup-ordering coverage. | Work-store behavior changes. |
