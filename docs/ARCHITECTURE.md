@@ -245,6 +245,13 @@ Mammoth uses six nested concepts:
 Core event consumers treat phase names, task names, coordinates, metric names,
 and artifact extensions as opaque validated data.
 
+`mammoth.core.derive_run_name(prefix, target_path)` derives a stable Run
+identity from an opaque caller-supplied prefix and a target path: the target's
+basename is sanitized into the name and an 8-hex-character SHA-256 digest of
+its absolute path is appended, so same-basename targets at different absolute
+paths stay distinguishable while the absolute path itself is never embedded
+in the returned name. The result always satisfies `validate_run_name`.
+
 Execution metadata may contain an optional sanitized `runtime` object. It
 records allowlisted framework facts such as strategy, backend, and device type;
 it never captures a complete process environment. Omitting this extension keeps
@@ -387,6 +394,14 @@ idempotent and retains cleanup failures as notes on an active workload error.
 session composition depends on logging. Core continues to own only immutable
 metadata, artifact paths, event schemas, leases, sanitization, and strict
 context join/publication primitives.
+
+`mammoth.execution` also owns `ExecutionObserver`, a detached no-op
+phase/task/progress/heartbeat call surface, and `SessionExecutionObserver`,
+which forwards the identical calls onto one live `ExecutionSession`. A
+consumer writes workflow code once against this shared shape and passes
+either the shared `NULL_EXECUTION_OBSERVER` instance or a session-bound
+observer depending on whether monitoring is active, without branching at each
+call site. The detached observer never creates artifacts, files, or events.
 
 `Runtime` owns framework-level single-process or standard DDP
 state. It resolves rank, local rank, world size, and device; initializes an
