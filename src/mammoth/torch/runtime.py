@@ -1,8 +1,9 @@
-"""Own generic single-process and standard PyTorch DDP execution state.
+"""Own PyTorch single-process and standard DDP execution state.
 
 CLI entrypoints construct this runtime before project code. The generic trainer
-consumes its device and rank identity, while execution logging uses an explicitly
-created or attached immutable attempt and opens one process-owned stream per rank.
+consumes its device and rank identity. The runtime composes the framework-neutral
+direct execution session after it has established an immutable attempt and one
+process-owned logging stream per rank.
 """
 
 from __future__ import annotations
@@ -10,23 +11,20 @@ from __future__ import annotations
 import logging
 import math
 import os
-import signal as signal_module
 import sys
-import time
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from threading import RLock
-from types import MappingProxyType, TracebackType
+from types import TracebackType
 from typing import Any, Literal, cast
 
 import torch
 import torch.distributed as dist
 
 from mammoth.core import (
-    BackgroundPipelineError,
     BoundedBackgroundPipeline,
     ExecutionContext,
     LogicalRunLease,
@@ -38,9 +36,6 @@ from mammoth.core import (
     sanitize_command,
     sanitize_metadata_fields,
     sanitize_reference,
-    validate_execution_id,
-    validate_resume_checkpoint_sha256,
-    validate_run_name,
 )
 from mammoth.core.execution import (
     EXECUTION_ID_ENV,
@@ -48,6 +43,8 @@ from mammoth.core.execution import (
     PHASE_ENV,
     RUN_NAME_ENV,
 )
+from mammoth.execution import ExecutionSession as NeutralExecutionSession
+from mammoth.execution import ExecutionSpec as ExecutionSpec
 from mammoth.logging import (
     ExecutionLogging,
     ObservationSink,
@@ -127,119 +124,6 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class ExecutionSpec:
-    """Immutable expected execution facts for strict create or attach operations.
-
-    :class:`Runtime` derives the invocation command and previous-attempt lineage
-    when it creates an execution.  Attachment uses the same value as an exact
-    expectation for canonical workflow-child metadata and resume provenance.
-    """
-
-    run_dir: Path
-    run_name: str
-    invocation_kind: str
-    intended_phases: tuple[str, ...]
-    config_reference: str | Path = ""
-    execution_id: str | None = None
-    resume_checkpoint: str | Path | None = None
-    resume_checkpoint_sha256: str | None = None
-    parent_execution_id: str | None = None
-    starting_epoch: int | None = None
-    starting_global_step: int | None = None
-    runtime: Mapping[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        """Detach mutable inputs and validate the complete resume-fact group."""
-        object.__setattr__(self, "run_dir", Path(self.run_dir))
-        validate_run_name(self.run_name)
-        if not isinstance(self.invocation_kind, str) or not self.invocation_kind:
-            raise ValueError("invocation_kind must be a non-empty string")
-        if isinstance(self.intended_phases, str) or not isinstance(
-            self.intended_phases, Sequence
-        ):
-            raise ValueError("intended_phases must be a sequence of phase names")
-        phases = tuple(self.intended_phases)
-        if not phases or any(not isinstance(phase, str) or not phase for phase in phases):
-            raise ValueError("intended_phases must contain non-empty phase names")
-        if len(set(phases)) != len(phases):
-            raise ValueError("intended_phases must not contain duplicate phase names")
-        object.__setattr__(self, "intended_phases", phases)
-        if not isinstance(self.runtime, Mapping):
-            raise ValueError("runtime must be a mapping")
-        object.__setattr__(self, "runtime", _freeze_runtime_mapping(self.runtime))
-        _validate_resume_coordinate("starting_epoch", self.starting_epoch)
-        _validate_resume_coordinate("starting_global_step", self.starting_global_step)
-        _validate_resume_facts(
-            resume_checkpoint=self.resume_checkpoint,
-            resume_checkpoint_sha256=self.resume_checkpoint_sha256,
-            parent_execution_id=self.parent_execution_id,
-            starting_epoch=self.starting_epoch,
-            starting_global_step=self.starting_global_step,
-        )
-
-
-def _validate_resume_coordinate(name: str, value: int | None) -> None:
-    """Reject non-integral resume coordinates before their exact join comparison."""
-    if value is not None and (
-        not isinstance(value, int) or isinstance(value, bool) or value < 0
-    ):
-        raise ValueError(f"{name} must be a non-negative integer or None, got {value!r}.")
-
-
-def _validate_resume_facts(
-    *,
-    resume_checkpoint: str | Path | None,
-    resume_checkpoint_sha256: str | None,
-    parent_execution_id: str | None,
-    starting_epoch: int | None,
-    starting_global_step: int | None,
-) -> None:
-    """Require resume provenance to be either wholly absent or fully attestable."""
-    if resume_checkpoint is None:
-        populated = {
-            "resume_checkpoint_sha256": resume_checkpoint_sha256,
-            "parent_execution_id": parent_execution_id,
-            "starting_epoch": starting_epoch,
-            "starting_global_step": starting_global_step,
-        }
-        unexpected = sorted(name for name, value in populated.items() if value is not None)
-        if unexpected:
-            raise ValueError(
-                "resume facts require resume_checkpoint: " + ", ".join(unexpected)
-            )
-        return
-    try:
-        checkpoint_reference = os.fspath(resume_checkpoint)
-    except TypeError as error:
-        raise ValueError("resume_checkpoint must be a non-empty path or reference") from error
-    if not isinstance(checkpoint_reference, str) or not checkpoint_reference:
-        raise ValueError("resume_checkpoint must be a non-empty path or reference")
-    if resume_checkpoint_sha256 is None:
-        raise ValueError("resume_checkpoint requires resume_checkpoint_sha256.")
-    validate_resume_checkpoint_sha256(resume_checkpoint_sha256)
-    if starting_epoch is None:
-        raise ValueError("resume_checkpoint requires starting_epoch.")
-    if parent_execution_id is not None:
-        validate_execution_id(parent_execution_id)
-
-
-def _freeze_runtime_mapping(runtime: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Recursively detach JSON-shaped runtime metadata from caller-owned values."""
-    return MappingProxyType(
-        {name: _freeze_runtime_value(value) for name, value in runtime.items()}
-    )
-
-
-def _freeze_runtime_value(value: Any) -> Any:
-    """Freeze nested mappings and sequences retained by :class:`ExecutionSpec`."""
-    if isinstance(value, Mapping):
-        return _freeze_runtime_mapping(value)
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes | os.PathLike):
-        return tuple(_freeze_runtime_value(item) for item in value)
-    return value
-
-
-@dataclass(frozen=True, slots=True)
 class _PrimaryResult:
     execution_id: str | None
     error: str | None
@@ -306,7 +190,7 @@ class _CreationIntent:
 
 
 class Runtime:
-    """Own one process's generic PyTorch identity, collectives, and execution IO."""
+    """Own one process's PyTorch identity, collectives, and execution IO."""
 
     def __init__(self, config: RuntimeConfig | None = None) -> None:
         self.config = config or RuntimeConfig()
@@ -1120,51 +1004,58 @@ class Runtime:
 
 
 class ExecutionSession:
-    """Own process/phase lifecycle plus resources created through this session."""
+    """Compose neutral execution lifecycle with Torch trainer ownership.
+
+    ``Runtime`` constructs this compatibility adapter after it has completed
+    device and distributed startup.  The contained neutral session owns logging,
+    lifecycle events, generic observers, and pipelines; this adapter keeps the
+    optional Torch-only ``Trainer`` factory and closes those trainers first.
+    """
 
     def __init__(self, runtime: Runtime) -> None:
         logging_bundle = runtime.execution_logging
         if logging_bundle is None:
             raise RuntimeError("Execution logging is required for an execution session")
         self.runtime = runtime
-        self.context = logging_bundle.context
-        self.execution_logging = logging_bundle
-        self.observer = logging_bundle.observer
-        self.event_writer = logging_bundle.event_writer
-        self._phase: str | None = None
-        self._phase_terminal = False
-        self._phase_outcome: Literal["completed", "failed", "interrupted", "skipped"] | None = None
-        self._process_started_at: float | None = None
-        self._phase_started_at: float | None = None
-        self._owned_resources = ExitStack()
-        self._owned_observers = ExitStack()
-        self._owned_pipelines = ExitStack()
+        self._neutral = NeutralExecutionSession.from_established(
+            logging_bundle.context,
+            logging_bundle,
+            close_callbacks=(
+                ("logical-run lease", lambda: runtime._release_logical_run_lease()),
+                ("process group", lambda: runtime.close_process_group()),
+                ("torch runtime", self._mark_runtime_closed),
+            ),
+        )
+        self.context = self._neutral.context
+        self.execution_logging = self._neutral.execution_logging
+        self.observer = self._neutral.observer
+        self.event_writer = self._neutral.event_writer
         self._owned_trainers = ExitStack()
-        self._owned_resources.callback(self._owned_observers.close)
-        self._owned_resources.callback(self._owned_pipelines.close)
-        self._owned_resources.callback(self._owned_trainers.close)
         self._owned_resource_errors: list[tuple[str, BaseException]] = []
         self._resource_lock = RLock()
         self._closed = False
 
     @property
     def phase(self) -> str | None:
-        """Return the active or most recently completed phase name."""
-        return self._phase
+        """Return the active or most recently completed neutral phase name."""
+        return self._neutral.phase
+
+    @property
+    def _phase_terminal(self) -> bool:
+        """Expose the legacy internal state used by existing test diagnostics."""
+        return self._neutral._phase_terminal
 
     def create_observer(
         self,
         sinks: Sequence[ObservationSink] = (),
     ) -> RunObserver:
-        """Create and own one sink-neutral observer for project training output."""
+        """Create a neutral observer owned by the contained lifecycle session."""
         with self.runtime._state_lock, self._resource_lock:
             self._require_open()
-            observer = RunObserver(sinks)
-            self._register_owned_resource(self._owned_observers, "observer", observer.close)
-            return observer
+        return self._neutral.create_observer(sinks, observer_factory=RunObserver)
 
     def create_trainer(self, **kwargs: Any) -> Trainer:
-        """Create and own one generic Trainer while borrowing all supplied inputs."""
+        """Create and own one generic Torch trainer while borrowing its inputs."""
         with self.runtime._state_lock, self._resource_lock:
             self._require_open()
             trainer = Trainer(**kwargs)
@@ -1178,88 +1069,25 @@ class ExecutionSession:
         max_pending: int = 1,
         thread_name_prefix: str = "mammoth-background",
     ) -> BoundedBackgroundPipeline[InputT, ResultT]:
-        """Create a pipeline that closes after trainers and before observers."""
-        self._require_open()
-        pipeline = BoundedBackgroundPipeline(
+        """Create a neutral pipeline that closes after trainers and before observers."""
+        with self.runtime._state_lock, self._resource_lock:
+            self._require_open()
+        return self._neutral.create_background_pipeline(
             worker,
             max_pending=max_pending,
             thread_name_prefix=thread_name_prefix,
+            pipeline_factory=BoundedBackgroundPipeline,
         )
 
-        def close_pipeline() -> None:
-            cleanup_errors: list[BaseException] = []
-
-            def acknowledge_submission(submission: Any) -> None:
-                while pipeline.owns(submission):
-                    try:
-                        pipeline.acknowledge(submission)
-                    except BaseException as error:
-                        cleanup_errors.append(error)
-
-            while True:
-                try:
-                    completed = pipeline.close()
-                except BaseException as error:
-                    cleanup_errors.append(error)
-                    if isinstance(error, BackgroundPipelineError):
-                        acknowledge_submission(error.submission)
-                    continue
-                for result in completed:
-                    acknowledge_submission(result.submission)
-                break
-            if cleanup_errors:
-                first_error = cleanup_errors[0]
-                for later_error in cleanup_errors[1:]:
-                    first_error.add_note(
-                        "Later background pipeline cleanup failure: "
-                        f"{type(later_error).__name__}: {later_error}"
-                    )
-                raise first_error
-
-        try:
-            with self.runtime._state_lock, self._resource_lock:
-                self._require_open()
-                self._register_owned_resource(
-                    self._owned_pipelines,
-                    "background pipeline",
-                    close_pipeline,
-                )
-        except BaseException as registration_error:
-            try:
-                close_pipeline()
-            except BaseException as cleanup_error:
-                registration_error.add_note(
-                    "Unregistered background pipeline cleanup failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
-                for note in getattr(cleanup_error, "__notes__", ()):
-                    registration_error.add_note(
-                        f"Unregistered background pipeline cleanup detail: {note}"
-                    )
-            raise
-        return pipeline
-
     def start_phase(self, phase: str) -> None:
-        """Start one phase and, on first use, this process lifecycle."""
+        """Delegate process and phase start lifecycle emission to the neutral session."""
         with self.runtime._state_lock, self._resource_lock:
             self._require_open()
-            if not isinstance(phase, str) or not phase:
-                raise ValueError("phase must be a non-empty string")
-            if self._phase is not None and not self._phase_terminal:
-                raise RuntimeError(f"Execution phase {self._phase!r} is still active")
-            now = time.monotonic()
-            if self._process_started_at is None:
-                self._process_started_at = now
-                self.observer.emit("process_started", phase=phase)
-            self._phase = phase
-            self._phase_terminal = False
-            self._phase_outcome = None
-            self._phase_started_at = now
-            self.observer.emit("phase_started", phase=phase)
+            self._neutral.start_phase(phase)
 
     @contextmanager
     def phase_scope(self, phase: str) -> Iterator[ExecutionSession]:
-        """Own one phase's success, failure, and interruption transition."""
+        """Own one phase transition while preserving the Torch compatibility type."""
         self.start_phase(phase)
         try:
             yield self
@@ -1270,53 +1098,22 @@ class ExecutionSession:
             self.complete_phase()
 
     def complete_phase(self, *, message: str | None = None) -> None:
-        """Mark the active phase successful."""
+        """Mark the active neutral phase successful."""
         with self.runtime._state_lock, self._resource_lock:
             self._require_open()
-            phase = self._active_phase()
-            fields: dict[str, Any] = {
-                "phase": phase,
-                "duration_seconds": self._phase_duration(),
-            }
-            if message is not None:
-                fields["message"] = message
-            self.observer.emit("phase_completed", **fields)
-            self._phase_terminal = True
-            self._phase_outcome = "completed"
+            self._neutral.complete_phase(message=message)
 
     def fail_phase(self, error: BaseException, *, interrupted: bool = False) -> None:
-        """Mark the active phase failed or interrupted."""
+        """Mark the active neutral phase failed or interrupted."""
         with self.runtime._state_lock, self._resource_lock:
             self._require_open()
-            self._fail_phase(error, interrupted=interrupted)
-
-    def _fail_phase(self, error: BaseException, *, interrupted: bool) -> None:
-        """Record phase failure while the caller owns terminal-state locks."""
-        phase = self._active_phase()
-        self.observer.emit(
-            "phase_failed",
-            phase=phase,
-            duration_seconds=self._phase_duration(),
-            message=_error_text(error),
-            status="interrupted" if interrupted else "failed",
-            error_type=type(error).__name__,
-        )
-        self._phase_terminal = True
-        self._phase_outcome = "interrupted" if interrupted else "failed"
+            self._neutral.fail_phase(error, interrupted=interrupted)
 
     def skip_phase(self, message: str) -> None:
-        """Mark the active phase skipped."""
+        """Mark the active neutral phase skipped."""
         with self.runtime._state_lock, self._resource_lock:
             self._require_open()
-            phase = self._active_phase()
-            self.observer.emit(
-                "phase_skipped",
-                phase=phase,
-                duration_seconds=self._phase_duration(),
-                message=message,
-            )
-            self._phase_terminal = True
-            self._phase_outcome = "skipped"
+            self._neutral.skip_phase(message)
 
     def close(
         self,
@@ -1327,96 +1124,25 @@ class ExecutionSession:
         message: str | None = None,
         before_close: Callable[[], None] | None = None,
     ) -> None:
-        """Close owned resources, lifecycle logging, leases, and owned runtime state."""
-        with self.runtime._state_lock:
-            self._close(
+        """Close Torch trainers before the neutral lifecycle and runtime finalizers."""
+        with self.runtime._state_lock, self._resource_lock:
+            if self._closed:
+                return
+            self._closed = True
+            cleanup_errors: list[tuple[str, BaseException]] = []
+            self._owned_resource_errors = cleanup_errors
+            self._owned_trainers.close()
+            self._neutral.close(
                 error=error,
                 exit_code=exit_code,
                 signal=signal,
                 message=message,
                 before_close=before_close,
+                prior_cleanup_errors=cleanup_errors,
             )
 
-    def _close(
-        self,
-        *,
-        error: BaseException | None,
-        exit_code: int | None,
-        signal: int | str | None,
-        message: str | None,
-        before_close: Callable[[], None] | None,
-    ) -> None:
-        """Implement session closure while the runtime state lock is held."""
-        with self._resource_lock:
-            if self._closed:
-                return
-            self._closed = True
-        cleanup_errors: list[tuple[str, BaseException]] = []
-        self._owned_resource_errors = cleanup_errors
-        self._owned_resources.close()
-        if before_close is not None:
-            try:
-                before_close()
-            except BaseException as callback_error:
-                cleanup_errors.append(("presentation lease", callback_error))
-        terminal_error = error or _first_cleanup_error(cleanup_errors)
-        try:
-            if self._phase is not None:
-                if not self._phase_terminal:
-                    lifecycle_error = terminal_error or RuntimeError(
-                        "Execution session closed before recording a phase outcome"
-                    )
-                    self._fail_phase(
-                        lifecycle_error,
-                        interrupted=isinstance(lifecycle_error, KeyboardInterrupt),
-                    )
-                effective_exit_code = _process_exit_code(
-                    terminal_error,
-                    requested=exit_code,
-                    phase_outcome=self._phase_outcome,
-                    cleanup_failed=bool(cleanup_errors),
-                )
-                fields: dict[str, Any] = {
-                    "phase": self._phase,
-                    "duration_seconds": self._process_duration(),
-                    "exit_code": effective_exit_code,
-                }
-                effective_signal = signal
-                if effective_signal is None and isinstance(terminal_error, KeyboardInterrupt):
-                    effective_signal = signal_module.SIGINT
-                if effective_signal is not None:
-                    fields["signal"] = effective_signal
-                if message is not None:
-                    fields["message"] = message
-                elif terminal_error is not None:
-                    fields["message"] = _error_text(terminal_error)
-                self.observer.emit("process_completed", **fields)
-        except BaseException as lifecycle_error:
-            cleanup_errors.append(("execution lifecycle", lifecycle_error))
-        try:
-            if self.runtime.execution_logging is not None:
-                self.runtime.execution_logging.close()
-        except BaseException as logging_error:
-            cleanup_errors.append(("execution logging", logging_error))
-        try:
-            self.runtime._release_logical_run_lease()
-        except BaseException as lease_error:
-            cleanup_errors.append(("logical-run lease", lease_error))
-        try:
-            self.runtime.close_process_group()
-        except BaseException as process_group_error:
-            cleanup_errors.append(("process group", process_group_error))
-        self.runtime._closed = True
-        if error is not None:
-            _attach_cleanup_errors(error, cleanup_errors)
-        elif cleanup_errors and exit_code in {None, 0}:
-            first_label, first_error = cleanup_errors[0]
-            _attach_cleanup_errors(first_error, cleanup_errors[1:])
-            first_error.add_note(f"Cleanup stage: {first_label}")
-            raise first_error
-
     def __enter__(self) -> ExecutionSession:
-        """Return this open execution session."""
+        """Return this open Torch compatibility session."""
         self._require_open()
         return self
 
@@ -1426,9 +1152,13 @@ class ExecutionSession:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        """Close the session without replacing the workload exception."""
+        """Close the session without replacing a workload exception."""
         del exc_type, traceback
         self.close(error=exc_value)
+
+    def _mark_runtime_closed(self) -> None:
+        """Make the runtime terminal after neutral lifecycle finalization."""
+        self.runtime._closed = True
 
     def _register_owned_resource(
         self,
@@ -1436,11 +1166,11 @@ class ExecutionSession:
         label: str,
         close: Callable[[], None],
     ) -> None:
-        """Register one close callback on the session's reverse-order stack."""
+        """Register one Torch-only close callback in reverse creation order."""
         stack.callback(self._close_owned_resource, label, close)
 
     def _close_owned_resource(self, label: str, close: Callable[[], None]) -> None:
-        """Capture one owned-resource failure while allowing later cleanup."""
+        """Capture a trainer cleanup error without skipping later cleanup stages."""
         try:
             close()
         except BaseException as error:
@@ -1449,23 +1179,6 @@ class ExecutionSession:
     def _require_open(self) -> None:
         if self._closed or self.runtime._closed:
             raise RuntimeError("Execution session is already closed")
-
-    def _active_phase(self) -> str:
-        if self._phase is None:
-            raise RuntimeError("No execution phase has been started")
-        if self._phase_terminal:
-            raise RuntimeError(f"Execution phase {self._phase!r} is already terminal")
-        return self._phase
-
-    def _phase_duration(self) -> float:
-        if self._phase_started_at is None:
-            return 0.0
-        return max(0.0, time.monotonic() - self._phase_started_at)
-
-    def _process_duration(self) -> float:
-        if self._process_started_at is None:
-            return 0.0
-        return max(0.0, time.monotonic() - self._process_started_at)
 
 
 def initialize_runtime(
@@ -1543,43 +1256,3 @@ def _environment_world_size() -> int:
 def _error_text(error: BaseException) -> str:
     message = str(error).strip()
     return f"{type(error).__name__}: {message}" if message else type(error).__name__
-
-
-def _first_cleanup_error(
-    errors: Sequence[tuple[str, BaseException]],
-) -> BaseException | None:
-    """Return the first captured cleanup failure, if any."""
-    return errors[0][1] if errors else None
-
-
-def _attach_cleanup_errors(
-    primary_error: BaseException,
-    errors: Sequence[tuple[str, BaseException]],
-) -> None:
-    """Retain cleanup failures as notes without replacing the primary error."""
-    for label, error in errors:
-        primary_error.add_note(f"{label} cleanup also failed: {_error_text(error)}")
-        for note in getattr(error, "__notes__", ()):
-            primary_error.add_note(f"{label} cleanup detail: {note}")
-
-
-def _process_exit_code(
-    error: BaseException | None,
-    *,
-    requested: int | None,
-    phase_outcome: str | None,
-    cleanup_failed: bool,
-) -> int:
-    if requested is not None:
-        exit_code = requested
-    elif isinstance(error, KeyboardInterrupt):
-        exit_code = 130
-    elif isinstance(error, SystemExit):
-        exit_code = error.code if isinstance(error.code, int) else 1
-    elif error is not None:
-        exit_code = 1
-    else:
-        exit_code = 0
-    if exit_code == 0 and (cleanup_failed or phase_outcome in {"failed", "interrupted"}):
-        return 1
-    return exit_code
