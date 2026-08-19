@@ -146,6 +146,160 @@ an artifact between declared roots: each publication rename is local to one
 root, while the coordinator journal makes interrupted multi-root publication
 recoverable.
 
+`mammoth.core.workstore` owns a separate, simpler recoverable primitive for one
+long-running chunked producer: exclusive store leasing, an append-only
+hash-chained completion journal, durable creation, and fail-closed
+classification of prior state. A consumer identifies its store with an opaque
+JSON-compatible identity payload and its own chunk-ID space. Mammoth derives
+a discrimination digest, `identity_digest`, from the caller's *raw* payload
+to detect a returning identity: two payloads differing only in a field whose
+name happens to match the sensitive-name heuristics `sanitize_metadata_fields`
+uses for execution `runtime` and event `extensions` fields (for example two
+different `session_id` values) would otherwise redact to the same value and
+collide as one identity, so deriving the digest from the raw form is what
+keeps them discriminated. Mammoth separately sanitizes that same payload the
+same way and persists and exposes only that redacted copy; the raw form is
+used only to derive the digest and is never itself persisted. Otherwise
+Mammoth never interprets the payload. A commit's chunk marker is likewise an
+opaque caller-supplied string recorded verbatim. Mammoth does not read,
+write, or verify the consumer's actual chunk payloads; those live and stay
+durable outside this contract, and a commit only records that the caller
+already made them durable.
+
+`identity_digest` is not a plain hash: it is `hashlib.scrypt` over the raw
+payload's canonical JSON, with a fresh random 16-byte salt generated per
+store (`os.urandom`) and fixed, deliberately memory-hard cost parameters
+(`n=2**14, r=8, p=1, dklen=32`). The salt and parameters are persisted
+alongside the digest (as `identity_kdf`) and reused, never regenerated, to
+recompute and compare the digest on every later load. A plain unsalted hash
+would let anyone holding the persisted metadata file mount an offline
+dictionary attack straight from a wordlist to recover a low-entropy raw
+payload (a short session ID, for example); scrypt's memory-hardness and a
+random per-store salt (which also defeats any precomputed/rainbow-table
+attack shared across stores) raise the cost of that attack substantially.
+**They do not eliminate it.** An attacker who holds the metadata file can
+still spend the same per-guess cost a legitimate load pays to brute-force a
+sufficiently low-entropy identity payload offline; consumers must not treat
+identity redaction as protection for high-value secrets with few plausible
+values, only as discrimination between otherwise-opaque returning
+identities. A genuinely secret, high-entropy credential does not belong in
+the identity payload at all.
+
+A `WorkStoreSession` is confined to one thread at a time within its owning
+process: the exclusive lease is a process-level `flock`, not a per-thread
+lock, so two threads sharing one session are not mutually excluded, and
+`commit()`/`verify()` hold no internal lock against concurrent callers. Two
+independent processes are always safely excluded by the lease itself.
+
+Mammoth defines its own versioned store format,
+`mammoth-work-store-jsonl-v1`, structurally mirroring the transaction
+journal's proven hash-chained-JSONL approach rather than adopting any
+consumer's pre-existing on-disk format. `claim_work_store_lease()` acquires a
+non-blocking advisory lease at a deterministic sibling path next to the store
+directory; it authenticates ownership and permissions on the already-opened
+lease descriptor itself, not a separate path re-stat, so a lease path
+replaced between open and validation cannot slip past the check. A second
+claim fails closed as `WorkStoreConflictError` instead of racing writers.
+Any other `OSError` from creating the lease's parent, opening the lease
+path (for example a pre-existing symlink defeating `O_NOFOLLOW`), or
+locking it translates into the `WorkStoreError` family rather than
+escaping as a raw `OSError`.
+`inspect_work_store()` claims that lease only long enough to classify
+existing state as `absent`, `resumable`, `legacy` (no Mammoth metadata and
+no Mammoth journal at the path), `incompatible` (Mammoth's own metadata
+names a different identity), `relocated` (Mammoth's own metadata matches
+this identity but was durably recorded for a different canonical store
+path), `damaged` (structurally invalid metadata, a missing or broken
+completion journal, a broken or foreign-seeded hash chain, or Mammoth's own
+journal present without Mammoth's own metadata — debris that must never be
+mistaken for adoptable-or-preservable legacy content), or
+`concurrently_owned`, and never mutates anything it inspects.
+`WorkStoreSession.open_or_create()` performs the same classification under a
+lease it retains: `absent` durably creates a new owner-only store (`0700`
+directory — with the new directory's own dentry made durable by fsyncing
+its parent, matching the transaction protocol's mkdir-then-parent-fsync
+precedent — `0600` files, fsynced metadata, an eagerly created empty
+completion journal, and their directory entries) and `resumable` reopens the
+authenticated match, while every other classification raises the matching
+`WorkStoreStatusError` instead of silently adopting or overwriting ambiguous
+state. A creation failure after some but not all of that durable state
+exists rolls back best-effort: it first attempts the same
+quarantine-rename-then-remove path as every other deletion (below), and if
+that cannot even be attempted, falls back to removing the live path
+directly. Both are best-effort and their failures are suppressed, not a
+guarantee: a further failure can still leave a remnant at the live store
+path, and the next `inspect_work_store()` or `open_or_create()` there
+classifies whatever it finds — `absent` if fully removed, or `damaged` if
+partial Mammoth debris such as a bare journal file survives.
+
+Store metadata durably records the creating call's canonical
+(`Path.resolve()`) store path alongside the identity digest, but that field
+is plain and unauthenticated by itself: it is a cheap first check, not a
+security boundary. The real binding is cryptographic. Every store's
+completion-journal chain is seeded — its first record's `previous_sha256` —
+with a digest over the format identifier, the identity digest, and
+metadata's own recorded store path, computed fresh from that same metadata
+every time the journal is loaded. An honest whole-directory copy or move
+carries its unedited metadata and untouched journal together, so the chain
+still validates against the recomputed seed; the plain path comparison then
+classifies it `relocated`, and copying or moving a store directory after
+creation costs its resume state by design, the same way a legacy or
+genuinely incompatible store is preserved but never adopted. A journal
+grafted from a different store's directory, or a metadata `store_path` field
+edited without regenerating the chain it seeds, desynchronizes the
+recomputed seed from what is actually baked into the journal's first record:
+both fail the very first record's check and classify `damaged` rather than
+being silently adopted or merely degrading to `relocated`. A validly created
+store's completion journal file always exists, even before the first
+commit; its later absence is therefore always `damaged`; the same guarantee
+is what makes `commit()`'s later `os.O_CREAT` a no-op except after
+intentional repair. `commit()` writes, flushes, and fsyncs each completion
+record under one shared failure guard, updates the session's cached state
+only from that already-durable point, and only then fsyncs the directory
+entry (load-bearing solely for a brand-new journal file's own creation), so
+a crash can never observe a completion that is not durable and can never
+lose one that was.
+
+After any exception from `commit()`, the session is unusable — every
+further `commit()` or `verify()` raises `WorkStoreDamagedError` — but the
+durable outcome differs by failure site. If the write, the flush, or the
+record's own fsync fails, including a short write, some or all of the
+record's bytes may already be visible to a later reader (a deferred ENOSPC
+or EIO can surface only at flush, after bytes already reached the
+descriptor), so Mammoth best-effort truncates the journal back to its
+pre-record length, even if that truncation itself fails, before poisoning
+the session and raising. If only the trailing directory fsync fails
+afterward, the record's own fsync had already succeeded — the commit is
+durable and nothing is truncated — but the session is still poisoned, since
+it just observed a filesystem failure; the caller must close it, and a
+reopen afterward may legitimately show the chunk as already completed. An
+interrupted commit's incomplete trailing journal line is recoverable, not
+damage: resuming truncates that torn tail before further commits are
+appended, the same way a torn write is tolerated elsewhere in Mammoth's
+append-only formats. `verify()` re-reads the durable journal under the same
+seed and rejects any divergence from the session's observed state, including
+a hash chain that was tampered with, or correctly re-hashed, to resurrect an
+already-completed chunk ID.
+
+`close()` releases ownership and preserves the store for a later resume;
+`remove_after_publication()` and the cross-invocation `cleanup_work_store()`
+delete a store only after the caller confirms its own final publication,
+never inferring publication from committed chunk markers. Deletion — for
+both an explicit cleanup and a failed creation's rollback — first renames
+the store directory to a deterministic retired sibling path and fsyncs the
+parent directory, mirroring the transaction protocol's documented
+retired-path approach, before removing the retired tree; a crash between the
+rename and the removal leaves the live path simply absent, never a
+half-deleted store that could be misread as a legitimate empty one or as
+foreign legacy content, and a stale retired remnant from an earlier
+interrupted deletion is reclaimed deterministically by the next call that
+retires a store at the same path.
+
+This module shares the transaction protocol's exact scope: local POSIX
+filesystems, no network filesystems, no cross-host coordination, and no
+hostile-writer model. A crashed or killed cooperating writer is recoverable;
+a writer that bypasses this module's lease is not.
+
 The workflow layer owns project-neutral local process supervision and serial
 multi-run orchestration through Python values only. `Workflow`, `Run`, `Step`,
 and `Execution` are immutable caller inputs; step commands are already-final
