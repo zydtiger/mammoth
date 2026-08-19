@@ -7,6 +7,11 @@ import pytest
 
 import mammoth.core.execution as execution_module
 from mammoth.core import (
+    EXECUTION_ID_ENV,
+    INVOCATION_KIND_ENV,
+    LOGICAL_RUN_LEASE_FILENAME,
+    PHASE_ENV,
+    RUN_NAME_ENV,
     ExecutionMetadata,
     RunLayout,
     claim_logical_run_lease,
@@ -286,6 +291,15 @@ def test_logical_run_lease_rejects_a_second_producer(tmp_path: Path) -> None:
             claim_logical_run_lease(layout.run_dir)
     with claim_logical_run_lease(layout.run_dir):
         pass
+
+
+def test_workflow_child_contract_symbols_are_public_from_core() -> None:
+    """`mammoth.core` re-exports the private-module workflow-child contract symbols."""
+    assert EXECUTION_ID_ENV == execution_module.EXECUTION_ID_ENV
+    assert RUN_NAME_ENV == execution_module.RUN_NAME_ENV
+    assert INVOCATION_KIND_ENV == execution_module.INVOCATION_KIND_ENV
+    assert PHASE_ENV == execution_module.PHASE_ENV
+    assert LOGICAL_RUN_LEASE_FILENAME == execution_module.LOGICAL_RUN_LEASE_FILENAME
 
 
 def test_logical_run_lease_closes_descriptor_after_lock_interruption(

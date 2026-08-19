@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 import mammoth.core.events as events_module
-from mammoth.core import RunLayout, create_execution_context
+from mammoth.core import (
+    EXECUTION_EVENT_SCHEMA_VERSION,
+    EventName,
+    RunLayout,
+    create_execution_context,
+)
 from mammoth.core.events import (
     ExecutionEvent,
     ExecutionEventReadError,
@@ -28,6 +33,12 @@ def execution_context(tmp_path: Path):
         command=("python", "worker.py"),
         execution_id="attempt",
     )
+
+
+def test_event_contract_symbols_are_public_from_core() -> None:
+    """`mammoth.core` re-exports the private-module event-contract symbols."""
+    assert EXECUTION_EVENT_SCHEMA_VERSION == events_module.EXECUTION_EVENT_SCHEMA_VERSION
+    assert EventName is events_module.EventName
 
 
 def test_event_stream_closes_descriptor_after_base_exception(
