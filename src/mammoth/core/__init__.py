@@ -53,7 +53,7 @@ from mammoth.core.execution import (
     sanitize_reference,
     validate_resume_checkpoint_sha256,
 )
-from mammoth.core.identity import validate_execution_id, validate_run_name
+from mammoth.core.identity import derive_run_name, validate_execution_id, validate_run_name
 from mammoth.core.layout import RunLayout
 from mammoth.core.pipeline import (
     BackgroundPipelineError,
@@ -135,6 +135,7 @@ __all__ = [
     "claim_logical_run_lease",
     "claim_artifact_transaction_leases",
     "create_execution_context",
+    "derive_run_name",
     "discard_prepared_artifact",
     "execution_id_from_environment",
     "generate_execution_id",
