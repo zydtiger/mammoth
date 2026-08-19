@@ -9,6 +9,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Rich enables ANSI color when it detects GitHub Actions; CLI tests assert
+  # plain substrings, so force the same colorless output as local runs.
+  NO_COLOR: "1"
+
 jobs:
   lint:
     runs-on: ubuntu-latest
