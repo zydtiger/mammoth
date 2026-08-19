@@ -16,6 +16,7 @@ from mammoth.core import (
     WorkStoreConflictError,
     WorkStoreDamagedError,
     WorkStoreIncompatibleError,
+    WorkStoreInspection,
     WorkStoreSession,
     WorkStoreValidationError,
     claim_work_store_lease,
@@ -226,6 +227,117 @@ def test_commit_then_close_then_resume_reports_resumable_with_completed_chunks(
             "chunk-2",
             "chunk-3",
         )
+
+
+def test_marker_round_trip_across_interruption_and_resume(tmp_path: Path) -> None:
+    store_path = tmp_path / "store"
+    with WorkStoreSession.open_or_create(store_path, _identity()) as session:
+        session.commit({"chunk-0": "marker-0", "chunk-1": "marker-1"})
+        assert session.completed_chunks == {"chunk-0": "marker-0", "chunk-1": "marker-1"}
+    # Session dropped without an explicit resume path in between; reopening
+    # must read the markers back exactly from the durable journal.
+
+    inspection = inspect_work_store(store_path, _identity())
+    assert inspection.status == "resumable"
+    assert inspection.completed_chunks == {"chunk-0": "marker-0", "chunk-1": "marker-1"}
+
+    with WorkStoreSession.open_or_create(store_path, _identity()) as session:
+        assert session.recovered is True
+        assert session.completed_chunks == {"chunk-0": "marker-0", "chunk-1": "marker-1"}
+
+
+def test_commit_reports_marker_fidelity_for_a_multi_chunk_single_call(tmp_path: Path) -> None:
+    store_path = tmp_path / "store"
+    with WorkStoreSession.open_or_create(store_path, _identity()) as session:
+        session.commit(
+            {
+                "chunk-0": "marker-0",
+                "chunk-1": "marker-1",
+                "chunk-2": "marker-2",
+            }
+        )
+        assert session.completed_chunks == {
+            "chunk-0": "marker-0",
+            "chunk-1": "marker-1",
+            "chunk-2": "marker-2",
+        }
+
+    inspection = inspect_work_store(store_path, _identity())
+    assert inspection.completed_chunks == {
+        "chunk-0": "marker-0",
+        "chunk-1": "marker-1",
+        "chunk-2": "marker-2",
+    }
+
+
+def test_damaged_journal_classifies_damaged_and_exposes_no_markers(tmp_path: Path) -> None:
+    store_path = tmp_path / "store"
+    with WorkStoreSession.open_or_create(store_path, _identity()) as session:
+        session.commit({"chunk-0": "marker-0"})
+
+    journal_path = store_path / workstore_module.WORK_STORE_JOURNAL_NAME
+    record = json.loads(journal_path.read_bytes())
+    record["chunks"][0]["marker"] = "tampered-marker"
+    journal_path.write_bytes((json.dumps(record) + "\n").encode("utf-8"))
+
+    inspection = inspect_work_store(store_path, _identity())
+    assert inspection.status == "damaged"
+    assert inspection.completed_chunk_ids == ()
+    assert inspection.completed_chunks == {}
+
+    with pytest.raises(WorkStoreDamagedError, match="integrity"):
+        WorkStoreSession.open_or_create(store_path, _identity())
+
+
+def test_completed_chunk_ids_unchanged_and_completed_chunks_mapping_is_read_only(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "store"
+    with WorkStoreSession.open_or_create(store_path, _identity()) as session:
+        session.commit({"chunk-0": "marker-0", "chunk-1": "marker-1"})
+        assert session.completed_chunk_ids == ("chunk-0", "chunk-1")
+        with pytest.raises(TypeError):
+            session.completed_chunks["chunk-2"] = "marker-2"  # type: ignore[index]
+        # Mutating the snapshot must never leak back into session state.
+        assert session.completed_chunk_ids == ("chunk-0", "chunk-1")
+
+    inspection = inspect_work_store(store_path, _identity())
+    assert inspection.completed_chunk_ids == ("chunk-0", "chunk-1")
+    with pytest.raises(TypeError):
+        inspection.completed_chunks["chunk-2"] = "marker-2"  # type: ignore[index]
+
+
+def test_work_store_inspection_stays_hashable_with_and_without_markers(tmp_path: Path) -> None:
+    absent = WorkStoreInspection(store_path=tmp_path / "store", status="absent")
+    hash(absent)  # Must not raise despite the unhashable completed_chunks mapping.
+
+    resumable = WorkStoreInspection(
+        store_path=tmp_path / "store",
+        status="resumable",
+        completed_chunk_ids=("chunk-0",),
+        completed_chunks={"chunk-0": "marker-0"},
+        detail="Resumable work store with 1 committed chunk(s).",
+    )
+    hash(resumable)
+
+    same = WorkStoreInspection(
+        store_path=tmp_path / "store",
+        status="resumable",
+        completed_chunk_ids=("chunk-0",),
+        completed_chunks={"chunk-0": "marker-0"},
+        detail="Resumable work store with 1 committed chunk(s).",
+    )
+    assert resumable == same
+    assert hash(resumable) == hash(same)
+
+
+def test_work_store_inspection_positional_construction_still_binds_detail(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "store"
+    inspection = WorkStoreInspection(store_path, "absent", (), "detail text")
+    assert inspection.detail == "detail text"
+    assert inspection.completed_chunks == {}
 
 
 def test_resume_after_interrupted_commit_truncates_torn_tail_and_accepts_new_commits(

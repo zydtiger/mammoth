@@ -164,7 +164,12 @@ Mammoth never interprets the payload. A commit's chunk marker is likewise an
 opaque caller-supplied string recorded verbatim. Mammoth does not read,
 write, or verify the consumer's actual chunk payloads; those live and stay
 durable outside this contract, and a commit only records that the caller
-already made them durable.
+already made them durable. `WorkStoreInspection.completed_chunks` and
+`WorkStoreSession.completed_chunks` read those markers back as a chunk-ID
+keyed mapping so a consumer can re-verify a durable chunk payload against
+its own marker at resume time; the mapping is populated only from a journal
+that already passed hash-chain verification, so a `damaged` classification
+still exposes no markers, and `completed_chunk_ids` is unchanged.
 
 `identity_digest` is not a plain hash: it is `hashlib.scrypt` over the raw
 payload's canonical JSON, with a fresh random 16-byte salt generated per
