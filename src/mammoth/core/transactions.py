@@ -21,7 +21,7 @@ from contextlib import suppress
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, overload
 
 from mammoth.core.artifacts import ArtifactReceipt, inspect_artifact
 
@@ -309,6 +309,21 @@ def locate_transaction_journal(plan: ArtifactTransactionPlan) -> Path:
     raise FileNotFoundError(f"transaction journal is missing: {journal}")
 
 
+def transaction_journal_exists(plan: ArtifactTransactionPlan) -> bool:
+    """Return whether an active or retired journal is visible for this plan.
+
+    Mirrors :func:`locate_transaction_journal` without claiming any lease, so
+    an ambiguous state where both an active and a retired journal are visible
+    still raises :class:`ArtifactTransactionRecoveryError` instead of
+    resolving to a boolean.
+    """
+    try:
+        locate_transaction_journal(plan)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def seal_artifact_transaction(
     plan: ArtifactTransactionPlan,
 ) -> tuple[TransactionObjectIdentity, ...]:
@@ -352,11 +367,32 @@ def publish_artifact_transaction(plan: ArtifactTransactionPlan) -> ArtifactTrans
             raise
 
 
-def recover_artifact_transaction(plan: ArtifactTransactionPlan) -> ArtifactTransactionResult:
-    """Idempotently recover one recorded transaction against its expected plan."""
+@overload
+def recover_artifact_transaction(
+    plan: ArtifactTransactionPlan, *, missing_ok: Literal[False] = ...
+) -> ArtifactTransactionResult: ...
+@overload
+def recover_artifact_transaction(
+    plan: ArtifactTransactionPlan, *, missing_ok: Literal[True]
+) -> ArtifactTransactionResult | None: ...
+def recover_artifact_transaction(
+    plan: ArtifactTransactionPlan, *, missing_ok: bool = False
+) -> ArtifactTransactionResult | None:
+    """Idempotently recover one recorded transaction against its expected plan.
+
+    Set ``missing_ok=True`` to return ``None`` when no active or retired
+    journal exists instead of raising ``FileNotFoundError``. Default behavior
+    is unchanged: with ``missing_ok`` left at its default, a missing journal
+    still raises.
+    """
     validated = validate_artifact_transaction_plan(plan, allow_missing_stages=True)
     with claim_artifact_transaction_leases(validated):
-        journal_path = locate_transaction_journal(validated)
+        try:
+            journal_path = locate_transaction_journal(validated)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
         journal, journal_handle = read_transaction_journal(journal_path)
         validate_journal_matches_plan(journal, validated)
         cleanup_transaction_journal_swap(validated)
