@@ -373,6 +373,37 @@ def summarize_output_value(value: Any) -> Mapping[str, Any]:
     return _summarize_value(value)
 
 
+def tensor_metadata(tensor: torch.Tensor, *, include_stats: bool = False) -> dict[str, Any]:
+    """Return compact tensor layout and optional health metadata for diagnostics."""
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError("tensor must be a torch.Tensor")
+    metadata: dict[str, Any] = {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "stride": list(tensor.stride()),
+        "is_contiguous": tensor.is_contiguous(),
+        "is_channels_last": tensor.dim() == 4
+        and tensor.is_contiguous(memory_format=torch.channels_last),
+        "numel": tensor.numel(),
+    }
+    if include_stats and tensor.numel() > 0:
+        stat_tensor = tensor.detach()
+        if stat_tensor.dtype == torch.bool:
+            stat_tensor = stat_tensor.to(dtype=torch.float32)
+        elif not torch.is_floating_point(stat_tensor):
+            stat_tensor = stat_tensor.float()
+        metadata.update(
+            {
+                "min": float(stat_tensor.min().item()),
+                "max": float(stat_tensor.max().item()),
+                "mean": float(stat_tensor.mean().item()),
+                "positive_fraction": float((stat_tensor > 0).float().mean().item()),
+            }
+        )
+    return metadata
+
+
 @contextmanager
 def torch_runtime_options(options: TorchRuntimeOptions) -> Iterator[None]:
     """Apply Torch backend settings and restore all prior values on exit."""
@@ -473,6 +504,19 @@ def _component_ranges(components: Mapping[str, torch.nn.Module]) -> Iterator[Non
                 stack.pop().__exit__(None, None, None)
         for handle in handles:
             handle.remove()
+
+
+def resolve_profiler_sort_key(requested: str, use_cuda: bool) -> str:
+    """Normalize a profiler sort key across legacy CUDA and current device names."""
+    if not isinstance(requested, str) or not requested:
+        raise ValueError("requested sort key must be a non-empty string")
+    if not use_cuda:
+        return requested
+    if requested == "cuda_time_total":
+        return "device_time_total"
+    if requested == "self_cuda_time_total":
+        return "self_device_time_total"
+    return requested
 
 
 def normalize_operation_profiles(

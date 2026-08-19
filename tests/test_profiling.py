@@ -21,9 +21,11 @@ from mammoth.torch import (
     normalize_operation_profiles,
     profile_callable,
     reset_cuda_peak_memory_stats,
+    resolve_profiler_sort_key,
     summarize_latency,
     summarize_output_value,
     synchronize_device,
+    tensor_metadata,
     write_profile_report,
 )
 
@@ -207,6 +209,61 @@ def test_default_output_summary_handles_non_strided_tensor() -> None:
     assert summary["layout"] == "torch.sparse_coo"
     assert summary["shape"] == [2, 2]
     assert "stride" not in summary
+
+
+def test_tensor_metadata_reports_layout_without_stats_by_default() -> None:
+    tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3).t()
+
+    metadata = tensor_metadata(tensor)
+
+    assert metadata["shape"] == [3, 2]
+    assert metadata["dtype"] == "torch.float32"
+    assert metadata["device"] == "cpu"
+    assert metadata["is_contiguous"] is False
+    assert metadata["is_channels_last"] is False
+    assert metadata["numel"] == 6
+    assert "min" not in metadata
+
+
+def test_tensor_metadata_includes_stats_for_floating_point_tensors() -> None:
+    tensor = torch.tensor([-1.0, 0.0, 2.0, 3.0])
+
+    metadata = tensor_metadata(tensor, include_stats=True)
+
+    assert metadata["min"] == -1.0
+    assert metadata["max"] == 3.0
+    assert metadata["mean"] == 1.0
+    assert metadata["positive_fraction"] == 0.5
+
+
+def test_tensor_metadata_casts_bool_and_integer_tensors_for_stats() -> None:
+    bool_tensor = torch.tensor([True, False, True])
+    int_tensor = torch.tensor([1, 2, 3])
+
+    bool_metadata = tensor_metadata(bool_tensor, include_stats=True)
+    int_metadata = tensor_metadata(int_tensor, include_stats=True)
+
+    assert bool_metadata["mean"] == pytest.approx(2 / 3)
+    assert int_metadata["mean"] == 2.0
+
+
+def test_tensor_metadata_detects_channels_last_layout() -> None:
+    tensor = torch.zeros(1, 3, 4, 4).to(memory_format=torch.channels_last)
+
+    metadata = tensor_metadata(tensor)
+
+    assert metadata["is_channels_last"] is True
+
+
+def test_tensor_metadata_skips_stats_for_empty_tensors() -> None:
+    metadata = tensor_metadata(torch.empty(0), include_stats=True)
+
+    assert "min" not in metadata
+
+
+def test_tensor_metadata_rejects_non_tensor_input() -> None:
+    with pytest.raises(TypeError, match="torch.Tensor"):
+        tensor_metadata([1, 2, 3])  # type: ignore[arg-type]
 
 
 def test_runtime_options_restore_state_after_success_and_failure() -> None:
@@ -413,6 +470,22 @@ def test_current_cuda_time_field_is_used_for_legacy_requested_sort() -> None:
     )
 
     assert [row.key for row in rows] == ["slow", "fast"]
+
+
+def test_resolve_profiler_sort_key_maps_legacy_cuda_names_when_using_cuda() -> None:
+    assert resolve_profiler_sort_key("cuda_time_total", True) == "device_time_total"
+    assert resolve_profiler_sort_key("self_cuda_time_total", True) == "self_device_time_total"
+
+
+def test_resolve_profiler_sort_key_leaves_other_names_and_cpu_requests_untouched() -> None:
+    assert resolve_profiler_sort_key("cpu_time_total", True) == "cpu_time_total"
+    assert resolve_profiler_sort_key("cuda_time_total", False) == "cuda_time_total"
+    assert resolve_profiler_sort_key("device_time_total", True) == "device_time_total"
+
+
+def test_resolve_profiler_sort_key_rejects_empty_request() -> None:
+    with pytest.raises(ValueError, match="non-empty string"):
+        resolve_profiler_sort_key("", True)
 
 
 @pytest.mark.parametrize(
