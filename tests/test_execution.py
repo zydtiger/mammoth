@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from mammoth.core import (
     claim_logical_run_lease,
     create_execution_context,
     execution_id_from_environment,
+    is_immutable_log_entry,
     join_execution_context,
     latest_execution_id,
 )
@@ -322,3 +324,70 @@ def test_logical_run_lease_closes_descriptor_after_lock_interruption(
 
     with claim_logical_run_lease(layout.run_dir):
         pass
+
+
+def test_is_immutable_log_entry_covers_known_immutable_entries(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "immutable-run").prepare()
+    log_dir = layout.logs_dir
+
+    assert is_immutable_log_entry(log_dir, log_dir / "executions") is True
+    assert is_immutable_log_entry(log_dir, log_dir / LOGICAL_RUN_LEASE_FILENAME) is True
+    # Nested entries under the execution-attempt container stay immutable too.
+    assert is_immutable_log_entry(log_dir, log_dir / "executions" / "attempt-1") is True
+    assert (
+        is_immutable_log_entry(
+            log_dir, log_dir / "executions" / "attempt-1" / "execution.json"
+        )
+        is True
+    )
+
+
+def test_is_immutable_log_entry_rejects_arbitrary_consumer_entries(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "mutable-run").prepare()
+    log_dir = layout.logs_dir
+    (log_dir / "events.out.tfevents.1").write_text("tensorboard")
+    (log_dir / "scratch").mkdir()
+    (log_dir / "scratch" / "child.txt").write_text("scratch")
+    os.symlink(log_dir / "scratch", log_dir / "scratch-link")
+
+    assert is_immutable_log_entry(log_dir, log_dir / "events.out.tfevents.1") is False
+    assert is_immutable_log_entry(log_dir, log_dir / "scratch") is False
+    assert is_immutable_log_entry(log_dir, log_dir / "scratch" / "child.txt") is False
+    assert is_immutable_log_entry(log_dir, log_dir / "scratch-link") is False
+    # An entry named "executions" one level too deep is not the real container.
+    assert is_immutable_log_entry(log_dir, log_dir / "scratch" / "executions") is False
+
+
+def test_is_immutable_log_entry_does_not_require_the_child_to_exist(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "nonexistent-run").prepare()
+    log_dir = layout.logs_dir
+
+    assert is_immutable_log_entry(log_dir, log_dir / "executions" / "never-created") is True
+    assert is_immutable_log_entry(log_dir, log_dir / "never-created.txt") is False
+
+
+def test_is_immutable_log_entry_classifies_a_symlinked_immutable_name_by_identity(
+    tmp_path: Path,
+) -> None:
+    """Classification is by path identity within ``log_dir``, not by content."""
+    layout = RunLayout(tmp_path, "symlink-run").prepare()
+    log_dir = layout.logs_dir
+    (log_dir / "executions").rmdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    os.symlink(elsewhere, log_dir / "executions")
+
+    assert is_immutable_log_entry(log_dir, log_dir / "executions") is True
+
+
+def test_is_immutable_log_entry_fails_closed_outside_log_dir(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "escape-run").prepare()
+    log_dir = layout.logs_dir
+    outside = tmp_path / "elsewhere.txt"
+
+    with pytest.raises(ValueError, match="does not lie inside log_dir"):
+        is_immutable_log_entry(log_dir, outside)
+    with pytest.raises(ValueError, match="does not lie inside log_dir"):
+        is_immutable_log_entry(log_dir, log_dir)
+    with pytest.raises(ValueError, match="does not lie inside log_dir"):
+        is_immutable_log_entry(log_dir, log_dir.parent)
