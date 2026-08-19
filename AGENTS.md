@@ -61,6 +61,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/core/identity.py` | Filesystem-safe run-name and execution-ID validation, plus `derive_run_name` stable path-derived run-name construction. | Identity syntax, length limits, or derived-name construction changes. |
 | `src/mammoth/core/layout.py` | Stable caller-entry/run-name artifact path resolution. | The run-directory contract changes. |
 | `src/mammoth/core/pipeline.py` | Framework-neutral ordered background execution, bounded backpressure, ownership, result attribution, interruption recovery, and cleanup. | Generic background pipeline behavior or public values change. |
+| `src/mammoth/core/transactions.py` | Multi-artifact transaction planning, exclusive staging, per-root leasing, journal schemas, coordinated publication, and semantic recovery preflight. | Transaction planning, staging, journal, publication, or recovery behavior changes. |
 | `src/mammoth/core/workstore.py` | Framework-neutral recoverable chunked work-store leasing, hash-chained completion journal, durable creation, and fail-closed prior-state classification. | Work-store leasing, journal format, durability, or classification behavior changes. |
 | `src/mammoth/logging/__init__.py` | Public lightweight logging exports that do not require TensorBoard. | A stable logging symbol is added, removed, or renamed. |
 | `src/mammoth/logging/execution.py` | Per-process execution logging bundle for JSONL observations and exclusive text diagnostics. | Execution logging composition or ownership changes. |
@@ -97,6 +98,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `tests/test_execution.py` | Execution metadata, lineage, sanitization, compatibility, lease, and immutable-log-entry classification unit coverage. | Execution behavior changes. |
 | `tests/test_layout.py` | Run identity, `derive_run_name`, and artifact-layout unit coverage. | Layout, run-name validation, or derived-name construction changes. |
 | `tests/test_pipeline.py` | Ordered background execution, backpressure, attribution, interruption, and cleanup coverage. | Generic background pipeline behavior changes. |
+| `tests/test_transactions.py` | Transaction planning, staging, leasing, journal, publication, recovery, and interruption unit coverage. | Transaction behavior changes. |
 | `tests/test_workstore.py` | Work-store lease exclusivity, interruption-and-resume, journal tamper detection, prior-state classification, durability, and cleanup-ordering coverage. | Work-store behavior changes. |
 | `tests/test_logging.py` | Observer, sink isolation, JSONL routing, text, and TensorBoard unit coverage. | Logging behavior changes. |
 | `tests/test_cli.py` | Typer version, monitor help, usage-error, and removed-workflow-route coverage. | Root or monitor CLI behavior changes. |
