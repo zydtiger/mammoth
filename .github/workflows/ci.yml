@@ -9,11 +9,6 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Rich enables ANSI color when it detects GitHub Actions; CLI tests assert
-  # plain substrings, so force the same colorless output as local runs.
-  NO_COLOR: "1"
-
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -48,6 +43,10 @@ jobs:
       - name: Mypy
         run: uv run mypy
       - name: Pytest with coverage
-        run: uv run pytest --cov=mammoth --cov-report=term-missing
+        # Rich force-enables terminal styling when it sees GITHUB_ACTIONS, which
+        # breaks plain-substring CLI output assertions; unset it so captured CLI
+        # output matches local runs. GITHUB_* variables cannot be overridden via
+        # the env mapping, so unset at the shell level.
+        run: env -u GITHUB_ACTIONS uv run pytest --cov=mammoth --cov-report=term-missing
       - name: Build distributions
         run: uv build
