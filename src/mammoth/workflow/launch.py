@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Never
+from typing import Any, Never, Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +38,26 @@ class ProcessResult:
     timed_out: bool = False
     interrupted: bool = False
     signal: int | None = None
+
+
+class Launcher(Protocol):
+    """Structural contract for substituting :func:`launch_process` process creation.
+
+    A caller-supplied launcher only replaces child-process construction. Signal
+    handling, lease ownership, lifecycle-JSONL emission, and cleanup remain
+    owned by :mod:`mammoth.workflow.runner`.
+    """
+
+    def __call__(
+        self,
+        command: tuple[str, ...],
+        *,
+        cwd: Path | None,
+        environment: Mapping[str, str],
+        timeout_seconds: float | None,
+    ) -> ProcessResult:
+        """Launch one already-final argv and return its terminal outcome."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)

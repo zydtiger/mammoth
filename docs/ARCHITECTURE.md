@@ -196,6 +196,17 @@ launcher/descendant cleanup. Mammoth does not persist child environments or
 inspect commands beyond executing their already-tokenized argument arrays,
 and does not assign outcome policy or persist captured output.
 
+`Workflow`'s optional `launcher` field is the supported dependency-injection
+seam for step-level process creation, typed by the structural `Launcher`
+protocol in `mammoth.workflow.launch`. `None`, the default, resolves to
+`launch_process` at dispatch time, so default behavior is byte-for-byte
+identical to a workflow with no `launcher` field. A caller-supplied launcher
+only replaces the single `launch_process` call per step; signal handling,
+lease ownership, lifecycle-JSONL emission, and cleanup remain owned by the
+runner regardless of which launcher is active. This is the intended seam for
+substituting subprocess creation in tests without importing or monkeypatching
+`mammoth.workflow.runner` internals.
+
 Framework-neutral callers may submit typed inputs to one
 `BoundedBackgroundPipeline`. Its single worker preserves acceptance order,
 applies a caller-selected bound across queued and active work, and associates

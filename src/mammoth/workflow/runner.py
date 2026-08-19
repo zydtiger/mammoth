@@ -44,7 +44,7 @@ from mammoth.core.execution import (
     RUN_NAME_ENV,
 )
 from mammoth.logging import JsonlEventSink, RunObserver
-from mammoth.workflow.launch import CommandPlan, ProcessResult, launch_process
+from mammoth.workflow.launch import CommandPlan, Launcher, ProcessResult, launch_process
 
 StepOutcome = Literal["completed", "failed", "interrupted"]
 RunOutcome = Literal["completed", "failed", "blocked", "interrupted"]
@@ -278,12 +278,21 @@ class WorkflowResult:
 
 @dataclass(frozen=True, slots=True)
 class Workflow:
-    """One validated programmatic workflow with two explicit serial orders."""
+    """One validated programmatic workflow with two explicit serial orders.
+
+    ``launcher`` is the supported dependency-injection seam for substituting
+    subprocess construction, for example in tests. ``None`` (the default)
+    resolves to this module's :func:`~mammoth.workflow.launch.launch_process`
+    at dispatch time, which keeps default behavior byte-for-byte identical.
+    An injected launcher only replaces process creation; signal handling,
+    lease ownership, lifecycle-JSONL emission, and cleanup remain owned here.
+    """
 
     runs: Sequence[Run]
     root: Path = Path("runs")
     order: WorkflowOrder = "run-major"
     step_order: Sequence[str] | None = None
+    launcher: Launcher | None = field(default=None, compare=False, repr=False)
     _dispatch: tuple[tuple[Run, Step], ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -310,6 +319,8 @@ class Workflow:
             if any(not isinstance(name, str) or not name for name in order):
                 raise ValueError("Workflow step_order must contain non-empty phase names")
             object.__setattr__(self, "step_order", order)
+        if self.launcher is not None and not callable(self.launcher):
+            raise ValueError("Workflow launcher must be callable or None")
         object.__setattr__(self, "_dispatch", _derive_dispatch(self))
 
     def plan(self) -> tuple[CommandPlan, ...]:
@@ -479,7 +490,9 @@ def _run_workflow(
                     first_failure = hook_failure
                     break
                 pending = _PendingStep(current, step)
-                result = _execute_step(current, step, environment, pending)
+                result = _execute_step(
+                    current, step, environment, pending, launcher=workflow.launcher
+                )
                 with _blocked_interruption_signals():
                     _record_pending_result(pending, results_by_run, dispatch_results)
                     transition_result = result
@@ -672,6 +685,8 @@ def _execute_step(
     step: Step,
     base_environment: Mapping[str, str],
     pending: _PendingStep,
+    *,
+    launcher: Launcher | None,
 ) -> StepResult:
     """Launch one final argv while emitting paired phase/task lifecycle records."""
     command = sanitize_command(step.command)
@@ -686,8 +701,9 @@ def _execute_step(
         )
         pending.task_started = True
     environment = _child_environment(active, step, base_environment)
+    launch = launcher if launcher is not None else launch_process
     try:
-        process = launch_process(
+        process = launch(
             tuple(step.command),
             cwd=step.cwd,
             environment=environment,
