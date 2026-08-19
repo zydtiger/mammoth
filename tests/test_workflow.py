@@ -448,6 +448,45 @@ def test_process_failure_exit_code_precedence(
     assert result.step("run", "step").outcome == expected_outcome
 
 
+def test_injected_launcher_replaces_process_creation_without_spawning_a_child(
+    tmp_path: Path,
+) -> None:
+    """A public ``launcher`` parameter substitutes process creation for a fake."""
+    calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+
+    def fake_launcher(
+        command: tuple[str, ...],
+        *,
+        cwd: Path | None,
+        environment: Mapping[str, str],
+        timeout_seconds: float | None,
+    ) -> ProcessResult:
+        del cwd, timeout_seconds
+        calls.append((command, dict(environment)))
+        return ProcessResult(return_code=0, duration_seconds=0.0)
+
+    workflow = Workflow(
+        root=tmp_path,
+        runs=(Run("run", (Step("step", ("this-binary-does-not-exist",)),)),),
+        launcher=fake_launcher,
+    )
+
+    result = workflow.run(base_environment={})
+
+    assert result.successful
+    assert result.step("run", "step").outcome == "completed"
+    assert [command for command, _ in calls] == [("this-binary-does-not-exist",)]
+
+
+def test_construction_rejects_a_non_callable_launcher(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="launcher must be callable"):
+        Workflow(
+            root=tmp_path,
+            runs=(Run("run", (Step("step", ("ignored",)),)),),
+            launcher="not callable",  # type: ignore[arg-type]
+        )
+
+
 @pytest.mark.parametrize(
     ("order", "alpha_outcome", "expected_dispatch"),
     (
