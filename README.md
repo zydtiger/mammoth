@@ -1,5 +1,7 @@
 # Mammoth
 
+[![CI](https://github.com/zydtiger/mammoth/actions/workflows/ci.yml/badge.svg)](https://github.com/zydtiger/mammoth/actions/workflows/ci.yml)
+
 Mammoth is project-independent infrastructure for running, training, logging,
 and monitoring AI workloads. Your project still defines the model, data, loss,
 metrics, and commands; Mammoth handles the repeatable operational work around
