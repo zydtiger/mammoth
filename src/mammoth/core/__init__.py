@@ -83,6 +83,7 @@ from mammoth.core.transactions import (
     recover_artifact_transaction,
     seal_artifact_transaction,
     stage_transaction_file,
+    transaction_journal_exists,
     transaction_journal_path,
     transaction_stage_path,
 )
@@ -153,6 +154,7 @@ __all__ = [
     "sanitize_reference",
     "seal_artifact_transaction",
     "stage_transaction_file",
+    "transaction_journal_exists",
     "transaction_journal_path",
     "transaction_stage_path",
     "validate_execution_id",
