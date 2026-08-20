@@ -10,6 +10,10 @@ classification of prior state. It never interprets the consumer's identity
 payload, chunk IDs, or chunk contents: the identity payload only selects one
 store path's ownership, and a chunk marker is an opaque caller-supplied
 string recorded verbatim for the consumer's own later use.
+``WorkStoreInspection.completed_chunks`` and ``WorkStoreSession.completed_chunks``
+read those markers back, keyed by chunk ID, from journal state that already
+passed hash-chain verification, so a consumer can re-verify a durable chunk
+payload against its own marker at resume time.
 
 This module shares the same scope as :mod:`mammoth.core.transactions`: local
 POSIX filesystems, no network filesystems, no cross-host coordination, and no
@@ -29,7 +33,7 @@ import stat
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -119,12 +123,35 @@ class WorkStoreIncompatibleError(WorkStoreStatusError):
 
 @dataclass(frozen=True, slots=True)
 class WorkStoreInspection:
-    """Non-mutating classification of one work-store path for a given identity."""
+    """Non-mutating classification of one work-store path for a given identity.
+
+    ``completed_chunks`` maps each committed chunk ID to its opaque marker
+    string, sourced only from a journal that passed hash-chain verification;
+    every other classification leaves it empty. It is declared last and
+    keyword-only so existing four-positional construction
+    (``store_path``, ``status``, ``completed_chunk_ids``, ``detail``) keeps
+    binding exactly as it did before this field existed.
+    """
 
     store_path: Path
     status: WorkStoreStatus
     completed_chunk_ids: tuple[str, ...] = ()
     detail: str = ""
+    completed_chunks: Mapping[str, str] = field(
+        default_factory=lambda: MappingProxyType({}), kw_only=True
+    )
+
+    def __hash__(self) -> int:
+        """Hash over the hashable fields, preserving hashability despite the marker mapping.
+
+        ``completed_chunks`` is a ``Mapping`` (backed by a ``MappingProxyType``
+        over a ``dict``) and therefore unhashable, so the dataclass-generated
+        ``__hash__`` would make every instance unhashable. This stays
+        consistent with the generated ``__eq__``: two instances equal under
+        ``__eq__`` have equal ``completed_chunk_ids`` and therefore equal
+        hashes here.
+        """
+        return hash((self.store_path, self.status, self.completed_chunk_ids, self.detail))
 
 
 @dataclass(slots=True)
@@ -237,6 +264,7 @@ def inspect_work_store(
             store_path=path,
             status="resumable",
             completed_chunk_ids=tuple(sorted(loaded.completed)),
+            completed_chunks=MappingProxyType(dict(loaded.completed)),
             detail=f"Resumable work store with {len(loaded.completed)} committed chunk(s).",
         )
     finally:
@@ -285,6 +313,11 @@ class WorkStoreSession:
     def completed_chunk_ids(self) -> tuple[str, ...]:
         """Return committed chunk IDs in stable sorted order."""
         return tuple(sorted(self._completed))
+
+    @property
+    def completed_chunks(self) -> Mapping[str, str]:
+        """Return a read-only snapshot mapping committed chunk IDs to their markers."""
+        return MappingProxyType(dict(self._completed))
 
     @classmethod
     def open_or_create(
