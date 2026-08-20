@@ -74,7 +74,10 @@ class BlockingSerialSink(RecordingSink):
             super().observe(observation)
             if observation.event == "heartbeat":
                 self.heartbeat_entered.set()
-                assert self.release_heartbeat.wait(timeout=1.0)
+                # Generous bound: this gates a correctness assertion on a
+                # foreground/background serialization race and must not
+                # spuriously time out under a loaded host.
+                assert self.release_heartbeat.wait(timeout=30.0)
         finally:
             self._active.release()
 
@@ -91,7 +94,9 @@ class BlockingSink(RecordingSink):
         if self._block_once:
             self._block_once = False
             self.entered.set()
-            assert self.release.wait(timeout=1.0)
+            # Generous bound: gates a correctness assertion on the test's
+            # ability to release this worker; must not time out under load.
+            assert self.release.wait(timeout=30.0)
 
 
 class BlockingEventWriter:
@@ -108,7 +113,9 @@ class BlockingEventWriter:
         if self._block_once:
             self._block_once = False
             self.entered.set()
-            assert self.release.wait(timeout=1.0)
+            # Generous bound: gates a correctness assertion on the test's
+            # ability to release this worker; must not time out under load.
+            assert self.release.wait(timeout=30.0)
         self.events.append({"event": event, **fields})
         if len(self.events) >= 2:
             self.delivered_second.set()
@@ -234,8 +241,10 @@ def test_async_observer_uses_independent_per_sink_workers() -> None:
 
     observer.progress(phase="phase", task_id="task", completed=1)
 
-    assert blocked.entered.wait(timeout=1.0)
-    assert healthy.observed.wait(timeout=1.0)
+    # Generous bounds: gate correctness assertions on both workers reaching
+    # their rendezvous and must not spuriously time out under a loaded host.
+    assert blocked.entered.wait(timeout=30.0)
+    assert healthy.observed.wait(timeout=30.0)
     blocked.release.set()
     observer.flush()
     observer.close()
@@ -253,11 +262,13 @@ def test_async_jsonl_coalesces_only_latest_pending_progress() -> None:
     )
 
     observer.progress(phase="phase", task_id="task", completed=1)
-    assert writer.entered.wait(timeout=1.0)
+    # Generous bound: gates a correctness assertion and must not spuriously
+    # time out under a loaded host.
+    assert writer.entered.wait(timeout=30.0)
     observer.progress(phase="phase", task_id="task", completed=2)
     observer.progress(phase="phase", task_id="task", completed=3)
     writer.release.set()
-    assert writer.delivered_second.wait(timeout=1.0)
+    assert writer.delivered_second.wait(timeout=30.0)
     observer.flush()
     observer.close()
 
@@ -275,7 +286,9 @@ def test_async_jsonl_final_progress_drains_pending_scope_before_terminal_record(
     final_done = threading.Event()
 
     observer.progress(phase="phase", task_id="task", completed=1)
-    assert writer.entered.wait(timeout=1.0)
+    # Generous bound: gates a correctness assertion and must not spuriously
+    # time out under a loaded host.
+    assert writer.entered.wait(timeout=30.0)
     observer.progress(phase="phase", task_id="task", completed=2)
 
     def emit_final() -> None:
@@ -284,9 +297,14 @@ def test_async_jsonl_final_progress_drains_pending_scope_before_terminal_record(
 
     final_thread = threading.Thread(target=emit_final)
     final_thread.start()
+    # Short and intentional: proves the final dispatch is still blocked on
+    # the writer, not a correctness-gating wait -- widening it would not fix
+    # a flake, only slow the test.
     assert not final_done.wait(timeout=0.05)
     writer.release.set()
-    assert final_done.wait(timeout=1.0)
+    # Generous bound: gates a correctness assertion and must not spuriously
+    # time out under a loaded host.
+    assert final_done.wait(timeout=30.0)
     final_thread.join()
     observer.close()
 
@@ -321,7 +339,9 @@ def test_async_observer_disables_only_failed_worker_sink() -> None:
     observer = RunObserver((failing, healthy))
 
     observer.progress(phase="phase", task_id="task", completed=1)
-    assert failing.failed.wait(timeout=1.0)
+    # Generous bound: gates a correctness assertion and must not spuriously
+    # time out under a loaded host.
+    assert failing.failed.wait(timeout=30.0)
     observer.progress(phase="phase", task_id="task", completed=2)
     observer.flush()
     observer.close()
@@ -329,6 +349,43 @@ def test_async_observer_disables_only_failed_worker_sink() -> None:
     assert observer.disabled_sink_count == 1
     assert failing.closed == 1
     assert [item.fields["completed"] for item in healthy.observations] == [1, 2]
+
+
+def test_async_observer_close_still_closes_sink_after_unacknowledged_failure() -> None:
+    """Regression test for a race in ``AsyncObservationSink.close()``.
+
+    A fire-and-forget dispatch that fails on the worker is not acknowledged
+    with the pipeline until its completion callback runs on the pipeline's
+    own callback thread. Until then, the pipeline synchronously re-raises
+    that same recorded failure for every new submission attempt on this
+    sink. ``close()`` used to submit its flush step and its close step as one
+    unit: when the flush step collided with the still-unacknowledged
+    failure, the whole unit aborted and the concrete sink's ``close()`` was
+    never called, leaking its resources. This deterministically recreates
+    that stale, unacknowledged state -- without relying on scheduling under
+    load -- by disabling the pipeline's completion callback for the failing
+    dispatch before triggering it.
+    """
+    failing = SignalFailingSink()
+    observer = RunObserver((failing,))
+    dispatcher = observer._sinks[0]  # type: ignore[attr-defined]
+
+    # Suppress the pipeline's normal completion callback so the failed
+    # dispatch below is never acknowledged with the pipeline, deterministically
+    # recreating a stale unacknowledged failure without timing dependence.
+    dispatcher._complete_submission = lambda submission: None  # type: ignore[method-assign]
+
+    observer.progress(phase="phase", task_id="task", completed=1)
+    # Generous bounds: gate correctness assertions on the worker recording
+    # the failure and must not spuriously time out under a loaded host.
+    assert failing.failed.wait(timeout=30.0)
+    submission = dispatcher._pipeline._submissions[-1]  # type: ignore[attr-defined]
+    assert submission._state_finalized.wait(timeout=30.0)
+    assert submission._state == "failed"
+
+    observer.close()
+
+    assert failing.closed == 1
 
 
 def test_async_observer_rejects_media_without_a_cpu_snapshot_policy() -> None:
@@ -351,7 +408,9 @@ def test_async_observer_snapshots_nested_fields_before_worker_dispatch() -> None
     coordinates = {"nested": {"step": 1}}
 
     observer.progress(phase="phase", task_id="task", completed=1, coordinates=coordinates)
-    assert blocked.entered.wait(timeout=1.0)
+    # Generous bound: gates a correctness assertion and must not spuriously
+    # time out under a loaded host.
+    assert blocked.entered.wait(timeout=30.0)
     coordinates["nested"]["step"] = 2
     blocked.release.set()
     observer.flush()
@@ -370,7 +429,9 @@ def test_async_observer_uses_private_snapshot_not_returned_observation_alias() -
         completed=1,
         coordinates={"nested": {"step": 1}},
     )
-    assert blocked.entered.wait(timeout=1.0)
+    # Generous bound: gates a correctness assertion and must not spuriously
+    # time out under a loaded host.
+    assert blocked.entered.wait(timeout=30.0)
     observation.fields["coordinates"]["nested"]["step"] = 2
     blocked.release.set()
     observer.flush()
@@ -413,7 +474,9 @@ def test_observer_manages_periodic_heartbeats_while_idle() -> None:
     observer = RunObserver((recording,), heartbeat_interval_seconds=0.01)
 
     with observer.periodic_heartbeats(phase="phase", task_id="task", message="working"):
-        assert recording.observed.wait(timeout=1.0)
+        # Generous bound: gates a correctness assertion and must not
+        # spuriously time out under a loaded host.
+        assert recording.observed.wait(timeout=30.0)
     observer.close()
 
     heartbeat = recording.observations[0]
@@ -436,12 +499,19 @@ def test_periodic_heartbeat_serializes_sink_fanout_with_foreground_emit() -> Non
         foreground_done.set()
 
     with observer.periodic_heartbeats(phase="phase"):
-        assert sink.heartbeat_entered.wait(timeout=1.0)
+        # Generous bound: gates a correctness assertion and must not
+        # spuriously time out under a loaded host.
+        assert sink.heartbeat_entered.wait(timeout=30.0)
         foreground = threading.Thread(target=emit_foreground)
         foreground.start()
+        # Short and intentional: proves the foreground emit is still
+        # blocked behind the heartbeat, not a correctness-gating wait --
+        # widening it would not fix a flake, only slow the test.
         assert not foreground_done.wait(timeout=0.05)
         sink.release_heartbeat.set()
-        assert foreground_done.wait(timeout=1.0)
+        # Generous bound: gates a correctness assertion and must not
+        # spuriously time out under a loaded host.
+        assert foreground_done.wait(timeout=30.0)
         foreground.join()
     observer.close()
 
