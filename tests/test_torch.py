@@ -6422,16 +6422,23 @@ def test_async_checkpoint_flush_waits_for_later_work_before_raising(
 ) -> None:
     checkpoint_root = tmp_path / "checkpoints"
     checkpoint_root.mkdir()
+    first_entered = threading.Event()
+    release_first = threading.Event()
     second_started = threading.Event()
     release_second = threading.Event()
 
     def fail_first(temporary: Path) -> None:
         temporary.write_bytes(b"partial")
+        first_entered.set()
+        # Generous bound: gates a correctness assertion and must not
+        # spuriously time out under a loaded host.
+        if not release_first.wait(timeout=30):
+            raise TimeoutError("test did not release first checkpoint writer")
         raise OSError("first plan failed")
 
     def block_second(temporary: Path) -> None:
         second_started.set()
-        if not release_second.wait(timeout=5):
+        if not release_second.wait(timeout=30):
             raise TimeoutError("test did not release second checkpoint writer")
         temporary.write_bytes(b"second")
 
@@ -6442,6 +6449,15 @@ def test_async_checkpoint_flush_waits_for_later_work_before_raising(
             (CheckpointArtifact(checkpoint_root / "first.pt", fail_first),),
         )
     )
+    # The worker must still be blocked inside the first writer -- not yet
+    # marked failed with the pipeline -- before the second, unrelated plan
+    # submits. Otherwise submit() can race the pipeline's own bookkeeping and
+    # eagerly surface the first plan's not-yet-acknowledged failure instead
+    # of accepting this independent second plan. That eager surfacing is a
+    # deliberate contract elsewhere (see
+    # test_async_checkpoint_plan_failure_surfaces_at_next_bounded_submission),
+    # so this test controls the ordering instead of racing it.
+    assert first_entered.wait(timeout=30)
     publisher.submit(
         CheckpointPlan(
             checkpoint_root,
@@ -6458,11 +6474,12 @@ def test_async_checkpoint_flush_waits_for_later_work_before_raising(
 
     waiter = threading.Thread(target=flush)
     waiter.start()
-    assert second_started.wait(timeout=5)
+    release_first.set()
+    assert second_started.wait(timeout=30)
     waiter.join(timeout=0.1)
     assert waiter.is_alive()
     release_second.set()
-    waiter.join(timeout=5)
+    waiter.join(timeout=30)
     publisher.close()
 
     assert not waiter.is_alive()
@@ -6478,9 +6495,16 @@ def test_async_checkpoint_flush_preserves_process_exception_priority(
     """A later worker signal remains primary without losing an earlier failure."""
     checkpoint_root = tmp_path / "checkpoints"
     checkpoint_root.mkdir()
+    fail_entered = threading.Event()
+    release_fail = threading.Event()
 
     def fail(temporary: Path) -> None:
         temporary.write_bytes(b"partial")
+        fail_entered.set()
+        # Generous bound: gates a correctness assertion and must not
+        # spuriously time out under a loaded host.
+        if not release_fail.wait(timeout=30):
+            raise TimeoutError("test did not release the ordinary-failure checkpoint writer")
         raise OSError("ordinary failure")
 
     def interrupt(temporary: Path) -> None:
@@ -6494,12 +6518,18 @@ def test_async_checkpoint_flush_preserves_process_exception_priority(
             (CheckpointArtifact(checkpoint_root / "failed.pt", fail),),
         )
     )
+    # The worker must still be blocked inside the first writer -- not yet
+    # marked failed with the pipeline -- before the second, unrelated plan
+    # submits; see test_async_checkpoint_flush_waits_for_later_work_before_raising
+    # for why racing that ordering is unsound.
+    assert fail_entered.wait(timeout=30)
     publisher.submit(
         CheckpointPlan(
             checkpoint_root,
             (CheckpointArtifact(checkpoint_root / "interrupted.pt", interrupt),),
         )
     )
+    release_fail.set()
 
     with pytest.raises(KeyboardInterrupt, match="worker interrupted") as raised:
         publisher.flush()
@@ -6527,9 +6557,16 @@ def test_async_checkpoint_flush_retains_failures_if_aggregation_is_interrupted(
     checkpoint_root = tmp_path / "checkpoints"
     checkpoint_root.mkdir()
     first_error = InterruptingFailure("first publication failed")
+    first_entered = threading.Event()
+    release_first = threading.Event()
 
     def fail_first(temporary: Path) -> None:
         temporary.write_bytes(b"partial")
+        first_entered.set()
+        # Generous bound: gates a correctness assertion and must not
+        # spuriously time out under a loaded host.
+        if not release_first.wait(timeout=30):
+            raise TimeoutError("test did not release the first checkpoint writer")
         raise first_error
 
     def fail_second(temporary: Path) -> None:
@@ -6543,12 +6580,18 @@ def test_async_checkpoint_flush_retains_failures_if_aggregation_is_interrupted(
             (CheckpointArtifact(checkpoint_root / "first.pt", fail_first),),
         )
     )
+    # The worker must still be blocked inside the first writer -- not yet
+    # marked failed with the pipeline -- before the second, unrelated plan
+    # submits; see test_async_checkpoint_flush_waits_for_later_work_before_raising
+    # for why racing that ordering is unsound.
+    assert first_entered.wait(timeout=30)
     publisher.submit(
         CheckpointPlan(
             checkpoint_root,
             (CheckpointArtifact(checkpoint_root / "second.pt", fail_second),),
         )
     )
+    release_first.set()
 
     with pytest.raises(KeyboardInterrupt, match="failure aggregation interrupted"):
         publisher.flush()
