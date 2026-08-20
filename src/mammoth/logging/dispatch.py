@@ -11,6 +11,7 @@ from __future__ import annotations
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Protocol
 
 from mammoth.core.pipeline import (
@@ -99,14 +100,29 @@ class AsyncObservationSink:
             self._submit_operation(self.sink.flush, wait=True)
 
     def close(self) -> None:
-        """Drain work and close the concrete sink on its owning worker."""
+        """Drain work and close the concrete sink on its owning worker.
+
+        Each step below records its own failure independently. An earlier
+        step raising must never skip the final ``sink.close`` submission: a
+        prior fire-and-forget dispatch can still be sitting in the pipeline
+        as an unacknowledged failure when this runs, which would otherwise
+        make every later submission attempt on this sink -- including the
+        close itself -- re-raise that same stale failure and return without
+        ever releasing the concrete sink's resources.
+        """
         with self._lock:
             if self._closed:
                 return
             self._closed = True
             try:
                 self._drain_progress(allow_closed=True)
+            except BaseException as error:
+                self._remember_failure(error)
+            try:
                 self._submit_operation(self.sink.flush, wait=True, allow_closed=True)
+            except BaseException as error:
+                self._remember_failure(error)
+            try:
                 self._submit_operation(self.sink.close, wait=True, allow_closed=True)
             except BaseException as error:
                 self._remember_failure(error)
@@ -155,17 +171,38 @@ class AsyncObservationSink:
     ) -> None:
         if not allow_closed:
             self._require_open()
-        try:
-            submission = self._pipeline.submit(operation, on_done=self._complete_submission)
-        except BackgroundPipelineError as error:
-            self._remember_failure(error.cause)
-            raise self._dispatch_error() from error.cause
+        submission = self._submit_past_stale_failures(operation)
         if wait:
             try:
                 submission.result()
             except BaseException as error:
                 self._remember_failure(error)
                 raise self._dispatch_error() from error
+
+    def _submit_past_stale_failures(
+        self,
+        operation: Callable[[], None],
+    ) -> BackgroundPipelineSubmission[Callable[[], None], None]:
+        """Submit one operation, clearing any stale unacknowledged failures first.
+
+        A fire-and-forget dispatch that failed on the worker is not
+        acknowledged until its completion callback runs on the pipeline's own
+        callback thread. Until then, the pipeline synchronously re-raises
+        that same recorded failure for every new submission attempt on this
+        sink, regardless of what the new operation is. More than one such
+        failure can accumulate this way before the callback thread catches
+        up. Acknowledging each one as it is found and retrying lets a
+        genuinely new operation -- notably ``close()``'s flush and close
+        steps -- still run instead of being permanently blocked by failures
+        the caller has already recorded.
+        """
+        while True:
+            try:
+                return self._pipeline.submit(operation, on_done=self._complete_submission)
+            except BackgroundPipelineError as error:
+                self._remember_failure(error.cause)
+                with suppress(Exception):
+                    self._pipeline.acknowledge(error.submission)
 
     def _complete_submission(
         self,
