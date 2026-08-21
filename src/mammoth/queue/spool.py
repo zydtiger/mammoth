@@ -32,7 +32,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, cast
 
-from mammoth.core.artifacts import atomic_write_json
+from mammoth.core.artifacts import artifact_open_flags, atomic_write_json
 from mammoth.core.identity import validate_device_spec, validate_run_name
 from mammoth.core.layout import QueueLayout
 
@@ -250,13 +250,27 @@ class JobOutcome:
 
 @dataclass(frozen=True, slots=True)
 class QueueSnapshot:
-    """Passively readable pending, claimed, and terminal queue state."""
+    """Passively readable pending, claimed, and terminal queue state.
+
+    ``malformed_job_files`` lists the paths of any pending or claimed spool
+    file that failed to parse; those jobs are omitted from ``pending`` /
+    ``claimed`` rather than aborting the whole snapshot, but their paths are
+    still surfaced here so one corrupt file never silently hides the rest of
+    a healthy spool. ``journal_error`` is set instead of raising when the
+    completion journal itself fails to parse (for example a corrupted
+    non-trailing line); in that case ``completed`` / ``failed`` /
+    ``interrupted`` are all empty because Mammoth cannot safely determine
+    them, and callers should treat that as fail-closed, not as "no terminal
+    jobs yet".
+    """
 
     pending: tuple[Job, ...]
     claimed: tuple[Job, ...]
     completed: tuple[JobOutcome, ...]
     failed: tuple[JobOutcome, ...]
     interrupted: tuple[JobOutcome, ...]
+    malformed_job_files: tuple[str, ...] = ()
+    journal_error: str | None = None
 
 
 def submit_job(
@@ -293,28 +307,55 @@ def submit_job(
 
 
 def list_jobs(entry: Path) -> QueueSnapshot:
-    """Return a passive snapshot of pending, claimed, and terminal queue state."""
+    """Return a passive snapshot of pending, claimed, and terminal queue state.
+
+    Tolerates one malformed job file the way :func:`mammoth.queue.serve._claim_next_job`
+    and :func:`mammoth.queue.serve.reconcile_interrupted_jobs` already do: a
+    bad file is skipped rather than hiding every healthy job in the spool,
+    but its path is still reported through
+    :attr:`QueueSnapshot.malformed_job_files` so it is never silently lost.
+    A malformed completion journal is reported through
+    :attr:`QueueSnapshot.journal_error` instead, since a partially trusted
+    journal cannot safely populate ``completed`` / ``failed`` / ``interrupted``.
+    """
     layout = QueueLayout(entry)
+    malformed: list[str] = []
+
+    def _load_all(paths: Sequence[Path]) -> list[Job]:
+        jobs: list[Job] = []
+        for path in paths:
+            try:
+                jobs.append(_load_job(path))
+            except QueueError:
+                malformed.append(str(path))
+        return jobs
+
     pending = tuple(
-        sorted(
-            (_load_job(path) for path in _glob_json(layout.pending_dir)),
-            key=lambda job: job.sequence,
-        )
+        sorted(_load_all(_glob_json(layout.pending_dir)), key=lambda job: job.sequence)
     )
     claimed: list[Job] = []
     if layout.claimed_dir.is_dir():
         for lane_dir in sorted(layout.claimed_dir.iterdir()):
             if not lane_dir.is_dir():
                 continue
-            claimed.extend(_load_job(path) for path in _glob_json(lane_dir))
+            claimed.extend(_load_all(_glob_json(lane_dir)))
     claimed_sorted = tuple(sorted(claimed, key=lambda job: job.sequence))
-    outcomes = read_job_journal(layout.journal_path)
+
+    journal_error: str | None = None
+    outcomes: tuple[JobOutcome, ...] = ()
+    try:
+        outcomes = read_job_journal(layout.journal_path)
+    except QueueError as error:
+        journal_error = str(error)
+
     return QueueSnapshot(
         pending=pending,
         claimed=claimed_sorted,
         completed=tuple(outcome for outcome in outcomes if outcome.status == "completed"),
         failed=tuple(outcome for outcome in outcomes if outcome.status == "failed"),
         interrupted=tuple(outcome for outcome in outcomes if outcome.status == "interrupted"),
+        malformed_job_files=tuple(malformed),
+        journal_error=journal_error,
     )
 
 
@@ -431,8 +472,16 @@ def _glob_json(directory: Path) -> list[Path]:
 
 
 def _load_job(path: Path) -> Job:
+    """Read and validate one job spool file, rejecting a final-component symlink.
+
+    Uses :func:`mammoth.core.artifacts.artifact_open_flags` (``O_NOFOLLOW``)
+    like every write path in this module already does through
+    :func:`mammoth.core.artifacts.atomic_write_json`, since a job file's
+    ``argv`` is what a lane will later execute.
+    """
     try:
-        with path.open(encoding="utf-8") as handle:
+        descriptor = os.open(path, artifact_open_flags())
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
         return Job.from_dict(payload)
     except (OSError, ValueError, json.JSONDecodeError) as error:
