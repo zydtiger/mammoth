@@ -21,6 +21,7 @@ from rich.table import Table
 from rich.text import Text
 
 from mammoth.core.events import ExecutionEvent
+from mammoth.monitor.fleet import FleetSnapshot, GroupMemberSnapshot, GroupSnapshot, MemberProgress
 from mammoth.monitor.model import (
     MetricPoint,
     MonitorSnapshot,
@@ -39,6 +40,7 @@ _STATE_STYLE = {
     "completed": "bold cyan",
     "interrupted": "bold magenta",
     "skipped": "dim cyan",
+    "blocked": "dim red",
 }
 _SHORT_EXECUTION_ID_LENGTH = 8
 _COORDINATE_ORDER = (
@@ -162,6 +164,247 @@ def dashboard_layout(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class FleetRow:
+    """One selectable fleet-screen row: either a group or one loose run."""
+
+    kind: str
+    key: str
+
+
+def fleet_rows(fleet: FleetSnapshot) -> list[FleetRow]:
+    """Return the flat, ordered selection list a fleet screen navigates."""
+    rows = [FleetRow("group", group.group_id) for group in fleet.groups]
+    rows.extend(FleetRow("run", run.run_name) for run in fleet.loose_runs)
+    return rows
+
+
+def fleet_dashboard_layout(
+    fleet: FleetSnapshot,
+    *,
+    selected_index: int,
+    compact: bool,
+    stale_after_seconds: float = 90.0,
+    refresh_seconds: float = 2.0,
+    now: datetime | None = None,
+) -> RenderableType:
+    """Build the entry-level fleet overview: every group, then every loose run."""
+    observed_at = now or datetime.now(UTC)
+    rows = fleet_rows(fleet)
+    header = Table.grid(expand=True, padding=(0, 1), pad_edge=False)
+    header.add_column(justify="left", no_wrap=True)
+    header.add_column(justify="center", ratio=1, no_wrap=True, overflow="ellipsis")
+    header.add_column(justify="right", no_wrap=True)
+    header.add_row(
+        Text("Mammoth Fleet Monitor", style="bold"),
+        Text(str(fleet.entry)),
+        Text(f"refresh {refresh_seconds:g}s"),
+    )
+    pieces: list[RenderableType] = [
+        header,
+        _section("GROUPS") if not compact else Text("\nGROUPS", style="bold"),
+        _group_roll_up_table(fleet, selected_index, observed_at, stale_after_seconds),
+    ]
+    if fleet.match_pattern is None:
+        pieces.extend(
+            (
+                _section("LOOSE RUNS") if not compact else Text("\nLOOSE RUNS", style="bold"),
+                _loose_run_table(
+                    fleet, len(fleet.groups), selected_index, observed_at, stale_after_seconds
+                ),
+            )
+        )
+    if fleet.warnings:
+        pieces.extend(
+            (
+                _section("WARNINGS", style="yellow")
+                if not compact
+                else Text("\nWARNINGS", style="bold yellow"),
+                _warnings_panel(list(fleet.warnings)),
+            )
+        )
+    pieces.extend((Text(), _fleet_footer(bool(rows))))
+    return Group(*pieces)
+
+
+def group_dashboard_layout(
+    group: GroupSnapshot,
+    *,
+    selected_index: int,
+    compact: bool,
+    stale_after_seconds: float = 90.0,
+    refresh_seconds: float = 2.0,
+    now: datetime | None = None,
+) -> RenderableType:
+    """Build the group-level view: one row per member in schedule order."""
+    observed_at = now or datetime.now(UTC)
+    header = Table.grid(expand=True, padding=(0, 1), pad_edge=False)
+    header.add_column(justify="left", no_wrap=True)
+    header.add_column(justify="center", ratio=1, no_wrap=True, overflow="ellipsis")
+    header.add_column(justify="right", no_wrap=True)
+    header.add_row(
+        Text("Mammoth Group Monitor", style="bold"),
+        Text(group.group_id),
+        Text(f"refresh {refresh_seconds:g}s"),
+    )
+    aggregate_eta = format_duration(group.aggregate_eta_seconds)
+    summary = Text(
+        f"order={group.order or '--'}  "
+        f"members={group.completed_count}/{group.failed_count}/{group.total_count} "
+        "(completed/failed/total)  "
+        f"terminal={group.terminal_status or 'unknown'}  "
+        f"aggregate eta={aggregate_eta or '--'}"
+    )
+    pieces: list[RenderableType] = [
+        header,
+        summary,
+        _section("MEMBERS") if not compact else Text("\nMEMBERS", style="bold"),
+        _member_table(group, selected_index, observed_at, stale_after_seconds),
+    ]
+    if group.warnings:
+        pieces.extend(
+            (
+                _section("WARNINGS", style="yellow")
+                if not compact
+                else Text("\nWARNINGS", style="bold yellow"),
+                _warnings_panel(list(group.warnings)),
+            )
+        )
+    pieces.extend((Text(), _group_footer()))
+    return Group(*pieces)
+
+
+def _group_roll_up_table(
+    fleet: FleetSnapshot,
+    selected_index: int,
+    now: datetime,
+    stale_after_seconds: float,
+) -> RenderableType:
+    if not fleet.groups:
+        return Text("  (none observed)", style="dim")
+    table = Table(box=None, expand=True, padding=(0, 1), pad_edge=False, collapse_padding=True)
+    table.add_column("", width=1)
+    table.add_column("Group")
+    table.add_column("Order")
+    table.add_column("Members (done/failed/total)")
+    table.add_column("Active")
+    table.add_column("Heartbeat")
+    table.add_column("Terminal")
+    for index, group in enumerate(fleet.groups):
+        marker = ">" if index == selected_index else ""
+        active_style = _STATE_STYLE.get("running", "") if group.active_member else "dim"
+        table.add_row(
+            marker,
+            group.group_id,
+            group.order or "--",
+            f"{group.completed_count}/{group.failed_count}/{group.total_count}",
+            Text(group.active_member or "--", style=active_style),
+            _heartbeat_cell(group.updated_at, now, stale_after_seconds),
+            group.terminal_status or "unknown",
+        )
+    return table
+
+
+def _loose_run_table(
+    fleet: FleetSnapshot,
+    index_offset: int,
+    selected_index: int,
+    now: datetime,
+    stale_after_seconds: float,
+) -> RenderableType:
+    if not fleet.loose_runs:
+        return Text("  (none observed)", style="dim")
+    table = Table(box=None, expand=True, padding=(0, 1), pad_edge=False, collapse_padding=True)
+    table.add_column("", width=1)
+    table.add_column("Run")
+    table.add_column("Status")
+    table.add_column("Heartbeat")
+    table.add_column("Progress")
+    for offset, run in enumerate(fleet.loose_runs):
+        marker = ">" if index_offset + offset == selected_index else ""
+        table.add_row(
+            marker,
+            run.run_name,
+            Text(run.status.upper(), style=_STATE_STYLE.get(run.status, "")),
+            _heartbeat_cell(run.updated_at, now, stale_after_seconds),
+            _member_progress_text(run.progress),
+        )
+    return table
+
+
+def _member_table(
+    group: GroupSnapshot,
+    selected_index: int,
+    now: datetime,
+    stale_after_seconds: float,
+) -> RenderableType:
+    if not group.members:
+        return Text("  (none observed)", style="dim")
+    table = Table(box=None, expand=True, padding=(0, 1), pad_edge=False, collapse_padding=True)
+    table.add_column("", width=1)
+    table.add_column("Run")
+    table.add_column("Status")
+    table.add_column("Steps")
+    table.add_column("Progress")
+    table.add_column("Heartbeat")
+    for index, member in enumerate(group.members):
+        marker = ">" if index == selected_index else ""
+        table.add_row(
+            marker,
+            member.run_name,
+            Text(member.status.upper(), style=_STATE_STYLE.get(member.status, "")),
+            _member_steps_text(member),
+            _member_progress_text(member.progress),
+            _heartbeat_cell(member.updated_at, now, stale_after_seconds),
+        )
+    return table
+
+
+def _member_steps_text(member: GroupMemberSnapshot) -> str:
+    if not member.steps:
+        return "--"
+    return " ".join(f"{step.name}:{step.status}" for step in member.steps)
+
+
+def _member_progress_text(progress: MemberProgress | None) -> str:
+    if progress is None:
+        return "--"
+    counts = (
+        f"{progress.completed:,}"
+        if progress.total is None
+        else f"{progress.completed:,}/{progress.total:,}"
+    )
+    rate = f" · {progress.throughput:.1f} b/s" if progress.throughput is not None else ""
+    eta = format_duration(progress.eta_seconds)
+    eta_text = f" · ETA {eta}" if eta is not None else ""
+    return f"{counts}{rate}{eta_text}"
+
+
+def _heartbeat_cell(value: datetime | None, now: datetime, stale_after_seconds: float) -> Text:
+    if value is None:
+        return Text("--", style="dim")
+    age_seconds = max(0.0, (now - value).total_seconds())
+    text = f"{_age(value, now)} ago"
+    return Text(text, style="bold yellow" if age_seconds > stale_after_seconds else "")
+
+
+def _fleet_footer(has_rows: bool) -> Text:
+    instructions = (
+        "Enter drill in · ↑/↓ or j/k select · r refresh · q quit"
+        if has_rows
+        else "r refresh · q quit"
+    )
+    return Text(instructions, style="dim", justify="center")
+
+
+def _group_footer() -> Text:
+    return Text(
+        "Enter open run · Esc/Backspace back · ↑/↓ or j/k select · r refresh · q quit",
+        style="dim",
+        justify="center",
+    )
+
+
 def braille_line_chart(
     values: tuple[float, ...],
     width: int,
@@ -219,8 +462,7 @@ def braille_line_chart(
         cell_y, dot_y = divmod(y_coordinate, 4)
         cells[cell_y][cell_x] |= 1 << dot_bits[dot_x][dot_y]
     return "\n".join(
-        "".join(chr(0x2800 + dots) if dots else " " for dots in row).rstrip()
-        for row in cells
+        "".join(chr(0x2800 + dots) if dots else " " for dots in row).rstrip() for row in cells
     )
 
 
@@ -389,11 +631,7 @@ def _logical_panel(snapshot: RunSnapshot, *, compact: bool) -> RenderableType:
         fields.insert(0, f"Phase {_current_phase(selected)}")
 
     if compact:
-        primary = [
-            field
-            for field in fields
-            if not field.startswith("ETA ")
-        ]
+        primary = [field for field in fields if not field.startswith("ETA ")]
         lines = [" | ".join(field.lower() for field in primary)]
         if eta_text is not None:
             lines.append(f"eta {eta_text}")
@@ -684,9 +922,7 @@ def _overview_task(selected: MonitorSnapshot) -> TaskState | None:
     if task is None:
         return None
     by_id = {
-        item.task_id: item
-        for item in selected.tasks.values()
-        if item.producer == task.producer
+        item.task_id: item for item in selected.tasks.values() if item.producer == task.producer
     }
     current = task
     seen = {task.task_id}
@@ -822,9 +1058,7 @@ def _attempt_history(
             lines.append(marker)
             lines.append(f"{_short_execution_id(execution.execution_id):<10}")
             lines.append(f"{state.upper():<12}", style=_STATE_STYLE[state])
-            lines.append(
-                f"{_lineage_text(execution):<22} phase={_current_phase(execution)}\n"
-            )
+            lines.append(f"{_lineage_text(execution):<22} phase={_current_phase(execution)}\n")
         return lines
 
     table = Table(
@@ -863,9 +1097,7 @@ def _producer_current_task(
     tasks = [task for task in selected.tasks.values() if task.producer == producer]
     tasks.sort(key=lambda task: task.updated_at or selected.created_at)
     running = [task for task in tasks if task.status == "running"]
-    active_parent_ids = {
-        task.parent_task_id for task in running if task.parent_task_id is not None
-    }
+    active_parent_ids = {task.parent_task_id for task in running if task.parent_task_id is not None}
     active_leaves = [task for task in running if task.task_id not in active_parent_ids]
     return (active_leaves or running or tasks)[-1] if tasks else None
 
@@ -873,9 +1105,7 @@ def _producer_current_task(
 def _task_scope(selected: MonitorSnapshot, task: TaskState) -> str:
     """Render a bounded same-producer parent chain for one generic task."""
     tasks = {
-        item.task_id: item
-        for item in selected.tasks.values()
-        if item.producer == task.producer
+        item.task_id: item for item in selected.tasks.values() if item.producer == task.producer
     }
     names = [task.task_id]
     parent = task.parent_task_id
@@ -907,16 +1137,13 @@ def _terminal_event(selected: MonitorSnapshot) -> ExecutionEvent | None:
         (
             event
             for event in reversed(selected.events)
-            if event.event
-            in {"execution_completed", "execution_failed", "execution_interrupted"}
+            if event.event in {"execution_completed", "execution_failed", "execution_interrupted"}
         ),
         None,
     )
     if runner_terminal is not None:
         return runner_terminal
-    process_terminals = [
-        event for event in selected.events if event.event == "process_completed"
-    ]
+    process_terminals = [event for event in selected.events if event.event == "process_completed"]
     interrupted = [event for event in process_terminals if event.signal is not None]
     failed = [event for event in process_terminals if event.exit_code not in {None, 0}]
     preferred = interrupted or failed or process_terminals
@@ -1000,9 +1227,10 @@ def _downtime_before(executions: tuple[MonitorSnapshot, ...], index: int) -> str
         return "--"
     previous = executions[index - 1]
     current = executions[index]
-    return format_duration(
-        max(0.0, (current.created_at - previous.updated_at).total_seconds())
-    ) or "0s"
+    return (
+        format_duration(max(0.0, (current.created_at - previous.updated_at).total_seconds()))
+        or "0s"
+    )
 
 
 def _display_time(value: str) -> str:
@@ -1014,9 +1242,7 @@ def _task_counts(task: TaskState | None) -> str:
     if task is None:
         return "--"
     return (
-        f"{task.completed:,}/{task.total:,}"
-        if task.total is not None
-        else f"{task.completed:,}/?"
+        f"{task.completed:,}/{task.total:,}" if task.total is not None else f"{task.completed:,}/?"
     )
 
 
@@ -1038,11 +1264,7 @@ def _progress_text(progress: _ProgressView) -> str:
         if progress.total is not None
         else f"{progress.completed:,}/?"
     )
-    rate = (
-        f" · {progress.throughput:.1f} b/s"
-        if progress.throughput is not None
-        else " · --"
-    )
+    rate = f" · {progress.throughput:.1f} b/s" if progress.throughput is not None else " · --"
     eta = format_duration(progress.eta_seconds)
     eta_text = f" · ETA {eta}" if eta is not None else ""
     return f"{counts}{rate}{eta_text}"
