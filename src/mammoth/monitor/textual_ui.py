@@ -116,7 +116,9 @@ class MonitorApp(App[None]):
             with self._refresh_lock:
                 snapshot = self.monitor.poll(self.snapshot.selected_execution_id)
                 host = (
-                    self.telemetry_sampler.sample() if self.telemetry_sampler is not None else None
+                    self.telemetry_sampler.sample()
+                    if self.telemetry_sampler is not None
+                    else None
                 )
         except (OSError, RuntimeError, ValueError) as error:
             self.call_from_thread(self._accept_error, generation, str(error))
@@ -202,7 +204,9 @@ def run_textual(
 ) -> None:
     """Run the Textual monitor application until the viewer quits."""
     telemetry_sampler = (
-        PsutilViewerTelemetrySampler(allow_sudo_password_prompt=True) if telemetry else None
+        PsutilViewerTelemetrySampler(allow_sudo_password_prompt=True)
+        if telemetry
+        else None
     )
     initial_host = telemetry_sampler.sample() if telemetry_sampler is not None else None
     MonitorApp(
