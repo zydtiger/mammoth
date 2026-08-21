@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from mammoth.core.identity import validate_execution_id, validate_run_name
+from mammoth.core.identity import validate_execution_id, validate_group_id, validate_run_name
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,4 +69,50 @@ class RunLayout:
             self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
             self.results_dir.mkdir(parents=True, exist_ok=True)
             self.visualizations_dir.mkdir(parents=True, exist_ok=True)
+        return self
+
+
+@dataclass(frozen=True, slots=True)
+class GroupLayout:
+    """Resolve the stable ``<entry>/.mammoth/groups/<group-id>`` artifact contract.
+
+    A group is an optional entry-level record the workflow executor publishes
+    to name the runs it dispatched together. It sits between :class:`RunLayout`'s
+    entry and each member run: ``entry`` is the same caller-supplied artifact
+    root a :class:`RunLayout` resolves against, while ``group_id`` identifies
+    one workflow invocation. Consuming projects and every other Mammoth layer
+    never require this directory to exist; an entry with no ``.mammoth/``
+    subtree remains fully valid.
+    """
+
+    entry: Path
+    group_id: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "entry", Path(self.entry))
+        object.__setattr__(self, "group_id", validate_group_id(self.group_id))
+
+    @property
+    def groups_root(self) -> Path:
+        """Return the entry-level container for every published group."""
+        return self.entry / ".mammoth" / "groups"
+
+    @property
+    def group_dir(self) -> Path:
+        """Return this group's stable directory without creating it."""
+        return self.groups_root / self.group_id
+
+    @property
+    def manifest_path(self) -> Path:
+        """Return the immutable group manifest location."""
+        return self.group_dir / "manifest.json"
+
+    @property
+    def events_path(self) -> Path:
+        """Return the append-only group event stream location."""
+        return self.group_dir / "events.jsonl"
+
+    def prepare(self) -> GroupLayout:
+        """Create the stable group directory without creating manifest or events."""
+        self.group_dir.mkdir(parents=True, exist_ok=True)
         return self
