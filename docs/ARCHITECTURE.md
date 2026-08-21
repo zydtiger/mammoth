@@ -633,6 +633,32 @@ action for an unhandled SIGTERM, or `SIGKILL`) can leave the spool in an
 ambiguous state that the next lease acquisition's reconciliation cannot
 already classify correctly.
 
+That fail-closed classification is a bookkeeping guarantee about the queue's
+own on-disk state, not by itself a guarantee that the device is actually
+free: `SupervisedProcess` launches every job with `start_new_session=True`
+(its own new process group and session), so a runner killed with `SIGKILL`
+does not, on its own, take its job child down with it -- the child is simply
+reparented to the init process and keeps running, silently occupying the
+device the queue now believes is free. `mammoth queue serve` mitigates this
+with an opt-in, Linux-only, best-effort parent-death signal: its default
+launcher passes `parent_death_signal=signal.SIGTERM` to `launch_process`
+(see `mammoth.workflow.launch.SupervisedProcess.parent_death_signal`), which
+arms `prctl(PR_SET_PDEATHSIG, SIGTERM)` on the direct child before it execs,
+so the kernel itself delivers `SIGTERM` to that child the instant its parent
+process terminates for any reason, including `SIGKILL`, with no cooperation
+required from the dying runner. `Workflow.run()` never passes this
+parameter, so its behavior is byte-identical to before this mechanism
+existed. The mitigation's coverage is deliberately narrow and must not be
+overstated: it reaches only the *direct* child `launch_process` starts. A
+grandchild that job spawns into its own session (for example a training
+script that itself forks a data-loader worker pool, or execs into a
+supervisor of its own) is not armed with any death signal and can keep
+running -- and keep occupying the device -- after both the runner and its
+direct child are gone. Device exclusivity after a hard kill is therefore
+best-effort, not guaranteed; only a job whose own process tree fully
+terminates when its direct parent dies (the common case for a single
+training process) gets the full benefit.
+
 The completion journal is a single shared file that multiple concurrent
 lane processes append to. Each record is written with one raw `os.write()`
 call under `O_APPEND` (bypassing Python's buffered I/O layer, matching
