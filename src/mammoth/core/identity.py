@@ -14,11 +14,17 @@ from pathlib import Path
 RUN_NAME_MAX_LENGTH = 255
 EXECUTION_ID_MAX_LENGTH = 128
 GROUP_ID_MAX_LENGTH = 128
+DEVICE_SPEC_MAX_LENGTH = 128
 DERIVED_RUN_NAME_DIGEST_LENGTH = 8
 
 _RUN_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _EXECUTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _GROUP_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# Colon is additionally accepted so both plain indices ("0") and framework
+# device strings ("cuda:0") normalize without translation; queue lane leases
+# and claimed-job directories use the validated spec directly as one path
+# component, so it must stay a single filesystem-safe segment.
+_DEVICE_SPEC_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _DERIVED_STEM_UNSAFE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 _DERIVED_STEM_MAX_LENGTH = 64
 
@@ -74,6 +80,30 @@ def validate_group_id(group_id: str) -> str:
             "digit, and may not be '.' or '..'."
         )
     return group_id
+
+
+def validate_device_spec(device: str) -> str:
+    """Return a safe, opaque single-component device-lane identifier.
+
+    Mammoth never interprets a device spec's internal structure: a bare index
+    (``"0"``), a framework device string (``"cuda:0"``), or a stable hardware
+    UUID (``"GPU-xxxxxxxx-..."``) are all accepted as opaque tokens. The queue
+    uses the validated spec directly as one lease-file and claimed-job
+    directory name component, so it must stay filesystem-safe and free of any
+    path separator.
+    """
+    if (
+        not isinstance(device, str)
+        or len(device) > DEVICE_SPEC_MAX_LENGTH
+        or device in {".", ".."}
+        or _DEVICE_SPEC_PATTERN.fullmatch(device) is None
+    ):
+        raise ValueError(
+            "Device specs must be 1-128 filesystem-safe ASCII characters using "
+            "letters, digits, '.', '_', ':', or '-', must begin with a letter or "
+            "digit, and may not be '.' or '..'."
+        )
+    return device
 
 
 def derive_run_name(prefix: str, target_path: str | Path) -> str:
