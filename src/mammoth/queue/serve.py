@@ -25,9 +25,10 @@ from __future__ import annotations
 
 import fcntl
 import os
+import signal
 import stat
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -46,9 +47,35 @@ from mammoth.queue.spool import (
     journal_job_ids,
     load_job,
 )
-from mammoth.workflow.launch import Launcher, launch_process
+from mammoth.workflow.launch import Launcher, ProcessResult, launch_process
 
 _MAMMOTH_ENVIRONMENT_PREFIX = "MAMMOTH_"
+
+
+def _default_job_launcher(
+    command: tuple[str, ...],
+    *,
+    cwd: Path | None,
+    environment: Mapping[str, str],
+    timeout_seconds: float | None,
+) -> ProcessResult:
+    """Launch one job with a best-effort Linux parent-death SIGTERM armed.
+
+    This is ``serve_once``'s and ``run_serve_loop``'s default ``launcher``.
+    It matches the :class:`~mammoth.workflow.launch.Launcher` protocol
+    exactly (no new parameter on the protocol itself, so every existing
+    launcher -- including test doubles -- keeps working unchanged) and only
+    additionally passes ``parent_death_signal`` to :func:`launch_process`.
+    See ``docs/ARCHITECTURE.md``'s "Runner and crash safety" section for the
+    residual risk this does and does not cover.
+    """
+    return launch_process(
+        command,
+        cwd=cwd,
+        environment=environment,
+        timeout_seconds=timeout_seconds,
+        parent_death_signal=signal.SIGTERM,
+    )
 
 
 class DeviceLeaseConflictError(QueueError):
@@ -167,7 +194,7 @@ def serve_once(
     entry: Path,
     device: str,
     *,
-    launcher: Launcher = launch_process,
+    launcher: Launcher = _default_job_launcher,
 ) -> JobOutcome | None:
     """Claim, launch, and record the outcome of one FIFO-matching pending job.
 
@@ -213,7 +240,7 @@ def run_serve_loop(
     entry: Path,
     device: str,
     *,
-    launcher: Launcher = launch_process,
+    launcher: Launcher = _default_job_launcher,
     poll_interval_seconds: float = 1.0,
     sleep: Callable[[float], None] = time.sleep,
     max_jobs: int | None = None,

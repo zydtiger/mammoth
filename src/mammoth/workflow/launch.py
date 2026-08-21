@@ -6,6 +6,7 @@ process groups ensure timeout or interruption reaches descendants as a group.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import signal
 import subprocess
@@ -15,6 +16,8 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Never, Protocol
+
+_PR_SET_PDEATHSIG = 1  # Linux <sys/prctl.h>; unavailable on other kernels.
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +98,7 @@ class SupervisedProcess:
     start_new_session: bool = True
     terminate_grace_seconds: float = 5.0
     descendant_grace_seconds: float = 1.0
+    parent_death_signal: int | None = None
     process_factory: Callable[..., subprocess.Popen[Any]] = field(
         default=subprocess.Popen,
         repr=False,
@@ -132,6 +136,10 @@ class SupervisedProcess:
         }
         if self.start_new_session:
             options["start_new_session"] = True
+        if self.parent_death_signal is not None:
+            options["preexec_fn"] = _build_parent_death_signal_preexec_fn(
+                self.parent_death_signal
+            )
         if capture_output:
             options.update(
                 stdout=subprocess.PIPE,
@@ -163,12 +171,26 @@ def launch_process(
     timeout_seconds: float | None,
     terminate_grace_seconds: float = 5.0,
     on_started: Callable[[int], None] | None = None,
+    parent_death_signal: int | None = None,
 ) -> ProcessResult:
     """Run one command and terminate its process group on timeout or interruption.
 
     ``on_started`` receives the real launcher PID after Mammoth has started
     the supervised child and before it waits.  A callback failure follows the
     same owned cleanup path as any other launch-time failure.
+
+    ``parent_death_signal`` is an opt-in, Linux-only, best-effort mitigation:
+    when set, the direct child is armed (via ``prctl(PR_SET_PDEATHSIG, ...)``)
+    to receive that signal if this process itself terminates abruptly (for
+    example ``SIGKILL``) before it can otherwise supervise the child's
+    shutdown. The default, ``None``, adds no ``preexec_fn`` and leaves every
+    existing caller's behavior, including :meth:`mammoth.workflow.Workflow.run`,
+    byte-identical. This only reaches the *direct* child process: a
+    grandchild the job itself spawns into its own session is unaffected and
+    can still outlive a hard-killed launcher. See
+    ``docs/ARCHITECTURE.md``'s "Runner and crash safety" section for the full
+    residual-risk disclosure in the one caller that opts in,
+    :func:`mammoth.queue.serve.serve_once`.
     """
     started = time.monotonic()
     deadline = None if timeout_seconds is None else started + timeout_seconds
@@ -177,6 +199,7 @@ def launch_process(
         cwd=cwd,
         environment=environment,
         terminate_grace_seconds=terminate_grace_seconds,
+        parent_death_signal=parent_death_signal,
     )
     process_started = False
     try:
@@ -306,6 +329,46 @@ def run_captured_process(
         duration_seconds=time.monotonic() - started,
         signal=-return_code if return_code < 0 else None,
     )
+
+
+def _build_parent_death_signal_preexec_fn(signal_number: int) -> Callable[[], None]:
+    """Return a preexec hook that best-effort arms a Linux parent-death signal.
+
+    Called in the freshly forked child, before exec, from
+    :meth:`SupervisedProcess._start`. Uses ``prctl(PR_SET_PDEATHSIG, ...)``
+    via ``ctypes`` since the standard library exposes no wrapper. Any
+    failure -- including running on a non-Linux kernel where ``libc.so.6``
+    or ``prctl`` itself is unavailable -- is swallowed: this is a
+    best-effort mitigation, never a launch precondition, and an exception
+    escaping a ``preexec_fn`` would otherwise abort the whole launch.
+
+    After arming, it re-checks the parent PID: ``prctl(2)``'s NOTES section
+    documents that if the original parent already exited in the narrow
+    fork-to-prctl window, the death signal would be armed against whatever
+    process has since become the parent (usually the init process) instead
+    of the one this launch actually cares about, silently losing the
+    protection. Detecting that and delivering ``signal_number`` to this
+    process immediately instead closes that race the same way the manual
+    page recommends.
+    """
+
+    def _preexec() -> None:
+        with suppress(Exception):
+            original_ppid = os.getppid()
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            libc.prctl.restype = ctypes.c_int
+            libc.prctl.argtypes = [
+                ctypes.c_int,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+            ]
+            libc.prctl(_PR_SET_PDEATHSIG, ctypes.c_ulong(signal_number), 0, 0, 0)
+            if os.getppid() != original_ppid:
+                os.kill(os.getpid(), signal_number)
+
+    return _preexec
 
 
 def _supervisor_started(
