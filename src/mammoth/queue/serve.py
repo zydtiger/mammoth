@@ -255,8 +255,19 @@ def run_serve_loop(
     signal (see the module docstring), and swallows a ``KeyboardInterrupt``
     raised while idle between polls so an interactive SIGINT always exits
     this foreground command cleanly.
+
+    The completion journal is validated unconditionally, before FIFO
+    dispatch and regardless of whether this lane's claimed directory
+    currently holds anything to reconcile. :func:`reconcile_interrupted_jobs`
+    only reads the journal when its own ``claimed_lane_dir`` already exists,
+    so a lane with no debris to reconcile -- the common case -- would
+    otherwise never read a corrupted journal at all: it would claim and run
+    pending jobs and append new records past the corruption instead of
+    refusing to start. Raising here keeps ``serve`` fail-closed on a
+    corrupted journal in every case, not only the crash-recovery case.
     """
     with claim_device_lease(entry, device) as lease:
+        journal_job_ids(QueueLayout(entry).journal_path)
         reconcile_interrupted_jobs(entry, lease.device)
         outcomes: list[JobOutcome] = []
         try:
