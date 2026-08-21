@@ -348,6 +348,24 @@ runs, terminates or reaps any child, closes observers, releases every lease,
 and then re-raises the original error without allowing cleanup failures to
 replace it.
 
+`Workflow.run()` also publishes the optional entry-level group described
+under Artifact layout. Publication is lazy and happens at most once per
+invocation, the first time any run activates (inside that first run's own
+blocked setup window, alongside its layout preparation and lease claim), so a
+signal caught during earlier setup still returns a structured interruption
+result with no artifacts at all, group included. Once published, the same
+`GroupEventWriter` records every member run's and step's lifecycle
+transitions for the rest of that invocation, and `WorkflowResult.group_id`
+names it. `Workflow`'s `group_metadata` field is the caller's opaque,
+JSON-compatible attachment; Mammoth validates only its JSON compatibility,
+never interprets or redacts it, and it round-trips unchanged through the
+manifest. Group event emission is best-effort and mirrors the JSONL
+durability contract below: a write failure disables only that writer and
+never the workflow it observes, and `_finalize_group()` records the terminal
+group status from the outer `finally` block so it runs whether
+`Workflow.run()` is about to return a result or re-raise a setup or cleanup
+exception.
+
 The ordinary workflow launcher inherits the parent terminal streams; callers
 that explicitly need captured output use `run_captured_process()` for separately
 drained text stdout and stderr, timeout facts, and the same bounded
@@ -392,14 +410,19 @@ require caller-owned immutable captures.
 
 ## Runtime model
 
-Mammoth uses six nested concepts:
+Mammoth uses seven nested concepts:
 
 1. **Entry**: an arbitrary artifact root such as `runs` or `experiments`.
-2. **Run**: a stable logical identity beneath one entry.
-3. **Execution**: one immutable attempt to produce or continue a run.
-4. **Producer**: a runner or process/rank that exclusively owns one stream.
-5. **Phase and task**: arbitrary project-named work scopes.
-6. **Observation**: lifecycle, progress, heartbeat, metric, or terminal state.
+2. **Group**: an optional, entry-level record naming the runs one
+   `mammoth.workflow.Workflow` invocation dispatched together. Groups are
+   produced only by the workflow executor and consumed passively; an entry
+   with no group ever published, and every run launched outside a `Workflow`,
+   remain fully valid without one.
+3. **Run**: a stable logical identity beneath one entry.
+4. **Execution**: one immutable attempt to produce or continue a run.
+5. **Producer**: a runner or process/rank that exclusively owns one stream.
+6. **Phase and task**: arbitrary project-named work scopes.
+7. **Observation**: lifecycle, progress, heartbeat, metric, or terminal state.
 
 Core event consumers treat phase names, task names, coordinates, metric names,
 and artifact extensions as opaque validated data.
@@ -440,6 +463,33 @@ operational paths. The default contract is:
 
 The entry path is supplied by the caller. Mammoth does not assign semantic
 meaning to entry names.
+
+`GroupLayout(entry, group_id)` resolves the optional, entry-level group
+contract published only by `Workflow.run()`. The default contract is:
+
+```text
+<entry>/.mammoth/groups/<group-id>/
+├── manifest.json                immutable group manifest
+└── events.jsonl                 append-only group event stream
+```
+
+`manifest.json` records the group ID, creation time, declared schedule order
+(`run-major`/`step-major`), the ordered member run names and their planned
+step names, and the caller-supplied opaque metadata block, published
+atomically with `mammoth.core.artifacts.atomic_write_json` before the first
+step dispatches. `events.jsonl` reuses the schema-v1 JSONL conventions from
+`mammoth.core.events` at group scope: a monotonically sequenced, flush-per-
+record append-only stream recording member run and step lifecycle
+transitions (`run_started`/`run_completed`/`run_failed`/`run_blocked`/
+`run_interrupted`, `step_started`/`step_completed`/`step_failed`/
+`step_interrupted`) and exactly one terminal group status
+(`group_completed`/`group_failed`/`group_interrupted`) recorded on every exit
+path from `Workflow.run()`, including signal-driven interruption. A crashed
+workflow leaves a group without that terminal record; consumers infer
+staleness from event recency, exactly as they do for a run's own execution
+events. The `.mammoth/` subtree is entirely optional: an entry that never
+hosted a `Workflow` invocation, and every run launched outside one, remain
+fully valid without it.
 
 `mammoth.core.is_immutable_log_entry(log_dir, child)` classifies whether one
 child of a run's `logs/` directory is Mammoth-owned immutable state that a
