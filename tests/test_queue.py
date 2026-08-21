@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
+import sys
+import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -12,13 +18,17 @@ from typer.testing import CliRunner
 
 from mammoth.cli import app
 from mammoth.core import validate_device_spec
+from mammoth.core.layout import QueueLayout
 from mammoth.queue import (
     DeviceLeaseConflictError,
     JobAlreadyClaimedError,
     JobNotFoundError,
+    QueueError,
     cancel_job,
     claim_device_lease,
+    job_filename,
     list_jobs,
+    load_job,
     reconcile_interrupted_jobs,
     run_serve_loop,
     serve_once,
@@ -26,7 +36,7 @@ from mammoth.queue import (
 )
 from mammoth.queue import serve as serve_module
 from mammoth.queue.spool import Job, JobOutcome, append_job_outcome
-from mammoth.workflow.launch import ProcessResult
+from mammoth.workflow.launch import ProcessResult, descendant_process_ids, running_processes
 
 runner = CliRunner()
 
@@ -294,6 +304,71 @@ def test_reconcile_after_full_success_leaves_no_debris(tmp_path: Path) -> None:
     assert outcomes == ()
 
 
+# --- real-process crash safety: parent-death signal (P1 regression) ----------
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parent-death signal is Linux-only")
+def test_hard_killing_the_real_runner_kills_its_job_child_too(tmp_path: Path) -> None:
+    """A SIGKILLed real ``queue serve`` process's job child dies with it.
+
+    Regression test: before the parent-death-signal fix, ``SupervisedProcess``
+    launched every job child with ``start_new_session=True`` and no death
+    signal armed, so a hard-killed runner left its job child reparented to
+    PID 1 and still running -- silently defeating device exclusivity even
+    though ``reconcile_interrupted_jobs`` correctly freed the lane for the
+    next job. This spawns a real ``mammoth queue serve`` process and a real
+    long-sleeping job child, then SIGKILLs the runner and asserts the child
+    process actually exits, not merely that the queue *believes* it did.
+    """
+    submit(
+        tmp_path,
+        device="cuda:0",
+        argv=(sys.executable, "-c", "import time; time.sleep(20)"),
+    )
+    environment = dict(os.environ)
+    environment["CUDA_VISIBLE_DEVICES"] = ""
+    serve_process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "mammoth",
+            "queue",
+            "serve",
+            "--entry",
+            str(tmp_path),
+            "--device",
+            "cuda:0",
+            "--poll-interval",
+            "0.1",
+        ],
+        env=environment,
+    )
+    try:
+        deadline = time.monotonic() + 10.0
+        descendants: tuple[int, ...] = ()
+        while time.monotonic() < deadline and not descendants:
+            descendants = descendant_process_ids(serve_process.pid)
+            if not descendants:
+                time.sleep(0.05)
+        assert descendants, "the job child never appeared under the real runner process"
+
+        os.kill(serve_process.pid, signal.SIGKILL)
+        serve_process.wait(timeout=5.0)
+
+        deadline = time.monotonic() + 5.0
+        remaining = running_processes(descendants)
+        while remaining and time.monotonic() < deadline:
+            time.sleep(0.05)
+            remaining = running_processes(remaining)
+        assert remaining == (), "the job child outlived its hard-killed runner"
+    finally:
+        with suppress(ProcessLookupError):
+            os.kill(serve_process.pid, signal.SIGKILL)
+        for pid in running_processes(descendant_process_ids(serve_process.pid)):
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+
+
 # --- run_serve_loop ------------------------------------------------------------
 
 
@@ -395,6 +470,73 @@ def test_cancel_job_raises_not_found_for_an_unknown_id(tmp_path: Path) -> None:
         cancel_job(tmp_path, "does-not-exist")
 
 
+# --- malformed on-disk state: job files, the journal, and symlinks (P2/P3-1) --
+
+
+def _write_malformed_pending_job(entry: Path, *, job_id: str, sequence: int = 1) -> Path:
+    layout = QueueLayout(entry)
+    layout.pending_dir.mkdir(parents=True, exist_ok=True)
+    path = layout.pending_dir / f"{sequence:020d}-{job_id}.json"
+    path.write_text("{not valid json", encoding="utf-8")
+    return path
+
+
+def test_list_jobs_reports_malformed_job_files_without_hiding_healthy_ones(
+    tmp_path: Path,
+) -> None:
+    healthy = submit(tmp_path, device="cuda:0")
+    bad_path = _write_malformed_pending_job(tmp_path, job_id="broken-job")
+
+    snapshot = list_jobs(tmp_path)
+
+    assert [pending.job_id for pending in snapshot.pending] == [healthy.job_id]
+    assert snapshot.malformed_job_files == (str(bad_path),)
+
+
+def test_list_jobs_reports_a_malformed_journal_without_losing_healthy_state(
+    tmp_path: Path,
+) -> None:
+    job = submit(tmp_path, device="cuda:0")
+    QueueLayout(tmp_path).prepare().journal_path.write_bytes(b"{not valid json\n")
+
+    snapshot = list_jobs(tmp_path)
+
+    assert [pending.job_id for pending in snapshot.pending] == [job.job_id]
+    assert snapshot.journal_error is not None
+    assert snapshot.completed == ()
+    assert snapshot.failed == ()
+    assert snapshot.interrupted == ()
+
+
+def test_cancel_job_raises_queue_error_for_a_malformed_target_job(tmp_path: Path) -> None:
+    _write_malformed_pending_job(tmp_path, job_id="broken-job")
+
+    with pytest.raises(QueueError, match="Malformed queue job file"):
+        cancel_job(tmp_path, "broken-job")
+
+
+def test_run_serve_loop_fails_closed_on_a_malformed_journal(tmp_path: Path) -> None:
+    submit(tmp_path, device="cuda:0")
+    serve_module._claim_next_job(tmp_path, "cuda:0")  # something needs reconciling
+    QueueLayout(tmp_path).prepare().journal_path.write_bytes(b"{not valid json\n")
+
+    with pytest.raises(QueueError, match="Malformed queue journal record"):
+        run_serve_loop(tmp_path, "cuda:0", launcher=RecordingLauncher([]), stop_when_idle=True)
+
+
+def test_load_job_rejects_a_symlinked_job_file(tmp_path: Path) -> None:
+    job = submit(tmp_path, device="cuda:0")
+    layout = QueueLayout(tmp_path)
+    real_path = layout.pending_dir / job_filename(job)
+    target = tmp_path / "outside-target.json"
+    target.write_text(real_path.read_text(encoding="utf-8"), encoding="utf-8")
+    real_path.unlink()
+    real_path.symlink_to(target)
+
+    with pytest.raises(QueueError, match="Malformed queue job file"):
+        load_job(real_path)
+
+
 # --- CLI: submit, list, cancel --------------------------------------------------
 
 
@@ -466,6 +608,65 @@ def test_cli_queue_submit_rejects_invalid_device(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "Device specs" in result.output
+
+
+# --- CLI: malformed on-disk state reported cleanly, never a traceback (P2) ---
+
+
+def test_cli_queue_list_reports_malformed_job_and_still_shows_healthy_ones(
+    tmp_path: Path,
+) -> None:
+    healthy = submit(tmp_path, device="cuda:0")
+    _write_malformed_pending_job(tmp_path, job_id="broken-job")
+
+    result = runner.invoke(app, ["queue", "list", "--entry", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "Traceback" not in result.output
+    assert "pending: 1" in result.output
+    assert healthy.job_id in result.output
+    assert "malformed job files: 1" in result.output
+    assert "broken-job" in result.output
+
+
+def test_cli_queue_cancel_reports_a_malformed_target_job_cleanly(tmp_path: Path) -> None:
+    _write_malformed_pending_job(tmp_path, job_id="broken-job")
+
+    result = runner.invoke(app, ["queue", "cancel", "broken-job", "--entry", str(tmp_path)])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "Malformed queue job file" in result.output
+
+
+def test_cli_queue_list_reports_a_malformed_journal_and_still_shows_pending(
+    tmp_path: Path,
+) -> None:
+    healthy = submit(tmp_path, device="cuda:0")
+    QueueLayout(tmp_path).prepare().journal_path.write_bytes(b"{not valid json\n")
+
+    result = runner.invoke(app, ["queue", "list", "--entry", str(tmp_path)])
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "pending: 1" in result.output
+    assert healthy.job_id in result.output
+    assert "journal" in result.output.lower()
+
+
+def test_cli_queue_serve_refuses_to_start_on_a_malformed_journal(tmp_path: Path) -> None:
+    submit(tmp_path, device="cuda:0")
+    serve_module._claim_next_job(tmp_path, "cuda:0")  # something needs reconciling
+    QueueLayout(tmp_path).prepare().journal_path.write_bytes(b"{not valid json\n")
+
+    result = runner.invoke(
+        app,
+        ["queue", "serve", "--entry", str(tmp_path), "--device", "cuda:0"],
+    )
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "Malformed queue journal record" in result.output
 
 
 # --- CLI: serve wiring -----------------------------------------------------------
