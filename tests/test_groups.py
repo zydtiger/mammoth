@@ -314,6 +314,23 @@ def test_group_event_tail_reader_fails_on_truncation_and_returns_valid_events(
         reader.poll()
 
 
+def test_group_event_tail_reader_fails_on_a_blank_complete_line(tmp_path: Path) -> None:
+    """A blank line fails the stream, exactly like ExecutionEventTailReader."""
+    layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
+    writer = GroupEventWriter(layout.events_path, group_id="group-1")
+    writer.emit("group_started")
+    writer.close()
+    reader = GroupEventTailReader(layout.events_path)
+    assert [event.event for event in reader.poll()] == ["group_started"]
+
+    with layout.events_path.open("ab") as handle:
+        handle.write(b"\n")
+
+    with pytest.raises(GroupEventReadError) as excinfo:
+        reader.poll()
+    assert [event.event for event in excinfo.value.valid_events] == []
+
+
 def test_group_event_tail_reader_reports_out_of_sequence_records_with_valid_prefix(
     tmp_path: Path,
 ) -> None:
