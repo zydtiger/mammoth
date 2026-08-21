@@ -33,6 +33,7 @@ from mammoth.queue import (
     JobAlreadyClaimedError,
     JobNotFoundError,
     JobOutcome,
+    QueueError,
     QueueSnapshot,
     cancel_job,
     list_jobs,
@@ -218,6 +219,9 @@ def queue_submit(
         )
     except (OSError, ValueError) as error:
         raise typer.BadParameter(str(error)) from None
+    except QueueError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from None
     typer.echo(f"submitted {job.job_id} (sequence={job.sequence}, device={job.device})")
 
 
@@ -225,9 +229,25 @@ def queue_submit(
 def queue_list(
     entry: Annotated[Path, typer.Option("--entry", help="Queue entry root.")] = Path("./runs"),
 ) -> None:
-    """Render pending, claimed, completed, failed, and interrupted queue state."""
-    snapshot = list_jobs(entry)
+    """Render pending, claimed, completed, failed, and interrupted queue state.
+
+    A malformed pending or claimed job file is skipped and reported by
+    filename rather than aborting the whole listing. A malformed completion
+    journal, by contrast, is reported as a clean error with a nonzero exit
+    after the healthy pending/claimed sections are still printed: Mammoth
+    cannot safely determine completed/failed/interrupted state from a
+    partially trusted journal, so it reports that explicitly instead of
+    silently showing an empty (and misleadingly "nothing yet") history.
+    """
+    try:
+        snapshot = list_jobs(entry)
+    except QueueError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from None
     typer.echo(_render_queue_snapshot(snapshot))
+    if snapshot.journal_error is not None:
+        typer.echo(f"queue journal error: {snapshot.journal_error}", err=True)
+        raise typer.Exit(code=1) from None
 
 
 @queue_app.command("cancel")
@@ -241,6 +261,9 @@ def queue_cancel(
     except JobNotFoundError as error:
         raise typer.BadParameter(str(error)) from None
     except JobAlreadyClaimedError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from None
+    except QueueError as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from None
     typer.echo(f"cancelled {job.job_id}")
@@ -262,10 +285,18 @@ def queue_serve(
         ),
     ] = 1.0,
 ) -> None:
-    """Run the foreground FIFO device-lane runner until interrupted."""
+    """Run the foreground FIFO device-lane runner until interrupted.
+
+    A malformed completion journal is refused with a clean error instead of
+    starting this lane: silently skipping journal corruption risks
+    double-running a job the journal had already durably recorded.
+    """
     try:
         run_serve_loop(entry, device, poll_interval_seconds=poll_interval)
     except DeviceLeaseConflictError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from None
+    except QueueError as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from None
     except (OSError, ValueError) as error:
@@ -302,12 +333,18 @@ def _render_queue_snapshot(snapshot: QueueSnapshot) -> str:
     lines.extend(render_job("PENDING", job) for job in snapshot.pending)
     lines.append(f"claimed: {len(snapshot.claimed)}")
     lines.extend(render_job("CLAIMED", job) for job in snapshot.claimed)
-    lines.append(f"completed: {len(snapshot.completed)}")
-    lines.extend(render_outcome("COMPLETED", outcome) for outcome in snapshot.completed)
-    lines.append(f"failed: {len(snapshot.failed)}")
-    lines.extend(render_outcome("FAILED", outcome) for outcome in snapshot.failed)
-    lines.append(f"interrupted: {len(snapshot.interrupted)}")
-    lines.extend(render_outcome("INTERRUPTED", outcome) for outcome in snapshot.interrupted)
+    if snapshot.journal_error is not None:
+        lines.append(f"journal: unreadable ({snapshot.journal_error})")
+    else:
+        lines.append(f"completed: {len(snapshot.completed)}")
+        lines.extend(render_outcome("COMPLETED", outcome) for outcome in snapshot.completed)
+        lines.append(f"failed: {len(snapshot.failed)}")
+        lines.extend(render_outcome("FAILED", outcome) for outcome in snapshot.failed)
+        lines.append(f"interrupted: {len(snapshot.interrupted)}")
+        lines.extend(render_outcome("INTERRUPTED", outcome) for outcome in snapshot.interrupted)
+    if snapshot.malformed_job_files:
+        lines.append(f"malformed job files: {len(snapshot.malformed_job_files)}")
+        lines.extend(f"  {path}" for path in snapshot.malformed_job_files)
     return "\n".join(lines)
 
 
