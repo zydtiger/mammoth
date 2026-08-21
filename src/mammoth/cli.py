@@ -15,7 +15,7 @@ from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
 from types import ModuleType
-from typing import Annotated, NoReturn
+from typing import Annotated, Any, NoReturn
 
 import typer
 
@@ -27,6 +27,18 @@ from mammoth.monitor import (
     render_snapshot,
     sample_viewer_telemetry,
 )
+from mammoth.queue import (
+    DeviceLeaseConflictError,
+    Job,
+    JobAlreadyClaimedError,
+    JobNotFoundError,
+    JobOutcome,
+    QueueSnapshot,
+    cancel_job,
+    list_jobs,
+    run_serve_loop,
+    submit_job,
+)
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
 app = typer.Typer(
@@ -36,6 +48,14 @@ app = typer.Typer(
     no_args_is_help=True,
     pretty_exceptions_enable=False,
 )
+queue_app = typer.Typer(
+    add_completion=False,
+    context_settings=CONTEXT_SETTINGS,
+    help="Local device-aware job queue: submit, list, cancel, and serve opaque jobs.",
+    no_args_is_help=True,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(queue_app, name="queue")
 
 
 def version_callback(value: bool) -> None:
@@ -162,6 +182,133 @@ def run_monitor(
         if not should_watch or snapshot.status in {"completed", "failed", "interrupted"}:
             return
         time.sleep(interval)
+
+
+@queue_app.command("submit")
+def queue_submit(
+    command: Annotated[
+        list[str],
+        typer.Argument(help="Opaque job argv; separate options from it with '--'."),
+    ],
+    device: Annotated[str, typer.Option("--device", help="Device spec this job requires.")],
+    run_name: Annotated[
+        list[str],
+        typer.Option("--run-name", help="Run name this job expects to produce; repeatable."),
+    ],
+    entry: Annotated[Path, typer.Option("--entry", help="Queue entry root.")] = Path("./runs"),
+    cwd: Annotated[
+        Path | None,
+        typer.Option("--cwd", help="Working directory for the launched job."),
+    ] = None,
+    metadata: Annotated[
+        str | None,
+        typer.Option("--metadata", help="Opaque JSON object recorded with the job."),
+    ] = None,
+) -> None:
+    """Durably enqueue one opaque job under the entry's pending spool."""
+    parsed_metadata = _parse_metadata_option(metadata)
+    try:
+        job = submit_job(
+            entry,
+            argv=command,
+            expected_run_names=run_name,
+            device=device,
+            cwd=cwd,
+            metadata=parsed_metadata,
+        )
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from None
+    typer.echo(f"submitted {job.job_id} (sequence={job.sequence}, device={job.device})")
+
+
+@queue_app.command("list")
+def queue_list(
+    entry: Annotated[Path, typer.Option("--entry", help="Queue entry root.")] = Path("./runs"),
+) -> None:
+    """Render pending, claimed, completed, failed, and interrupted queue state."""
+    snapshot = list_jobs(entry)
+    typer.echo(_render_queue_snapshot(snapshot))
+
+
+@queue_app.command("cancel")
+def queue_cancel(
+    job_id: Annotated[str, typer.Argument(help="Job ID to cancel.")],
+    entry: Annotated[Path, typer.Option("--entry", help="Queue entry root.")] = Path("./runs"),
+) -> None:
+    """Remove one unclaimed job; refuse a job already claimed or terminal."""
+    try:
+        job = cancel_job(entry, job_id)
+    except JobNotFoundError as error:
+        raise typer.BadParameter(str(error)) from None
+    except JobAlreadyClaimedError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(f"cancelled {job.job_id}")
+
+
+@queue_app.command("serve")
+def queue_serve(
+    device: Annotated[
+        str,
+        typer.Option("--device", help="Device spec this lane exclusively serves."),
+    ],
+    entry: Annotated[Path, typer.Option("--entry", help="Queue entry root.")] = Path("./runs"),
+    poll_interval: Annotated[
+        float,
+        typer.Option(
+            "--poll-interval",
+            callback=positive_float,
+            help="Idle poll interval in seconds.",
+        ),
+    ] = 1.0,
+) -> None:
+    """Run the foreground FIFO device-lane runner until interrupted."""
+    try:
+        run_serve_loop(entry, device, poll_interval_seconds=poll_interval)
+    except DeviceLeaseConflictError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from None
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from None
+
+
+def _parse_metadata_option(metadata: str | None) -> dict[str, Any] | None:
+    """Parse the ``--metadata`` CLI option into an opaque JSON object."""
+    if metadata is None:
+        return None
+    try:
+        parsed = json.loads(metadata)
+    except json.JSONDecodeError as error:
+        raise typer.BadParameter(f"--metadata must be a JSON object: {error}") from None
+    if not isinstance(parsed, dict):
+        raise typer.BadParameter("--metadata must be a JSON object.")
+    return parsed
+
+
+def _render_queue_snapshot(snapshot: QueueSnapshot) -> str:
+    """Render one plain, stable snapshot for passive queue-state readers."""
+    lines: list[str] = []
+
+    def render_job(status: str, job: Job) -> str:
+        return f"{status:<12}{job.job_id} device={job.device} sequence={job.sequence}"
+
+    def render_outcome(status: str, outcome: JobOutcome) -> str:
+        return (
+            f"{status:<12}{outcome.job_id} device={outcome.device} "
+            f"return_code={outcome.return_code} signal={outcome.signal}"
+        )
+
+    lines.append(f"pending: {len(snapshot.pending)}")
+    lines.extend(render_job("PENDING", job) for job in snapshot.pending)
+    lines.append(f"claimed: {len(snapshot.claimed)}")
+    lines.extend(render_job("CLAIMED", job) for job in snapshot.claimed)
+    lines.append(f"completed: {len(snapshot.completed)}")
+    lines.extend(render_outcome("COMPLETED", outcome) for outcome in snapshot.completed)
+    lines.append(f"failed: {len(snapshot.failed)}")
+    lines.extend(render_outcome("FAILED", outcome) for outcome in snapshot.failed)
+    lines.append(f"interrupted: {len(snapshot.interrupted)}")
+    lines.extend(render_outcome("INTERRUPTED", outcome) for outcome in snapshot.interrupted)
+    return "\n".join(lines)
 
 
 def run(argv: Sequence[str] | None = None) -> int:
