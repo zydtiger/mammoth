@@ -524,6 +524,30 @@ def test_run_serve_loop_fails_closed_on_a_malformed_journal(tmp_path: Path) -> N
         run_serve_loop(tmp_path, "cuda:0", launcher=RecordingLauncher([]), stop_when_idle=True)
 
 
+def test_run_serve_loop_fails_closed_on_a_malformed_journal_with_a_clean_lane(
+    tmp_path: Path,
+) -> None:
+    """A corrupted journal must refuse the lane even with nothing to reconcile.
+
+    Regression test: ``reconcile_interrupted_jobs`` only reads the journal
+    when its own ``claimed_lane_dir`` already exists, so a lane that has
+    never claimed anything for this device (the common case) would
+    otherwise never read the journal at all during reconciliation --
+    letting ``run_serve_loop`` sail past a corrupted journal, claim and run
+    the pending job below, and append a new record past the corruption.
+    """
+    submit(tmp_path, device="cuda:0")  # a normal pending job, nothing claimed yet
+    QueueLayout(tmp_path).prepare().journal_path.write_bytes(b"{not valid json\n")
+    launcher = RecordingLauncher([ProcessResult(return_code=0, duration_seconds=0.0)])
+
+    with pytest.raises(QueueError, match="Malformed queue journal record"):
+        run_serve_loop(tmp_path, "cuda:0", launcher=launcher, stop_when_idle=True)
+
+    assert launcher.calls == []  # the pending job must never have been launched
+    snapshot = list_jobs(tmp_path)
+    assert len(snapshot.pending) == 1  # untouched: still pending, not claimed or run
+
+
 def test_load_job_rejects_a_symlinked_job_file(tmp_path: Path) -> None:
     job = submit(tmp_path, device="cuda:0")
     layout = QueueLayout(tmp_path)
@@ -667,6 +691,29 @@ def test_cli_queue_serve_refuses_to_start_on_a_malformed_journal(tmp_path: Path)
     assert result.exit_code == 1
     assert "Traceback" not in result.output
     assert "Malformed queue journal record" in result.output
+
+
+def test_cli_queue_serve_refuses_to_start_on_a_malformed_journal_with_a_clean_lane(
+    tmp_path: Path,
+) -> None:
+    """Same refusal as above, but with nothing claimed for this device yet.
+
+    This is the exact scenario reproduced live in the audit: a clean lane
+    (no debris to reconcile) plus a corrupted journal must still refuse to
+    start, not exit 0 and dispatch pending work past the corruption.
+    """
+    submit(tmp_path, device="cuda:0")  # a normal pending job, nothing claimed yet
+    QueueLayout(tmp_path).prepare().journal_path.write_bytes(b"{not valid json\n")
+
+    result = runner.invoke(
+        app,
+        ["queue", "serve", "--entry", str(tmp_path), "--device", "cuda:0"],
+    )
+
+    assert result.exit_code == 1
+    assert "Traceback" not in result.output
+    assert "Malformed queue journal record" in result.output
+    assert list_jobs(tmp_path).pending  # the pending job was never dispatched
 
 
 # --- CLI: serve wiring -----------------------------------------------------------
