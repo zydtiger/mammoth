@@ -137,8 +137,17 @@ class SupervisedProcess:
         if self.start_new_session:
             options["start_new_session"] = True
         if self.parent_death_signal is not None:
+            # Captured here, in the parent, before Popen() forks: this is the
+            # only point at which os.getpid() reliably names the process the
+            # armed death signal is actually supposed to track. Capturing it
+            # instead inside the forked child's preexec_fn (as an earlier
+            # revision of this mitigation did) reads os.getppid() *after*
+            # the fork, which already observes any reparenting that raced
+            # ahead of it, defeating the very race check it was meant to
+            # perform. See _build_parent_death_signal_preexec_fn.
             options["preexec_fn"] = _build_parent_death_signal_preexec_fn(
-                self.parent_death_signal
+                self.parent_death_signal,
+                os.getpid(),
             )
         if capture_output:
             options.update(
@@ -331,7 +340,10 @@ def run_captured_process(
     )
 
 
-def _build_parent_death_signal_preexec_fn(signal_number: int) -> Callable[[], None]:
+def _build_parent_death_signal_preexec_fn(
+    signal_number: int,
+    expected_parent_pid: int,
+) -> Callable[[], None]:
     """Return a preexec hook that best-effort arms a Linux parent-death signal.
 
     Called in the freshly forked child, before exec, from
@@ -342,19 +354,24 @@ def _build_parent_death_signal_preexec_fn(signal_number: int) -> Callable[[], No
     best-effort mitigation, never a launch precondition, and an exception
     escaping a ``preexec_fn`` would otherwise abort the whole launch.
 
-    After arming, it re-checks the parent PID: ``prctl(2)``'s NOTES section
-    documents that if the original parent already exited in the narrow
-    fork-to-prctl window, the death signal would be armed against whatever
-    process has since become the parent (usually the init process) instead
-    of the one this launch actually cares about, silently losing the
-    protection. Detecting that and delivering ``signal_number`` to this
-    process immediately instead closes that race the same way the manual
-    page recommends.
+    ``expected_parent_pid`` must be captured by the *caller*, in the parent
+    process, with ``os.getpid()`` before ``Popen()`` forks -- not read as
+    ``os.getppid()`` from inside this hook. By the time this hook runs, the
+    fork has already happened, so ``os.getppid()`` here only ever observes
+    the *current* parent, which already reflects any reparenting that raced
+    ahead of it; comparing it against itself can never detect a mismatch.
+    After arming, this hook re-checks ``os.getppid()`` against the
+    pre-captured value: ``prctl(2)``'s NOTES section documents that if the
+    original parent already exited in the narrow fork-to-prctl window, the
+    death signal would be armed against whatever process has since become
+    the parent (usually the init process) instead of the one this launch
+    actually cares about, silently losing the protection. Detecting that
+    and delivering ``signal_number`` to this process immediately instead
+    closes that race the same way the manual page recommends.
     """
 
     def _preexec() -> None:
         with suppress(Exception):
-            original_ppid = os.getppid()
             libc = ctypes.CDLL("libc.so.6", use_errno=True)
             libc.prctl.restype = ctypes.c_int
             libc.prctl.argtypes = [
@@ -365,7 +382,7 @@ def _build_parent_death_signal_preexec_fn(signal_number: int) -> Callable[[], No
                 ctypes.c_ulong,
             ]
             libc.prctl(_PR_SET_PDEATHSIG, ctypes.c_ulong(signal_number), 0, 0, 0)
-            if os.getppid() != original_ppid:
+            if os.getppid() != expected_parent_pid:
                 os.kill(os.getpid(), signal_number)
 
     return _preexec
