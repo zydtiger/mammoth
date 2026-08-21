@@ -58,7 +58,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/core/artifacts.py` | Atomic local bytes, text, JSON, and opaque artifact publication. | Local publication durability or writer behavior changes. |
 | `src/mammoth/core/events.py` | Schema-v1 event values, append-only producer writers, replay, and active tailing. | Event validation, retention, compatibility, or stream behavior changes. |
 | `src/mammoth/core/execution.py` | Immutable execution metadata, lineage, sanitization, discovery, joins, logical-run leases, and immutable-log-entry classification for consumer log resets. | Attempt identity, provenance, compatibility, lease, or immutable-log-entry classification behavior changes. |
-| `src/mammoth/core/groups.py` | Optional entry-level group manifests (atomic publication, generated-ID collision retry, opaque caller-metadata round trip) and schema-v1-style append-only group event streams. | Group manifest fields, group ID generation, or group event schema/durability behavior changes. |
+| `src/mammoth/core/groups.py` | Optional entry-level group manifests (atomic publication, generated-ID collision retry, opaque caller-metadata round trip), schema-v1-style append-only group event streams, and incremental `GroupEventTailReader` group-event tailing. | Group manifest fields, group ID generation, or group event schema/durability/tailing behavior changes. |
 | `src/mammoth/core/identity.py` | Filesystem-safe run-name, execution-ID, and group-ID validation, plus `derive_run_name` stable path-derived run-name construction. | Identity syntax, length limits, or derived-name construction changes. |
 | `src/mammoth/core/layout.py` | Stable caller-entry/run-name artifact path resolution, plus `GroupLayout` entry/group-ID group artifact path resolution. | The run-directory or group-directory contract changes. |
 | `src/mammoth/core/pipeline.py` | Framework-neutral ordered background execution, bounded backpressure, ownership, result attribution, interruption recovery, and cleanup. | Generic background pipeline behavior or public values change. |
@@ -72,13 +72,14 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/logging/tensorboard.py` | Optional rank-aware TensorBoard scalar and media history sink. | TensorBoard routing, step selection, or ownership changes. |
 | `src/mammoth/logging/text.py` | Process-exclusive plain-text Python logging handler. | Text-log ownership or formatting changes. |
 | `src/mammoth/monitor/__init__.py` | Public passive-monitor exports. | A stable monitor symbol is added, removed, or renamed. |
-| `src/mammoth/monitor/model.py` | Execution discovery, lineage, incremental stream reads, and project-neutral state folding. | Monitor selection or reconstructed state changes. |
-| `src/mammoth/monitor/dashboard.py` | Responsive Rich renderables for the optional Textual dashboard. | Interactive panels, progress bars, metric charts, or wide/compact presentation changes. |
+| `src/mammoth/monitor/model.py` | Single-run execution discovery, lineage, incremental stream reads, and project-neutral state folding. | Monitor selection or reconstructed single-run state changes. |
+| `src/mammoth/monitor/fleet.py` | Passive fleet and group discovery and folding from group manifests, incrementally tailed group event streams, and cheap per-run execution tails; ad-hoc `--match` grouping. | Fleet or group roll-up fields, folding sources, or ad-hoc grouping behavior changes. |
+| `src/mammoth/monitor/dashboard.py` | Responsive Rich renderables for the optional Textual dashboard, at the run, fleet, and group levels. | Interactive panels, progress bars, metric charts, or wide/compact presentation changes at any level. |
 | `src/mammoth/monitor/psutil_telemetry.py` | Optional psutil-backed viewer-host samples. | Optional CPU or memory sampling changes. |
-| `src/mammoth/monitor/render.py` | Canonical stable ANSI-free monitor snapshot rendering. | Plain monitor output changes. |
+| `src/mammoth/monitor/render.py` | Canonical stable ANSI-free monitor snapshot rendering for the run, fleet, and group views. | Plain monitor output changes at any level. |
 | `src/mammoth/monitor/rich_ui.py` | Compatibility route from the former Rich helper to the Textual application. | Legacy interactive-helper compatibility changes. |
 | `src/mammoth/monitor/telemetry.py` | Standard-library viewer-host telemetry with explicit provenance labels. | Base local telemetry changes. |
-| `src/mammoth/monitor/textual_ui.py` | Optional Textual application lifecycle, refresh worker, navigation, and resize handling. | Interactive monitor lifecycle, bindings, or polling behavior changes. |
+| `src/mammoth/monitor/textual_ui.py` | Optional Textual application lifecycle, refresh worker, the Fleet -> Group -> Run screen stack, navigation, and resize handling. | Interactive monitor lifecycle, screen-stack navigation, bindings, or polling behavior changes. |
 | `src/mammoth/workflow/__init__.py` | Public programmatic workflow planning, supervision, and result exports. | A stable workflow symbol is added, removed, or renamed. |
 | `src/mammoth/workflow/launch.py` | Final-argv subprocess launch plus reusable launcher/descendant supervision. | Launch, timeout, signal, or descendant handling changes. |
 | `src/mammoth/workflow/runner.py` | Side-effect-free planning, serial run/step attempts, narrow hooks, canonical child environments, lifecycle ownership, and lazy entry-level group manifest/event publication. | Workflow orchestration or group persistence behavior changes. |
@@ -97,14 +98,15 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `tests/test_artifacts.py` | Atomic artifact publication unit coverage. | Artifact publication behavior changes. |
 | `tests/test_events.py` | Event validation, writer, replay, tailing, and legacy-field unit coverage. | Event behavior changes. |
 | `tests/test_execution.py` | Execution metadata, lineage, sanitization, compatibility, lease, and immutable-log-entry classification unit coverage. | Execution behavior changes. |
-| `tests/test_groups.py` | Group-ID validation, `GroupLayout` path resolution, group manifest atomicity/collision/metadata-round-trip, and group event writer/reader unit coverage. | Group manifest, layout, or event-stream behavior changes. |
+| `tests/test_groups.py` | Group-ID validation, `GroupLayout` path resolution, group manifest atomicity/collision/metadata-round-trip, and group event writer/reader/incremental-tail-reader unit coverage. | Group manifest, layout, or event-stream/tailing behavior changes. |
 | `tests/test_layout.py` | Run identity, `derive_run_name`, and artifact-layout unit coverage. | Layout, run-name validation, or derived-name construction changes. |
 | `tests/test_pipeline.py` | Ordered background execution, backpressure, attribution, interruption, and cleanup coverage. | Generic background pipeline behavior changes. |
 | `tests/test_transactions.py` | Transaction planning, staging, leasing, journal, publication, recovery, and interruption unit coverage. | Transaction behavior changes. |
 | `tests/test_workstore.py` | Work-store lease exclusivity, interruption-and-resume, journal tamper detection, prior-state classification, durability, cleanup-ordering, and committed-marker read-back coverage. | Work-store behavior changes. |
 | `tests/test_logging.py` | Observer, sink isolation, JSONL routing, text, and TensorBoard unit coverage. | Logging behavior changes. |
-| `tests/test_cli.py` | Typer version, monitor help, usage-error, and removed-workflow-route coverage. | Root or monitor CLI behavior changes. |
-| `tests/test_monitor.py` | Discovery, lineage, folding, rendering, telemetry, malformed streams, and CLI unit coverage. | Monitor or monitor CLI behavior changes. |
+| `tests/test_cli.py` | Typer version, monitor help, usage-error, removed-workflow-route, and fleet/group CLI invocation coverage. | Root or monitor CLI behavior changes. |
+| `tests/test_fleet.py` | Fleet and group folding from group manifests, group event streams, and run tails (including partial writes and crashed producers), ad-hoc `--match` grouping, and their plain-mode rendering. | Fleet or group folding, discovery, or plain-mode rendering behavior changes. |
+| `tests/test_monitor.py` | Single-run discovery, lineage, folding, rendering, telemetry, malformed streams, CLI unit coverage, and fleet/group Rich presentation and Textual screen-stack navigation. | Monitor or monitor CLI behavior changes. |
 | `tests/test_workflow.py` | Programmatic models, both serial orders, lifecycle boundaries, failure results, canonical environments, subprocess supervision, and group manifest/event publication (including terminal status on success, failure, and signal-driven interruption) coverage. | Workflow or group persistence behavior changes. |
 | `tests/test_execution_session.py` | Neutral direct-session create/attach, lifecycle event, cleanup-ordering, torch-free import, and no-op/session-backed observer coverage. | Neutral direct-session behavior or the no-op/session-backed observer call surface changes. |
 | `tests/test_torch.py` | Multi-task trainer, device movement, precision, accumulation, metrics, callbacks, checkpoints, and DDP unit coverage. | Optional trainer behavior changes. |
