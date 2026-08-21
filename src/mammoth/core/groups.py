@@ -691,8 +691,6 @@ class GroupEventTailReader:
         events: list[GroupEvent] = []
         for line in complete_lines:
             self._line_number += 1
-            if not line:
-                continue
             try:
                 payload = json.loads(line.decode("utf-8"))
                 event = GroupEvent.from_dict(payload)
