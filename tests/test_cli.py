@@ -11,7 +11,14 @@ from typer.testing import CliRunner
 
 from mammoth import __version__
 from mammoth.cli import app
-from mammoth.core import RunLayout, create_execution_context
+from mammoth.core import (
+    GroupEventWriter,
+    GroupLayout,
+    GroupMember,
+    RunLayout,
+    create_execution_context,
+    publish_group_manifest,
+)
 from mammoth.core.events import ExecutionEventWriter
 
 runner = CliRunner()
@@ -203,3 +210,146 @@ def test_monitor_missing_interactive_dependencies_has_actionable_error(
     assert result.exit_code == 2
     assert "uv sync --extra monitor" in result.output
     assert "--plain" in result.output
+
+
+def test_monitor_fleet_view_plain_lists_groups_and_loose_runs(tmp_path: Path) -> None:
+    manifest = publish_group_manifest(
+        tmp_path,
+        order="run-major",
+        members=[GroupMember("alpha", ("prepare",))],
+    )
+    group_layout = GroupLayout(tmp_path, manifest.group_id)
+    writer = GroupEventWriter(group_layout.events_path, group_id=manifest.group_id)
+    writer.emit("group_started")
+    writer.emit("run_started", run_name="alpha")
+    writer.emit("run_completed", run_name="alpha")
+    writer.emit("group_completed")
+    writer.close()
+    RunLayout(tmp_path, "loose").prepare()
+
+    result = runner.invoke(app, ["monitor", "--entry", str(tmp_path), "--plain"])
+
+    assert result.exit_code == 0
+    assert f"Entry: {tmp_path}" in result.output
+    assert "members=1/0/1" in result.output
+    assert "terminal=group_completed" in result.output
+    assert "loose: pending" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_monitor_fleet_view_reports_useful_output_with_nothing_published(
+    tmp_path: Path,
+) -> None:
+    result = runner.invoke(app, ["monitor", "--entry", str(tmp_path), "--plain"])
+
+    assert result.exit_code == 0
+    assert "(none observed)" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_monitor_group_view_plain_renders_selected_group(tmp_path: Path) -> None:
+    manifest = publish_group_manifest(
+        tmp_path,
+        order="run-major",
+        members=[GroupMember("alpha", ("prepare",))],
+    )
+
+    result = runner.invoke(
+        app,
+        ["monitor", "--entry", str(tmp_path), "--group", manifest.group_id, "--plain"],
+    )
+
+    assert result.exit_code == 0
+    assert f"Group: {manifest.group_id}" in result.output
+    assert "alpha: pending" in result.output
+
+
+def test_monitor_group_view_rejects_an_unknown_group_id(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["monitor", "--entry", str(tmp_path), "--group", "does-not-exist", "--plain"],
+    )
+
+    assert result.exit_code == 2
+    assert "No group" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_monitor_match_groups_loose_runs_ad_hoc_in_plain_mode(tmp_path: Path) -> None:
+    RunLayout(tmp_path, "sweep-a").prepare()
+    RunLayout(tmp_path, "sweep-b").prepare()
+    RunLayout(tmp_path, "other").prepare()
+
+    result = runner.invoke(
+        app,
+        ["monitor", "--entry", str(tmp_path), "--match", "sweep-*", "--plain"],
+    )
+
+    assert result.exit_code == 0
+    assert "Match: sweep-*" in result.output
+    assert "match:sweep-*" in result.output
+    assert "Loose runs:" not in result.output
+
+
+def test_monitor_rejects_group_or_match_combined_with_a_run_name(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["monitor", "run", "--entry", str(tmp_path), "--group", "some-group"],
+    )
+
+    assert result.exit_code == 2
+    assert "--group and --match apply only when RUN_NAME is" in result.output
+    assert "omitted" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_monitor_fleet_view_defaults_to_textual_watch_and_telemetry_on_tty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    RunLayout(tmp_path, "loose").prepare()
+    run_fleet_textual = Mock()
+    monkeypatch.setattr("mammoth.cli.stdout_is_interactive", lambda: True)
+    monkeypatch.setattr(
+        "mammoth.cli.load_textual_ui",
+        lambda: SimpleNamespace(run_fleet_textual=run_fleet_textual),
+    )
+
+    result = runner.invoke(app, ["monitor", "--entry", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert run_fleet_textual.call_count == 1
+    kwargs = run_fleet_textual.call_args.kwargs
+    assert kwargs["watch"] is True
+    assert kwargs["telemetry"] is True
+    assert kwargs["interval_seconds"] == 2.0
+    assert kwargs["stale_after_seconds"] == 90.0
+    assert kwargs["open_group_id"] is None
+
+
+def test_monitor_single_run_invocation_is_unaffected_by_the_fleet_view(
+    tmp_path: Path,
+) -> None:
+    """Regression: `mammoth monitor <run_name>` keeps its exact original behavior."""
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_execution_context(
+        layout.run_dir,
+        run_name="run",
+        invocation_kind="test",
+        intended_phases=("train",),
+        world_size=1,
+        execution_mode="single",
+        command=("train",),
+        execution_id="attempt",
+        created_at="2026-01-01T00:00:00Z",
+    )
+    with ExecutionEventWriter.for_runner(context) as writer:
+        writer.emit("execution_started")
+        writer.emit("execution_completed")
+
+    result = runner.invoke(app, ["monitor", "run", "--entry", str(tmp_path), "--plain"])
+
+    assert result.exit_code == 0
+    assert "Run: run" in result.output
+    assert "Execution: attempt" in result.output
+    assert "Entry:" not in result.output
