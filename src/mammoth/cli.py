@@ -160,6 +160,16 @@ def run_monitor(
             "--group and --match apply only when RUN_NAME is omitted",
             param_hint="RUN_NAME",
         )
+    if run_name is None and execution is not None:
+        raise typer.BadParameter(
+            "--execution applies only to a single-run invocation (RUN_NAME given)",
+            param_hint="--execution",
+        )
+    if group is not None and match is not None:
+        raise typer.BadParameter(
+            "--group and --match are mutually exclusive",
+            param_hint="--group",
+        )
     interactive = stdout_is_interactive() if rich is None else rich
     should_watch = interactive if watch is None else watch
     include_telemetry = interactive if telemetry is None else telemetry
