@@ -210,6 +210,29 @@ class FleetSnapshot:
     warnings: tuple[str, ...] = ()
 
 
+@dataclass
+class _MemberTail:
+    """Cached per-run tail state: the active monitor and a staleness signal.
+
+    ``executions_signature`` is one ``stat()`` of the run's
+    ``logs/executions`` directory, not its contents: creating or removing an
+    execution directory always changes its parent directory's link count
+    (each subdirectory contributes one ``..`` entry back to its parent) and
+    usually its mtime, while appending events inside an already-discovered
+    execution changes neither. The link count is the primary signal because
+    it is an exact integer, immune to the timestamp-granularity coalescing
+    that can make two rapid directory creations report the same mtime; mtime
+    is kept alongside it to also catch changes a link-count comparison alone
+    would miss. Together they are a cheap, sufficient signal for "a new
+    attempt may have appeared" without repeating the full attempt discovery
+    (a directory listing plus parsing every ``execution.json``) on every
+    poll.
+    """
+
+    monitor: ExecutionMonitor | None = None
+    executions_signature: tuple[int, int] | None = None
+
+
 def discover_group_ids(entry: Path) -> list[str]:
     """Return every published group ID beneath one entry, oldest name first.
 
@@ -265,7 +288,7 @@ class FleetMonitor:
         self._group_readers: dict[str, GroupEventTailReader] = {}
         self._group_events: dict[str, list[GroupEvent]] = {}
         self._failed_group_streams: set[str] = set()
-        self._monitors: dict[str, ExecutionMonitor] = {}
+        self._member_tails: dict[str, _MemberTail] = {}
         self._warnings: list[str] = []
 
     def poll(
@@ -290,7 +313,7 @@ class FleetMonitor:
                     self.entry,
                     manifest,
                     events,
-                    monitors=self._monitors,
+                    tails=self._member_tails,
                     now=observed_at,
                     stale_after_seconds=stale_after_seconds,
                 )
@@ -306,7 +329,7 @@ class FleetMonitor:
                         self.entry,
                         self.match,
                         matched,
-                        monitors=self._monitors,
+                        tails=self._member_tails,
                         now=observed_at,
                         stale_after_seconds=stale_after_seconds,
                     )
@@ -316,7 +339,7 @@ class FleetMonitor:
                 _fold_loose_run(
                     self.entry,
                     name,
-                    monitors=self._monitors,
+                    tails=self._member_tails,
                     now=observed_at,
                     stale_after_seconds=stale_after_seconds,
                 )
@@ -369,7 +392,7 @@ def _fold_group(
     manifest: GroupManifest,
     events: list[GroupEvent],
     *,
-    monitors: dict[str, ExecutionMonitor],
+    tails: dict[str, _MemberTail],
     now: datetime,
     stale_after_seconds: float,
 ) -> GroupSnapshot:
@@ -399,7 +422,7 @@ def _fold_group(
             )
             for step_name in member.steps
         )
-        tail = _poll_member_tail(entry, member.run_name, monitors)
+        tail = _poll_member_tail(entry, member.run_name, tails)
         run_event = latest_run_event.get(member.run_name)
         if run_event is not None:
             status: MemberStatus = _RUN_EVENT_STATUS[run_event.event]
@@ -445,7 +468,7 @@ def _fold_adhoc_group(
     pattern: str,
     run_names: list[str],
     *,
-    monitors: dict[str, ExecutionMonitor],
+    tails: dict[str, _MemberTail],
     now: datetime,
     stale_after_seconds: float,
 ) -> GroupSnapshot:
@@ -454,7 +477,7 @@ def _fold_adhoc_group(
     warnings: list[str] = []
     newest_heartbeat: datetime | None = None
     for run_name in run_names:
-        tail = _poll_member_tail(entry, run_name, monitors)
+        tail = _poll_member_tail(entry, run_name, tails)
         status: MemberStatus = (
             "pending" if tail is None else _tail_status(tail, now, stale_after_seconds)
         )
@@ -491,12 +514,12 @@ def _fold_loose_run(
     entry: Path,
     run_name: str,
     *,
-    monitors: dict[str, ExecutionMonitor],
+    tails: dict[str, _MemberTail],
     now: datetime,
     stale_after_seconds: float,
 ) -> LooseRunSnapshot:
     """Fold one run not claimed by any group from a cheap execution tail alone."""
-    tail = _poll_member_tail(entry, run_name, monitors)
+    tail = _poll_member_tail(entry, run_name, tails)
     if tail is None:
         return LooseRunSnapshot(
             run_name=run_name,
@@ -517,26 +540,51 @@ def _fold_loose_run(
 def _poll_member_tail(
     entry: Path,
     run_name: str,
-    monitors: dict[str, ExecutionMonitor],
+    tails: dict[str, _MemberTail],
 ) -> MonitorSnapshot | None:
     """Return a cheap incremental tail of one run's newest execution, if any.
 
     Reuses the cached :class:`~mammoth.monitor.model.ExecutionMonitor` for
-    that run when its newest execution is unchanged, and replaces it only
-    when a new attempt has appeared; it never constructs a full
+    that run across polls, and skips re-running attempt discovery
+    (:func:`~mammoth.monitor.model.select_execution`, a directory listing
+    plus parsing every ``execution.json``) whenever a single cheap ``stat()``
+    of the run's executions directory shows it has not changed since the
+    monitor was last selected. It never constructs a full
     :class:`~mammoth.monitor.model.RunMonitor` across the whole lineage.
     """
     layout = RunLayout(entry, run_name)
+    tail = tails.setdefault(run_name, _MemberTail())
+
+    if tail.monitor is not None:
+        current_signature = _executions_dir_signature(layout)
+        if current_signature is not None and current_signature == tail.executions_signature:
+            return tail.monitor.poll()
+
     try:
         newest = select_execution(layout)
     except (FileNotFoundError, OSError):
-        monitors.pop(run_name, None)
+        tails.pop(run_name, None)
         return None
-    monitor = monitors.get(run_name)
-    if monitor is None or monitor.context.metadata.execution_id != newest.metadata.execution_id:
-        monitor = ExecutionMonitor(layout, newest.metadata.execution_id)
-        monitors[run_name] = monitor
-    return monitor.poll()
+    tail.executions_signature = _executions_dir_signature(layout)
+    if (
+        tail.monitor is None
+        or tail.monitor.context.metadata.execution_id != newest.metadata.execution_id
+    ):
+        tail.monitor = ExecutionMonitor(layout, newest.metadata.execution_id)
+    return tail.monitor.poll()
+
+
+def _executions_dir_signature(layout: RunLayout) -> tuple[int, int] | None:
+    """Return ``(link count, mtime in nanoseconds)`` for the executions directory.
+
+    ``None`` when the directory cannot be stat-ed (for example, it does not
+    exist yet).
+    """
+    try:
+        status = layout.executions_dir.stat()
+    except OSError:
+        return None
+    return (status.st_nlink, status.st_mtime_ns)
 
 
 def _member_progress(tail: MonitorSnapshot | None) -> MemberProgress | None:
