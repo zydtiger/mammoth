@@ -119,6 +119,11 @@ def test_publish_group_manifest_rejects_duplicate_member_run_names() -> None:
         )
 
 
+def test_group_member_rejects_duplicate_step_names() -> None:
+    with pytest.raises(ValueError, match="unique"):
+        GroupMember("alpha", ("prepare", "prepare"))
+
+
 def test_group_event_writer_emits_ordered_records_and_read_back_matches(tmp_path: Path) -> None:
     layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
     writer = GroupEventWriter(layout.events_path, group_id="group-1")
