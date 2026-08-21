@@ -201,6 +201,62 @@ Task branches, when requested, must use the matching pinned category prefix:
 `ci/`, followed by a concise lowercase hyphenated name. Do not put a person,
 agent, model, tool, or session identity in a branch name.
 
+## Versioning And Releases
+
+Mammoth is pre-1.0 and versioned with semantic versioning. The public surfaces
+are the importable API under `src/mammoth/`, the on-disk journal and store
+layouts, and the CLI's commands, options, and exit behavior. A change is
+breaking only against one of those.
+
+- Before `1.0.0`, bump the minor version for a breaking change to any public
+  surface and the patch version for everything else, including fixes and
+  additive API, layout, or CLI surface.
+- From `1.0.0` on, a breaking change requires a major bump, new
+  backward-compatible functionality a minor bump, and a compatible fix a patch
+  bump.
+
+Before `1.0.0` the project is under active development, so a breaking change is
+expected and needs no migration path; still name it as breaking in the release
+notes. `1.0.0` is a deliberate commitment to the stability of those surfaces,
+not the number after `0.9`; confirm reaching it with the user. After `1.0.0`,
+prefer deprecating the old form, introducing its replacement alongside it,
+giving consumers at least one minor release to migrate, and removing the old
+form in the next major release. Break compatibility directly only for a genuine
+mistake whose cost outweighs migration, and record why no deprecation path was
+possible.
+
+Keep `pyproject.toml` as the package-version source of truth, keep
+`src/mammoth/__init__.py` `__version__` equal to it, and refresh `uv.lock`
+whenever the version changes.
+
+Release only from a clean `main` synchronized with `origin/main`, after the
+change has merged, so a release records what shipped rather than what is
+proposed.
+
+1. Verify `main` is synchronized and passes the validation commands above.
+2. Set the version in `pyproject.toml` and `__init__.py`, refresh `uv.lock`,
+   and commit with `build: release Mammoth X.Y.Z`.
+3. Create an annotated `vX.Y.Z` tag on that exact commit and push it.
+4. Publish a GitHub Release from that tag. Its notes are the version history:
+   state user-visible changes, grouped as added, changed, fixed, deprecated,
+   and breaking, and give each deprecation its replacement and each breaking
+   entry its migration path or the reason none was possible.
+5. Verify the published tag, the release, and installation from the exact tag.
+
+Publishing a release is one action. Ask for explicit approval once, immediately
+before pushing the release tag, presenting the exact version, the commit it
+will point at, and the rationale for that number. That approval covers
+publishing the GitHub Release from that tag. Ask again only for a different
+version or commit, or to modify or delete a release that already exists.
+Approval to edit, commit, push, or merge ordinary changes is never release
+approval.
+
+Never move or replace a published release tag; correct a mistaken release by
+publishing the next version. A repository ruleset named `protect-release-tags`
+enforces this on the remote for `refs/tags/v*`, denying tag deletion,
+non-fast-forward updates, and updates, with no bypass. A rejected tag push is
+that rule working, not a broken remote.
+
 ## Documentation Maintenance
 
 The file-ownership table above is the sole index of documentation purposes.
