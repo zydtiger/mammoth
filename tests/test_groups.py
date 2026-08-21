@@ -171,6 +171,45 @@ def test_group_event_writer_disables_after_a_write_failure(tmp_path: Path) -> No
     assert writer.emit("group_failed") is None
 
 
+def test_group_event_writer_disables_after_an_open_failure(tmp_path: Path) -> None:
+    layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
+    # A pre-existing regular file at the destination defeats O_CREAT | O_EXCL,
+    # so construction itself must observe and survive the open failure.
+    layout.events_path.write_bytes(b"")
+
+    writer = GroupEventWriter(layout.events_path, group_id="group-1")
+
+    assert not writer.enabled
+    assert writer.emit("group_started") is None
+    writer.close()
+
+
+def test_group_event_writer_disables_after_a_close_failure(tmp_path: Path) -> None:
+    layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
+    writer = GroupEventWriter(layout.events_path, group_id="group-1")
+    writer.emit("group_started")
+
+    class FailingCloseStream:
+        def write(self, data: bytes) -> int:
+            return len(data)
+
+        def flush(self) -> None:
+            return None
+
+        def close(self) -> None:
+            raise OSError("close blocked")
+
+    writer._stream = FailingCloseStream()  # type: ignore[assignment]
+
+    writer.close()
+
+    assert writer._closed
+    assert writer._stream is None
+    assert not writer.enabled
+    assert writer.emit("group_completed") is None
+    assert [event.event for event in read_group_events(layout.events_path)] == ["group_started"]
+
+
 def test_group_event_writer_close_is_idempotent(tmp_path: Path) -> None:
     layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
     writer = GroupEventWriter(layout.events_path, group_id="group-1")
