@@ -604,17 +604,30 @@ journal, is refused with a clear `JobAlreadyClaimedError`.
 
 `mammoth queue serve --device <spec>` is a foreground process with no
 daemonization and no network listener. After claiming its lease, it first
-calls `reconcile_interrupted_jobs()`: because the lease was just exclusively
-acquired, any job file still present in this lane's `claimed/<device>/`
-directory can only be debris from a runner that died before recording that
-job's outcome, or debris from a runner that died *after* durably recording
-the outcome but before removing the claimed file. The completion journal is
-authoritative: a job ID already present there is stale cleanup, silently
-removed with no new record; every other leftover is durably appended as
-`status="interrupted"` (with `return_code`/`signal`/`duration_seconds` left
-`None`, since this process never observed the job run) before its claimed
-file is removed. A crashed job is therefore always classified fail-closed
-on restart, never silently re-run and never silently lost.
+validates the completion journal unconditionally (one `read_job_journal`-
+backed call, regardless of whether this lane's claimed directory currently
+holds anything), then calls `reconcile_interrupted_jobs()`: because the
+lease was just exclusively acquired, any job file still present in this
+lane's `claimed/<device>/` directory can only be debris from a runner that
+died before recording that job's outcome, or debris from a runner that died
+*after* durably recording the outcome but before removing the claimed file.
+The completion journal is authoritative: a job ID already present there is
+stale cleanup, silently removed with no new record; every other leftover is
+durably appended as `status="interrupted"` (with
+`return_code`/`signal`/`duration_seconds` left `None`, since this process
+never observed the job run) before its claimed file is removed. A crashed
+job is therefore always classified fail-closed on restart, never silently
+re-run and never silently lost.
+
+The unconditional journal validation exists as a separate step because
+`reconcile_interrupted_jobs()` only reads the journal when its own
+`claimed_lane_dir` already exists; a lane with nothing to reconcile -- the
+common case -- would otherwise never read the journal at all during
+reconciliation, letting `serve` sail past a corrupted journal, claim and run
+pending jobs, and append new records past the corruption instead of
+refusing to start. Validating the journal up front keeps every `serve`
+invocation fail-closed on a corrupted journal, not only the crash-recovery
+case that happens to already have claimed debris.
 
 After reconciliation, the lane repeatedly claims the oldest pending job
 whose device matches, launches its argv through
@@ -679,6 +692,26 @@ function in `mammoth.queue.spool` only read `pending/`, `claimed/`, and
 `journal.jsonl` directly, contacting no runner process. This is the
 contract a future monitor (#86) renders against; this change adds no
 monitor rendering of queue state.
+
+`list_jobs()` tolerates malformed on-disk state instead of aborting the
+whole snapshot: one unparsable pending or claimed job file is skipped and
+its path recorded in `QueueSnapshot.malformed_job_files`, so one bad file
+never hides the rest of a healthy spool. A malformed completion journal is
+instead recorded in `QueueSnapshot.journal_error`, leaving `completed`,
+`failed`, and `interrupted` empty, since Mammoth cannot safely determine
+terminal state from a partially trusted journal; `mammoth queue list`
+still prints the healthy pending/claimed sections in that case before
+reporting the journal error and exiting nonzero.
+
+Every `mammoth queue` command shares one clean-error contract for its own
+`QueueError` family (malformed job files, a malformed journal, an
+unreadable lease path, and similar on-disk problems): a one-line message
+on stderr and a nonzero exit, never a raw Python traceback. `serve`
+additionally validates the completion journal unconditionally before FIFO
+dispatch, regardless of whether its own lane currently has anything to
+reconcile, so a corrupted journal always refuses to start that lane
+through this same clean-error path instead of silently dispatching pending
+work past the corruption.
 
 ## Logging responsibilities
 
