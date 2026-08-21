@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from mammoth.core import (
     GroupEventWriter,
@@ -14,6 +17,7 @@ from mammoth.core import (
     publish_group_manifest,
 )
 from mammoth.core.events import ExecutionEventWriter
+from mammoth.monitor import fleet as fleet_module
 from mammoth.monitor.fleet import (
     FleetMonitor,
     discover_group_ids,
@@ -93,6 +97,41 @@ def test_fleet_monitor_folds_loose_runs_only(tmp_path: Path) -> None:
     assert snapshot.groups == ()
     assert [run.run_name for run in snapshot.loose_runs] == ["solo"]
     assert snapshot.loose_runs[0].status == "completed"
+
+
+def test_fleet_monitor_skips_attempt_rediscovery_once_the_newest_execution_is_known(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bound the per-tick cost: no full directory rescan once nothing changed."""
+    entry = tmp_path / "runs"
+    layout = RunLayout(entry, "alpha").prepare()
+    context = create_context(layout, "first", "2026-01-01T00:00:00Z")
+    with ExecutionEventWriter.for_runner(context) as writer:
+        writer.emit("execution_started")
+
+    calls: list[Any] = []
+    original_select_execution = fleet_module.select_execution
+
+    def counting_select_execution(*args: Any, **kwargs: Any) -> Any:
+        calls.append((args, kwargs))
+        return original_select_execution(*args, **kwargs)
+
+    monkeypatch.setattr(fleet_module, "select_execution", counting_select_execution)
+
+    monitor = FleetMonitor(entry)
+    monitor.poll()
+    monitor.poll()
+    monitor.poll()
+    assert len(calls) == 1
+
+    # A newer attempt appears: its directory creation bumps the executions
+    # directory mtime, so the very next poll must rediscover exactly once.
+    create_context(layout, "second", "2026-01-02T00:00:00Z")
+    monitor.poll()
+    assert len(calls) == 2
+    monitor.poll()
+    assert len(calls) == 2
 
 
 def test_fleet_monitor_excludes_group_members_from_loose_runs(tmp_path: Path) -> None:
