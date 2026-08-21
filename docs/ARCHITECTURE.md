@@ -29,12 +29,18 @@ Dependencies point downward only:
 consuming project
     │
     ├── mammoth.torch       optional generic nn.Module/DataLoader training
+    ├── mammoth.queue       local device-aware job spool and FIFO runner
     ├── mammoth.workflow    programmatic serial steps and supervision
     ├── mammoth.monitor     replay, terminal UI, and telemetry
     ├── mammoth.execution   direct process lifecycle composition
     ├── mammoth.logging     JSONL, text, and TensorBoard sinks
     └── mammoth.core        identities, layout, events, artifacts, provenance
 ```
+
+`mammoth.queue` imports `mammoth.core` (layout, identity, and atomic artifact
+publication) and reuses `mammoth.workflow.launch.launch_process` as its child
+launcher; nothing imports `mammoth.queue`, so a project that never queues a
+job carries no additional runtime dependency.
 
 `mammoth.core` should use the Python standard library. TensorBoard, Rich,
 Textual, psutil, and PyTorch belong in optional dependency groups and must not
@@ -489,7 +495,9 @@ workflow leaves a group without that terminal record; consumers infer
 staleness from event recency, exactly as they do for a run's own execution
 events. The `.mammoth/` subtree is entirely optional: an entry that never
 hosted a `Workflow` invocation, and every run launched outside one, remain
-fully valid without it.
+fully valid without it. `QueueLayout` resolves a sibling `.mammoth/queue/`
+subtree under the same optional root; see "Device-aware local job queue"
+below.
 
 `mammoth.core.is_immutable_log_entry(log_dir, child)` classifies whether one
 child of a run's `logs/` directory is Mammoth-owned immutable state that a
@@ -504,6 +512,147 @@ whether it is a file, directory, or symlink. `child` must resolve inside
 `log_dir`; a path that is `log_dir` itself or lies outside it raises
 `ValueError` instead of guessing. Extend this classification in the same
 change as any future addition to the immutable `logs/` layout.
+
+## Device-aware local job queue
+
+`mammoth.queue` is a component beside the workflow layer, not a workflow
+feature: it never parses or interprets a job's argv, and `Workflow`'s
+immutable frozen-at-construction dispatch is unchanged. A job is typically
+itself a workflow-launching invocation, but Mammoth treats it as an opaque
+caller-final command throughout. The queue is local-single-host scope only:
+no cluster or cloud scheduler integration, no priorities, preemption, or
+backfill beyond FIFO-per-lane, and no GPU health or idleness preflight.
+
+### Spool layout
+
+`QueueLayout(entry)` resolves the optional, entry-level spool sharing
+`GroupLayout`'s `.mammoth/` root:
+
+```text
+<entry>/.mammoth/queue/
+├── pending/
+│   └── <sequence>-<job-id>.json     unclaimed jobs, FIFO by filename
+├── claimed/
+│   └── <device-spec>/
+│       └── <sequence>-<job-id>.json claimed jobs, one subdirectory per lane
+├── lanes/
+│   └── <device-spec>.lock           per-device exclusive lease files
+├── journal.jsonl                    append-only completion journal
+└── .sequence.lock                   monotonic submission-sequence counter
+```
+
+A job file records its opaque `argv`, the run names it expects to produce
+(`expected_run_names`, validated with the same `validate_run_name` every
+other Mammoth identity uses), a single opaque `device` requirement, UTC
+`submitted_at` provenance, an optional working directory, and an optional
+caller-supplied JSON-compatible `metadata` block that Mammoth never
+interprets, mirroring `Workflow`'s own opaque `group_metadata` field. Job
+files are published with `mammoth.core.artifacts.atomic_write_json` and are
+never rewritten in place; their queue state is entirely their filesystem
+location (`pending/`, one lane's `claimed/<device>/`, or removed after a
+terminal journal record exists). Completed, failed, and interrupted jobs are
+never deleted: their terminal record moves to the completion journal.
+
+The submission sequence is a small monotonic counter, not a security
+boundary: `submit_job()` allocates it under a short-held blocking exclusive
+lease at `.sequence.lock` (open, `flock`, read-increment-write, `fsync`,
+unlock), so concurrent submitters from independent processes never race for
+the same FIFO position and job filenames sort lexicographically into
+submission order regardless of clock resolution.
+
+### Device spec
+
+A device spec is an opaque, caller-defined, single-path-component string
+(`mammoth.core.identity.validate_device_spec`): Mammoth never parses its
+internal structure. A bare index (`"0"`), a framework device string
+(`"cuda:0"`), and a stable hardware UUID are all accepted as opaque tokens,
+resolving the issue's open question in favor of the simplest defensible
+choice. A job's device requirement matches a lane by exact string equality
+against that lane's `--device` value; Mammoth defines no wildcard, set, or
+prefix matching. The runner never exports `CUDA_VISIBLE_DEVICES` or any
+other device-selection variable to a job's child process: a claimed job's
+argv is launched with the parent environment minus `MAMMOTH_*` variables
+only (mirroring the workflow layer's own child-environment sanitization),
+so the job's own argv remains fully self-describing about how it targets the
+device it declared. The lane's device spec is still recorded on every job
+outcome for provenance.
+
+### Lease and lane concurrency
+
+`claim_device_lease(entry, device)` mirrors
+`mammoth.core.execution.claim_logical_run_lease` exactly: a non-blocking
+`O_NOFOLLOW`-guarded advisory `flock` on `lanes/<device>.lock`, failing
+closed with `DeviceLeaseConflictError` instead of blocking when another
+lane already holds it, and released automatically by the OS on process
+exit or crash. Two `serve` processes on the same device spec can never both
+run; two processes on disjoint device specs are fully independent lanes
+with no shared mutable state beyond the pending directory and the shared
+completion journal.
+
+A pending job is claimed by exactly one lane through `os.rename` directly
+from `pending/<file>` to that lane's `claimed/<device>/<file>`: this is
+atomic on a local filesystem, and a source path already renamed away by a
+racing lane raises `FileNotFoundError` rather than silently overwriting
+anything, so contention between two lanes (for example two misconfigured
+`serve` processes started against the same device before the lease
+conflict is discovered) still yields exactly one claimant. `mammoth queue
+cancel` removes only a job still in `pending/`; a job already renamed into
+any lane's `claimed/` directory, or already present in the completion
+journal, is refused with a clear `JobAlreadyClaimedError`.
+
+### Runner and crash safety
+
+`mammoth queue serve --device <spec>` is a foreground process with no
+daemonization and no network listener. After claiming its lease, it first
+calls `reconcile_interrupted_jobs()`: because the lease was just exclusively
+acquired, any job file still present in this lane's `claimed/<device>/`
+directory can only be debris from a runner that died before recording that
+job's outcome, or debris from a runner that died *after* durably recording
+the outcome but before removing the claimed file. The completion journal is
+authoritative: a job ID already present there is stale cleanup, silently
+removed with no new record; every other leftover is durably appended as
+`status="interrupted"` (with `return_code`/`signal`/`duration_seconds` left
+`None`, since this process never observed the job run) before its claimed
+file is removed. A crashed job is therefore always classified fail-closed
+on restart, never silently re-run and never silently lost.
+
+After reconciliation, the lane repeatedly claims the oldest pending job
+whose device matches, launches its argv through
+`mammoth.workflow.launch.launch_process` (the same supervised-child seam
+`Workflow` uses), and appends one terminal `JobOutcome` to `journal.jsonl`
+before removing the claimed file. `launch_process` already terminates a
+running child's process group and reports an interrupted outcome when
+SIGINT reaches the lane while a job is active; `run_serve_loop` additionally
+stops polling immediately after such an outcome instead of claiming further
+work, so an interactive Ctrl-C stops the whole lane rather than skipping one
+job. This is deliberately lighter than `Workflow.run()`'s stricter
+`pthread_sigmask` setup-signal masking: a job's queue state is always either
+untouched pending, or already durably claimed via one atomic rename, before
+its child ever launches, so no signal window (including the OS default
+action for an unhandled SIGTERM, or `SIGKILL`) can leave the spool in an
+ambiguous state that the next lease acquisition's reconciliation cannot
+already classify correctly.
+
+The completion journal is a single shared file that multiple concurrent
+lane processes append to. Each record is written with one raw `os.write()`
+call under `O_APPEND` (bypassing Python's buffered I/O layer, matching
+`mammoth.core.workstore.WorkStoreSession.commit`'s care around short
+writes) so concurrent appends from independent processes never interleave
+on a local filesystem, then `fsync`ed before the call returns. Unlike
+`mammoth.core.events` or `mammoth.core.groups`, journal records carry no
+cross-record sequence chain: each record is self-contained and independently
+validated, because a shared multi-writer file cannot support one writer's
+exclusive next-sequence ownership. `read_job_journal()` tolerates an
+incomplete trailing line exactly as `read_execution_events()` and
+`read_group_events()` do.
+
+### Passive readability
+
+Queue and lane state are plain files: `mammoth queue list` and every
+function in `mammoth.queue.spool` only read `pending/`, `claimed/`, and
+`journal.jsonl` directly, contacting no runner process. This is the
+contract a future monitor (#86) renders against; this change adds no
+monitor rendering of queue state.
 
 ## Logging responsibilities
 
