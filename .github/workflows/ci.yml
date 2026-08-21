@@ -18,12 +18,10 @@ jobs:
         with:
           enable-cache: true
           python-version: "3.12"
-      - name: Check lock consistency
-        run: uv lock --check
-      - name: Sync dev environment
-        run: uv sync --locked
-      - name: Ruff
-        run: uv run ruff check .
+      - name: Sync all extras
+        run: uv sync --locked --all-extras
+      - name: Commit hooks
+        run: uvx prek run --all-files
 
   test:
     runs-on: ubuntu-latest
@@ -40,8 +38,6 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Sync all extras
         run: uv sync --locked --all-extras
-      - name: Mypy
-        run: uv run mypy
       - name: Pytest with coverage
         # Rich force-enables terminal styling when it sees GITHUB_ACTIONS, which
         # breaks plain-substring CLI output assertions; unset it so captured CLI
