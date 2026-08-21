@@ -303,6 +303,29 @@ def test_monitor_rejects_group_or_match_combined_with_a_run_name(tmp_path: Path)
     assert "Traceback" not in result.output
 
 
+def test_monitor_rejects_execution_without_a_run_name(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["monitor", "--entry", str(tmp_path), "--execution", "bogus"],
+    )
+
+    assert result.exit_code == 2
+    assert "--execution applies only to a single-run" in result.output
+    assert "RUN_NAME given" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_monitor_rejects_group_and_match_combined(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["monitor", "--entry", str(tmp_path), "--group", "some-group", "--match", "sweep-*"],
+    )
+
+    assert result.exit_code == 2
+    assert "--group and --match are mutually exclusive" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_monitor_fleet_view_defaults_to_textual_watch_and_telemetry_on_tty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
