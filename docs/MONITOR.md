@@ -112,26 +112,45 @@ rendering is unaffected: it keeps printing every row unconditionally.
 
 The selected row is guaranteed visible whenever the viewport can physically
 fit its chrome (headers, section labels, the table's own header row) plus at
-least one data row. The budget available to each table is the real,
-wrap-aware rendered height of everything around it at the terminal's actual
-width, not a fixed line-count guess — a summary line wrapping at a narrow
-width, or a table's own header row wrapping (for example the fleet group
-table's "Members (done/failed/total)" column), is accounted for exactly. The
-trailing warnings and footer are measured and reserved first, since they
-render *after* both tables and would otherwise silently eat into a budget
-computed only against the tables: their real height always comes out of the
-viewport before either table is sized against what remains.
+least one data row, and the total rendered height never exceeds the
+viewport. The budget available to each table is the real, wrap-aware
+rendered height of everything around it at the terminal's actual width, not
+a fixed line-count guess or piecewise arithmetic that can drift from what a
+real, assembled render actually produces — a summary line wrapping at a
+narrow width, or a table's own header row wrapping (for example the fleet
+group table's "Members (done/failed/total)" column), is accounted for
+exactly.
 
-On a viewport too small even for that minimum, optional chrome is dropped
-before the selected row ever would be, richest to sparsest:
+The table region is sized first and has priority, since it carries the
+selected-row guarantee; the trailing warnings and footer, which render
+*after* it, are fitted to whatever room genuinely remains once the table
+region's real height is known, rather than reserved at a fixed guessed
+height and trusted to fit. On an ultra-small viewport the guarantee can
+still floor the table region taller than a first guess at that remaining
+room predicted, so trailing content is measured again against the table
+region's actual height and, if it no longer fits, drops least-essential
+content first (warnings, then the footer) — disappearing entirely rather
+than ever pushing the total past the viewport. The row's priority over the
+footer always holds.
+
+An unfocused table (the unselected one, whether it renders before or after
+the focused table) uses as many rows as genuinely fit, not an artificial
+cap: a small guaranteed floor exists only to protect the focused table's
+budget on a genuinely scarce viewport, so a large viewport with only a
+handful of groups and loose runs shows every row of both tables with no
+overflow markers, instead of an unfocused table stopping early while
+surplus rows of screen space sit empty.
+
+On a viewport too small even for the selected row's own minimum, optional
+chrome is dropped before the selected row ever would be, richest to
+sparsest:
 
 1. The group screen drops its summary line, then its "MEMBERS" label.
 2. The fleet screen drops the *unfocused* table's whole section (its label
    and its table together, never just one) when that section renders
    *before* the focused table — content that renders after the focused table
-   never threatens the guarantee, so it is only capped small, never
-   force-dropped. If still tight, the focused table's own section label
-   goes too.
+   never threatens the guarantee, so it is only capped, never force-dropped.
+   If still tight, the focused table's own section label goes too.
 3. As an absolute last resort, if even the focused table's own header row
    cannot fit alongside its one guaranteed data row, the header row itself
    is suppressed (the table renders with no column headers) rather than the

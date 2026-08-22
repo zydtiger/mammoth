@@ -32,6 +32,7 @@ from mammoth.monitor import (
     select_execution,
 )
 from mammoth.monitor.dashboard import (
+    _rendered_height,
     _row_window,
     braille_line_chart,
     dashboard_layout,
@@ -1679,3 +1680,124 @@ def test_fleet_textual_keeps_selection_visible_in_a_mixed_fleet_both_directions(
             assert any(rows[loose_index].key in line for line in lines)
 
     asyncio.run(exercise())
+
+
+def test_fleet_textual_shows_the_footer_with_groups_focused_at_an_ordinary_size(
+    tmp_path: Path,
+) -> None:
+    """Round-4 P1 regression: the loose section's own label was never budgeted.
+
+    With groups focused, `_fleet_tables_within_viewport` measured
+    `header + groups_table` for the room left over for the loose table but
+    then unconditionally appended `loose_label` too, so the real render
+    always ran about two rows taller than computed -- clipping the footer
+    at a perfectly ordinary size (120x16 with 5 groups + 5 loose runs; the
+    footer reappeared only at 120x18).
+    """
+    entry = tmp_path / "runs"
+    for index in range(5):
+        publish_group_manifest(
+            entry,
+            group_id=f"group-{index:02d}",
+            order="run-major",
+            members=[GroupMember(f"g{index:02d}-member", ("prepare",))],
+        )
+    for index in range(5):
+        RunLayout(entry, f"run-{index:02d}").prepare()
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 16)) as pilot:
+            await pilot.pause()
+            assert app.screen.selected_index == 0  # a group: groups are focused
+
+            lines = _composited_lines(app.screen.query_one("#body", Static))
+            assert any("Enter drill in" in line for line in lines)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("width", [60, 78, 80, 100, 120])
+@pytest.mark.parametrize("focus", ["groups", "loose"])
+def test_fleet_dashboard_layout_never_exceeds_its_viewport_rows_budget(
+    tmp_path: Path,
+    focus: str,
+    width: int,
+) -> None:
+    """General invariant behind the round-4 fix: rendered height <= viewport_rows.
+
+    Sweeps a range of heights for both the groups-focused and loose-focused
+    branches of ``_fleet_tables_within_viewport``, which is the exact claim
+    the fix's commit message makes -- this test is what enforces it instead
+    of leaving it as an unverified assertion in prose.
+    """
+    entry = tmp_path / "runs"
+    for index in range(5):
+        publish_group_manifest(
+            entry,
+            group_id=f"group-{index:02d}",
+            order="run-major",
+            members=[GroupMember(f"g{index:02d}-member", ("prepare",))],
+        )
+    for index in range(5):
+        RunLayout(entry, f"run-{index:02d}").prepare()
+    snapshot = FleetMonitor(entry).poll()
+    rows = fleet_rows(snapshot)
+    group_count = sum(1 for row in rows if row.kind == "group")
+    selected_index = 0 if focus == "groups" else len(rows) - 1
+
+    avail_width = max(1, width - 2)
+    for height in range(4, 21):
+        avail_height = max(1, height - 1)
+        renderable = fleet_dashboard_layout(
+            snapshot,
+            selected_index=selected_index,
+            compact=avail_width < 80,
+            viewport_rows=avail_height,
+            width=avail_width,
+        )
+        actual_height = _rendered_height(renderable, width=avail_width)
+        assert actual_height <= avail_height, (
+            f"width={width} height={height} focus={focus}: "
+            f"rendered {actual_height} rows against a budget of {avail_height}"
+        )
+    assert 0 < group_count < len(rows)
+
+
+def test_fleet_dashboard_layout_uses_full_room_at_a_large_viewport(tmp_path: Path) -> None:
+    """Round-4 P2 regression: the unfocused table must not waste surplus room.
+
+    A fixed cap of 3 rows for the unfocused table meant a 120x40 viewport
+    with only 5 groups and 5 loose runs still showed an overflow marker and
+    hid rows despite ~20 empty rows of surplus space. The cap should only
+    bind when room is genuinely scarce, not unconditionally.
+    """
+    entry = tmp_path / "runs"
+    for index in range(5):
+        publish_group_manifest(
+            entry,
+            group_id=f"group-{index:02d}",
+            order="run-major",
+            members=[GroupMember(f"g{index:02d}-member", ("prepare",))],
+        )
+    for index in range(5):
+        RunLayout(entry, f"run-{index:02d}").prepare()
+    snapshot = FleetMonitor(entry).poll()
+    rows = fleet_rows(snapshot)
+
+    for selected_index in (0, len(rows) - 1):
+        renderable = fleet_dashboard_layout(
+            snapshot,
+            selected_index=selected_index,
+            compact=False,
+            viewport_rows=39,
+            width=118,
+        )
+        console = Console(width=118, record=True, color_system=None)
+        console.print(renderable)
+        text = console.export_text()
+        assert "more above" not in text
+        assert "more below" not in text
+        for row in rows:
+            assert row.key in text

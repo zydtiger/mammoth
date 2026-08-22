@@ -299,6 +299,32 @@ def _budget_with_fallback(
         kept_chunks.pop(0)
 
 
+def _fitted_trailing(
+    chunks: list[list[RenderableType]],
+    *,
+    remaining_rows: int,
+    width: int,
+) -> list[RenderableType]:
+    """Keep as much trailing content as fits in ``remaining_rows``.
+
+    Content that renders *after* the table region (warnings, the footer)
+    must never be reserved at its full fixed height and trusted to fit:
+    the table region has priority (it carries the selected-row guarantee,
+    which can floor to more than its nominal budget on an ultra-small
+    viewport), so trailing content instead fits itself into whatever
+    genuinely remains once the table region's real height is known,
+    dropping whole chunks -- least essential first -- until it does, and
+    disappearing entirely rather than ever pushing the total over budget.
+    """
+    kept_chunks = list(chunks)
+    while kept_chunks:
+        pieces = [piece for chunk in kept_chunks for piece in chunk]
+        if _rendered_height(Group(*pieces), width=width) <= remaining_rows:
+            return pieces
+        kept_chunks.pop(0)
+    return []
+
+
 def _fleet_tables_within_viewport(
     fleet: FleetSnapshot,
     selected_index: int,
@@ -358,43 +384,80 @@ def _fleet_tables_within_viewport(
         loose_table: RenderableType | None = None
         loose_label_kept: RenderableType | None = None
         if loose_shown:
-            groups_table_height = _rendered_height(groups_table, width=width)
-            loose_room = max(
-                0, viewport_rows - prefix_height - groups_table_height - loose_header_rows
-            )
-            loose_budget = min(_UNFOCUSED_TABLE_CAP, loose_count, loose_room)
-            loose_table = _loose_run_table(
-                fleet, group_count, selected_index, now, stale_after_seconds, loose_budget
-            )
-            loose_label_kept = loose_label
+            assert loose_label is not None
+            # _row_window always claims at least one row once it is given a
+            # windowed budget at all (that floor exists to protect a
+            # *focused* table's selected row), so an unfocused table must be
+            # omitted outright -- never handed a merely small budget -- once
+            # there is truly no room left, rather than relying on that floor
+            # to somehow respect a zero budget it was never designed to.
+            # Measure the real assembled Group -- including loose_label,
+            # which piecewise arithmetic previously omitted -- rather than
+            # summing individually measured pieces that can drift from what
+            # is actually rendered once they are combined; try with the
+            # label first, then without it, before dropping the section.
+            base_prefix: list[RenderableType] = [header]
+            if groups_label_kept is not None:
+                base_prefix.append(groups_label_kept)
+            base_prefix.append(groups_table)
+            for keep_loose_label in (True, False):
+                pieces = [*base_prefix, loose_label] if keep_loose_label else base_prefix
+                prefix_before_loose = _rendered_height(Group(*pieces), width=width)
+                loose_room = viewport_rows - prefix_before_loose - loose_header_rows
+                if loose_room >= 1:
+                    # No fixed cap here: this table renders last, after the
+                    # focused table has already claimed its own guaranteed
+                    # budget, so using every row genuinely available never
+                    # threatens anything else.
+                    loose_budget = min(loose_count, loose_room)
+                    loose_table = _loose_run_table(
+                        fleet, group_count, selected_index, now, stale_after_seconds, loose_budget
+                    )
+                    loose_label_kept = loose_label if keep_loose_label else None
+                    break
         return groups_table, loose_table, groups_label_kept, loose_label_kept
 
-    # Loose focused: the groups section (if any) renders before it. Try,
-    # from richest to sparsest, until the loose table gets at least one row:
-    # both sections shown; the whole groups section dropped; the groups
-    # section dropped and the loose section's own label dropped too.
+    # Loose focused: the groups section (if any) renders before it, so its
+    # size can starve the loose table's budget. Try, richest to sparsest,
+    # until the loose table gets at least one row: the *whole* (uncapped)
+    # groups table shown; the groups table capped to a small guaranteed
+    # preview (protecting the loose table only when room is genuinely
+    # contended); the whole groups section dropped; the groups section
+    # dropped and the loose section's own label dropped too.
     assert loose_label is not None
-    unfocused_groups_table = _group_roll_up_table(
+    full_groups_table = _group_roll_up_table(
+        fleet, selected_index, now, stale_after_seconds, group_count
+    )
+    capped_groups_table = _group_roll_up_table(
         fleet, selected_index, now, stale_after_seconds, min(_UNFOCUSED_TABLE_CAP, group_count)
     )
 
-    def prefix_for(keep_groups_section: bool, keep_loose_label: bool) -> list[RenderableType]:
+    def prefix_for(
+        groups_variant: RenderableType | None, keep_loose_label: bool
+    ) -> list[RenderableType]:
         pieces: list[RenderableType] = [header]
-        if keep_groups_section:
-            pieces.extend((groups_label, unfocused_groups_table))
+        if groups_variant is not None:
+            pieces.extend((groups_label, groups_variant))
         if keep_loose_label:
             pieces.append(loose_label)
         return pieces
 
-    keep_groups_section = keep_loose_label = True
+    candidates: tuple[tuple[RenderableType | None, bool], ...] = (
+        (full_groups_table, True),
+        (capped_groups_table, True),
+        (None, True),
+        (None, False),
+    )
+    kept_groups_variant: RenderableType | None = full_groups_table
+    keep_loose_label = True
     loose_budget = 0
     prefix_height = 0
-    for candidate_groups, candidate_label in ((True, True), (False, True), (False, False)):
+    for groups_variant, candidate_label in candidates:
         prefix_height = _rendered_height(
-            Group(*prefix_for(candidate_groups, candidate_label)), width=width
+            Group(*prefix_for(groups_variant, candidate_label)), width=width
         )
         loose_budget = viewport_rows - prefix_height - loose_header_rows
-        keep_groups_section, keep_loose_label = candidate_groups, candidate_label
+        kept_groups_variant, keep_loose_label = groups_variant, candidate_label
         if loose_budget >= 1 or not candidate_label:
             break
 
@@ -412,12 +475,9 @@ def _fleet_tables_within_viewport(
         max(1, loose_budget),
         show_header=show_loose_header,
     )
-    kept_groups_table: RenderableType | None = (
-        unfocused_groups_table if keep_groups_section else None
-    )
-    groups_label_kept = groups_label if keep_groups_section else None
+    groups_label_kept = groups_label if kept_groups_variant is not None else None
     loose_label_kept = loose_label if keep_loose_label else None
-    return kept_groups_table, loose_table, groups_label_kept, loose_label_kept
+    return kept_groups_variant, loose_table, groups_label_kept, loose_label_kept
 
 
 def fleet_dashboard_layout(
@@ -472,17 +532,17 @@ def fleet_dashboard_layout(
     )
     group_count = len(fleet.groups)
     loose_count = len(fleet.loose_runs) if loose_shown else 0
-    trailing: list[RenderableType] = []
+    trailing_chunks: list[list[RenderableType]] = []
     if fleet.warnings:
-        trailing.extend(
-            (
+        trailing_chunks.append(
+            [
                 _section("WARNINGS", style="yellow")
                 if not compact
                 else Text("\nWARNINGS", style="bold yellow"),
                 _warnings_panel(list(fleet.warnings)),
-            )
+            ]
         )
-    trailing.extend((Text(), _fleet_footer(bool(rows))))
+    trailing_chunks.append([Text(), _fleet_footer(bool(rows))])
 
     groups_label_kept: RenderableType | None = groups_label
     loose_label_kept: RenderableType | None = loose_label
@@ -499,9 +559,19 @@ def fleet_dashboard_layout(
             if loose_shown
             else None
         )
+        trailing = [piece for chunk in trailing_chunks for piece in chunk]
     else:
-        trailing_height = _rendered_height(Group(*trailing), width=width)
-        table_viewport_rows = max(0, viewport_rows - trailing_height)
+        # First guess the table region's budget from the trailing content's
+        # full height, then size the tables. The table region carries the
+        # selected-row guarantee, which can floor to more than this guess on
+        # an ultra-small viewport, so trailing content is fitted to
+        # whatever *actually* remains once the table region's real height
+        # is known -- never trusted to fit at its full fixed height -- so
+        # the row's priority over the footer holds even then.
+        trailing_height_guess = _rendered_height(
+            Group(*(piece for chunk in trailing_chunks for piece in chunk)), width=width
+        )
+        table_viewport_rows = max(0, viewport_rows - trailing_height_guess)
         groups_table, loose_table, groups_label_kept, loose_label_kept = (
             _fleet_tables_within_viewport(
                 fleet,
@@ -518,6 +588,20 @@ def fleet_dashboard_layout(
                 viewport_rows=table_viewport_rows,
                 width=width,
             )
+        )
+        table_region: list[RenderableType] = [header]
+        if groups_label_kept is not None:
+            table_region.append(groups_label_kept)
+        if groups_table is not None:
+            table_region.append(groups_table)
+        if loose_shown and loose_table is not None:
+            if loose_label_kept is not None:
+                table_region.append(loose_label_kept)
+            table_region.append(loose_table)
+        table_region_height = _rendered_height(Group(*table_region), width=width)
+        remaining_for_trailing = max(0, viewport_rows - table_region_height)
+        trailing = _fitted_trailing(
+            trailing_chunks, remaining_rows=remaining_for_trailing, width=width
         )
 
     pieces: list[RenderableType] = [header]
@@ -578,25 +662,35 @@ def group_dashboard_layout(
     )
     members_label = _section("MEMBERS") if not compact else Text("\nMEMBERS", style="bold")
     total_members = len(group.members)
-    trailing: list[RenderableType] = []
+    trailing_chunks: list[list[RenderableType]] = []
     if group.warnings:
-        trailing.extend(
-            (
+        trailing_chunks.append(
+            [
                 _section("WARNINGS", style="yellow")
                 if not compact
                 else Text("\nWARNINGS", style="bold yellow"),
                 _warnings_panel(list(group.warnings)),
-            )
+            ]
         )
-    trailing.extend((Text(), _group_footer()))
+    trailing_chunks.append([Text(), _group_footer()])
 
     show_member_header = True
     if viewport_rows is None:
         kept_optional = [summary, members_label]
         member_max_visible = None
+        trailing = [piece for chunk in trailing_chunks for piece in chunk]
     else:
-        trailing_height = _rendered_height(Group(*trailing), width=width)
-        table_viewport_rows = max(0, viewport_rows - trailing_height)
+        # First guess the table region's budget from the trailing content's
+        # full height, then size the table. The table region carries the
+        # selected-row guarantee, which can floor to more than this guess on
+        # an ultra-small viewport, so trailing content is fitted to
+        # whatever *actually* remains once the table region's real height is
+        # known -- never trusted to fit at its full fixed height -- so the
+        # row's priority over the footer holds even then.
+        trailing_height_guess = _rendered_height(
+            Group(*(piece for chunk in trailing_chunks for piece in chunk)), width=width
+        )
+        table_viewport_rows = max(0, viewport_rows - trailing_height_guess)
         kept_optional, member_max_visible, show_member_header = _budget_with_fallback(
             [header],
             [[summary], [members_label]],
@@ -607,18 +701,24 @@ def group_dashboard_layout(
             ),
         )
 
-    pieces: list[RenderableType] = [
-        header,
-        *kept_optional,
-        _member_table(
-            group,
-            selected_index,
-            observed_at,
-            stale_after_seconds,
-            member_max_visible,
-            show_header=show_member_header,
-        ),
-    ]
+    member_table = _member_table(
+        group,
+        selected_index,
+        observed_at,
+        stale_after_seconds,
+        member_max_visible,
+        show_header=show_member_header,
+    )
+    if viewport_rows is not None:
+        table_region_height = _rendered_height(
+            Group(header, *kept_optional, member_table), width=width
+        )
+        remaining_for_trailing = max(0, viewport_rows - table_region_height)
+        trailing = _fitted_trailing(
+            trailing_chunks, remaining_rows=remaining_for_trailing, width=width
+        )
+
+    pieces: list[RenderableType] = [header, *kept_optional, member_table]
     pieces.extend(trailing)
     return Group(*pieces)
 
