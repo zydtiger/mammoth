@@ -100,7 +100,13 @@ reconstruction:
    total and a positive throughput; when a member's rate is unknown, the view
    omits the synthetic aggregate rather than guessing and lets each member's
    own progress speak for itself — member durations can diverge widely across
-   a group, and a summed estimate would otherwise mislead.
+   a group, and a summed estimate would otherwise mislead. The same honesty
+   rule applies to one member's own ETA (and a loose run's): it is shown only
+   when that member's task currently reports throughput; otherwise it is
+   withheld rather than falling back to an elapsed-time estimate, because
+   under the bounded tail window (see below) a task's recorded start is only
+   the first event the window happened to capture, not its true start, and
+   an elapsed-time ETA derived from it can be wrong by an arbitrary factor.
 3. **Run** (selecting one member or loose run). Pushes the existing
    single-run dashboard described in the sections below, unchanged. Back
    navigation (`Esc`/`Backspace`) pops the Textual screen stack and returns to

@@ -23,7 +23,7 @@ from mammoth.monitor.fleet import (
     discover_group_ids,
     discover_run_names,
 )
-from mammoth.monitor.model import FLEET_TAIL_WINDOW_BYTES
+from mammoth.monitor.model import FLEET_TAIL_WINDOW_BYTES, ExecutionMonitor
 from mammoth.monitor.render import render_fleet_snapshot, render_group_snapshot
 
 
@@ -736,6 +736,56 @@ def test_fleet_monitor_sorts_an_untimestamped_ad_hoc_cohort_last_among_groups(
     assert snapshot.groups[1].updated_at is None
     rendered = render_fleet_snapshot(snapshot)
     assert "match:sweep-*" in rendered
+
+
+def test_fleet_monitor_withholds_bounded_eta_without_reported_throughput(
+    tmp_path: Path,
+) -> None:
+    """P1-1 regression.
+
+    Under a bounded read, ``TaskState.started_at`` is merely the first event
+    the window happened to capture, not the task's true start, so its
+    throughput-less ETA fallback (elapsed-time based) can be wildly wrong.
+    Fleet/group folding must withhold the member ETA in that case rather
+    than show a fabricated number; the unbounded single-run path is
+    unaffected and still computes the same fallback estimate.
+    """
+    entry = tmp_path / "runs"
+    layout = RunLayout(entry, "eta-no-throughput").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    writer = ExecutionEventWriter.for_process(context, rank=0, world_size=1)
+    writer.emit("process_started", phase="train")
+    writer.emit("task_started", phase="train", task_id="epoch")
+    steps = 3000
+    for step in range(1, steps + 1):
+        # No throughput reported: exercises TaskState.eta_seconds's
+        # elapsed-time fallback, the path P1-1 found unsafe under bounding.
+        writer.emit_progress(
+            phase="train",
+            task_id="epoch",
+            completed=step,
+            total=steps * 4,
+            final=True,
+            message="padding-" + "x" * 160,
+        )
+    writer.close()
+    stream_size = (context.execution_dir / "rank-0.jsonl").stat().st_size
+    assert stream_size > FLEET_TAIL_WINDOW_BYTES * 3, "fixture must dwarf the tail window"
+
+    fleet_snapshot = FleetMonitor(entry).poll(stale_after_seconds=10**9)
+    run = fleet_snapshot.loose_runs[0]
+    assert run.status == "running"
+    assert run.progress is not None
+    assert run.progress.throughput is None
+    assert run.progress.eta_seconds is None
+
+    # The unbounded single-run path folds the same underlying data with a
+    # true started_at, so it still computes a (fallback) ETA: withholding is
+    # specific to the bounded fleet/group path, not a general regression.
+    unbounded_task = ExecutionMonitor(layout, "attempt").poll().current_task
+    assert unbounded_task is not None
+    assert unbounded_task.throughput is None
+    assert unbounded_task.eta_seconds is not None
 
 
 def test_fleet_monitor_bounded_tail_reports_terminal_status_from_a_large_stream(
