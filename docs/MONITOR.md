@@ -112,17 +112,30 @@ rendering is unaffected: it keeps printing every row unconditionally.
 
 The selected row is guaranteed visible whenever the viewport can physically
 fit its chrome (headers, section labels, the table's own header row) plus at
-least one data row: the budget available to each table is the real,
+least one data row. The budget available to each table is the real,
 wrap-aware rendered height of everything around it at the terminal's actual
-width, not a fixed line-count guess, so a summary line wrapping at a narrow
-width is accounted for exactly. On a viewport too small even for that
-minimum, optional chrome is dropped before the selected row ever would be —
-the group screen drops its summary line, then its "MEMBERS" label, in that
-order; the fleet screen's unfocused table (the one not currently holding the
-selection) is capped small enough that it can never crowd out the focused
-table's guaranteed row. Only as an absolute last resort, when a table's own
-markers would not fit alongside its single guaranteed row, are the "N more"
-markers themselves dropped rather than the row.
+width, not a fixed line-count guess — a summary line wrapping at a narrow
+width, or a table's own header row wrapping (for example the fleet group
+table's "Members (done/failed/total)" column), is accounted for exactly. The
+trailing warnings and footer are measured and reserved first, since they
+render *after* both tables and would otherwise silently eat into a budget
+computed only against the tables: their real height always comes out of the
+viewport before either table is sized against what remains.
+
+On a viewport too small even for that minimum, optional chrome is dropped
+before the selected row ever would be, richest to sparsest:
+
+1. The group screen drops its summary line, then its "MEMBERS" label.
+2. The fleet screen drops the *unfocused* table's whole section (its label
+   and its table together, never just one) when that section renders
+   *before* the focused table — content that renders after the focused table
+   never threatens the guarantee, so it is only capped small, never
+   force-dropped. If still tight, the focused table's own section label
+   goes too.
+3. As an absolute last resort, if even the focused table's own header row
+   cannot fit alongside its one guaranteed data row, the header row itself
+   is suppressed (the table renders with no column headers) rather than the
+   row.
 
 `mammoth monitor <run_name>` without `--group` or `--match` is unaffected by
 any of this: it keeps its original single-run behavior exactly, entering

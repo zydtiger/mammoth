@@ -9,6 +9,7 @@ project-neutral run state. The canonical ANSI-free renderer remains in
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from statistics import median
@@ -265,28 +266,37 @@ def _rendered_height(renderable: RenderableType, *, width: int) -> int:
 
 def _budget_with_fallback(
     mandatory_prefix: list[RenderableType],
-    optional_prefix: list[RenderableType],
+    optional_chunks: list[list[RenderableType]],
     *,
     viewport_rows: int,
     width: int,
     table_header_rows: int,
-) -> tuple[list[RenderableType], int]:
-    """Return ``(kept_optional_pieces, data_row_budget)`` for one table.
+) -> tuple[list[RenderableType], int, bool]:
+    """Return ``(kept_optional_pieces, data_row_budget, show_table_header)``.
 
     Measures the real rendered height of ``mandatory_prefix`` plus however
-    much of ``optional_prefix`` survives, dropping pieces from
-    ``optional_prefix`` in order (least essential first) whenever the
-    remaining viewport cannot fit at least one data row. ``data_row_budget``
-    is always at least 1: the selected row is never sacrificed to keep an
-    optional piece such as a summary line or section label.
+    many of ``optional_chunks`` survive, dropping whole chunks in order
+    (least essential first) whenever the remaining viewport cannot fit at
+    least one data row. Each chunk is a list of one or more pieces dropped
+    together, never partially (for example a section's label and its own
+    table, which would be meaningless shown alone). As an absolute last
+    resort, once every chunk is dropped and the budget still cannot fit one
+    row alongside ``table_header_rows``, the table's own header row is
+    dropped too (``show_table_header=False``) rather than the row.
+    ``data_row_budget`` is always at least 1.
     """
-    kept = list(optional_prefix)
+    kept_chunks = list(optional_chunks)
     while True:
-        prefix_height = _rendered_height(Group(*mandatory_prefix, *kept), width=width)
+        kept_pieces = [piece for chunk in kept_chunks for piece in chunk]
+        prefix_height = _rendered_height(Group(*mandatory_prefix, *kept_pieces), width=width)
         budget = viewport_rows - prefix_height - table_header_rows
-        if budget >= 1 or not kept:
-            return kept, max(1, budget)
-        kept.pop(0)
+        if budget >= 1:
+            return kept_pieces, budget, True
+        if not kept_chunks:
+            if table_header_rows <= 0:
+                return kept_pieces, max(1, budget), True
+            return kept_pieces, max(1, viewport_rows - prefix_height), False
+        kept_chunks.pop(0)
 
 
 def _fleet_tables_within_viewport(
@@ -304,49 +314,110 @@ def _fleet_tables_within_viewport(
     focus_groups: bool,
     viewport_rows: int,
     width: int,
-) -> tuple[RenderableType, RenderableType | None]:
+) -> tuple[
+    RenderableType | None, RenderableType | None, RenderableType | None, RenderableType | None
+]:
     """Size the fleet screen's two tables so the selected row always fits.
 
-    The table holding the current selection gets whatever the viewport has
-    left after the real (wrap-aware) measured height of everything rendered
-    before it, including the other, unfocused table when that one renders
-    first; the unfocused table is bounded the same way so it can never
-    crowd out the focused table's one guaranteed row.
+    Returns ``(groups_table, loose_table, groups_label_kept, loose_label_kept)``.
+    A ``None`` table or label means that section is dropped entirely to make
+    room. Whichever table holds ``selected_index`` always gets at least one
+    row of budget: everything that would render *before* it -- the header,
+    the other table's whole section when it renders first, the focused
+    table's own section label, and, as an absolute last resort, the focused
+    table's own header row -- is progressively dropped, least essential
+    first, before the selected row itself is ever sacrificed. Content that
+    renders *after* the focused table (an unfocused table when it comes
+    second) never threatens the guarantee, so it is only capped, never
+    force-dropped.
     """
-    groups_header_rows = 1 if group_count > 0 else 0
-    prefix_before_groups = _rendered_height(Group(header, groups_label), width=width)
-    groups_room = max(0, viewport_rows - prefix_before_groups - groups_header_rows)
+    groups_header_rows = _table_header_height(_new_groups_table, width) if group_count > 0 else 0
+    loose_header_rows = _table_header_height(_new_loose_table, width) if loose_count > 0 else 0
 
     if focus_groups:
+        keep_groups_label = True
+        prefix_height = _rendered_height(Group(header, groups_label), width=width)
+        groups_budget = viewport_rows - prefix_height - groups_header_rows
+        if groups_budget < 1:
+            keep_groups_label = False
+            prefix_height = _rendered_height(Group(header), width=width)
+            groups_budget = viewport_rows - prefix_height - groups_header_rows
+        show_groups_header = True
+        if groups_budget < 1 and groups_header_rows > 0:
+            show_groups_header = False
+            groups_budget = viewport_rows - prefix_height
         groups_table = _group_roll_up_table(
-            fleet, selected_index, now, stale_after_seconds, max(1, groups_room)
+            fleet,
+            selected_index,
+            now,
+            stale_after_seconds,
+            max(1, groups_budget),
+            show_header=show_groups_header,
         )
+        groups_label_kept = groups_label if keep_groups_label else None
         loose_table: RenderableType | None = None
+        loose_label_kept: RenderableType | None = None
         if loose_shown:
             groups_table_height = _rendered_height(groups_table, width=width)
-            loose_room = max(0, viewport_rows - prefix_before_groups - groups_table_height)
+            loose_room = max(
+                0, viewport_rows - prefix_height - groups_table_height - loose_header_rows
+            )
             loose_budget = min(_UNFOCUSED_TABLE_CAP, loose_count, loose_room)
             loose_table = _loose_run_table(
                 fleet, group_count, selected_index, now, stale_after_seconds, loose_budget
             )
-        return groups_table, loose_table
+            loose_label_kept = loose_label
+        return groups_table, loose_table, groups_label_kept, loose_label_kept
 
-    groups_budget = min(_UNFOCUSED_TABLE_CAP, group_count, groups_room)
-    groups_table = _group_roll_up_table(
-        fleet, selected_index, now, stale_after_seconds, groups_budget
+    # Loose focused: the groups section (if any) renders before it. Try,
+    # from richest to sparsest, until the loose table gets at least one row:
+    # both sections shown; the whole groups section dropped; the groups
+    # section dropped and the loose section's own label dropped too.
+    assert loose_label is not None
+    unfocused_groups_table = _group_roll_up_table(
+        fleet, selected_index, now, stale_after_seconds, min(_UNFOCUSED_TABLE_CAP, group_count)
     )
-    loose_table = None
-    if loose_shown:
-        assert loose_label is not None
-        prefix_before_loose = _rendered_height(
-            Group(header, groups_label, groups_table, loose_label), width=width
+
+    def prefix_for(keep_groups_section: bool, keep_loose_label: bool) -> list[RenderableType]:
+        pieces: list[RenderableType] = [header]
+        if keep_groups_section:
+            pieces.extend((groups_label, unfocused_groups_table))
+        if keep_loose_label:
+            pieces.append(loose_label)
+        return pieces
+
+    keep_groups_section = keep_loose_label = True
+    loose_budget = 0
+    prefix_height = 0
+    for candidate_groups, candidate_label in ((True, True), (False, True), (False, False)):
+        prefix_height = _rendered_height(
+            Group(*prefix_for(candidate_groups, candidate_label)), width=width
         )
-        loose_header_rows = 1 if loose_count > 0 else 0
-        loose_budget = max(1, viewport_rows - prefix_before_loose - loose_header_rows)
-        loose_table = _loose_run_table(
-            fleet, group_count, selected_index, now, stale_after_seconds, loose_budget
-        )
-    return groups_table, loose_table
+        loose_budget = viewport_rows - prefix_height - loose_header_rows
+        keep_groups_section, keep_loose_label = candidate_groups, candidate_label
+        if loose_budget >= 1 or not candidate_label:
+            break
+
+    show_loose_header = True
+    if loose_budget < 1 and loose_header_rows > 0:
+        show_loose_header = False
+        loose_budget = viewport_rows - prefix_height
+
+    loose_table = _loose_run_table(
+        fleet,
+        group_count,
+        selected_index,
+        now,
+        stale_after_seconds,
+        max(1, loose_budget),
+        show_header=show_loose_header,
+    )
+    kept_groups_table: RenderableType | None = (
+        unfocused_groups_table if keep_groups_section else None
+    )
+    groups_label_kept = groups_label if keep_groups_section else None
+    loose_label_kept = loose_label if keep_loose_label else None
+    return kept_groups_table, loose_table, groups_label_kept, loose_label_kept
 
 
 def fleet_dashboard_layout(
@@ -368,13 +439,18 @@ def fleet_dashboard_layout(
     plain-mode and other non-windowed callers, which keep printing every row.
     ``width`` is the terminal column count windowing measures wrapping
     against (for example the header bar's path, or a summary line); it is
-    only meaningful together with ``viewport_rows``. When windowing, each
+    only meaningful together with ``viewport_rows``. When windowing, the
+    trailing warnings and footer are measured and reserved first (they
+    render after both tables, so their real height must come out of the
+    budget before either table is sized against what remains), then each
     table is sized around ``selected_index`` (whichever table currently
     holds the selection) with "... N more above/below" markers where room
     allows; see :func:`_fleet_tables_within_viewport` for exactly how the
-    two tables' budgets are derived from real measured heights, and
-    :func:`_row_window` for the guarantee that the selected row itself is
-    never dropped to make room for markers.
+    two tables' budgets are derived from real measured heights -- including
+    dropping a section's label, or an entire unfocused section, before ever
+    giving up a row of the focused table -- and :func:`_row_window` for the
+    guarantee that the selected row itself is never dropped to make room for
+    markers.
     """
     observed_at = now or datetime.now(UTC)
     rows = fleet_rows(fleet)
@@ -396,7 +472,22 @@ def fleet_dashboard_layout(
     )
     group_count = len(fleet.groups)
     loose_count = len(fleet.loose_runs) if loose_shown else 0
+    trailing: list[RenderableType] = []
+    if fleet.warnings:
+        trailing.extend(
+            (
+                _section("WARNINGS", style="yellow")
+                if not compact
+                else Text("\nWARNINGS", style="bold yellow"),
+                _warnings_panel(list(fleet.warnings)),
+            )
+        )
+    trailing.extend((Text(), _fleet_footer(bool(rows))))
 
+    groups_label_kept: RenderableType | None = groups_label
+    loose_label_kept: RenderableType | None = loose_label
+    groups_table: RenderableType | None
+    loose_table: RenderableType | None
     if viewport_rows is None:
         groups_table = _group_roll_up_table(
             fleet, selected_index, observed_at, stale_after_seconds, None
@@ -409,37 +500,36 @@ def fleet_dashboard_layout(
             else None
         )
     else:
-        groups_table, loose_table = _fleet_tables_within_viewport(
-            fleet,
-            selected_index,
-            observed_at,
-            stale_after_seconds,
-            header=header,
-            groups_label=groups_label,
-            loose_label=loose_label,
-            loose_shown=loose_shown,
-            group_count=group_count,
-            loose_count=loose_count,
-            focus_groups=selected_index < group_count,
-            viewport_rows=viewport_rows,
-            width=width,
-        )
-
-    pieces: list[RenderableType] = [header, groups_label, groups_table]
-    if loose_shown:
-        assert loose_label is not None
-        assert loose_table is not None
-        pieces.extend((loose_label, loose_table))
-    if fleet.warnings:
-        pieces.extend(
-            (
-                _section("WARNINGS", style="yellow")
-                if not compact
-                else Text("\nWARNINGS", style="bold yellow"),
-                _warnings_panel(list(fleet.warnings)),
+        trailing_height = _rendered_height(Group(*trailing), width=width)
+        table_viewport_rows = max(0, viewport_rows - trailing_height)
+        groups_table, loose_table, groups_label_kept, loose_label_kept = (
+            _fleet_tables_within_viewport(
+                fleet,
+                selected_index,
+                observed_at,
+                stale_after_seconds,
+                header=header,
+                groups_label=groups_label,
+                loose_label=loose_label,
+                loose_shown=loose_shown,
+                group_count=group_count,
+                loose_count=loose_count,
+                focus_groups=selected_index < group_count,
+                viewport_rows=table_viewport_rows,
+                width=width,
             )
         )
-    pieces.extend((Text(), _fleet_footer(bool(rows))))
+
+    pieces: list[RenderableType] = [header]
+    if groups_label_kept is not None:
+        pieces.append(groups_label_kept)
+    if groups_table is not None:
+        pieces.append(groups_table)
+    if loose_shown and loose_table is not None:
+        if loose_label_kept is not None:
+            pieces.append(loose_label_kept)
+        pieces.append(loose_table)
+    pieces.extend(trailing)
     return Group(*pieces)
 
 
@@ -460,7 +550,10 @@ def group_dashboard_layout(
     actual height; ``width`` is the column count windowing measures
     wrapping against (the summary line can wrap at a narrow width) and is
     only meaningful together with ``viewport_rows``. When windowing, the
-    summary line and then the "MEMBERS" section label are dropped, in that
+    trailing warnings and footer are measured and reserved first (they
+    render after the table, so their real height must come out of the
+    budget before the table is sized against what remains); the summary
+    line and then the "MEMBERS" section label are then dropped, in that
     order, if the remaining room cannot otherwise fit the selected member
     row — see :func:`_budget_with_fallback`. ``None`` (plain-mode and other
     non-windowed callers) renders every member unconditionally.
@@ -485,26 +578,9 @@ def group_dashboard_layout(
     )
     members_label = _section("MEMBERS") if not compact else Text("\nMEMBERS", style="bold")
     total_members = len(group.members)
-
-    if viewport_rows is None:
-        kept_optional = [summary, members_label]
-        member_max_visible = None
-    else:
-        kept_optional, member_max_visible = _budget_with_fallback(
-            [header],
-            [summary, members_label],
-            viewport_rows=viewport_rows,
-            width=width,
-            table_header_rows=1 if total_members > 0 else 0,
-        )
-
-    pieces: list[RenderableType] = [
-        header,
-        *kept_optional,
-        _member_table(group, selected_index, observed_at, stale_after_seconds, member_max_visible),
-    ]
+    trailing: list[RenderableType] = []
     if group.warnings:
-        pieces.extend(
+        trailing.extend(
             (
                 _section("WARNINGS", style="yellow")
                 if not compact
@@ -512,8 +588,112 @@ def group_dashboard_layout(
                 _warnings_panel(list(group.warnings)),
             )
         )
-    pieces.extend((Text(), _group_footer()))
+    trailing.extend((Text(), _group_footer()))
+
+    show_member_header = True
+    if viewport_rows is None:
+        kept_optional = [summary, members_label]
+        member_max_visible = None
+    else:
+        trailing_height = _rendered_height(Group(*trailing), width=width)
+        table_viewport_rows = max(0, viewport_rows - trailing_height)
+        kept_optional, member_max_visible, show_member_header = _budget_with_fallback(
+            [header],
+            [[summary], [members_label]],
+            viewport_rows=table_viewport_rows,
+            width=width,
+            table_header_rows=(
+                _table_header_height(_new_member_table, width) if total_members > 0 else 0
+            ),
+        )
+
+    pieces: list[RenderableType] = [
+        header,
+        *kept_optional,
+        _member_table(
+            group,
+            selected_index,
+            observed_at,
+            stale_after_seconds,
+            member_max_visible,
+            show_header=show_member_header,
+        ),
+    ]
+    pieces.extend(trailing)
     return Group(*pieces)
+
+
+def _new_groups_table(*, show_header: bool = True) -> Table:
+    """Return an empty groups table shell with only its columns declared.
+
+    Shared by :func:`_group_roll_up_table` and :func:`_table_header_height`
+    so the header row measured for windowing budgets is always the exact
+    header the real table renders, never a hand-kept duplicate.
+    """
+    table = Table(
+        box=None,
+        expand=True,
+        padding=(0, 1),
+        pad_edge=False,
+        collapse_padding=True,
+        show_header=show_header,
+    )
+    table.add_column("", width=1)
+    table.add_column("Group")
+    table.add_column("Order")
+    table.add_column("Members (done/failed/total)")
+    table.add_column("Active")
+    table.add_column("Heartbeat")
+    table.add_column("Terminal")
+    return table
+
+
+def _new_loose_table(*, show_header: bool = True) -> Table:
+    """Return an empty loose-run table shell with only its columns declared."""
+    table = Table(
+        box=None,
+        expand=True,
+        padding=(0, 1),
+        pad_edge=False,
+        collapse_padding=True,
+        show_header=show_header,
+    )
+    table.add_column("", width=1)
+    table.add_column("Run")
+    table.add_column("Status")
+    table.add_column("Heartbeat")
+    table.add_column("Progress")
+    return table
+
+
+def _new_member_table(*, show_header: bool = True) -> Table:
+    """Return an empty group-member table shell with only its columns declared."""
+    table = Table(
+        box=None,
+        expand=True,
+        padding=(0, 1),
+        pad_edge=False,
+        collapse_padding=True,
+        show_header=show_header,
+    )
+    table.add_column("", width=1)
+    table.add_column("Run")
+    table.add_column("Status")
+    table.add_column("Steps")
+    table.add_column("Progress")
+    table.add_column("Heartbeat")
+    return table
+
+
+def _table_header_height(builder: Callable[..., Table], width: int) -> int:
+    """Return one table's real, wrap-aware header-row height at ``width``.
+
+    A table's header can itself wrap onto more than one physical line at a
+    narrow width (for example "Members (done/failed/total)"); measuring the
+    same empty table shell the real table builds, rather than assuming a
+    fixed one row, keeps windowing budgets exact instead of approximate.
+    """
+    return _rendered_height(builder(), width=width)
 
 
 def _group_roll_up_table(
@@ -522,20 +702,15 @@ def _group_roll_up_table(
     now: datetime,
     stale_after_seconds: float,
     max_visible: int | None,
+    *,
+    show_header: bool = True,
 ) -> RenderableType:
     total = len(fleet.groups)
     if total == 0:
         return Text("  (none observed)", style="dim")
     local_selected = selected_index if 0 <= selected_index < total else None
     start, end, hidden_above, hidden_below = _row_window(total, local_selected, max_visible)
-    table = Table(box=None, expand=True, padding=(0, 1), pad_edge=False, collapse_padding=True)
-    table.add_column("", width=1)
-    table.add_column("Group")
-    table.add_column("Order")
-    table.add_column("Members (done/failed/total)")
-    table.add_column("Active")
-    table.add_column("Heartbeat")
-    table.add_column("Terminal")
+    table = _new_groups_table(show_header=show_header)
     for index in range(start, end):
         group = fleet.groups[index]
         marker = ">" if index == selected_index else ""
@@ -559,6 +734,8 @@ def _loose_run_table(
     now: datetime,
     stale_after_seconds: float,
     max_visible: int | None,
+    *,
+    show_header: bool = True,
 ) -> RenderableType:
     total = len(fleet.loose_runs)
     if total == 0:
@@ -566,12 +743,7 @@ def _loose_run_table(
     local_selected_index = selected_index - index_offset
     local_selected = local_selected_index if 0 <= local_selected_index < total else None
     start, end, hidden_above, hidden_below = _row_window(total, local_selected, max_visible)
-    table = Table(box=None, expand=True, padding=(0, 1), pad_edge=False, collapse_padding=True)
-    table.add_column("", width=1)
-    table.add_column("Run")
-    table.add_column("Status")
-    table.add_column("Heartbeat")
-    table.add_column("Progress")
+    table = _new_loose_table(show_header=show_header)
     for offset in range(start, end):
         run = fleet.loose_runs[offset]
         marker = ">" if index_offset + offset == selected_index else ""
@@ -591,19 +763,15 @@ def _member_table(
     now: datetime,
     stale_after_seconds: float,
     max_visible: int | None,
+    *,
+    show_header: bool = True,
 ) -> RenderableType:
     total = len(group.members)
     if total == 0:
         return Text("  (none observed)", style="dim")
     local_selected = selected_index if 0 <= selected_index < total else None
     start, end, hidden_above, hidden_below = _row_window(total, local_selected, max_visible)
-    table = Table(box=None, expand=True, padding=(0, 1), pad_edge=False, collapse_padding=True)
-    table.add_column("", width=1)
-    table.add_column("Run")
-    table.add_column("Status")
-    table.add_column("Steps")
-    table.add_column("Progress")
-    table.add_column("Heartbeat")
+    table = _new_member_table(show_header=show_header)
     for index in range(start, end):
         member = group.members[index]
         marker = ">" if index == selected_index else ""
