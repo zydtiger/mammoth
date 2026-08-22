@@ -43,7 +43,14 @@ from mammoth.monitor.psutil_telemetry import (
     PsutilViewerTelemetrySampler,
     sample_psutil_viewer_telemetry,
 )
-from mammoth.monitor.textual_ui import FleetApp, FleetScreen, GroupScreen, MonitorApp, RunScreen
+from mammoth.monitor.textual_ui import (
+    FleetApp,
+    FleetScreen,
+    GroupScreen,
+    MonitorApp,
+    RunScreen,
+    run_fleet_textual,
+)
 
 
 def create_context(
@@ -1055,5 +1062,199 @@ def test_fleet_textual_selecting_a_run_with_no_executions_does_not_navigate(
             await pilot.pause()
             assert isinstance(app.screen, FleetScreen)
             assert len(app.screen_stack) == 2
+
+    asyncio.run(exercise())
+
+
+def test_run_fleet_textual_samples_telemetry_before_the_app_runs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Regression for the fleet sudo-prompt-inside-the-TUI defect.
+
+    ``run_fleet_textual`` must sample viewer-host telemetry (and take any
+    sudo password prompt it needs) on the plain terminal before the Textual
+    app is even constructed, mirroring ``run_textual``'s single-run
+    ordering. A recording fake sampler and fake ``FleetApp`` pin the exact
+    call order without spinning up a real Textual application.
+    """
+    entry = tmp_path / "runs"
+    RunLayout(entry, "loose").prepare()
+    fleet_monitor = FleetMonitor(entry)
+    snapshot = fleet_monitor.poll()
+
+    events: list[str] = []
+
+    class RecordingSampler:
+        def __init__(self, *, allow_sudo_password_prompt: bool = False) -> None:
+            events.append("sampler-constructed")
+            self.allow_sudo_password_prompt = allow_sudo_password_prompt
+
+        def sample(self) -> str:
+            events.append("sampled")
+            return "host-sample"
+
+    class RecordingFleetApp:
+        def __init__(self, *_args, **kwargs) -> None:
+            events.append("app-constructed")
+            self.kwargs = kwargs
+
+        def run(self) -> None:
+            events.append("app-run")
+
+    monkeypatch.setattr(
+        "mammoth.monitor.textual_ui.PsutilViewerTelemetrySampler", RecordingSampler
+    )
+    monkeypatch.setattr("mammoth.monitor.textual_ui.FleetApp", RecordingFleetApp)
+
+    run_fleet_textual(
+        entry,
+        fleet_monitor,
+        snapshot,
+        watch=False,
+        telemetry=True,
+        interval_seconds=2.0,
+        stale_after_seconds=90.0,
+    )
+
+    assert events == ["sampler-constructed", "sampled", "app-constructed", "app-run"]
+
+
+def test_run_fleet_textual_disabled_telemetry_builds_no_sampler_or_host(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    entry = tmp_path / "runs"
+    RunLayout(entry, "loose").prepare()
+    fleet_monitor = FleetMonitor(entry)
+    snapshot = fleet_monitor.poll()
+
+    def fail_if_constructed(*_args, **_kwargs):
+        raise AssertionError("no sampler should be constructed when telemetry is disabled")
+
+    captured: dict = {}
+
+    class RecordingFleetApp:
+        def __init__(self, *_args, **kwargs) -> None:
+            captured.update(kwargs)
+
+        def run(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "mammoth.monitor.textual_ui.PsutilViewerTelemetrySampler", fail_if_constructed
+    )
+    monkeypatch.setattr("mammoth.monitor.textual_ui.FleetApp", RecordingFleetApp)
+
+    run_fleet_textual(
+        entry,
+        fleet_monitor,
+        snapshot,
+        watch=False,
+        telemetry=False,
+        interval_seconds=2.0,
+        stale_after_seconds=90.0,
+    )
+
+    assert captured["telemetry_sampler"] is None
+    assert captured["initial_host"] is None
+
+
+def test_fleet_app_next_run_screen_host_reuses_the_pre_ui_sample_once(tmp_path: Path) -> None:
+    """The pre-UI telemetry sample is spent on the first drill-in, not wasted.
+
+    ``push_run_screen`` never constructs its own sampler; it either consumes
+    the initial pre-UI sample once or delegates to the already-shared
+    sampler, which is exactly what ``FleetApp`` receives from
+    ``run_fleet_textual``.
+    """
+    entry = tmp_path / "runs"
+    fleet_monitor = FleetMonitor(entry)
+
+    class CountingSampler:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def sample(self) -> str:
+            self.calls += 1
+            return f"sampled-{self.calls}"
+
+    sampler = CountingSampler()
+    app = FleetApp(
+        entry,
+        fleet_monitor,
+        fleet_monitor.poll(),
+        watch=False,
+        telemetry=True,
+        telemetry_sampler=sampler,
+        initial_host="pre-ui-sample",
+    )
+
+    assert app._next_run_screen_host() == "pre-ui-sample"
+    assert sampler.calls == 0
+    assert app._next_run_screen_host() == "sampled-1"
+    assert sampler.calls == 1
+    assert app._next_run_screen_host() == "sampled-2"
+    assert sampler.calls == 2
+
+
+def test_fleet_textual_run_screen_receives_the_fleet_apps_shared_sampler(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Drilling into a run must reuse the injected sampler, not build a new one."""
+    entry = tmp_path / "runs"
+    run_layout = RunLayout(entry, "loose").prepare()
+    create_context(run_layout, "attempt", "2026-01-01T00:00:00Z")
+
+    def fail_if_constructed(*_args, **_kwargs):
+        raise AssertionError("FleetApp/RunScreen must not construct their own sampler")
+
+    monkeypatch.setattr(
+        "mammoth.monitor.textual_ui.PsutilViewerTelemetrySampler", fail_if_constructed
+    )
+
+    class FakeSampler:
+        def __init__(self) -> None:
+            self.sample_calls = 0
+
+        def sample(self) -> PsutilViewerTelemetry:
+            self.sample_calls += 1
+            return PsutilViewerTelemetry(
+                host_role="viewer",
+                hostname="refreshed",
+                sampled_at="2026-01-01T00:00:05Z",
+                cpu_percent=None,
+                memory_percent=None,
+                load_average_1m=None,
+            )
+
+    fake_sampler = FakeSampler()
+    initial_host = PsutilViewerTelemetry(
+        host_role="viewer",
+        hostname="pre-ui",
+        sampled_at="2026-01-01T00:00:00Z",
+        cpu_percent=None,
+        memory_percent=None,
+        load_average_1m=None,
+    )
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(
+        entry,
+        fleet_monitor,
+        fleet_monitor.poll(),
+        watch=False,
+        telemetry=True,
+        telemetry_sampler=fake_sampler,
+        initial_host=initial_host,
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, RunScreen)
+            assert app.screen.telemetry_sampler is fake_sampler
 
     asyncio.run(exercise())

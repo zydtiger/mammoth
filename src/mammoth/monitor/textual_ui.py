@@ -662,19 +662,30 @@ class FleetApp(App[None]):
         interval_seconds: float = 2.0,
         stale_after_seconds: float = 90.0,
         open_group_id: str | None = None,
+        telemetry_sampler: PsutilViewerTelemetrySampler | None = None,
+        initial_host: PsutilViewerTelemetry | None = None,
     ) -> None:
-        """Bind the entry-wide fleet monitor and optional direct group target."""
+        """Bind the entry-wide fleet monitor and optional direct group target.
+
+        ``telemetry_sampler`` and ``initial_host`` are created by
+        :func:`run_fleet_textual` before this app is constructed, sampling
+        DIMM identity (and any sudo password prompt it needs) on the plain
+        terminal instead of from inside the running Textual app. This app
+        never constructs a sampler itself. The pre-UI ``initial_host`` sample
+        is reused for the first run screen drilled into rather than
+        discarded; see :meth:`push_run_screen`.
+        """
         super().__init__()
         self.entry = entry
         self.fleet_monitor = fleet_monitor
         self.initial_snapshot = initial_snapshot
         self.watch_enabled = watch
+        self.telemetry_enabled = telemetry
         self.interval_seconds = interval_seconds
         self.stale_after_seconds = stale_after_seconds
         self.open_group_id = open_group_id
-        self._telemetry_sampler = (
-            PsutilViewerTelemetrySampler(allow_sudo_password_prompt=True) if telemetry else None
-        )
+        self._telemetry_sampler = telemetry_sampler
+        self._initial_host = initial_host
 
     def on_mount(self) -> None:
         """Root the screen stack at the fleet view, opening a requested group."""
@@ -721,7 +732,6 @@ class FleetApp(App[None]):
             initial_snapshot = run_monitor.poll()
         except FileNotFoundError:
             return
-        host = self._telemetry_sampler.sample() if self._telemetry_sampler is not None else None
         self.push_screen(
             RunScreen(
                 run_monitor,
@@ -729,10 +739,24 @@ class FleetApp(App[None]):
                 watch=self.watch_enabled,
                 interval_seconds=self.interval_seconds,
                 stale_after_seconds=self.stale_after_seconds,
-                host=host,
+                host=self._next_run_screen_host(),
                 telemetry_sampler=self._telemetry_sampler,
             )
         )
+
+    def _next_run_screen_host(self) -> PsutilViewerTelemetry | None:
+        """Reuse the pre-UI telemetry sample once, then sample fresh after.
+
+        The first run drilled into after startup gets the sample already
+        taken before this app ran (see :func:`run_fleet_textual`) instead of
+        a redundant duplicate; every later drill-in samples again through the
+        same sampler, which never prompts twice since it tries cached sudo
+        credentials first.
+        """
+        if self._initial_host is not None:
+            host, self._initial_host = self._initial_host, None
+            return host
+        return self._telemetry_sampler.sample() if self._telemetry_sampler is not None else None
 
 
 def run_fleet_textual(
@@ -746,7 +770,17 @@ def run_fleet_textual(
     stale_after_seconds: float,
     open_group_id: str | None = None,
 ) -> None:
-    """Run the Textual fleet application until the viewer quits."""
+    """Run the Textual fleet application until the viewer quits.
+
+    Mirrors :func:`run_textual`: samples viewer-host telemetry once on the
+    plain terminal, before the app is constructed or run, so a DIMM-identity
+    sudo password prompt happens outside the Textual UI instead of erupting
+    from inside it the first time an operator drills into a run.
+    """
+    telemetry_sampler = (
+        PsutilViewerTelemetrySampler(allow_sudo_password_prompt=True) if telemetry else None
+    )
+    initial_host = telemetry_sampler.sample() if telemetry_sampler is not None else None
     FleetApp(
         entry,
         fleet_monitor,
@@ -755,5 +789,7 @@ def run_fleet_textual(
         telemetry=telemetry,
         interval_seconds=interval_seconds,
         stale_after_seconds=stale_after_seconds,
+        telemetry_sampler=telemetry_sampler,
+        initial_host=initial_host,
         open_group_id=open_group_id,
     ).run()
