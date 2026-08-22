@@ -944,29 +944,40 @@ class ExecutionEventTailReader:
                     "consumed stream prefix changed",
                 )
             appended = self._read_from(descriptor, read_offset, descriptor_stat.st_size)
-            bounded = read_offset > self._offset
-            if bounded:
-                # An oversized single line spanning the whole window (or a
-                # window so small it captures no complete line beyond the
-                # discarded leading partial one) would otherwise starve the
-                # reader of any events; fall back to a full read from the
-                # true start in that rare case instead.
-                newline_index = appended.find(b"\n")
-                remainder = appended[newline_index + 1 :] if newline_index != -1 else b""
-                if not remainder:
-                    appended = self._read_from(descriptor, 0, descriptor_stat.st_size)
-                    bounded = False
+            seek_ahead = read_offset > self._offset
+            mid_stream_start = False
+            if seek_ahead:
+                landed_on_line_start = os.pread(descriptor, 1, read_offset - 1) == b"\n"
+                if landed_on_line_start:
+                    # The seek point happened to land exactly on a line
+                    # boundary (the byte immediately before it is the
+                    # previous line's terminator): the window's first line
+                    # is already complete, not a partial line straddling the
+                    # seek point, so there is nothing to discard.
+                    mid_stream_start = True
                 else:
-                    read_offset = read_offset + newline_index + 1
-                    appended = remainder
+                    # An oversized single line spanning the whole window (or
+                    # a window so small it captures no complete line beyond
+                    # the discarded leading partial one) would otherwise
+                    # starve the reader of any events; fall back to a full
+                    # read from the true start in that rare case instead.
+                    newline_index = appended.find(b"\n")
+                    remainder = appended[newline_index + 1 :] if newline_index != -1 else b""
+                    if not remainder:
+                        read_offset = 0
+                        appended = self._read_from(descriptor, 0, descriptor_stat.st_size)
+                    else:
+                        read_offset = read_offset + newline_index + 1
+                        appended = remainder
+                        mid_stream_start = True
         except BaseException:
             with suppress(Exception):
                 os.close(descriptor)
             raise
         os.close(descriptor)
         self._file_identity = identity
-        self._offset = read_offset + len(appended) if bounded else self._offset + len(appended)
-        if bounded:
+        self._offset = read_offset + len(appended)
+        if mid_stream_start:
             self._sequence_baseline_synced = False
         self._append_guard = (self._append_guard + appended)[-_APPEND_GUARD_BYTES:]
         return appended
