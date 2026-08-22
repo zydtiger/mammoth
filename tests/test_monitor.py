@@ -11,7 +11,14 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from mammoth.cli import app
-from mammoth.core import RunLayout, create_execution_context
+from mammoth.core import (
+    GroupEventWriter,
+    GroupLayout,
+    GroupMember,
+    RunLayout,
+    create_execution_context,
+    publish_group_manifest,
+)
 from mammoth.core.events import ExecutionEventWriter
 from mammoth.monitor import (
     ExecutionMonitor,
@@ -22,14 +29,21 @@ from mammoth.monitor import (
     sample_viewer_telemetry,
     select_execution,
 )
-from mammoth.monitor.dashboard import braille_line_chart, dashboard_layout
+from mammoth.monitor.dashboard import (
+    braille_line_chart,
+    dashboard_layout,
+    fleet_dashboard_layout,
+    fleet_rows,
+    group_dashboard_layout,
+)
+from mammoth.monitor.fleet import FleetMonitor
 from mammoth.monitor.psutil_telemetry import (
     GpuTelemetry,
     PsutilViewerTelemetry,
     PsutilViewerTelemetrySampler,
     sample_psutil_viewer_telemetry,
 )
-from mammoth.monitor.textual_ui import MonitorApp
+from mammoth.monitor.textual_ui import FleetApp, FleetScreen, GroupScreen, MonitorApp, RunScreen
 
 
 def create_context(
@@ -258,7 +272,7 @@ def test_monitor_cli_preserves_public_command_shape(tmp_path: Path) -> None:
             "--execution",
             "attempt",
             "--telemetry",
-        ]
+        ],
     )
 
     assert result.exit_code == 0
@@ -785,8 +799,7 @@ def test_psutil_telemetry_restores_sudo_dimm_probe_and_all_gpu_rows() -> None:
             return subprocess.CompletedProcess(
                 normalized,
                 0,
-                "0, NVIDIA RTX A, 25, 200, 2400\n"
-                "1, NVIDIA RTX B, 75, 275.25, 2800\n",
+                "0, NVIDIA RTX A, 25, 200, 2400\n1, NVIDIA RTX B, 75, 275.25, 2800\n",
                 "",
             )
         raise AssertionError(normalized)
@@ -864,5 +877,183 @@ def test_exact_textual_monitor_opens_and_remains_in_locked_detail_mode(
             await pilot.press("enter", "j")
             assert app.detail is True
             assert app.snapshot.selected_execution_id == "first"
+
+    asyncio.run(exercise())
+
+
+def test_fleet_dashboard_layout_renders_group_roll_up_and_selection_marker(
+    tmp_path: Path,
+) -> None:
+    entry = tmp_path / "runs"
+    manifest = publish_group_manifest(
+        entry,
+        order="run-major",
+        members=[GroupMember("alpha", ("prepare",))],
+    )
+    layout = GroupLayout(entry, manifest.group_id)
+    writer = GroupEventWriter(layout.events_path, group_id=manifest.group_id)
+    writer.emit("group_started")
+    writer.emit("run_started", run_name="alpha")
+    writer.close()
+    RunLayout(entry, "loose").prepare()
+
+    snapshot = FleetMonitor(entry).poll()
+    console = Console(width=120, record=True, color_system=None)
+    console.print(
+        fleet_dashboard_layout(snapshot, selected_index=0, compact=False, now=datetime.now(UTC))
+    )
+    rendered = console.export_text()
+
+    assert manifest.group_id[:16] in rendered
+    assert "run-major" in rendered
+    assert "0/0/1" in rendered
+    assert "alpha" in rendered
+    assert "loose" in rendered
+    assert ">" in rendered
+
+
+def test_group_dashboard_layout_renders_member_steps_and_progress(tmp_path: Path) -> None:
+    entry = tmp_path / "runs"
+    manifest = publish_group_manifest(
+        entry,
+        order="run-major",
+        members=[GroupMember("alpha", ("prepare", "train"))],
+    )
+    layout = GroupLayout(entry, manifest.group_id)
+    writer = GroupEventWriter(layout.events_path, group_id=manifest.group_id)
+    writer.emit("group_started")
+    writer.emit("run_started", run_name="alpha")
+    writer.emit("step_started", run_name="alpha", step_name="prepare")
+    writer.emit("step_completed", run_name="alpha", step_name="prepare")
+    writer.emit("step_started", run_name="alpha", step_name="train")
+    writer.close()
+    run_layout = RunLayout(entry, "alpha").prepare()
+    context = create_context(run_layout, "attempt", "2026-01-01T00:00:00Z")
+    with ExecutionEventWriter.for_process(context, rank=0) as event_writer:
+        event_writer.emit("execution_started")
+        event_writer.emit_progress(phase="train", task_id="epoch", completed=3, total=10)
+
+    snapshot = FleetMonitor(entry).poll()
+    console = Console(width=120, record=True, color_system=None)
+    console.print(
+        group_dashboard_layout(
+            snapshot.groups[0], selected_index=0, compact=False, now=datetime.now(UTC)
+        )
+    )
+    rendered = console.export_text()
+
+    assert "alpha" in rendered
+    assert "prepare:completed" in rendered
+    assert "train:running" in rendered
+    assert "3/10" in rendered
+
+
+def test_fleet_textual_navigates_fleet_group_run_and_back(tmp_path: Path) -> None:
+    entry = tmp_path / "runs"
+    manifest = publish_group_manifest(
+        entry,
+        order="run-major",
+        members=[GroupMember("alpha", ("prepare",))],
+    )
+    group_layout = GroupLayout(entry, manifest.group_id)
+    writer = GroupEventWriter(group_layout.events_path, group_id=manifest.group_id)
+    writer.emit("group_started")
+    writer.emit("run_started", run_name="alpha")
+    writer.close()
+    run_layout = RunLayout(entry, "alpha").prepare()
+    create_context(run_layout, "attempt", "2026-01-01T00:00:00Z")
+
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, FleetScreen)
+            assert len(app.screen_stack) == 2
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, GroupScreen)
+            assert app.screen.group_id == manifest.group_id
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, RunScreen)
+            assert app.screen.snapshot.layout.run_name == "alpha"
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, GroupScreen)
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, FleetScreen)
+
+    asyncio.run(exercise())
+
+
+def test_fleet_textual_drills_directly_into_a_loose_run(tmp_path: Path) -> None:
+    entry = tmp_path / "runs"
+    run_layout = RunLayout(entry, "loose").prepare()
+    create_context(run_layout, "attempt", "2026-01-01T00:00:00Z")
+
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert fleet_rows(app.screen.snapshot) == fleet_rows(fleet_monitor.poll())
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, RunScreen)
+            assert app.screen.snapshot.layout.run_name == "loose"
+
+    asyncio.run(exercise())
+
+
+def test_fleet_textual_opens_a_group_directly_via_open_group_id(tmp_path: Path) -> None:
+    entry = tmp_path / "runs"
+    manifest = publish_group_manifest(
+        entry,
+        order="run-major",
+        members=[GroupMember("alpha", ("prepare",))],
+    )
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(
+        entry,
+        fleet_monitor,
+        fleet_monitor.poll(),
+        watch=False,
+        telemetry=False,
+        open_group_id=manifest.group_id,
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert len(app.screen_stack) == 3
+            assert isinstance(app.screen, GroupScreen)
+            assert app.screen.group_id == manifest.group_id
+
+    asyncio.run(exercise())
+
+
+def test_fleet_textual_selecting_a_run_with_no_executions_does_not_navigate(
+    tmp_path: Path,
+) -> None:
+    entry = tmp_path / "runs"
+    RunLayout(entry, "empty").prepare()
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, FleetScreen)
+            assert len(app.screen_stack) == 2
 
     asyncio.run(exercise())

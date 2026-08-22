@@ -23,7 +23,12 @@ from mammoth import __version__
 from mammoth.core import RunLayout
 from mammoth.monitor import (
     ExecutionMonitor,
+    FleetMonitor,
+    FleetSnapshot,
+    GroupSnapshot,
     RunMonitor,
+    render_fleet_snapshot,
+    render_group_snapshot,
     render_snapshot,
     sample_viewer_telemetry,
 )
@@ -100,11 +105,31 @@ def load_textual_ui() -> ModuleType:
 
 @app.command("monitor")
 def run_monitor(
-    run_name: Annotated[str, typer.Argument(help="Logical run name to inspect.")],
+    run_name: Annotated[
+        str | None,
+        typer.Argument(help="Logical run name to inspect; omit for the entry-level fleet view."),
+    ] = None,
     entry: Annotated[
         Path,
         typer.Option("--entry", help="Run-directory entry path."),
     ] = Path("./runs"),
+    group: Annotated[
+        str | None,
+        typer.Option(
+            "--group",
+            help="Exact group ID to open directly, without RUN_NAME.",
+        ),
+    ] = None,
+    match: Annotated[
+        str | None,
+        typer.Option(
+            "--match",
+            help=(
+                "Glob pattern grouping loose runs ad hoc in the fleet view, "
+                "for entries without group manifests."
+            ),
+        ),
+    ] = None,
     execution: Annotated[
         str | None,
         typer.Option("--execution", help="Exact immutable execution to inspect."),
@@ -144,10 +169,45 @@ def run_monitor(
         ),
     ] = 90.0,
 ) -> None:
-    """Open the live dashboard on a TTY or render a stable plain snapshot."""
+    """Open the live dashboard on a TTY or render a stable plain snapshot.
+
+    With ``RUN_NAME`` this is exactly the original single-run invocation.
+    Without it, ``--entry`` opens the fleet view listing every group and
+    loose run; ``--group`` opens one group directly; ``--match`` groups loose
+    runs by name pattern ad hoc for entries without group manifests.
+    """
+    if run_name is not None and (group is not None or match is not None):
+        raise typer.BadParameter(
+            "--group and --match apply only when RUN_NAME is omitted",
+            param_hint="RUN_NAME",
+        )
+    if run_name is None and execution is not None:
+        raise typer.BadParameter(
+            "--execution applies only to a single-run invocation (RUN_NAME given)",
+            param_hint="--execution",
+        )
+    if group is not None and match is not None:
+        raise typer.BadParameter(
+            "--group and --match are mutually exclusive",
+            param_hint="--group",
+        )
     interactive = stdout_is_interactive() if rich is None else rich
     should_watch = interactive if watch is None else watch
     include_telemetry = interactive if telemetry is None else telemetry
+
+    if run_name is None:
+        _run_fleet_monitor(
+            entry,
+            group=group,
+            match=match,
+            interactive=interactive,
+            should_watch=should_watch,
+            include_telemetry=include_telemetry,
+            interval=interval,
+            stale_after=stale_after,
+        )
+        return
+
     try:
         layout = RunLayout(entry, run_name)
         monitor = ExecutionMonitor(layout, execution)
@@ -346,6 +406,69 @@ def _render_queue_snapshot(snapshot: QueueSnapshot) -> str:
         lines.append(f"malformed job files: {len(snapshot.malformed_job_files)}")
         lines.extend(f"  {path}" for path in snapshot.malformed_job_files)
     return "\n".join(lines)
+def _run_fleet_monitor(
+    entry: Path,
+    *,
+    group: str | None,
+    match: str | None,
+    interactive: bool,
+    should_watch: bool,
+    include_telemetry: bool,
+    interval: float,
+    stale_after: float,
+) -> None:
+    """Open the fleet view, or one directly requested group within it."""
+    fleet_monitor = FleetMonitor(entry, match=match)
+    fleet_snapshot = fleet_monitor.poll(stale_after_seconds=stale_after)
+    selected_group: GroupSnapshot | None = None
+    if group is not None:
+        selected_group = _find_group(fleet_snapshot, group)
+        if selected_group is None:
+            raise typer.BadParameter(
+                f"No group {group!r} found under {entry}", param_hint="--group"
+            )
+
+    if interactive:
+        try:
+            textual_module = load_textual_ui()
+        except ModuleNotFoundError as error:
+            typer.echo(
+                "Interactive monitoring requires the monitor extra; "
+                "install it with `uv sync --extra monitor` or pass `--plain`.",
+                err=True,
+            )
+            raise typer.Exit(code=2) from error
+        textual_module.run_fleet_textual(
+            entry,
+            fleet_monitor,
+            fleet_snapshot,
+            watch=should_watch,
+            telemetry=include_telemetry,
+            interval_seconds=interval,
+            stale_after_seconds=stale_after,
+            open_group_id=group,
+        )
+        return
+
+    while True:
+        if selected_group is not None:
+            sys.stdout.write(render_group_snapshot(selected_group, stale_after_seconds=stale_after))
+        else:
+            sys.stdout.write(render_fleet_snapshot(fleet_snapshot, stale_after_seconds=stale_after))
+        if include_telemetry:
+            sys.stdout.write(json.dumps(asdict(sample_viewer_telemetry()), sort_keys=True) + "\n")
+        sys.stdout.flush()
+        if not should_watch:
+            return
+        time.sleep(interval)
+        fleet_snapshot = fleet_monitor.poll(stale_after_seconds=stale_after)
+        if group is not None:
+            selected_group = _find_group(fleet_snapshot, group) or selected_group
+
+
+def _find_group(fleet_snapshot: FleetSnapshot, group_id: str) -> GroupSnapshot | None:
+    """Return one group snapshot by ID, or ``None`` when it is not present."""
+    return next((item for item in fleet_snapshot.groups if item.group_id == group_id), None)
 
 
 def run(argv: Sequence[str] | None = None) -> int:

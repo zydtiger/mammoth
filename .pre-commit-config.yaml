@@ -1,0 +1,27 @@
+repos:
+  - repo: builtin
+    hooks:
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: check-yaml
+
+  - repo: local
+    hooks:
+      - id: uv-lock-check
+        name: uv lock --check
+        entry: uv lock --check
+        language: system
+        pass_filenames: false
+        files: ^(pyproject\.toml|uv\.lock)$
+      - id: ruff-check-fix
+        name: ruff check --fix .
+        entry: uv run ruff check --fix .
+        language: system
+        pass_filenames: false
+        types_or: [python, pyi]
+      - id: mypy
+        name: mypy
+        entry: uv run mypy
+        language: system
+        pass_filenames: false
+        types_or: [python, pyi]

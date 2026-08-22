@@ -485,10 +485,11 @@ step names, and the caller-supplied opaque metadata block, published
 atomically with `mammoth.core.artifacts.atomic_write_json` before the first
 step dispatches. `events.jsonl` reuses the schema-v1 JSONL conventions from
 `mammoth.core.events` at group scope: a monotonically sequenced, flush-per-
-record append-only stream recording member run and step lifecycle
-transitions (`run_started`/`run_completed`/`run_failed`/`run_blocked`/
-`run_interrupted`, `step_started`/`step_completed`/`step_failed`/
-`step_interrupted`) and exactly one terminal group status
+record append-only stream that opens with a `group_started` record, then
+records member run and step lifecycle transitions (`run_started`/
+`run_completed`/`run_failed`/`run_blocked`/`run_interrupted`,
+`step_started`/`step_completed`/`step_failed`/`step_interrupted`), and
+exactly one terminal group status
 (`group_completed`/`group_failed`/`group_interrupted`) recorded on every exit
 path from `Workflow.run()`, including signal-driven interruption. A crashed
 workflow leaves a group without that terminal record; consumers infer
