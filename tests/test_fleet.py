@@ -40,6 +40,17 @@ def create_context(layout: RunLayout, execution_id: str, created_at: str):
     )
 
 
+def _clock(*values: str) -> Any:
+    """Return a callable yielding ``values`` in order, one per call.
+
+    Lets a test pin exact event timestamps through ``ExecutionEventWriter``'s
+    or ``GroupEventWriter``'s ``utc_clock`` option instead of relying on the
+    real wall clock.
+    """
+    iterator = iter(values)
+    return lambda: next(iterator)
+
+
 def make_manifest_group(
     entry: Path,
     *,
@@ -449,4 +460,246 @@ def test_render_fleet_snapshot_with_match_omits_the_loose_runs_section(tmp_path:
 
     assert "Match: sweep-*" in rendered
     assert "Loose runs:" not in rendered
+
+
+def test_fleet_monitor_orders_loose_runs_by_descending_recency_then_name(tmp_path: Path) -> None:
+    entry = tmp_path / "runs"
+
+    # Finished the longest ago of the two terminal runs.
+    old_finished = RunLayout(entry, "loose-old-finished").prepare()
+    with ExecutionEventWriter.for_runner(
+        create_context(old_finished, "attempt", "2026-01-01T00:00:00Z"),
+        utc_clock=_clock("2026-01-01T00:05:00Z", "2026-01-01T00:10:00Z"),
+    ) as writer:
+        writer.emit("execution_started")
+        writer.emit("execution_completed")
+
+    # Finished most recently of everything in this fleet.
+    new_finished = RunLayout(entry, "loose-new-finished").prepare()
+    with ExecutionEventWriter.for_runner(
+        create_context(new_finished, "attempt", "2026-01-02T00:00:00Z"),
+        utc_clock=_clock("2026-01-02T00:05:00Z", "2026-01-03T00:00:00Z"),
+    ) as writer:
+        writer.emit("execution_started")
+        writer.emit("execution_completed")
+
+    # Still running: no terminal event, so its heartbeat is the sort key.
+    active = RunLayout(entry, "loose-active").prepare()
+    with ExecutionEventWriter.for_process(
+        create_context(active, "attempt", "2026-01-01T10:00:00Z"),
+        rank=0,
+        utc_clock=_clock("2026-01-02T12:00:00Z"),
+    ) as writer:
+        writer.emit("process_started", phase="train")
+
+    # No execution at all: no usable timestamp, must sort last.
+    RunLayout(entry, "loose-no-timestamp").prepare()
+
+    # Two runs tied on the exact same heartbeat: broken deterministically by
+    # name rather than reshuffling across polls.
+    tie_b = RunLayout(entry, "loose-tie-b").prepare()
+    with ExecutionEventWriter.for_process(
+        create_context(tie_b, "attempt", "2026-01-01T09:00:00Z"),
+        rank=0,
+        utc_clock=_clock("2026-01-01T11:00:00Z"),
+    ) as writer:
+        writer.emit("process_started", phase="train")
+    tie_a = RunLayout(entry, "loose-tie-a").prepare()
+    with ExecutionEventWriter.for_process(
+        create_context(tie_a, "attempt", "2026-01-01T09:00:00Z"),
+        rank=0,
+        utc_clock=_clock("2026-01-01T11:00:00Z"),
+    ) as writer:
+        writer.emit("process_started", phase="train")
+
+    expected_order = [
+        "loose-new-finished",
+        "loose-active",
+        "loose-tie-a",
+        "loose-tie-b",
+        "loose-old-finished",
+        "loose-no-timestamp",
+    ]
+
+    snapshot = FleetMonitor(entry).poll()
+    assert [run.run_name for run in snapshot.loose_runs] == expected_order
+
+    rendered = render_fleet_snapshot(snapshot)
+    rendered_order = [
+        line.strip().split(":", 1)[0]
+        for line in rendered.splitlines()
+        if line.startswith("  loose-")
+    ]
+    assert rendered_order == expected_order
+
+
+def test_fleet_monitor_treats_a_still_running_multirank_execution_as_not_finished(
+    tmp_path: Path,
+) -> None:
+    """P2-1 regression: one rank's completion must not finish the whole run.
+
+    A multi-rank execution has staggered rank completion: rank 0 can emit
+    its own process_completed well before every other rank does. Overall
+    ``status`` correctly stays "running" until all ranks finish (see
+    ``_finalize_run_status``); ``terminal_event_time`` must agree, so a
+    still-active run sorts by its newest activity rather than an older,
+    genuinely finished run appearing more recent than it.
+    """
+    entry = tmp_path / "runs"
+
+    # Older, but genuinely finished: must sort below the still-active run.
+    older_finished = RunLayout(entry, "loose-older-finished").prepare()
+    with ExecutionEventWriter.for_runner(
+        create_context(older_finished, "attempt", "2026-01-01T00:00:00Z"),
+        utc_clock=_clock("2026-01-01T00:05:00Z", "2026-01-01T00:20:00Z"),
+    ) as writer:
+        writer.emit("execution_started")
+        writer.emit("execution_completed")
+
+    # Two-rank run: rank 0 completed at 00:10, rank 1 is still running with
+    # a fresh 00:30 heartbeat. The run as a whole has not finished.
+    active_layout = RunLayout(entry, "loose-active-multirank").prepare()
+    active_context = create_execution_context(
+        active_layout.run_dir,
+        run_name=active_layout.run_name,
+        invocation_kind="test",
+        intended_phases=("opaque",),
+        world_size=2,
+        execution_mode="distributed",
+        command=("python", "job.py"),
+        execution_id="attempt",
+        created_at="2026-01-01T00:00:00Z",
+    )
+    with ExecutionEventWriter.for_process(
+        active_context,
+        rank=0,
+        world_size=2,
+        utc_clock=_clock("2026-01-01T00:05:00Z", "2026-01-01T00:10:00Z"),
+    ) as writer:
+        writer.emit("execution_started")
+        writer.emit("process_completed", phase="train")
+    with ExecutionEventWriter.for_process(
+        active_context,
+        rank=1,
+        world_size=2,
+        utc_clock=_clock("2026-01-01T00:29:00Z", "2026-01-01T00:30:00Z"),
+    ) as writer:
+        writer.emit("execution_started")
+        writer.emit("process_started", phase="train")
+
+    # Poll shortly after rank 1's heartbeat so it reads as a fresh, live run
+    # rather than merely non-terminal; the sort behavior under test does not
+    # depend on this, but it keeps the fixture honest about "still running".
+    snapshot = FleetMonitor(entry).poll(now=datetime.fromisoformat("2026-01-01T00:30:30+00:00"))
+
+    assert [run.run_name for run in snapshot.loose_runs] == [
+        "loose-active-multirank",
+        "loose-older-finished",
+    ]
+    active = next(run for run in snapshot.loose_runs if run.run_name == "loose-active-multirank")
+    assert active.status == "running"
+    assert active.finished_at is None
+
+
+def test_fleet_monitor_orders_groups_by_descending_recency_then_name(tmp_path: Path) -> None:
+    entry = tmp_path / "runs"
+
+    old_finished = publish_group_manifest(
+        entry,
+        group_id="group-old-finished",
+        order="run-major",
+        members=[GroupMember("old-finished-member", ("prepare",))],
+    )
+    old_layout = GroupLayout(entry, old_finished.group_id)
+    old_writer = GroupEventWriter(
+        old_layout.events_path,
+        group_id=old_finished.group_id,
+        utc_clock=_clock("2026-01-01T00:05:00Z", "2026-01-01T00:20:00Z"),
+    )
+    old_writer.emit("group_started")
+    old_writer.emit("group_completed")
+    old_writer.close()
+
+    new_finished = publish_group_manifest(
+        entry,
+        group_id="group-new-finished",
+        order="run-major",
+        members=[GroupMember("new-finished-member", ("prepare",))],
+    )
+    new_layout = GroupLayout(entry, new_finished.group_id)
+    new_writer = GroupEventWriter(
+        new_layout.events_path,
+        group_id=new_finished.group_id,
+        utc_clock=_clock("2026-01-02T00:05:00Z", "2026-01-03T01:00:00Z"),
+    )
+    new_writer.emit("group_started")
+    new_writer.emit("group_completed")
+    new_writer.close()
+
+    # No terminal group event: its sole member's heartbeat is the sort key.
+    active = publish_group_manifest(
+        entry,
+        group_id="group-active",
+        order="run-major",
+        members=[GroupMember("active-member", ("prepare",))],
+    )
+    active_layout = GroupLayout(entry, active.group_id)
+    active_writer = GroupEventWriter(active_layout.events_path, group_id=active.group_id)
+    active_writer.emit("group_started")
+    active_writer.emit("run_started", run_name="active-member")
+    active_writer.close()
+    member_layout = RunLayout(entry, "active-member").prepare()
+    with ExecutionEventWriter.for_process(
+        create_context(member_layout, "attempt", "2026-01-02T13:00:00Z"),
+        rank=0,
+        utc_clock=_clock("2026-01-02T13:00:00Z"),
+    ) as writer:
+        writer.emit("process_started", phase="train")
+
+    snapshot = FleetMonitor(entry).poll()
+    expected_order = ["group-new-finished", "group-active", "group-old-finished"]
+    assert [group.group_id for group in snapshot.groups] == expected_order
+
+    rendered = render_fleet_snapshot(snapshot)
+    rendered_order = [
+        line.strip().split(":", 1)[0]
+        for line in rendered.splitlines()
+        if line.startswith("  group-")
+    ]
+    assert rendered_order == expected_order
+
+
+def test_fleet_monitor_sorts_an_untimestamped_ad_hoc_cohort_last_among_groups(
+    tmp_path: Path,
+) -> None:
+    entry = tmp_path / "runs"
+    timestamped = publish_group_manifest(
+        entry,
+        group_id="group-timestamped",
+        order="run-major",
+        members=[GroupMember("timestamped-member", ("prepare",))],
+    )
+    layout = GroupLayout(entry, timestamped.group_id)
+    writer = GroupEventWriter(
+        layout.events_path,
+        group_id=timestamped.group_id,
+        utc_clock=_clock("2026-01-01T00:05:00Z", "2026-01-01T00:20:00Z"),
+    )
+    writer.emit("group_started")
+    writer.emit("group_completed")
+    writer.close()
+
+    # An ad-hoc `--match` cohort has no manifest and no group event stream;
+    # with no member execution tail yet, it has no usable timestamp at all.
+    RunLayout(entry, "sweep-untimestamped").prepare()
+
+    snapshot = FleetMonitor(entry, match="sweep-*").poll()
+
+    assert [group.group_id for group in snapshot.groups] == [
+        "group-timestamped",
+        "match:sweep-*",
+    ]
+    assert snapshot.groups[1].finished_at is None
+    assert snapshot.groups[1].updated_at is None
+    rendered = render_fleet_snapshot(snapshot)
     assert "match:sweep-*" in rendered
