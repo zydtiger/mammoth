@@ -27,7 +27,7 @@ from mammoth.monitor.dashboard import (
     group_dashboard_layout,
 )
 from mammoth.monitor.fleet import FleetMonitor, FleetSnapshot, GroupSnapshot
-from mammoth.monitor.model import RunMonitor, RunSnapshot
+from mammoth.monitor.model import RunMonitor, RunSnapshot, select_execution
 from mammoth.monitor.psutil_telemetry import (
     PsutilViewerTelemetry,
     PsutilViewerTelemetrySampler,
@@ -229,6 +229,12 @@ class RunScreen(Screen[None]):
     drilling into a run from the fleet or a group view reaches the same
     dashboard the standalone ``mammoth monitor <run_name>`` invocation opens.
     Back navigation pops this screen and returns to the originating view.
+
+    ``initial_snapshot`` is ``None`` when pushed from a fleet or group drill-
+    down (see :meth:`FleetApp.push_run_screen`): the screen mounts and shows
+    a loading state immediately, and the run's first poll — potentially a
+    full-history read — runs in the same exclusive background-worker refresh
+    this screen already uses for every later poll, never on the UI thread.
     """
 
     CSS = MonitorApp.CSS
@@ -245,7 +251,7 @@ class RunScreen(Screen[None]):
     def __init__(
         self,
         monitor: RunMonitor,
-        initial_snapshot: RunSnapshot,
+        initial_snapshot: RunSnapshot | None,
         *,
         watch: bool = True,
         interval_seconds: float = 2.0,
@@ -291,9 +297,10 @@ class RunScreen(Screen[None]):
     @work(name="run-screen-refresh", group="run-screen-refresh", exclusive=True, thread=True)
     def _refresh_state(self, generation: int) -> None:
         """Poll files and local telemetry outside the Textual event loop."""
+        selected = self.snapshot.selected_execution_id if self.snapshot is not None else None
         try:
             with self._refresh_lock:
-                snapshot = self.monitor.poll(self.snapshot.selected_execution_id)
+                snapshot = self.monitor.poll(selected)
                 host = (
                     self.telemetry_sampler.sample() if self.telemetry_sampler is not None else None
                 )
@@ -333,11 +340,15 @@ class RunScreen(Screen[None]):
 
     def action_toggle_detail(self) -> None:
         """Toggle logical overview and exact selected-execution details."""
+        if self.snapshot is None:
+            return
         self.detail = not self.detail
         self._update_body()
 
     def _move_selection(self, offset: int) -> None:
         """Move within immutable execution history and render immediately."""
+        if self.snapshot is None:
+            return
         ids = [execution.execution_id for execution in self.snapshot.executions]
         index = ids.index(self.snapshot.selected_execution_id)
         next_index = min(len(ids) - 1, max(0, index + offset))
@@ -348,6 +359,9 @@ class RunScreen(Screen[None]):
     def _update_body(self) -> None:
         """Update the Rich dashboard using the current terminal width."""
         body = self.query_one("#body", Static)
+        if self.snapshot is None:
+            body.update(Text("Loading run…", style="dim"))
+            return
         available_width = body.size.width or max(0, self.size.width - 2)
         compact = available_width < 80
         renderable = dashboard_layout(
@@ -732,16 +746,24 @@ class FleetApp(App[None]):
         )
 
     def push_run_screen(self, run_name: str) -> None:
-        """Lazily construct one full RunMonitor and push its dashboard screen."""
-        run_monitor = RunMonitor(RunLayout(self.entry, run_name))
+        """Push a loading run screen and poll its full history in the background.
+
+        Only a cheap existence check (immutable execution metadata, no
+        event-stream read) runs on the UI thread here; ``RunMonitor``
+        construction and its first, potentially expensive, poll run in
+        :class:`RunScreen`'s own exclusive background-worker refresh, kicked
+        off by that screen's own ``on_mount``.
+        """
+        layout = RunLayout(self.entry, run_name)
         try:
-            initial_snapshot = run_monitor.poll()
+            select_execution(layout)
         except FileNotFoundError:
             return
+        run_monitor = RunMonitor(layout, lazy_first_poll=True)
         self.push_screen(
             RunScreen(
                 run_monitor,
-                initial_snapshot,
+                None,
                 watch=self.watch_enabled,
                 interval_seconds=self.interval_seconds,
                 stale_after_seconds=self.stale_after_seconds,
