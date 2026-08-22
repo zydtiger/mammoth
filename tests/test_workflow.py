@@ -20,9 +20,12 @@ import pytest
 import mammoth.workflow.launch as workflow_launch
 import mammoth.workflow.runner as workflow_runner
 from mammoth.core import (
+    GroupLayout,
     claim_logical_run_lease,
     join_execution_context,
+    load_group_manifest,
     read_execution_events,
+    read_group_events,
 )
 from mammoth.workflow import (
     Execution,
@@ -1586,3 +1589,200 @@ def test_captured_start_signal_is_redelivered_to_workflow_hook(
     assert result.exit_code == 128 + signal.SIGTERM
     assert result.run("run").outcome == "interrupted"
     assert result.run("run").steps == ()
+
+
+def group_events(root: Path, group_id: str):
+    """Read one workflow's group event stream by its published group ID."""
+    return read_group_events(GroupLayout(root, group_id).events_path)
+
+
+def test_group_manifest_is_published_before_the_first_step_in_run_major_order(
+    tmp_path: Path,
+) -> None:
+    """The manifest records the full declared plan; events mirror run-major dispatch."""
+    root = tmp_path / "runs"
+    workflow = Workflow(
+        root=root,
+        runs=(
+            Run("alpha", (successful_step("prepare"), successful_step("train"))),
+            Run("beta", (successful_step("prepare"),)),
+        ),
+    )
+
+    result = workflow.run(base_environment={})
+
+    assert result.group_id is not None
+    layout = GroupLayout(root, result.group_id)
+    manifest = load_group_manifest(layout.manifest_path)
+    assert manifest.order == "run-major"
+    assert [(member.run_name, member.steps) for member in manifest.members] == [
+        ("alpha", ("prepare", "train")),
+        ("beta", ("prepare",)),
+    ]
+    events = group_events(root, result.group_id)
+    # Run terminals are only known once the whole dispatch finishes (workflow
+    # finalization runs once, after every step), so they batch at the very
+    # end in declaration order rather than interleaving with step events.
+    assert [(event.event, event.run_name, event.step_name) for event in events] == [
+        ("group_started", None, None),
+        ("run_started", "alpha", None),
+        ("step_started", "alpha", "prepare"),
+        ("step_completed", "alpha", "prepare"),
+        ("step_started", "alpha", "train"),
+        ("step_completed", "alpha", "train"),
+        ("run_started", "beta", None),
+        ("step_started", "beta", "prepare"),
+        ("step_completed", "beta", "prepare"),
+        ("run_completed", "alpha", None),
+        ("run_completed", "beta", None),
+        ("group_completed", None, None),
+    ]
+
+
+def test_group_events_mirror_step_major_interleaving(tmp_path: Path) -> None:
+    root = tmp_path / "runs"
+    workflow = Workflow(
+        root=root,
+        order="step-major",
+        step_order=("prepare", "train"),
+        runs=(
+            Run("alpha", (successful_step("prepare"), successful_step("train"))),
+            Run("beta", (successful_step("prepare"), successful_step("train"))),
+        ),
+    )
+
+    result = workflow.run(base_environment={})
+
+    assert result.group_id is not None
+    manifest = load_group_manifest(GroupLayout(root, result.group_id).manifest_path)
+    assert manifest.order == "step-major"
+    events = group_events(root, result.group_id)
+    step_events = [
+        (event.event, event.run_name, event.step_name)
+        for event in events
+        if event.event in {"step_started", "step_completed"}
+    ]
+    assert step_events == [
+        ("step_started", "alpha", "prepare"),
+        ("step_completed", "alpha", "prepare"),
+        ("step_started", "beta", "prepare"),
+        ("step_completed", "beta", "prepare"),
+        ("step_started", "alpha", "train"),
+        ("step_completed", "alpha", "train"),
+        ("step_started", "beta", "train"),
+        ("step_completed", "beta", "train"),
+    ]
+    assert events[-1].event == "group_completed"
+
+
+def test_group_metadata_round_trips_and_detaches_caller_collections(tmp_path: Path) -> None:
+    root = tmp_path / "runs"
+    metadata = {"campaign": "demo", "tags": UserList(["a", "b"])}
+    workflow = Workflow(
+        root=root,
+        runs=(Run("run", (successful_step("step"),)),),
+        group_metadata=metadata,
+    )
+    metadata["tags"].append("changed-after-construction")
+
+    result = workflow.run(base_environment={})
+
+    assert result.group_id is not None
+    manifest = load_group_manifest(GroupLayout(root, result.group_id).manifest_path)
+    assert manifest.to_dict()["metadata"] == {"campaign": "demo", "tags": ["a", "b"]}
+
+
+def test_group_terminal_status_is_failed_and_never_names_blocked_members(
+    tmp_path: Path,
+) -> None:
+    """A stopped dispatch records failure and omits never-activated members."""
+    root = tmp_path / "runs"
+    workflow = Workflow(
+        root=root,
+        order="step-major",
+        step_order=("prepare", "train"),
+        runs=(
+            Run("alpha", (successful_step("prepare"), successful_step("train"))),
+            Run(
+                "beta",
+                (
+                    Step("prepare", (sys.executable, "-c", "raise SystemExit(3)")),
+                    successful_step("train"),
+                ),
+            ),
+            Run("gamma", (successful_step("prepare"), successful_step("train"))),
+        ),
+    )
+
+    result = workflow.run(base_environment={})
+
+    assert result.group_id is not None
+    events = group_events(root, result.group_id)
+    assert [event.run_name for event in events if event.event == "run_started"] == ["alpha", "beta"]
+    assert ("run_blocked", "alpha") in [(event.event, event.run_name) for event in events]
+    assert ("run_failed", "beta") in [(event.event, event.run_name) for event in events]
+    assert "gamma" not in [event.run_name for event in events if event.run_name is not None]
+    assert events[-1].event == "group_failed"
+
+
+def test_group_terminal_status_is_interrupted_on_workflow_signal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def interrupt(*args: Any, **kwargs: Any) -> ProcessResult:
+        del args, kwargs
+        raise workflow_runner._WorkflowInterrupted(signal.SIGTERM)
+
+    monkeypatch.setattr(workflow_runner, "launch_process", interrupt)
+    root = tmp_path / "runs"
+    result = Workflow(
+        root=root,
+        runs=(Run("run", (Step("step", ("ignored",)),)),),
+    ).run(base_environment={})
+
+    assert result.group_id is not None
+    events = group_events(root, result.group_id)
+    assert events[-1].event == "group_interrupted"
+    assert events[-1].signal == signal.SIGTERM
+
+
+def test_group_artifacts_are_absent_when_no_run_ever_activates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A signal caught during setup leaves no group manifest or event stream."""
+    root = tmp_path / "runs"
+
+    def interrupt_base_environment(_environment: Any) -> Mapping[str, str]:
+        signal.raise_signal(signal.SIGINT)
+        raise AssertionError("workflow interruption must leave base setup immediately")
+
+    monkeypatch.setattr(workflow_runner, "_base_environment", interrupt_base_environment)
+    workflow = Workflow(root=root, runs=(Run("run", (Step("step", ("ignored",)),)),))
+
+    result = workflow.run(base_environment={})
+
+    assert result.group_id is None
+    assert not root.exists()
+
+
+def test_loose_runs_outside_a_workflow_remain_valid_without_group_artifacts(
+    tmp_path: Path,
+) -> None:
+    """A run created directly through core APIs never requires ``.mammoth/``."""
+    from mammoth.core import RunLayout, create_execution_context
+
+    entry = tmp_path / "runs"
+    layout = RunLayout(entry, "loose-run").prepare()
+    context = create_execution_context(
+        layout.run_dir,
+        run_name="loose-run",
+        invocation_kind="direct",
+        intended_phases=("only",),
+        world_size=1,
+        execution_mode="single",
+        command=("python", "job.py"),
+    )
+
+    assert context.metadata.run_name == "loose-run"
+    assert not (entry / ".mammoth").exists()
