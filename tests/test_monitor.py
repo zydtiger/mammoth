@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from itertools import count
 from pathlib import Path
 
+import pytest
 from rich.console import Console
 from textual.widgets import Static
 from typer.testing import CliRunner
@@ -55,15 +56,18 @@ from mammoth.monitor.textual_ui import (
 )
 
 
-def _static_content(static: Static) -> object:
-    """Return the Rich renderable last passed to a Static widget's ``update``.
+def _composited_lines(body: Static) -> list[str]:
+    """Return the actual visible rows a mounted Static widget shows.
 
-    Static exposes no public accessor for its current content; reading the
-    same private, name-mangled attribute ``update`` writes lets a windowing
-    test inspect exactly what a screen rendered without duplicating layout
-    logic.
+    Reads ``Widget.render_line(y)`` for each row Textual's scrollable
+    ``#body`` container actually composites, rather than printing the
+    widget's full (possibly taller-than-viewport) renderable. A row that
+    the layout function windowed in but the container then clips off screen
+    would still show up in the unclipped renderable, so a visibility
+    assertion must read this composited reality, not the pre-composite
+    content, to be a genuine regression guard.
     """
-    return static._Static__content
+    return [body.render_line(y).text for y in range(body.size.height)]
 
 
 def create_context(
@@ -1300,8 +1304,8 @@ def test_fleet_dashboard_layout_windows_loose_runs_around_the_selection(tmp_path
     assert "run-10" in rendered
     assert "run-00" not in rendered
     assert "run-19" not in rendered
-    assert "5 more above" in rendered
-    assert "4 more below" in rendered
+    assert "6 more above" in rendered
+    assert "5 more below" in rendered
 
 
 def test_fleet_dashboard_layout_reaches_first_and_last_rows_without_a_dangling_marker(
@@ -1328,12 +1332,12 @@ def test_fleet_dashboard_layout_reaches_first_and_last_rows_without_a_dangling_m
     first = rendered_for(0)
     assert "run-00" in first
     assert "more above" not in first
-    assert "8 more below" in first
+    assert "10 more below" in first
 
     last = rendered_for(19)
     assert "run-19" in last
     assert "more below" not in last
-    assert "8 more above" in last
+    assert "10 more above" in last
 
 
 def test_group_dashboard_layout_windows_members_around_the_selection(tmp_path: Path) -> None:
@@ -1362,8 +1366,8 @@ def test_group_dashboard_layout_windows_members_around_the_selection(tmp_path: P
     assert "member-10" in rendered
     assert "member-00" not in rendered
     assert "member-19" not in rendered
-    assert "4 more above" in rendered
-    assert "3 more below" in rendered
+    assert "5 more above" in rendered
+    assert "4 more below" in rendered
 
 
 def test_row_window_never_exceeds_budget_and_always_shows_the_selected_row() -> None:
@@ -1403,11 +1407,8 @@ def test_fleet_textual_windows_many_loose_runs_and_keeps_selection_visible(
     fleet_monitor = FleetMonitor(entry)
     app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
 
-    def rendered_text() -> str:
-        body = app.screen.query_one("#body", Static)
-        console = Console(width=120, record=True, color_system=None)
-        console.print(_static_content(body))
-        return console.export_text()
+    def visible_lines() -> list[str]:
+        return _composited_lines(app.screen.query_one("#body", Static))
 
     async def exercise() -> None:
         async with app.run_test(size=(120, 16)) as pilot:
@@ -1415,26 +1416,26 @@ def test_fleet_textual_windows_many_loose_runs_and_keeps_selection_visible(
             rows = fleet_rows(app.screen.snapshot)
             last_index = len(rows) - 1
 
-            text = rendered_text()
-            assert "run-000" in text
-            assert "more above" not in text
-            assert "more below" in text
+            lines = visible_lines()
+            assert any("run-000" in line for line in lines)
+            assert not any("more above" in line for line in lines)
+            assert any("more below" in line for line in lines)
 
             for _ in range(last_index + 5):
                 await pilot.press("j")
             await pilot.pause()
             assert app.screen.selected_index == last_index
-            text = rendered_text()
-            assert "run-039" in text
-            assert "more below" not in text
+            lines = visible_lines()
+            assert any("run-039" in line for line in lines)
+            assert not any("more below" in line for line in lines)
 
             for _ in range(last_index + 5):
                 await pilot.press("k")
             await pilot.pause()
             assert app.screen.selected_index == 0
-            text = rendered_text()
-            assert "run-000" in text
-            assert "more above" not in text
+            lines = visible_lines()
+            assert any("run-000" in line for line in lines)
+            assert not any("more above" in line for line in lines)
 
     asyncio.run(exercise())
 
@@ -1458,50 +1459,49 @@ def test_group_textual_windows_many_members_and_keeps_selection_visible(
         open_group_id=manifest.group_id,
     )
 
-    def rendered_text() -> str:
-        body = app.screen.query_one("#body", Static)
-        console = Console(width=120, record=True, color_system=None)
-        console.print(_static_content(body))
-        return console.export_text()
+    def visible_lines() -> list[str]:
+        return _composited_lines(app.screen.query_one("#body", Static))
 
     async def exercise() -> None:
         async with app.run_test(size=(120, 16)) as pilot:
             await pilot.pause()
             assert isinstance(app.screen, GroupScreen)
 
-            text = rendered_text()
-            assert "member-000" in text
-            assert "more above" not in text
-            assert "more below" in text
+            lines = visible_lines()
+            assert any("member-000" in line for line in lines)
+            assert not any("more above" in line for line in lines)
+            assert any("more below" in line for line in lines)
 
             for _ in range(45):
                 await pilot.press("j")
             await pilot.pause()
             assert app.screen.selected_index == 39
-            text = rendered_text()
-            assert "member-039" in text
-            assert "more below" not in text
+            lines = visible_lines()
+            assert any("member-039" in line for line in lines)
+            assert not any("more below" in line for line in lines)
 
             for _ in range(45):
                 await pilot.press("k")
             await pilot.pause()
             assert app.screen.selected_index == 0
-            text = rendered_text()
-            assert "member-000" in text
-            assert "more above" not in text
+            lines = visible_lines()
+            assert any("member-000" in line for line in lines)
+            assert not any("more above" in line for line in lines)
 
     asyncio.run(exercise())
 
 
-def test_group_textual_keeps_the_selected_row_visible_at_a_very_small_height(
+def test_group_textual_keeps_the_selected_row_visible_at_the_named_benchmark(
     tmp_path: Path,
 ) -> None:
-    """P1-1 regression: an ultra-small viewport must not hide the selected row.
+    """P1-1 regression, named benchmark: GroupScreen at size (80, 7).
 
     Reproduces the reviewed failure directly: 20 members, selection moved to
     index 10, terminal size (80, 7) -- small enough that a fixed chrome
     estimate would have left no room for the table header, let alone the
-    selected row, once the summary line wraps at this width.
+    selected row, once the summary line wraps at this width. Asserts on the
+    actual composited output (``render_line``), not the unclipped
+    renderable, so a still-broken screen cannot pass by accident.
     """
     entry = tmp_path / "runs"
     manifest = publish_group_manifest(
@@ -1528,19 +1528,16 @@ def test_group_textual_keeps_the_selected_row_visible_at_a_very_small_height(
             await pilot.pause()
             assert app.screen.selected_index == 10
 
-            body = app.screen.query_one("#body", Static)
-            console = Console(width=80, record=True, color_system=None)
-            console.print(_static_content(body))
-            rendered = console.export_text()
-            assert "member-10" in rendered
+            lines = _composited_lines(app.screen.query_one("#body", Static))
+            assert any("member-10" in line for line in lines)
 
     asyncio.run(exercise())
 
 
-def test_fleet_textual_keeps_the_selected_row_visible_at_a_very_small_height(
+def test_fleet_textual_keeps_the_selected_row_visible_at_the_named_benchmark(
     tmp_path: Path,
 ) -> None:
-    """P1-1 regression: the same ultra-small-viewport guarantee on the fleet screen."""
+    """P1-1 regression, named benchmark: FleetScreen at size (80, 8)."""
     entry = tmp_path / "runs"
     for index in range(20):
         RunLayout(entry, f"run-{index:02d}").prepare()
@@ -1555,10 +1552,130 @@ def test_fleet_textual_keeps_the_selected_row_visible_at_a_very_small_height(
             await pilot.pause()
             assert app.screen.selected_index == 10
 
-            body = app.screen.query_one("#body", Static)
-            console = Console(width=80, record=True, color_system=None)
-            console.print(_static_content(body))
-            rendered = console.export_text()
-            assert "run-10" in rendered
+            lines = _composited_lines(app.screen.query_one("#body", Static))
+            assert any("run-10" in line for line in lines)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("width,height", [(60, 4), (78, 6), (80, 8), (100, 12), (120, 16)])
+def test_fleet_textual_keeps_a_groups_focused_selection_visible_at_small_sizes(
+    tmp_path: Path,
+    width: int,
+    height: int,
+) -> None:
+    """Coverage (a): groups-focused fleet windowing, no loose runs at all."""
+    entry = tmp_path / "runs"
+    for index in range(20):
+        publish_group_manifest(
+            entry,
+            group_id=f"group-{index:02d}",
+            order="run-major",
+            members=[GroupMember(f"g{index:02d}-member", ("prepare",))],
+        )
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(width, height)) as pilot:
+            await pilot.pause()
+            rows = fleet_rows(app.screen.snapshot)
+            index = min(10, len(rows) - 1)
+            for _ in range(index):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == index
+
+            lines = _composited_lines(app.screen.query_one("#body", Static))
+            assert any(rows[index].key in line for line in lines)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("width,height", [(60, 4), (78, 6), (80, 8), (100, 15), (120, 19)])
+@pytest.mark.parametrize("fixture", ["loose", "groups", "mixed"])
+def test_fleet_textual_keeps_the_last_row_visible_at_small_sizes(
+    tmp_path: Path,
+    fixture: str,
+    width: int,
+    height: int,
+) -> None:
+    """Coverage (b): last-row selection, the header-wrap failure mode, across shapes."""
+    entry = tmp_path / "runs"
+    if fixture in ("loose", "mixed"):
+        for index in range(20 if fixture == "loose" else 12):
+            RunLayout(entry, f"run-{index:02d}").prepare()
+    if fixture in ("groups", "mixed"):
+        count = 20 if fixture == "groups" else 10
+        for index in range(count):
+            publish_group_manifest(
+                entry,
+                group_id=f"group-{index:02d}",
+                order="run-major",
+                members=[GroupMember(f"g{index:02d}-member", ("prepare",))],
+            )
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(width, height)) as pilot:
+            await pilot.pause()
+            rows = fleet_rows(app.screen.snapshot)
+            last_index = len(rows) - 1
+            for _ in range(last_index + 5):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == last_index
+
+            lines = _composited_lines(app.screen.query_one("#body", Static))
+            assert any(rows[last_index].key in line for line in lines)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("width,height", [(60, 4), (78, 6), (80, 8), (100, 12)])
+def test_fleet_textual_keeps_selection_visible_in_a_mixed_fleet_both_directions(
+    tmp_path: Path,
+    width: int,
+    height: int,
+) -> None:
+    """Coverage (c): mixed groups + loose runs, selection tested in each table."""
+    entry = tmp_path / "runs"
+    for index in range(8):
+        publish_group_manifest(
+            entry,
+            group_id=f"group-{index:02d}",
+            order="run-major",
+            members=[GroupMember(f"g{index:02d}-member", ("prepare",))],
+        )
+    for index in range(10):
+        RunLayout(entry, f"run-{index:02d}").prepare()
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(width, height)) as pilot:
+            await pilot.pause()
+            rows = fleet_rows(app.screen.snapshot)
+            group_count = sum(1 for row in rows if row.kind == "group")
+            assert 0 < group_count < len(rows)
+
+            # A selection inside the groups table.
+            groups_index = group_count // 2
+            for _ in range(groups_index):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == groups_index
+            lines = _composited_lines(app.screen.query_one("#body", Static))
+            assert any(rows[groups_index].key in line for line in lines)
+
+            # A selection inside the loose-runs table.
+            loose_index = group_count + (len(rows) - group_count) // 2
+            for _ in range(loose_index - groups_index):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == loose_index
+            lines = _composited_lines(app.screen.query_one("#body", Static))
+            assert any(rows[loose_index].key in line for line in lines)
 
     asyncio.run(exercise())
