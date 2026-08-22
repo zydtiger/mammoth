@@ -39,6 +39,7 @@ from mammoth.core.groups import (
 from mammoth.core.identity import validate_group_id, validate_run_name
 from mammoth.core.layout import GroupLayout, RunLayout
 from mammoth.monitor.model import (
+    FLEET_TAIL_WINDOW_BYTES,
     ExecutionMonitor,
     MonitorSnapshot,
     ScopeStatus,
@@ -629,7 +630,11 @@ def _poll_member_tail(
         tail.monitor is None
         or tail.monitor.context.metadata.execution_id != newest.metadata.execution_id
     ):
-        tail.monitor = ExecutionMonitor(layout, newest.metadata.execution_id)
+        tail.monitor = ExecutionMonitor(
+            layout,
+            newest.metadata.execution_id,
+            tail_window_bytes=FLEET_TAIL_WINDOW_BYTES,
+        )
     return tail.monitor.poll()
 
 
