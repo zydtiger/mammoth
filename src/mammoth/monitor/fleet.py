@@ -39,6 +39,7 @@ from mammoth.core.groups import (
 from mammoth.core.identity import validate_group_id, validate_run_name
 from mammoth.core.layout import GroupLayout, RunLayout
 from mammoth.monitor.model import (
+    FLEET_TAIL_WINDOW_BYTES,
     ExecutionMonitor,
     MonitorSnapshot,
     ScopeStatus,
@@ -629,7 +630,11 @@ def _poll_member_tail(
         tail.monitor is None
         or tail.monitor.context.metadata.execution_id != newest.metadata.execution_id
     ):
-        tail.monitor = ExecutionMonitor(layout, newest.metadata.execution_id)
+        tail.monitor = ExecutionMonitor(
+            layout,
+            newest.metadata.execution_id,
+            tail_window_bytes=FLEET_TAIL_WINDOW_BYTES,
+        )
     return tail.monitor.poll()
 
 
@@ -647,17 +652,31 @@ def _executions_dir_signature(layout: RunLayout) -> tuple[int, int] | None:
 
 
 def _member_progress(tail: MonitorSnapshot | None) -> MemberProgress | None:
-    """Project one member's current task into unitless progress fields."""
+    """Project one member's current task into unitless progress fields.
+
+    ``eta_seconds`` is withheld (``None``) whenever the task carries no
+    reported throughput. ``TaskState.eta_seconds``'s honest throughput-based
+    estimate is unaffected by fleet folding's bounded tail window, but its
+    fallback estimate divides by ``updated_at - started_at`` using the
+    task's own ``started_at`` — which, under a bounded read, is merely the
+    first event this fold's window happened to capture, not the task's true
+    start, and can understate elapsed time (and therefore ETA) by an
+    arbitrary factor. Every tail this function receives comes from a bounded
+    fleet/group read (see ``FLEET_TAIL_WINDOW_BYTES``), so that fallback is
+    never trustworthy here; mirrors ``GroupSnapshot.aggregate_eta_seconds``'s
+    same honesty rule of showing nothing rather than a fabricated estimate.
+    """
     if tail is None:
         return None
     task = tail.current_task
     if task is None:
         return None
+    has_reported_throughput = task.throughput is not None and task.throughput > 0
     return MemberProgress(
         completed=task.completed,
         total=task.total,
         throughput=task.throughput,
-        eta_seconds=task.eta_seconds,
+        eta_seconds=task.eta_seconds if has_reported_throughput else None,
     )
 
 

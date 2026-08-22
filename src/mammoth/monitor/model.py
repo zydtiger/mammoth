@@ -6,6 +6,7 @@ metadata and JSONL events, so monitoring never imports a consuming project.
 
 from __future__ import annotations
 
+import bisect
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -37,6 +38,14 @@ ScopeStatus = Literal[
 ]
 
 _RANK_STREAM_PATTERN = re.compile(r"^rank-(?P<rank>[0-9]+)\.jsonl$")
+FLEET_TAIL_WINDOW_BYTES = 128 * 1024
+"""Bytes from the end of each stream that fleet/group roll-up folding reads.
+
+Passed as ``ExecutionMonitor(..., tail_window_bytes=FLEET_TAIL_WINDOW_BYTES)``
+by :mod:`mammoth.monitor.fleet`. See ``docs/MONITOR.md`` for the rationale
+and the approximation this bound introduces; single-run folding never uses
+this constant, so its exact full-history semantics are unaffected.
+"""
 _TERMINAL_RUN_STATUS: dict[str, RunStatus] = {
     "execution_completed": "completed",
     "execution_failed": "failed",
@@ -155,6 +164,12 @@ class MonitorSnapshot:
     lineage: tuple[str, ...] = ()
     warnings: list[str] = field(default_factory=list)
     events: tuple[ExecutionEvent, ...] = ()
+    _phase_keys: dict[str, tuple[datetime, str, int, int]] = field(
+        default_factory=dict, compare=False, repr=False
+    )
+    _metric_keys: dict[str, list[tuple[datetime, str, int, int]]] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
     @property
     def execution_id(self) -> str:
@@ -378,6 +393,20 @@ def execution_lineage(layout: RunLayout, metadata: ExecutionMetadata) -> tuple[s
     return tuple(lineage)
 
 
+def _event_sort_key(event: ExecutionEvent) -> tuple[datetime, str, int, int]:
+    """Return the deterministic cross-stream fold order for one event.
+
+    Ties on time break on source, then rank (runner sorts before any rank),
+    then sequence, matching one producer's own append order.
+    """
+    return (
+        parse_time(event.time),
+        event.source,
+        -1 if event.rank is None else event.rank,
+        event.sequence,
+    )
+
+
 def fold_events(
     context: ExecutionContext,
     events: Iterable[ExecutionEvent],
@@ -386,15 +415,7 @@ def fold_events(
     warnings: Iterable[str] = (),
 ) -> MonitorSnapshot:
     """Fold an arbitrary producer-event collection into deterministic state."""
-    ordered = sorted(
-        events,
-        key=lambda event: (
-            parse_time(event.time),
-            event.source,
-            -1 if event.rank is None else event.rank,
-            event.sequence,
-        ),
-    )
+    ordered = sorted(events, key=_event_sort_key)
     snapshot = MonitorSnapshot(
         context=context,
         lineage=lineage,
@@ -403,13 +424,69 @@ def fold_events(
     )
     for event in ordered:
         apply_event(snapshot, event)
-    _finalize_run_status(snapshot, ordered)
+    _finalize_run_status(
+        snapshot,
+        has_runner_terminal=any(event.event in _TERMINAL_RUN_STATUS for event in ordered),
+    )
     return snapshot
+
+
+def _apply_if_newer(
+    watermarks: dict[str, tuple[datetime, str, int, int]],
+    values: dict[str, ScopeStatus],
+    name: str,
+    value: ScopeStatus,
+    key: tuple[datetime, str, int, int],
+) -> None:
+    """Overwrite ``values[name]`` only if ``key`` is newer than its watermark.
+
+    Keeps a cross-producer "true event order, last writer wins" register
+    order-independent of *application* order: incremental folding applies
+    each poll's newly read events sorted only among themselves, so a value
+    shared across producers (a phase name multiple ranks or the runner can
+    all touch) can otherwise see a chronologically-earlier event applied
+    after a chronologically-later one already applied from an earlier poll
+    (clock skew or a stalled writer flush can make an earlier-timestamped
+    event become readable only later). Full folding's already-globally-
+    sorted input always advances this watermark forward, so this adds no
+    observable behavior there, only a cheap comparison.
+    """
+    if name not in watermarks or key > watermarks[name]:
+        watermarks[name] = key
+        values[name] = value
+
+
+def _insert_metric_point(
+    history: dict[str, list[MetricPoint]],
+    keys: dict[str, list[tuple[datetime, str, int, int]]],
+    name: str,
+    point: MetricPoint,
+    key: tuple[datetime, str, int, int],
+) -> None:
+    """Insert ``point`` at its correct chronological position for ``name``.
+
+    Appends in the common case (O(1)): points normally arrive already in
+    order, including under full folding's pre-sorted input. Falls back to a
+    positional insert only when a point turns out older than the newest one
+    already recorded for this metric — the same cross-producer visibility-
+    order issue :func:`_apply_if_newer` guards against, but for an ordered
+    history list rather than one current value.
+    """
+    points = history.setdefault(name, [])
+    point_keys = keys.setdefault(name, [])
+    if not point_keys or key >= point_keys[-1]:
+        points.append(point)
+        point_keys.append(key)
+        return
+    position = bisect.bisect_right(point_keys, key)
+    points.insert(position, point)
+    point_keys.insert(position, key)
 
 
 def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
     """Apply one validated observation to an existing snapshot."""
     observed_at = parse_time(event.time)
+    sort_key = _event_sort_key(event)
     producer_key = ProducerKey(event.source, event.rank)
     producer = snapshot.producers.setdefault(producer_key, ProducerState(producer_key))
     producer.sequence = event.sequence
@@ -446,9 +523,17 @@ def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
 
     if event.phase is not None:
         if event.event == "phase_started":
-            snapshot.phases[event.phase] = "running"
+            _apply_if_newer(
+                snapshot._phase_keys, snapshot.phases, event.phase, "running", sort_key
+            )
         elif event.event in _TERMINAL_SCOPE_STATUS and event.event.startswith("phase_"):
-            snapshot.phases[event.phase] = _TERMINAL_SCOPE_STATUS[event.event]
+            _apply_if_newer(
+                snapshot._phase_keys,
+                snapshot.phases,
+                event.phase,
+                _TERMINAL_SCOPE_STATUS[event.event],
+                sort_key,
+            )
 
     if event.task_id is not None:
         task_key = (producer_key, event.task_id)
@@ -484,8 +569,12 @@ def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
     if event.display_metrics:
         coordinates = combined_coordinates(event)
         for name, value in event.display_metrics.items():
-            snapshot.metric_history.setdefault(name, []).append(
-                MetricPoint(observed_at, value, producer_key, coordinates)
+            _insert_metric_point(
+                snapshot.metric_history,
+                snapshot._metric_keys,
+                name,
+                MetricPoint(observed_at, value, producer_key, coordinates),
+                sort_key,
             )
 
 
@@ -526,10 +615,11 @@ def _metric_precedes_resume(
 
 def _finalize_run_status(
     snapshot: MonitorSnapshot,
-    events: list[ExecutionEvent],
+    *,
+    has_runner_terminal: bool,
 ) -> None:
     """Infer direct-process terminal state when no runner terminal was emitted."""
-    if any(event.event in _TERMINAL_RUN_STATUS for event in events):
+    if has_runner_terminal:
         return
     processes = [
         producer
@@ -554,48 +644,119 @@ def _finalize_run_status(
 
 
 class ExecutionMonitor:
-    """Incrementally tail all recognized streams for one immutable attempt."""
+    """Incrementally tail all recognized streams for one immutable attempt.
 
-    def __init__(self, layout: RunLayout, execution_id: str | None = None) -> None:
+    Maintains one persistent folded :class:`MonitorSnapshot` across polls,
+    applying only newly read events (:func:`apply_event`) instead of
+    re-folding the complete accumulated history, and never retains the
+    complete raw event list: only terminal-class events
+    (:attr:`~mammoth.core.events.ExecutionEvent.is_terminal`) are kept, in
+    :attr:`MonitorSnapshot.events`, since that is the only subset any reader
+    of that field consumes (:meth:`MonitorSnapshot.terminal_event_time` and
+    the dashboard's phase-history and terminal-event rendering).
+
+    Each poll's newly read events, across every stream, are sorted among
+    themselves before being applied, then applied after everything already
+    folded — but *application* order is not the same as *event-time* order
+    across producers: a later poll can make a chronologically-earlier event
+    visible only after a chronologically-later event from a different
+    producer was already applied from an earlier poll (a stalled writer
+    flush or cross-host clock skew, not merely a slow poller). Fields scoped
+    to one producer or one producer's task are unaffected regardless — each
+    producer's own stream is always read and applied in that producer's own
+    strict order, matching :func:`fold_events` exactly no matter how polls
+    are batched. Fields a phase name or a metric name can share *across*
+    producers (:attr:`MonitorSnapshot.phases`, :attr:`MonitorSnapshot.
+    metric_history`) apply each event only if it is newer, by true event
+    order, than whatever last set that name (see ``_apply_if_newer`` /
+    ``_insert_metric_point``), which is what keeps those exactly equivalent
+    to a full re-fold regardless of poll batching — not merely appending or
+    overwriting in the order events happened to become visible.
+
+    ``tail_window_bytes``, when set, bounds only the *first* read of each
+    underlying stream (see
+    :class:`~mammoth.core.events.ExecutionEventTailReader`); this is what
+    :mod:`mammoth.monitor.fleet` roll-up folding uses, never single-run
+    folding, so single-run behavior and outputs are unchanged.
+    """
+
+    def __init__(
+        self,
+        layout: RunLayout,
+        execution_id: str | None = None,
+        *,
+        tail_window_bytes: int | None = None,
+    ) -> None:
         self.layout = layout
         self.context = select_execution(layout, execution_id)
+        self._tail_window_bytes = tail_window_bytes
         self._readers: dict[Path, ExecutionEventTailReader] = {}
-        self._events: list[ExecutionEvent] = []
         self._warnings: list[str] = []
         self._failed_paths: set[Path] = set()
+        self._snapshot = MonitorSnapshot(context=self.context)
+        self._retained_events: list[ExecutionEvent] = []
+        self._has_runner_terminal = False
 
     def poll(self) -> MonitorSnapshot:
-        """Read newly appended records and return a fresh deterministic fold."""
+        """Read newly appended records and apply them to the folded state."""
+        new_events: list[ExecutionEvent] = []
         for path in event_stream_paths(self.context):
             if path in self._failed_paths:
                 continue
-            reader = self._readers.setdefault(path, ExecutionEventTailReader(path))
+            reader = self._readers.setdefault(
+                path,
+                ExecutionEventTailReader(path, tail_window_bytes=self._tail_window_bytes),
+            )
             try:
-                self._events.extend(reader.poll())
+                new_events.extend(reader.poll())
             except ExecutionEventReadError as error:
-                self._events.extend(error.valid_events)
+                new_events.extend(error.valid_events)
                 self._warnings.append(str(error))
                 self._failed_paths.add(path)
             except OSError as error:
                 self._warnings.append(str(error))
                 self._failed_paths.add(path)
-        return fold_events(
-            self.context,
-            self._events,
-            lineage=execution_lineage(self.layout, self.context.metadata),
-            warnings=self._warnings,
-        )
+        new_events.sort(key=_event_sort_key)
+        for event in new_events:
+            apply_event(self._snapshot, event)
+            if event.is_terminal:
+                bisect.insort(self._retained_events, event, key=_event_sort_key)
+            if event.event in _TERMINAL_RUN_STATUS:
+                self._has_runner_terminal = True
+        _finalize_run_status(self._snapshot, has_runner_terminal=self._has_runner_terminal)
+        self._snapshot.events = tuple(self._retained_events)
+        self._snapshot.lineage = execution_lineage(self.layout, self.context.metadata)
+        self._snapshot.warnings = list(self._warnings)
+        return self._snapshot
 
 
 class RunMonitor:
-    """Incrementally monitor every valid execution for one logical run."""
+    """Incrementally monitor every valid execution for one logical run.
 
-    def __init__(self, layout: RunLayout, execution_id: str | None = None) -> None:
+    ``lazy_first_poll``, when set, fully polls only the selected (or newest)
+    execution on this monitor's *first* :meth:`poll` call; every other
+    attempt gets a cheap unpolled placeholder (immutable metadata only, no
+    event-stream read) for that one call. Every subsequent call polls every
+    attempt exactly as before, so the attempt-history panel is complete
+    again from the very next scheduled refresh. This exists only to let a
+    fleet drill-down's first screen paint without waiting on every historical
+    attempt's full-history read; standalone single-run monitoring never sets
+    it, so its output is unaffected — see ``docs/MONITOR.md``.
+    """
+
+    def __init__(
+        self,
+        layout: RunLayout,
+        execution_id: str | None = None,
+        *,
+        lazy_first_poll: bool = False,
+    ) -> None:
         self.layout = layout
         self.execution_id = execution_id
         if execution_id is not None:
             select_execution(layout, execution_id)
         self._monitors: dict[str, ExecutionMonitor] = {}
+        self._lazy_next_poll = lazy_first_poll
 
     def poll(self, selected_execution_id: str | None = None) -> RunSnapshot:
         """Discover attempts, tail each stream, and select one execution."""
@@ -608,16 +769,22 @@ class RunMonitor:
                 execution_id,
                 ExecutionMonitor(self.layout, execution_id),
             )
-        snapshots = tuple(
-            self._monitors[context.metadata.execution_id].poll() for context in contexts
-        )
         if self.execution_id is not None and self.execution_id not in execution_ids:
             raise FileNotFoundError(
                 f"Execution {self.execution_id!r} is no longer available for "
                 f"{self.layout.run_dir}"
             )
         requested = self.execution_id or selected_execution_id
-        selected = requested if requested in execution_ids else snapshots[-1].execution_id
+        selected = requested if requested in execution_ids else contexts[-1].metadata.execution_id
+
+        lazy = self._lazy_next_poll
+        self._lazy_next_poll = False
+        snapshots = tuple(
+            self._monitors[context.metadata.execution_id].poll()
+            if not lazy or context.metadata.execution_id == selected
+            else MonitorSnapshot(context=context)
+            for context in contexts
+        )
         return RunSnapshot(
             layout=self.layout,
             executions=snapshots,

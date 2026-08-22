@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import subprocess
+import threading
+from collections.abc import Callable
 from datetime import UTC, datetime
 from itertools import count
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from rich.console import Console
+from textual.pilot import Pilot
 from textual.widgets import Static
 from typer.testing import CliRunner
 
@@ -21,12 +26,17 @@ from mammoth.core import (
     create_execution_context,
     publish_group_manifest,
 )
-from mammoth.core.events import ExecutionEventWriter
+from mammoth.core.events import (
+    ExecutionEventReadError,
+    ExecutionEventTailReader,
+    ExecutionEventWriter,
+)
 from mammoth.monitor import (
     ExecutionMonitor,
     RunMonitor,
     discover_executions,
     execution_lineage,
+    fold_events,
     render_snapshot,
     sample_viewer_telemetry,
     select_execution,
@@ -41,6 +51,7 @@ from mammoth.monitor.dashboard import (
     group_dashboard_layout,
 )
 from mammoth.monitor.fleet import FleetMonitor
+from mammoth.monitor.model import event_stream_paths
 from mammoth.monitor.psutil_telemetry import (
     GpuTelemetry,
     PsutilViewerTelemetry,
@@ -69,6 +80,27 @@ def _composited_lines(body: Static) -> list[str]:
     content, to be a genuine regression guard.
     """
     return [body.render_line(y).text for y in range(body.size.height)]
+
+
+async def _wait_until(
+    pilot: Pilot[object],
+    predicate: Callable[[], bool],
+    *,
+    attempts: int = 50,
+) -> None:
+    """Pump the Textual message loop until ``predicate`` holds.
+
+    Bounds waiting for a background-worker refresh (``@work(thread=True)``)
+    to publish its result back onto the event loop: each iteration yields
+    control via ``pilot.pause()`` so the worker's ``call_from_thread``
+    callback gets a chance to run, without a fixed sleep that would be
+    either flaky (too short) or slow (too long).
+    """
+    for _ in range(attempts):
+        if predicate():
+            return
+        await pilot.pause()
+    assert predicate(), "condition did not become true before the attempt budget ran out"
 
 
 def create_context(
@@ -278,6 +310,253 @@ def test_monitor_preserves_valid_prefix_and_isolates_malformed_stream(tmp_path: 
     assert snapshot.status == "running"
     assert len(snapshot.warnings) == 1
     assert "line 2" in snapshot.warnings[0]
+
+
+def _oracle_snapshot(layout: RunLayout, context: object) -> object:
+    """Fold every stream from scratch with the same per-path error isolation
+    :class:`ExecutionMonitor` uses, as the full, non-incremental reference
+    fold that incremental polling must stay equivalent to.
+    """
+    events: list[object] = []
+    warnings: list[str] = []
+    for path in event_stream_paths(context):
+        reader = ExecutionEventTailReader(path)
+        try:
+            events.extend(reader.poll())
+        except ExecutionEventReadError as error:
+            events.extend(error.valid_events)
+            warnings.append(str(error))
+    return fold_events(
+        context,
+        events,
+        lineage=execution_lineage(layout, context.metadata),
+        warnings=warnings,
+    )
+
+
+def _assert_snapshot_equivalent(incremental: object, oracle: object) -> None:
+    """Assert every observable field an incremental poll exposes matches the oracle.
+
+    ``events`` is compared against only the oracle's terminal-class events,
+    since incremental folding deliberately retains only that subset (see
+    ``ExecutionMonitor``'s docstring) rather than the complete raw history.
+    """
+    assert incremental.status == oracle.status
+    assert incremental.phases == oracle.phases
+    assert incremental.producers == oracle.producers
+    assert incremental.tasks == oracle.tasks
+    assert incremental.metric_history == oracle.metric_history
+    assert incremental.terminal_event_time == oracle.terminal_event_time
+    assert incremental.duration_seconds == oracle.duration_seconds
+    assert incremental.updated_at == oracle.updated_at
+    assert incremental.current_task == oracle.current_task
+    assert incremental.current_coordinates == oracle.current_coordinates
+    assert incremental.execution_id == oracle.execution_id
+    assert incremental.created_at == oracle.created_at
+    assert incremental.lineage == oracle.lineage
+    assert sorted(incremental.warnings) == sorted(oracle.warnings)
+    assert incremental.events == tuple(event for event in oracle.events if event.is_terminal)
+
+
+def _iso_clock(*values: str) -> Callable[[], str]:
+    """Return a callable yielding ``values`` in order, one per call.
+
+    Pins exact event timestamps through ``ExecutionEventWriter``'s
+    ``utc_clock`` option, decoupled from real wall-clock write order — lets a
+    test simulate a writer whose flush is delayed (or whose host clock is
+    skewed) relative to another producer's writer.
+    """
+    iterator = iter(values)
+    return lambda: next(iterator)
+
+
+def test_incremental_fold_matches_full_fold_under_cross_producer_visibility_skew(
+    tmp_path: Path,
+) -> None:
+    """P1-2 regression.
+
+    A later poll can make a chronologically-earlier event (from a different
+    producer) visible only after a chronologically-later event was already
+    applied from an earlier poll: a stalled writer flush or cross-host clock
+    skew, not merely poll timing. ``ExecutionMonitor.poll`` sorts only each
+    poll's own newly read events among themselves and applies them after
+    everything already folded, so a naive append/overwrite would record
+    rank 1's chronologically-earlier point after rank 0's, diverging from
+    the full re-fold. This must be equivalent regardless.
+    """
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z", world_size=2)
+    monitor = ExecutionMonitor(layout, "attempt")
+
+    rank0 = ExecutionEventWriter.for_process(
+        context,
+        rank=0,
+        world_size=2,
+        utc_clock=_iso_clock("2026-01-01T00:00:00Z", "2026-01-01T00:03:20Z"),
+    )
+    rank1 = ExecutionEventWriter.for_process(
+        context,
+        rank=1,
+        world_size=2,
+        utc_clock=_iso_clock("2026-01-01T00:00:50Z"),
+    )
+
+    rank0.emit("process_started", phase="train")
+    rank0.emit_progress(
+        phase="train",
+        task_id="epoch",
+        completed=1,
+        total=10,
+        final=True,
+        display_metrics={"loss": 9.0},
+    )
+
+    # First poll observes only rank 0 so far: its T+200 metric point is
+    # applied now, well before rank 1's chronologically-earlier T+50 point
+    # ever becomes visible.
+    monitor.poll()
+
+    # rank 1's event is only written now (visible in a later poll), but its
+    # own timestamp (T+50) precedes rank 0's already-applied T+200 event.
+    rank1.emit_progress(
+        phase="train",
+        task_id="epoch",
+        completed=1,
+        total=10,
+        final=True,
+        display_metrics={"loss": 1.0},
+    )
+
+    incremental = monitor.poll()
+    oracle = _oracle_snapshot(layout, context)
+    _assert_snapshot_equivalent(incremental, oracle)
+
+    # Pin the concrete ordering this regression is about: true event-time
+    # order, not application/visibility order.
+    assert [point.time.isoformat() for point in oracle.metric_history["loss"]] == [
+        "2026-01-01T00:00:50+00:00",
+        "2026-01-01T00:03:20+00:00",
+    ]
+    assert [point.value for point in incremental.metric_history["loss"]] == [1.0, 9.0]
+
+    rank0.close()
+    rank1.close()
+
+
+def _run_incremental_equivalence_case(
+    tmp_path: Path,
+    *,
+    seed: int,
+    world_size: int,
+    checkpoint_probability: float = 0.3,
+) -> None:
+    """Drive a randomized multi-producer event sequence through incremental
+    and full (oracle) folding, asserting equivalence at randomized
+    checkpoints and at the end. This is the property/equivalence test that
+    pins incremental folding as exactly matching a full re-fold — the spec
+    issue #92 requires be written first and kept as the ongoing guarantee.
+    """
+    rng = random.Random(seed)
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z", world_size=world_size)
+    monitor = ExecutionMonitor(layout, "attempt")
+
+    runner_writer = ExecutionEventWriter.for_runner(context)
+    rank_writers = [
+        ExecutionEventWriter.for_process(context, rank=rank, world_size=world_size)
+        for rank in range(world_size)
+    ]
+    writers: dict[str, ExecutionEventWriter] = {"runner": runner_writer}
+    pending: dict[str, list[tuple[str, dict[str, object]]]] = {
+        "runner": [("execution_started", {}), ("phase_started", {"phase": "train"})]
+    }
+    for rank in range(world_size):
+        key = f"rank{rank}"
+        writers[key] = rank_writers[rank]
+        total = rng.randint(3, 6)
+        steps: list[tuple[str, dict[str, object]]] = [
+            ("process_started", {"phase": "train"}),
+            ("task_started", {"phase": "train", "task_id": "epoch"}),
+        ]
+        for step in range(1, total + 1):
+            steps.append(
+                (
+                    "progress",
+                    {
+                        "phase": "train",
+                        "task_id": "epoch",
+                        "completed": step,
+                        "total": total,
+                        "final": step == total,
+                        "throughput": 2.0,
+                        "display_metrics": {"loss": 1.0 / step},
+                    },
+                )
+            )
+        steps.append(("task_completed", {"phase": "train", "task_id": "epoch"}))
+        steps.append(("process_completed", {"phase": "train", "exit_code": 0}))
+        pending[key] = steps
+
+    def _rank_keys() -> list[str]:
+        return [f"rank{rank}" for rank in range(world_size)]
+
+    def _checkpoint() -> None:
+        oracle = _oracle_snapshot(layout, context)
+        _assert_snapshot_equivalent(monitor.poll(), oracle)
+
+    runner_closed = False
+    while any(pending.values()):
+        ranks_done = all(not pending[key] for key in _rank_keys())
+        if ranks_done and not runner_closed:
+            pending["runner"].extend(
+                [("phase_completed", {"phase": "train"}), ("execution_completed", {})]
+            )
+            runner_closed = True
+        active = [key for key, steps in pending.items() if steps]
+        key = rng.choice(active)
+        event_name, kwargs = pending[key].pop(0)
+        writers[key].emit(event_name, **kwargs)
+        if rng.random() < checkpoint_probability:
+            _checkpoint()
+
+    for writer in writers.values():
+        writer.close()
+    _checkpoint()
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 17, 42])
+def test_incremental_fold_matches_full_fold_multi_rank(tmp_path: Path, seed: int) -> None:
+    _run_incremental_equivalence_case(tmp_path, seed=seed, world_size=3)
+
+
+@pytest.mark.parametrize("seed", [4, 9])
+def test_incremental_fold_matches_full_fold_single_rank(tmp_path: Path, seed: int) -> None:
+    _run_incremental_equivalence_case(tmp_path, seed=seed, world_size=1)
+
+
+def test_incremental_fold_matches_full_fold_with_malformed_trailing_line(
+    tmp_path: Path,
+) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    with ExecutionEventWriter.for_process(context, rank=0) as writer:
+        writer.emit("execution_started")
+        writer.emit("process_started", phase="train")
+        writer.emit_progress(phase="train", task_id="epoch", completed=1, total=4, final=True)
+    stream = context.execution_dir / "rank-0.jsonl"
+    with stream.open("ab") as handle:
+        handle.write(b"{not valid json\n")
+
+    monitor = ExecutionMonitor(layout, "attempt")
+    oracle = _oracle_snapshot(layout, context)
+    _assert_snapshot_equivalent(monitor.poll(), oracle)
+    assert len(oracle.warnings) == 1
+    assert "line 4" in oracle.warnings[0]
+
+    # A second poll of a permanently failed stream stays equivalent too: no
+    # new bytes are (successfully) read from the now-isolated path.
+    oracle_again = _oracle_snapshot(layout, context)
+    _assert_snapshot_equivalent(monitor.poll(), oracle_again)
 
 
 def test_monitor_cli_preserves_public_command_shape(tmp_path: Path) -> None:
@@ -1005,7 +1284,10 @@ def test_fleet_textual_navigates_fleet_group_run_and_back(tmp_path: Path) -> Non
             await pilot.press("enter")
             await pilot.pause()
             assert isinstance(app.screen, RunScreen)
-            assert app.screen.snapshot.layout.run_name == "alpha"
+            run_screen = app.screen
+            await _wait_until(pilot, lambda: run_screen.snapshot is not None)
+            assert run_screen.snapshot is not None
+            assert run_screen.snapshot.layout.run_name == "alpha"
 
             await pilot.press("escape")
             await pilot.pause()
@@ -1033,7 +1315,213 @@ def test_fleet_textual_drills_directly_into_a_loose_run(tmp_path: Path) -> None:
             await pilot.press("enter")
             await pilot.pause()
             assert isinstance(app.screen, RunScreen)
-            assert app.screen.snapshot.layout.run_name == "loose"
+            run_screen = app.screen
+            await _wait_until(pilot, lambda: run_screen.snapshot is not None)
+            assert run_screen.snapshot is not None
+            assert run_screen.snapshot.layout.run_name == "loose"
+
+    asyncio.run(exercise())
+
+
+def test_fleet_textual_run_screen_shows_loading_state_before_first_poll(
+    tmp_path: Path,
+) -> None:
+    """Drilling in must not block the UI thread on the run's first poll.
+
+    Gates ``RunMonitor.poll`` on a controllable event so the test can assert
+    a visible loading state deterministically, before releasing the poll and
+    asserting the real dashboard replaces it once the background worker's
+    first snapshot arrives.
+    """
+    entry = tmp_path / "runs"
+    run_layout = RunLayout(entry, "loose").prepare()
+    create_context(run_layout, "attempt", "2026-01-01T00:00:00Z")
+
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    release = threading.Event()
+    original_poll = RunMonitor.poll
+
+    def gated_poll(self: RunMonitor, selected_execution_id: str | None = None) -> object:
+        release.wait(timeout=5)
+        return original_poll(self, selected_execution_id)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            with mock.patch.object(RunMonitor, "poll", gated_poll):
+                await pilot.press("enter")
+                await pilot.pause()
+                assert isinstance(app.screen, RunScreen)
+                run_screen = app.screen
+                assert run_screen.snapshot is None
+                body = run_screen.query_one("#body", Static)
+                assert "loading" in " ".join(_composited_lines(body)).lower()
+
+                release.set()
+                await _wait_until(pilot, lambda: run_screen.snapshot is not None)
+
+            assert run_screen.snapshot is not None
+            assert run_screen.snapshot.layout.run_name == "loose"
+            body = run_screen.query_one("#body", Static)
+            assert "loading" not in " ".join(_composited_lines(body)).lower()
+
+    asyncio.run(exercise())
+
+
+def test_fleet_textual_run_screen_ignores_navigation_before_first_poll(
+    tmp_path: Path,
+) -> None:
+    """P3-3(a) regression: navigation/detail keys while still loading must
+    no-op, not crash, since ``RunScreen.snapshot`` is ``None`` until the
+    background worker's first poll completes.
+    """
+    entry = tmp_path / "runs"
+    run_layout = RunLayout(entry, "loose").prepare()
+    create_context(run_layout, "attempt", "2026-01-01T00:00:00Z")
+
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    release = threading.Event()
+    original_poll = RunMonitor.poll
+
+    def gated_poll(self: RunMonitor, selected_execution_id: str | None = None) -> object:
+        release.wait(timeout=5)
+        return original_poll(self, selected_execution_id)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            with mock.patch.object(RunMonitor, "poll", gated_poll):
+                await pilot.press("enter")
+                await pilot.pause()
+                assert isinstance(app.screen, RunScreen)
+                run_screen = app.screen
+                assert run_screen.snapshot is None
+
+                # Next/previous execution and the detail toggle must all
+                # no-op while there is nothing to navigate or toggle yet.
+                await pilot.press("j")
+                await pilot.press("k")
+                await pilot.press("down")
+                await pilot.press("up")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert isinstance(app.screen, RunScreen)
+                assert run_screen.snapshot is None
+                assert run_screen.detail is False
+
+                release.set()
+                await _wait_until(pilot, lambda: run_screen.snapshot is not None)
+
+            assert run_screen.snapshot is not None
+            assert run_screen.snapshot.layout.run_name == "loose"
+            # Navigation works normally once loaded.
+            await pilot.press("enter")
+            assert run_screen.detail is True
+
+    asyncio.run(exercise())
+
+
+def test_fleet_textual_stale_worker_from_a_popped_run_screen_never_leaks_forward(
+    tmp_path: Path,
+) -> None:
+    """P3-3(b) regression: a popped screen's slow worker must not leak into
+    whatever screen is active when it finally completes.
+
+    Pushes a run screen, pops it before its gated first poll ever finishes,
+    and only then releases that stale poll. Textual routes a background
+    worker's result back through the *screen instance* that started it
+    (``self.app.call_from_thread`` from inside ``_refresh_state``); once
+    that screen is popped, Textual itself refuses to deliver the result
+    (``NoActiveAppError``) rather than silently applying it anywhere,
+    including back onto the popped screen. This test pins that safety
+    property — the stale worker's completion is a no-op, never a crash and
+    never a leak — rather than merely asserting on
+    ``RunScreen._refresh_generation`` in isolation. A fresh drill-down into a
+    second run afterward confirms its own independent poll still produces
+    the correct snapshot, unaffected by the earlier stale worker.
+    """
+    entry = tmp_path / "runs"
+    for name in ("loose-a", "loose-b"):
+        layout = RunLayout(entry, name).prepare()
+        create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    release_by_run: dict[str, threading.Event] = {
+        "loose-a": threading.Event(),
+        "loose-b": threading.Event(),
+    }
+    completed_by_run: dict[str, threading.Event] = {
+        "loose-a": threading.Event(),
+        "loose-b": threading.Event(),
+    }
+    original_poll = RunMonitor.poll
+
+    def gated_poll(self: RunMonitor, selected_execution_id: str | None = None) -> object:
+        release_by_run[self.layout.run_name].wait(timeout=5)
+        result = original_poll(self, selected_execution_id)
+        completed_by_run[self.layout.run_name].set()
+        return result
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, FleetScreen)
+            rows = fleet_rows(app.screen.snapshot)
+            names = [row.key for row in rows]
+
+            with mock.patch.object(RunMonitor, "poll", gated_poll):
+                # Drill into "loose-a" and pop back out before its gated
+                # poll ever completes.
+                app.screen.selected_index = names.index("loose-a")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert isinstance(app.screen, RunScreen)
+                stale_screen = app.screen
+                assert stale_screen.snapshot is None
+
+                await pilot.press("escape")
+                await pilot.pause()
+                assert isinstance(app.screen, FleetScreen)
+
+                # Release the now-orphaned poll and wait for the underlying
+                # RunMonitor.poll call itself (not any UI callback, which
+                # this stale worker can no longer deliver) to finish, so the
+                # background thread genuinely ran its course rather than the
+                # assertions below merely racing it.
+                release_by_run["loose-a"].set()
+                assert completed_by_run["loose-a"].wait(timeout=5)
+                await pilot.pause()
+
+                # The stale result was never applied anywhere: not back onto
+                # the popped screen, and not onto whatever is now active.
+                assert stale_screen.snapshot is None
+                assert isinstance(app.screen, FleetScreen)
+
+                # A fresh drill-down into a different run gets its own
+                # independent, correct snapshot, unaffected by the earlier
+                # stale worker.
+                app.screen.selected_index = names.index("loose-b")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert isinstance(app.screen, RunScreen)
+                new_screen = app.screen
+                assert new_screen is not stale_screen
+                assert new_screen.snapshot is None
+
+                release_by_run["loose-b"].set()
+                await _wait_until(pilot, lambda: new_screen.snapshot is not None)
+
+            assert new_screen.snapshot is not None
+            assert new_screen.snapshot.layout.run_name == "loose-b"
+            # The popped screen's own snapshot is still untouched: its
+            # worker's result was discarded, not queued or replayed later.
+            assert stale_screen.snapshot is None
 
     asyncio.run(exercise())
 
