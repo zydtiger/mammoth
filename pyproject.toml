@@ -1,6 +1,6 @@
 [project]
 name = "mammoth"
-version = "0.7.0"
+version = "0.8.0"
 description = "Project-independent orchestration, training, logging, and monitoring infrastructure for AI workloads"
 readme = "README.md"
 authors = [
