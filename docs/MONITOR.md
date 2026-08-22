@@ -185,7 +185,15 @@ row followed by edge-aligned live metrics.
 - DIMM identity is sampled once per monitor process. The interactive monitor
   first runs `sudo -n dmidecode --type memory`. If cached sudo authentication is
   unavailable, it permits sudo to request a password from the local terminal
-  once before the Textual app starts. A failed probe leaves hardware identity
+  once before the Textual app starts. This holds at every interactive entry
+  point, including the fleet view (which has no `HOST RESOURCES` panel of its
+  own): the initial telemetry sample is always taken before any Textual app
+  is constructed or run, never from inside a running screen stack, so the
+  prompt never erupts mid-navigation. Drilling from the fleet into a run
+  reuses that same pre-UI sample for the first run screen instead of
+  sampling again; later drill-ins and periodic refreshes sample again
+  through the same sampler, which never reprompts since it retries cached
+  sudo credentials first. A failed probe leaves hardware identity
   unavailable without blocking later refreshes.
 - NVIDIA telemetry queries `nvidia-smi` on every refresh. Every reported GPU
   receives its own block whose identity includes index and model name and whose
