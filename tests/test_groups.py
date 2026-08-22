@@ -9,6 +9,8 @@ import pytest
 from mammoth.core import GroupLayout, validate_group_id
 from mammoth.core.groups import (
     GroupEvent,
+    GroupEventReadError,
+    GroupEventTailReader,
     GroupEventWriter,
     GroupManifest,
     GroupMember,
@@ -119,6 +121,11 @@ def test_publish_group_manifest_rejects_duplicate_member_run_names() -> None:
         )
 
 
+def test_group_member_rejects_duplicate_step_names() -> None:
+    with pytest.raises(ValueError, match="unique"):
+        GroupMember("alpha", ("prepare", "prepare"))
+
+
 def test_group_event_writer_emits_ordered_records_and_read_back_matches(tmp_path: Path) -> None:
     layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
     writer = GroupEventWriter(layout.events_path, group_id="group-1")
@@ -166,6 +173,45 @@ def test_group_event_writer_disables_after_a_write_failure(tmp_path: Path) -> No
     assert writer.emit("group_failed") is None
 
 
+def test_group_event_writer_disables_after_an_open_failure(tmp_path: Path) -> None:
+    layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
+    # A pre-existing regular file at the destination defeats O_CREAT | O_EXCL,
+    # so construction itself must observe and survive the open failure.
+    layout.events_path.write_bytes(b"")
+
+    writer = GroupEventWriter(layout.events_path, group_id="group-1")
+
+    assert not writer.enabled
+    assert writer.emit("group_started") is None
+    writer.close()
+
+
+def test_group_event_writer_disables_after_a_close_failure(tmp_path: Path) -> None:
+    layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
+    writer = GroupEventWriter(layout.events_path, group_id="group-1")
+    writer.emit("group_started")
+
+    class FailingCloseStream:
+        def write(self, data: bytes) -> int:
+            return len(data)
+
+        def flush(self) -> None:
+            return None
+
+        def close(self) -> None:
+            raise OSError("close blocked")
+
+    writer._stream = FailingCloseStream()  # type: ignore[assignment]
+
+    writer.close()
+
+    assert writer._closed
+    assert writer._stream is None
+    assert not writer.enabled
+    assert writer.emit("group_completed") is None
+    assert [event.event for event in read_group_events(layout.events_path)] == ["group_started"]
+
+
 def test_group_event_writer_close_is_idempotent(tmp_path: Path) -> None:
     layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
     writer = GroupEventWriter(layout.events_path, group_id="group-1")
@@ -196,6 +242,112 @@ def test_read_group_events_ignores_an_incomplete_trailing_line(tmp_path: Path) -
 
 def test_read_group_events_returns_empty_for_a_missing_stream(tmp_path: Path) -> None:
     assert read_group_events(tmp_path / "does-not-exist.jsonl") == []
+
+
+def test_group_event_tail_reader_returns_only_newly_appended_records(tmp_path: Path) -> None:
+    layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
+    writer = GroupEventWriter(layout.events_path, group_id="group-1")
+    writer.emit("group_started")
+    reader = GroupEventTailReader(layout.events_path)
+
+    first = reader.poll()
+    assert [event.event for event in first] == ["group_started"]
+    assert reader.poll() == []
+
+    writer.emit("run_started", run_name="alpha")
+    writer.close()
+    second = reader.poll()
+    assert [event.event for event in second] == ["run_started"]
+
+
+def test_group_event_tail_reader_retains_an_incomplete_trailing_line_across_polls(
+    tmp_path: Path,
+) -> None:
+    layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
+    writer = GroupEventWriter(layout.events_path, group_id="group-1")
+    writer.emit("group_started")
+    reader = GroupEventTailReader(layout.events_path)
+    assert [event.event for event in reader.poll()] == ["group_started"]
+
+    with layout.events_path.open("ab") as handle:
+        handle.write(
+            b'{"schema_version":1,"sequence":2,"time":"2026-01-01T00:00:00Z","group_id":"group-1"'
+        )
+    assert reader.poll() == []
+
+    with layout.events_path.open("ab") as handle:
+        handle.write(b',"event":"run_started","run_name":"alpha"}\n')
+    completed = reader.poll()
+    assert [event.event for event in completed] == ["run_started"]
+
+
+def test_group_event_tail_reader_allows_a_missing_stream_until_it_exists(tmp_path: Path) -> None:
+    layout = GroupLayout(tmp_path / "runs", "group-1")
+    reader = GroupEventTailReader(layout.events_path)
+
+    assert reader.poll() == []
+
+    layout.prepare()
+    writer = GroupEventWriter(layout.events_path, group_id="group-1")
+    writer.emit("group_started")
+    assert [event.event for event in reader.poll()] == ["group_started"]
+
+
+def test_group_event_tail_reader_fails_on_truncation_and_returns_valid_events(
+    tmp_path: Path,
+) -> None:
+    layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
+    writer = GroupEventWriter(layout.events_path, group_id="group-1")
+    writer.emit("group_started")
+    writer.emit("run_started", run_name="alpha")
+    writer.close()
+    reader = GroupEventTailReader(layout.events_path)
+    assert len(reader.poll()) == 2
+
+    layout.events_path.write_bytes(b"")
+
+    with pytest.raises(GroupEventReadError) as excinfo:
+        reader.poll()
+    assert excinfo.value.valid_events == ()
+    # The reader is permanently disabled after the failure it already raised.
+    with pytest.raises(GroupEventReadError):
+        reader.poll()
+
+
+def test_group_event_tail_reader_fails_on_a_blank_complete_line(tmp_path: Path) -> None:
+    """A blank line fails the stream, exactly like ExecutionEventTailReader."""
+    layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
+    writer = GroupEventWriter(layout.events_path, group_id="group-1")
+    writer.emit("group_started")
+    writer.close()
+    reader = GroupEventTailReader(layout.events_path)
+    assert [event.event for event in reader.poll()] == ["group_started"]
+
+    with layout.events_path.open("ab") as handle:
+        handle.write(b"\n")
+
+    with pytest.raises(GroupEventReadError) as excinfo:
+        reader.poll()
+    assert [event.event for event in excinfo.value.valid_events] == []
+
+
+def test_group_event_tail_reader_reports_out_of_sequence_records_with_valid_prefix(
+    tmp_path: Path,
+) -> None:
+    layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
+    writer = GroupEventWriter(layout.events_path, group_id="group-1")
+    writer.emit("group_started")
+    writer.close()
+    with layout.events_path.open("ab") as handle:
+        handle.write(
+            b'{"schema_version":1,"sequence":9,"time":"2026-01-01T00:00:00Z",'
+            b'"group_id":"group-1","event":"run_started","run_name":"alpha"}\n'
+        )
+    reader = GroupEventTailReader(layout.events_path)
+
+    with pytest.raises(GroupEventReadError, match="sequence") as excinfo:
+        reader.poll()
+    assert [event.event for event in excinfo.value.valid_events] == ["group_started"]
 
 
 @pytest.mark.parametrize(
