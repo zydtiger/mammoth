@@ -55,6 +55,16 @@ _COORDINATE_ORDER = (
 )
 _LIGHT_LOAD_PERCENT = 40.0
 _HEAVY_LOAD_PERCENT = 80.0
+# Fixed non-table line counts for windowing (see `_split_table_budget` and
+# `_row_window`): the fleet screen's header, its two section labels, each
+# table's own header row, and its footer; the group screen's header,
+# summary, one section label, and its member table's own header row plus
+# footer. Both figures are a deliberately conservative overestimate (they do
+# not shrink for a warnings-free render), trading a little unused headroom
+# for never overflowing the viewport.
+_FLEET_CHROME_ROWS = 9
+_GROUP_CHROME_ROWS = 7
+_UNFOCUSED_TABLE_CAP = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +189,75 @@ def fleet_rows(fleet: FleetSnapshot) -> list[FleetRow]:
     return rows
 
 
+def _row_window(
+    total: int,
+    selected_local_index: int | None,
+    max_visible: int | None,
+) -> tuple[int, int, int, int]:
+    """Return ``(start, end, hidden_above, hidden_below)`` bounding one table.
+
+    ``max_visible`` is ``None`` for every non-windowed caller (plain mode,
+    and any call site that has not measured a viewport), which renders every
+    row (``start=0, end=total``, nothing hidden). Otherwise the returned
+    ``[start, end)`` slice always contains ``selected_local_index`` when one
+    is given, reserving up to two of ``max_visible`` for the "N more
+    above/below" marker lines :func:`_with_overflow_markers` adds so the
+    windowed table plus its markers still fits the budget.
+    """
+    if max_visible is None or total <= max_visible:
+        return 0, total, 0, 0
+    budget = max(1, max_visible - 2)
+    if total <= budget:
+        return 0, total, 0, 0
+    index = 0 if selected_local_index is None else min(max(0, selected_local_index), total - 1)
+    start = min(max(0, index - budget // 2), total - budget)
+    end = start + budget
+    return start, end, start, total - end
+
+
+def _with_overflow_markers(
+    table: RenderableType,
+    hidden_above: int,
+    hidden_below: int,
+) -> RenderableType:
+    """Wrap a windowed table with dim "N more above/below" marker lines."""
+    if not hidden_above and not hidden_below:
+        return table
+    pieces: list[RenderableType] = []
+    if hidden_above:
+        pieces.append(Text(f"  ... {hidden_above} more above ...", style="dim"))
+    pieces.append(table)
+    if hidden_below:
+        pieces.append(Text(f"  ... {hidden_below} more below ...", style="dim"))
+    return Group(*pieces)
+
+
+def _split_table_budget(
+    viewport_rows: int | None,
+    group_count: int,
+    loose_count: int,
+    *,
+    focus_groups: bool,
+) -> tuple[int | None, int | None]:
+    """Split the fleet screen's data-row budget between its two tables.
+
+    Returns ``(None, None)`` when ``viewport_rows`` is ``None``, meaning
+    render every row (the plain-mode and legacy-call contract). Otherwise the
+    table holding the current selection (``focus_groups``) gets the budget
+    left after reserving up to :data:`_UNFOCUSED_TABLE_CAP` rows for the
+    other table, so the two windowed tables together never exceed the
+    viewport.
+    """
+    if viewport_rows is None:
+        return None, None
+    available = max(2, viewport_rows - _FLEET_CHROME_ROWS)
+    if focus_groups:
+        loose_budget = min(_UNFOCUSED_TABLE_CAP, loose_count, max(0, available - 1))
+        return max(1, available - loose_budget), loose_budget
+    group_budget = min(_UNFOCUSED_TABLE_CAP, group_count, max(0, available - 1))
+    return group_budget, max(1, available - group_budget)
+
+
 def fleet_dashboard_layout(
     fleet: FleetSnapshot,
     *,
@@ -187,8 +266,19 @@ def fleet_dashboard_layout(
     stale_after_seconds: float = 90.0,
     refresh_seconds: float = 2.0,
     now: datetime | None = None,
+    viewport_rows: int | None = None,
 ) -> RenderableType:
-    """Build the entry-level fleet overview: every group, then every loose run."""
+    """Build the entry-level fleet overview: every group, then every loose run.
+
+    ``viewport_rows`` bounds the two tables to a scrolling terminal's actual
+    height instead of rendering every group and loose run unconditionally: it
+    is the interactive screen's rendered row count, and stays ``None`` for
+    plain-mode and other non-windowed callers, which keep printing every row.
+    When given, each table is windowed around ``selected_index`` (whichever
+    table currently holds the selection) with "... N more above/below"
+    markers; the non-selected table is capped to a small preview instead of
+    also claiming scarce rows, since only one table can hold the selection.
+    """
     observed_at = now or datetime.now(UTC)
     rows = fleet_rows(fleet)
     header = Table.grid(expand=True, padding=(0, 1), pad_edge=False)
@@ -200,17 +290,31 @@ def fleet_dashboard_layout(
         Text(str(fleet.entry)),
         Text(f"refresh {refresh_seconds:g}s"),
     )
+    loose_count = len(fleet.loose_runs) if fleet.match_pattern is None else 0
+    groups_max_visible, loose_max_visible = _split_table_budget(
+        viewport_rows,
+        len(fleet.groups),
+        loose_count,
+        focus_groups=selected_index < len(fleet.groups),
+    )
     pieces: list[RenderableType] = [
         header,
         _section("GROUPS") if not compact else Text("\nGROUPS", style="bold"),
-        _group_roll_up_table(fleet, selected_index, observed_at, stale_after_seconds),
+        _group_roll_up_table(
+            fleet, selected_index, observed_at, stale_after_seconds, groups_max_visible
+        ),
     ]
     if fleet.match_pattern is None:
         pieces.extend(
             (
                 _section("LOOSE RUNS") if not compact else Text("\nLOOSE RUNS", style="bold"),
                 _loose_run_table(
-                    fleet, len(fleet.groups), selected_index, observed_at, stale_after_seconds
+                    fleet,
+                    len(fleet.groups),
+                    selected_index,
+                    observed_at,
+                    stale_after_seconds,
+                    loose_max_visible,
                 ),
             )
         )
@@ -235,8 +339,16 @@ def group_dashboard_layout(
     stale_after_seconds: float = 90.0,
     refresh_seconds: float = 2.0,
     now: datetime | None = None,
+    viewport_rows: int | None = None,
 ) -> RenderableType:
-    """Build the group-level view: one row per member in schedule order."""
+    """Build the group-level view: one row per member in schedule order.
+
+    ``viewport_rows`` bounds the member table to a scrolling terminal's
+    actual height, windowed around ``selected_index`` with "... N more
+    above/below" markers; see :func:`fleet_dashboard_layout` for the same
+    contract on the fleet screen. ``None`` (plain-mode and other non-windowed
+    callers) renders every member unconditionally.
+    """
     observed_at = now or datetime.now(UTC)
     header = Table.grid(expand=True, padding=(0, 1), pad_edge=False)
     header.add_column(justify="left", no_wrap=True)
@@ -255,11 +367,14 @@ def group_dashboard_layout(
         f"terminal={group.terminal_status or 'unknown'}  "
         f"aggregate eta={aggregate_eta or '--'}"
     )
+    member_max_visible = (
+        None if viewport_rows is None else max(1, viewport_rows - _GROUP_CHROME_ROWS)
+    )
     pieces: list[RenderableType] = [
         header,
         summary,
         _section("MEMBERS") if not compact else Text("\nMEMBERS", style="bold"),
-        _member_table(group, selected_index, observed_at, stale_after_seconds),
+        _member_table(group, selected_index, observed_at, stale_after_seconds, member_max_visible),
     ]
     if group.warnings:
         pieces.extend(
@@ -279,9 +394,13 @@ def _group_roll_up_table(
     selected_index: int,
     now: datetime,
     stale_after_seconds: float,
+    max_visible: int | None,
 ) -> RenderableType:
-    if not fleet.groups:
+    total = len(fleet.groups)
+    if total == 0:
         return Text("  (none observed)", style="dim")
+    local_selected = selected_index if 0 <= selected_index < total else None
+    start, end, hidden_above, hidden_below = _row_window(total, local_selected, max_visible)
     table = Table(box=None, expand=True, padding=(0, 1), pad_edge=False, collapse_padding=True)
     table.add_column("", width=1)
     table.add_column("Group")
@@ -290,7 +409,8 @@ def _group_roll_up_table(
     table.add_column("Active")
     table.add_column("Heartbeat")
     table.add_column("Terminal")
-    for index, group in enumerate(fleet.groups):
+    for index in range(start, end):
+        group = fleet.groups[index]
         marker = ">" if index == selected_index else ""
         active_style = _STATE_STYLE.get("running", "") if group.active_member else "dim"
         table.add_row(
@@ -302,7 +422,7 @@ def _group_roll_up_table(
             _heartbeat_cell(group.updated_at, now, stale_after_seconds),
             group.terminal_status or "unknown",
         )
-    return table
+    return _with_overflow_markers(table, hidden_above, hidden_below)
 
 
 def _loose_run_table(
@@ -311,16 +431,22 @@ def _loose_run_table(
     selected_index: int,
     now: datetime,
     stale_after_seconds: float,
+    max_visible: int | None,
 ) -> RenderableType:
-    if not fleet.loose_runs:
+    total = len(fleet.loose_runs)
+    if total == 0:
         return Text("  (none observed)", style="dim")
+    local_selected_index = selected_index - index_offset
+    local_selected = local_selected_index if 0 <= local_selected_index < total else None
+    start, end, hidden_above, hidden_below = _row_window(total, local_selected, max_visible)
     table = Table(box=None, expand=True, padding=(0, 1), pad_edge=False, collapse_padding=True)
     table.add_column("", width=1)
     table.add_column("Run")
     table.add_column("Status")
     table.add_column("Heartbeat")
     table.add_column("Progress")
-    for offset, run in enumerate(fleet.loose_runs):
+    for offset in range(start, end):
+        run = fleet.loose_runs[offset]
         marker = ">" if index_offset + offset == selected_index else ""
         table.add_row(
             marker,
@@ -329,7 +455,7 @@ def _loose_run_table(
             _heartbeat_cell(run.updated_at, now, stale_after_seconds),
             _member_progress_text(run.progress),
         )
-    return table
+    return _with_overflow_markers(table, hidden_above, hidden_below)
 
 
 def _member_table(
@@ -337,9 +463,13 @@ def _member_table(
     selected_index: int,
     now: datetime,
     stale_after_seconds: float,
+    max_visible: int | None,
 ) -> RenderableType:
-    if not group.members:
+    total = len(group.members)
+    if total == 0:
         return Text("  (none observed)", style="dim")
+    local_selected = selected_index if 0 <= selected_index < total else None
+    start, end, hidden_above, hidden_below = _row_window(total, local_selected, max_visible)
     table = Table(box=None, expand=True, padding=(0, 1), pad_edge=False, collapse_padding=True)
     table.add_column("", width=1)
     table.add_column("Run")
@@ -347,7 +477,8 @@ def _member_table(
     table.add_column("Steps")
     table.add_column("Progress")
     table.add_column("Heartbeat")
-    for index, member in enumerate(group.members):
+    for index in range(start, end):
+        member = group.members[index]
         marker = ">" if index == selected_index else ""
         table.add_row(
             marker,
@@ -357,7 +488,7 @@ def _member_table(
             _member_progress_text(member.progress),
             _heartbeat_cell(member.updated_at, now, stale_after_seconds),
         )
-    return table
+    return _with_overflow_markers(table, hidden_above, hidden_below)
 
 
 def _member_steps_text(member: GroupMemberSnapshot) -> str:

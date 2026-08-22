@@ -488,9 +488,10 @@ class GroupScreen(Screen[None]):
         self.fleet_app.push_run_screen(run_name)
 
     def _update_body(self) -> None:
-        """Update the Rich dashboard using the current terminal width."""
+        """Update the Rich dashboard using the current terminal width and height."""
         body = self.query_one("#body", Static)
         available_width = body.size.width or max(0, self.size.width - 2)
+        available_height = body.size.height or max(0, self.size.height - 1)
         compact = available_width < 80
         renderable = group_dashboard_layout(
             self.group,
@@ -498,6 +499,7 @@ class GroupScreen(Screen[None]):
             compact=compact,
             stale_after_seconds=self.stale_after_seconds,
             refresh_seconds=self.interval_seconds,
+            viewport_rows=max(1, available_height),
         )
         if self.error is not None:
             renderable = Group(
@@ -622,9 +624,10 @@ class FleetScreen(Screen[None]):
             self.fleet_app.push_run_screen(row.key)
 
     def _update_body(self) -> None:
-        """Update the Rich dashboard using the current terminal width."""
+        """Update the Rich dashboard using the current terminal width and height."""
         body = self.query_one("#body", Static)
         available_width = body.size.width or max(0, self.size.width - 2)
+        available_height = body.size.height or max(0, self.size.height - 1)
         compact = available_width < 80
         renderable = fleet_dashboard_layout(
             self.snapshot,
@@ -632,6 +635,7 @@ class FleetScreen(Screen[None]):
             compact=compact,
             stale_after_seconds=self.stale_after_seconds,
             refresh_seconds=self.interval_seconds,
+            viewport_rows=max(1, available_height),
         )
         if self.error is not None:
             renderable = Group(
