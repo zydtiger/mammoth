@@ -24,6 +24,7 @@ from typing import Any, Literal
 
 from mammoth.core import (
     ExecutionContext,
+    GroupLayout,
     LogicalRunLease,
     RunLayout,
     claim_logical_run_lease,
@@ -42,6 +43,15 @@ from mammoth.core.execution import (
     INVOCATION_KIND_ENV,
     PHASE_ENV,
     RUN_NAME_ENV,
+)
+from mammoth.core.groups import (
+    GroupEventName,
+    GroupEventWriter,
+    GroupManifest,
+    GroupMember,
+    freeze_group_metadata,
+    publish_group_manifest,
+    thaw_group_metadata,
 )
 from mammoth.logging import JsonlEventSink, RunObserver
 from mammoth.workflow.launch import CommandPlan, Launcher, ProcessResult, launch_process
@@ -250,11 +260,18 @@ class RunResult:
 
 @dataclass(frozen=True, slots=True)
 class WorkflowResult:
-    """Structured terminal outcome for one :meth:`Workflow.run` invocation."""
+    """Structured terminal outcome for one :meth:`Workflow.run` invocation.
+
+    ``group_id`` names the entry-level group manifest and event stream
+    published under ``<root>/.mammoth/groups/<group_id>/`` (see
+    :class:`~mammoth.core.layout.GroupLayout`). It is ``None`` only when no run
+    ever activated, for example a signal caught before the first run's setup.
+    """
 
     runs: tuple[RunResult, ...]
     dispatch: tuple[DispatchResult, ...]
     exit_code: int
+    group_id: str | None = None
 
     @property
     def successful(self) -> bool:
@@ -293,6 +310,7 @@ class Workflow:
     order: WorkflowOrder = "run-major"
     step_order: Sequence[str] | None = None
     launcher: Launcher | None = field(default=None, compare=False, repr=False)
+    group_metadata: Mapping[str, Any] = field(default_factory=dict)
     _dispatch: tuple[tuple[Run, Step], ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -321,6 +339,7 @@ class Workflow:
             object.__setattr__(self, "step_order", order)
         if self.launcher is not None and not callable(self.launcher):
             raise ValueError("Workflow launcher must be callable or None")
+        object.__setattr__(self, "group_metadata", freeze_group_metadata(self.group_metadata))
         object.__setattr__(self, "_dispatch", _derive_dispatch(self))
 
     def plan(self) -> tuple[CommandPlan, ...]:
@@ -361,6 +380,8 @@ class _ActiveRun:
     context: ExecutionContext
     observer: RunObserver
     event_writer: ExecutionEventWriter
+    group_writer: GroupEventWriter | None = None
+    group_run_event_emitted: bool = False
     before_first_step_done: bool = False
     failure_reason: str | None = None
     terminal_result: RunResult | None = None
@@ -382,8 +403,25 @@ class _PendingStep:
     step: Step
     phase_started: bool = False
     task_started: bool = False
+    group_step_emitted: bool = False
     result: StepResult | None = None
     registered: bool = False
+
+
+@dataclass(slots=True)
+class _GroupState:
+    """Executor-owned entry-level group resources, published lazily.
+
+    A :class:`Workflow` publishes at most one group manifest and opens at most
+    one group event stream per :meth:`Workflow.run` invocation, on demand the
+    first time any run activates. ``writer`` stays ``None`` when no run ever
+    activates (for example a signal caught during setup), so no group
+    artifacts exist for that invocation.
+    """
+
+    published: bool = False
+    manifest: GroupManifest | None = None
+    writer: GroupEventWriter | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,6 +491,96 @@ def _derive_dispatch(workflow: Workflow) -> tuple[tuple[Run, Step], ...]:
     )
 
 
+_GROUP_STEP_EVENT_BY_OUTCOME: dict[StepOutcome, GroupEventName] = {
+    "completed": "step_completed",
+    "failed": "step_failed",
+    "interrupted": "step_interrupted",
+}
+_GROUP_RUN_EVENT_BY_OUTCOME: dict[RunOutcome, GroupEventName] = {
+    "completed": "run_completed",
+    "failed": "run_failed",
+    "blocked": "run_blocked",
+    "interrupted": "run_interrupted",
+}
+
+
+def _ensure_group_published(group: _GroupState, workflow: Workflow) -> None:
+    """Publish the group manifest and open its event stream exactly once."""
+    if group.published:
+        return
+    members = tuple(
+        GroupMember(run.name, tuple(step.name for step in run.steps)) for run in workflow.runs
+    )
+    manifest = publish_group_manifest(
+        workflow.root,
+        order=workflow.order,
+        members=members,
+        metadata=thaw_group_metadata(workflow.group_metadata),
+    )
+    layout = GroupLayout(workflow.root, manifest.group_id)
+    writer = GroupEventWriter(layout.events_path, group_id=manifest.group_id)
+    writer.emit("group_started")
+    group.published = True
+    group.manifest = manifest
+    group.writer = writer
+
+
+def _emit_group_step_terminal(active: _ActiveRun, step: Step, result: StepResult) -> None:
+    """Best-effort record one step's terminal outcome on the group event stream."""
+    if active.group_writer is None:
+        return
+    fields: dict[str, Any] = {"run_name": active.run.name, "step_name": step.name}
+    if result.reason is not None:
+        fields["message"] = result.reason
+    if result.outcome == "interrupted" and result.signal is not None:
+        fields["signal"] = result.signal
+    active.group_writer.emit(_GROUP_STEP_EVENT_BY_OUTCOME[result.outcome], **fields)
+
+
+def _emit_group_run_terminal(active: _ActiveRun) -> None:
+    """Best-effort record one run's terminal outcome on the group event stream."""
+    if active.group_writer is None or active.terminal_result is None:
+        return
+    result = active.terminal_result
+    fields: dict[str, Any] = {"run_name": active.run.name}
+    if result.reason is not None:
+        fields["message"] = result.reason
+    active.group_writer.emit(_GROUP_RUN_EVENT_BY_OUTCOME[result.outcome], **fields)
+
+
+def _finalize_group(
+    group: _GroupState,
+    *,
+    first_failure: _Failure | None,
+    original_error: BaseException | None,
+    cleanup_error: BaseException | None,
+) -> None:
+    """Record one terminal group status and close the writer on every exit path.
+
+    Called from the outer ``finally`` block after run finalization settles, so
+    this runs whether ``Workflow.run()`` is about to return a structured result
+    or re-raise ``original_error``/``cleanup_error``. ``GroupEventWriter`` never
+    raises, so this never masks or replaces the workflow's own outcome.
+    """
+    writer = group.writer
+    if writer is None:
+        return
+    if original_error is not None or cleanup_error is not None:
+        error = original_error if original_error is not None else cleanup_error
+        assert error is not None
+        writer.emit("group_failed", message=f"{type(error).__name__}: {error}")
+    elif first_failure is not None and first_failure.workflow_interruption:
+        fields: dict[str, Any] = {"message": first_failure.reason}
+        if first_failure.signal is not None:
+            fields["signal"] = first_failure.signal
+        writer.emit("group_interrupted", **fields)
+    elif first_failure is not None:
+        writer.emit("group_failed", message=first_failure.reason)
+    else:
+        writer.emit("group_completed")
+    writer.close()
+
+
 def _run_workflow(
     workflow: Workflow,
     *,
@@ -469,6 +597,7 @@ def _run_workflow(
     cleanup_error: BaseException | None = None
     finalization_errors: list[tuple[str, BaseException]] = []
     run_results: tuple[RunResult, ...] = ()
+    group = _GroupState()
 
     with _interruption_signals() as interruption_state:
         try:
@@ -484,6 +613,7 @@ def _run_workflow(
                         run,
                         active,
                         invocation_command=invocation_command,
+                        group=group,
                     )
                 hook_failure = _run_before_first_step(current)
                 if hook_failure is not None:
@@ -557,6 +687,13 @@ def _run_workflow(
                 except BaseException as error:
                     cleanup_error = error
                 break
+            with _blocked_interruption_signals(deliver_deferred=False):
+                _finalize_group(
+                    group,
+                    first_failure=first_failure,
+                    original_error=original_error,
+                    cleanup_error=cleanup_error,
+                )
 
     if original_error is not None:
         if cleanup_error is not None:
@@ -571,6 +708,7 @@ def _run_workflow(
         runs=run_results,
         dispatch=tuple(dispatch_results),
         exit_code=0 if first_failure is None else first_failure.exit_code,
+        group_id=group.manifest.group_id if group.manifest is not None else None,
     )
 
 
@@ -580,12 +718,14 @@ def _start_run(
     active: dict[str, _ActiveRun],
     *,
     invocation_command: tuple[str, ...],
+    group: _GroupState,
 ) -> _ActiveRun:
     """Prepare layout/lease, resolve execution, and publish immutable metadata."""
     current: _ActiveRun | None = None
     lease: LogicalRunLease | None = None
     try:
         with _blocked_interruption_signals():
+            _ensure_group_published(group, workflow)
             layout = _layout_for(workflow, run).prepare()
             lease = claim_logical_run_lease(layout.run_dir)
             previous_execution_id = latest_execution_id(layout.run_dir)
@@ -635,9 +775,12 @@ def _start_run(
                 context,
                 observer,
                 event_writer,
+                group_writer=group.writer,
             )
             active[run.name] = current
             observer.emit("execution_started")
+            if current.group_writer is not None:
+                current.group_writer.emit("run_started", run_name=run.name)
         return current
     except BaseException as original_error:
         if current is None and lease is not None:
@@ -700,6 +843,9 @@ def _execute_step(
             command=command,
         )
         pending.task_started = True
+        if active.group_writer is not None:
+            active.group_writer.emit("step_started", run_name=active.run.name, step_name=step.name)
+        pending.group_step_emitted = True
     environment = _child_environment(active, step, base_environment)
     launch = launcher if launcher is not None else launch_process
     try:
@@ -721,6 +867,8 @@ def _execute_step(
     with _blocked_interruption_signals():
         _emit_step_terminal(active, step, result)
         pending.result = result
+        if pending.group_step_emitted:
+            _emit_group_step_terminal(active, step, result)
     return result
 
 
@@ -871,6 +1019,8 @@ def _finish_pending_interruption(pending: _PendingStep, signal_number: int) -> S
             )
         if pending.phase_started:
             pending.active.observer.emit("phase_failed", **fields)
+        if pending.group_step_emitted:
+            _emit_group_step_terminal(pending.active, pending.step, result)
     pending.result = result
     return result
 
@@ -969,6 +1119,9 @@ def _finalize_runs(
                             current.terminal_result = terminal_result
             if current.terminal_result is None:
                 continue
+            if not current.group_run_event_emitted:
+                current.group_run_event_emitted = True
+                _emit_group_run_terminal(current)
             if not current.observer_closed and not current.observer_close_failed:
                 stage_error: BaseException | None = None
                 try:

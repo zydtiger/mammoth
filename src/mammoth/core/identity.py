@@ -13,10 +13,12 @@ from pathlib import Path
 
 RUN_NAME_MAX_LENGTH = 255
 EXECUTION_ID_MAX_LENGTH = 128
+GROUP_ID_MAX_LENGTH = 128
 DERIVED_RUN_NAME_DIGEST_LENGTH = 8
 
 _RUN_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _EXECUTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_GROUP_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _DERIVED_STEM_UNSAFE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 _DERIVED_STEM_MAX_LENGTH = 64
 
@@ -51,6 +53,27 @@ def validate_execution_id(execution_id: str) -> str:
             "or digit, and may not be '.' or '..'."
         )
     return execution_id
+
+
+def validate_group_id(group_id: str) -> str:
+    """Return a safe workflow-group identifier.
+
+    Group IDs share their filesystem-safe syntax with execution IDs so both
+    identities resolve safely beneath their respective entry-scoped and
+    run-scoped directories.
+    """
+    if (
+        not isinstance(group_id, str)
+        or len(group_id) > GROUP_ID_MAX_LENGTH
+        or group_id in {".", ".."}
+        or _GROUP_ID_PATTERN.fullmatch(group_id) is None
+    ):
+        raise ValueError(
+            "Group IDs must be 1-128 filesystem-safe ASCII characters using "
+            "letters, digits, '.', '_', or '-', must begin with a letter or "
+            "digit, and may not be '.' or '..'."
+        )
+    return group_id
 
 
 def derive_run_name(prefix: str, target_path: str | Path) -> str:
