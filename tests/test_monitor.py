@@ -8,6 +8,7 @@ from itertools import count
 from pathlib import Path
 
 from rich.console import Console
+from textual.widgets import Static
 from typer.testing import CliRunner
 
 from mammoth.cli import app
@@ -51,6 +52,17 @@ from mammoth.monitor.textual_ui import (
     RunScreen,
     run_fleet_textual,
 )
+
+
+def _static_content(static: Static) -> object:
+    """Return the Rich renderable last passed to a Static widget's ``update``.
+
+    Static exposes no public accessor for its current content; reading the
+    same private, name-mangled attribute ``update`` writes lets a windowing
+    test inspect exactly what a screen rendered without duplicating layout
+    logic.
+    """
+    return static._Static__content
 
 
 def create_context(
@@ -1256,5 +1268,198 @@ def test_fleet_textual_run_screen_receives_the_fleet_apps_shared_sampler(
             await pilot.pause()
             assert isinstance(app.screen, RunScreen)
             assert app.screen.telemetry_sampler is fake_sampler
+
+    asyncio.run(exercise())
+
+
+def test_fleet_dashboard_layout_windows_loose_runs_around_the_selection(tmp_path: Path) -> None:
+    """Regression for the fleet-view overflow defect: window, don't dump everything.
+
+    With 20 loose runs and a viewport too small to show them all, only a
+    band around the selected row renders, bounded by "N more above/below"
+    markers instead of every row overflowing the terminal.
+    """
+    entry = tmp_path / "runs"
+    for index in range(20):
+        RunLayout(entry, f"run-{index:02d}").prepare()
+    snapshot = FleetMonitor(entry).poll()
+
+    console = Console(width=120, record=True, color_system=None)
+    console.print(
+        fleet_dashboard_layout(
+            snapshot,
+            selected_index=10,
+            compact=False,
+            now=datetime.now(UTC),
+            viewport_rows=20,
+        )
+    )
+    rendered = console.export_text()
+
+    assert "run-10" in rendered
+    assert "run-00" not in rendered
+    assert "run-19" not in rendered
+    assert "6 more above" in rendered
+    assert "5 more below" in rendered
+
+
+def test_fleet_dashboard_layout_reaches_first_and_last_rows_without_a_dangling_marker(
+    tmp_path: Path,
+) -> None:
+    entry = tmp_path / "runs"
+    for index in range(20):
+        RunLayout(entry, f"run-{index:02d}").prepare()
+    snapshot = FleetMonitor(entry).poll()
+
+    def rendered_for(selected_index: int) -> str:
+        console = Console(width=120, record=True, color_system=None)
+        console.print(
+            fleet_dashboard_layout(
+                snapshot,
+                selected_index=selected_index,
+                compact=False,
+                now=datetime.now(UTC),
+                viewport_rows=20,
+            )
+        )
+        return console.export_text()
+
+    first = rendered_for(0)
+    assert "run-00" in first
+    assert "more above" not in first
+    assert "11 more below" in first
+
+    last = rendered_for(19)
+    assert "run-19" in last
+    assert "more below" not in last
+    assert "11 more above" in last
+
+
+def test_group_dashboard_layout_windows_members_around_the_selection(tmp_path: Path) -> None:
+    entry = tmp_path / "runs"
+    manifest = publish_group_manifest(
+        entry,
+        order="run-major",
+        members=[GroupMember(f"member-{index:02d}", ("prepare",)) for index in range(20)],
+    )
+    snapshot = FleetMonitor(entry).poll()
+    group = snapshot.groups[0]
+    assert group.group_id == manifest.group_id
+
+    console = Console(width=120, record=True, color_system=None)
+    console.print(
+        group_dashboard_layout(
+            group,
+            selected_index=10,
+            compact=False,
+            now=datetime.now(UTC),
+            viewport_rows=20,
+        )
+    )
+    rendered = console.export_text()
+
+    assert "member-10" in rendered
+    assert "member-00" not in rendered
+    assert "member-19" not in rendered
+    assert "5 more above" in rendered
+    assert "4 more below" in rendered
+
+
+def test_fleet_textual_windows_many_loose_runs_and_keeps_selection_visible(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: a small terminal windows the fleet screen and j/k reach both ends."""
+    entry = tmp_path / "runs"
+    for index in range(40):
+        RunLayout(entry, f"run-{index:03d}").prepare()
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    def rendered_text() -> str:
+        body = app.screen.query_one("#body", Static)
+        console = Console(width=120, record=True, color_system=None)
+        console.print(_static_content(body))
+        return console.export_text()
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 16)) as pilot:
+            await pilot.pause()
+            rows = fleet_rows(app.screen.snapshot)
+            last_index = len(rows) - 1
+
+            text = rendered_text()
+            assert "run-000" in text
+            assert "more above" not in text
+            assert "more below" in text
+
+            for _ in range(last_index + 5):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == last_index
+            text = rendered_text()
+            assert "run-039" in text
+            assert "more below" not in text
+
+            for _ in range(last_index + 5):
+                await pilot.press("k")
+            await pilot.pause()
+            assert app.screen.selected_index == 0
+            text = rendered_text()
+            assert "run-000" in text
+            assert "more above" not in text
+
+    asyncio.run(exercise())
+
+
+def test_group_textual_windows_many_members_and_keeps_selection_visible(
+    tmp_path: Path,
+) -> None:
+    entry = tmp_path / "runs"
+    manifest = publish_group_manifest(
+        entry,
+        order="run-major",
+        members=[GroupMember(f"member-{index:03d}", ("prepare",)) for index in range(40)],
+    )
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(
+        entry,
+        fleet_monitor,
+        fleet_monitor.poll(),
+        watch=False,
+        telemetry=False,
+        open_group_id=manifest.group_id,
+    )
+
+    def rendered_text() -> str:
+        body = app.screen.query_one("#body", Static)
+        console = Console(width=120, record=True, color_system=None)
+        console.print(_static_content(body))
+        return console.export_text()
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 16)) as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, GroupScreen)
+
+            text = rendered_text()
+            assert "member-000" in text
+            assert "more above" not in text
+            assert "more below" in text
+
+            for _ in range(45):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == 39
+            text = rendered_text()
+            assert "member-039" in text
+            assert "more below" not in text
+
+            for _ in range(45):
+                await pilot.press("k")
+            await pilot.pause()
+            assert app.screen.selected_index == 0
+            text = rendered_text()
+            assert "member-000" in text
+            assert "more above" not in text
 
     asyncio.run(exercise())

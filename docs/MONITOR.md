@@ -90,6 +90,16 @@ reconstruction:
    navigation (`Esc`/`Backspace`) pops the Textual screen stack and returns to
    the fleet or group view the operator drilled in from.
 
+Both the fleet screen (its groups table and its loose-runs table
+independently) and the group screen window their row table to the terminal's
+actual height instead of rendering every row unconditionally: the table
+scrolls to keep the `j`/`k`-selected row visible, showing a band of rows
+around the selection with "... N more above ..." / "... N more below ..."
+markers in place of the rows that do not fit. `j`/`k` still walk the entire
+row set — every group and loose run on the fleet screen, every member on the
+group screen — not only the currently visible band. Plain-mode snapshot
+rendering is unaffected: it keeps printing every row unconditionally.
+
 `mammoth monitor <run_name>` without `--group` or `--match` is unaffected by
 any of this: it keeps its original single-run behavior exactly, entering
 directly at the run view with no fleet or group screen beneath it.
