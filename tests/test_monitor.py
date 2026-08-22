@@ -358,6 +358,91 @@ def _assert_snapshot_equivalent(incremental: object, oracle: object) -> None:
     assert incremental.events == tuple(event for event in oracle.events if event.is_terminal)
 
 
+def _iso_clock(*values: str) -> Callable[[], str]:
+    """Return a callable yielding ``values`` in order, one per call.
+
+    Pins exact event timestamps through ``ExecutionEventWriter``'s
+    ``utc_clock`` option, decoupled from real wall-clock write order — lets a
+    test simulate a writer whose flush is delayed (or whose host clock is
+    skewed) relative to another producer's writer.
+    """
+    iterator = iter(values)
+    return lambda: next(iterator)
+
+
+def test_incremental_fold_matches_full_fold_under_cross_producer_visibility_skew(
+    tmp_path: Path,
+) -> None:
+    """P1-2 regression.
+
+    A later poll can make a chronologically-earlier event (from a different
+    producer) visible only after a chronologically-later event was already
+    applied from an earlier poll: a stalled writer flush or cross-host clock
+    skew, not merely poll timing. ``ExecutionMonitor.poll`` sorts only each
+    poll's own newly read events among themselves and applies them after
+    everything already folded, so a naive append/overwrite would record
+    rank 1's chronologically-earlier point after rank 0's, diverging from
+    the full re-fold. This must be equivalent regardless.
+    """
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z", world_size=2)
+    monitor = ExecutionMonitor(layout, "attempt")
+
+    rank0 = ExecutionEventWriter.for_process(
+        context,
+        rank=0,
+        world_size=2,
+        utc_clock=_iso_clock("2026-01-01T00:00:00Z", "2026-01-01T00:03:20Z"),
+    )
+    rank1 = ExecutionEventWriter.for_process(
+        context,
+        rank=1,
+        world_size=2,
+        utc_clock=_iso_clock("2026-01-01T00:00:50Z"),
+    )
+
+    rank0.emit("process_started", phase="train")
+    rank0.emit_progress(
+        phase="train",
+        task_id="epoch",
+        completed=1,
+        total=10,
+        final=True,
+        display_metrics={"loss": 9.0},
+    )
+
+    # First poll observes only rank 0 so far: its T+200 metric point is
+    # applied now, well before rank 1's chronologically-earlier T+50 point
+    # ever becomes visible.
+    monitor.poll()
+
+    # rank 1's event is only written now (visible in a later poll), but its
+    # own timestamp (T+50) precedes rank 0's already-applied T+200 event.
+    rank1.emit_progress(
+        phase="train",
+        task_id="epoch",
+        completed=1,
+        total=10,
+        final=True,
+        display_metrics={"loss": 1.0},
+    )
+
+    incremental = monitor.poll()
+    oracle = _oracle_snapshot(layout, context)
+    _assert_snapshot_equivalent(incremental, oracle)
+
+    # Pin the concrete ordering this regression is about: true event-time
+    # order, not application/visibility order.
+    assert [point.time.isoformat() for point in oracle.metric_history["loss"]] == [
+        "2026-01-01T00:00:50+00:00",
+        "2026-01-01T00:03:20+00:00",
+    ]
+    assert [point.value for point in incremental.metric_history["loss"]] == [1.0, 9.0]
+
+    rank0.close()
+    rank1.close()
+
+
 def _run_incremental_equivalence_case(
     tmp_path: Path,
     *,

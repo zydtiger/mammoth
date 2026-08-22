@@ -164,6 +164,12 @@ class MonitorSnapshot:
     lineage: tuple[str, ...] = ()
     warnings: list[str] = field(default_factory=list)
     events: tuple[ExecutionEvent, ...] = ()
+    _phase_keys: dict[str, tuple[datetime, str, int, int]] = field(
+        default_factory=dict, compare=False, repr=False
+    )
+    _metric_keys: dict[str, list[tuple[datetime, str, int, int]]] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
     @property
     def execution_id(self) -> str:
@@ -425,9 +431,62 @@ def fold_events(
     return snapshot
 
 
+def _apply_if_newer(
+    watermarks: dict[str, tuple[datetime, str, int, int]],
+    values: dict[str, ScopeStatus],
+    name: str,
+    value: ScopeStatus,
+    key: tuple[datetime, str, int, int],
+) -> None:
+    """Overwrite ``values[name]`` only if ``key`` is newer than its watermark.
+
+    Keeps a cross-producer "true event order, last writer wins" register
+    order-independent of *application* order: incremental folding applies
+    each poll's newly read events sorted only among themselves, so a value
+    shared across producers (a phase name multiple ranks or the runner can
+    all touch) can otherwise see a chronologically-earlier event applied
+    after a chronologically-later one already applied from an earlier poll
+    (clock skew or a stalled writer flush can make an earlier-timestamped
+    event become readable only later). Full folding's already-globally-
+    sorted input always advances this watermark forward, so this adds no
+    observable behavior there, only a cheap comparison.
+    """
+    if name not in watermarks or key > watermarks[name]:
+        watermarks[name] = key
+        values[name] = value
+
+
+def _insert_metric_point(
+    history: dict[str, list[MetricPoint]],
+    keys: dict[str, list[tuple[datetime, str, int, int]]],
+    name: str,
+    point: MetricPoint,
+    key: tuple[datetime, str, int, int],
+) -> None:
+    """Insert ``point`` at its correct chronological position for ``name``.
+
+    Appends in the common case (O(1)): points normally arrive already in
+    order, including under full folding's pre-sorted input. Falls back to a
+    positional insert only when a point turns out older than the newest one
+    already recorded for this metric — the same cross-producer visibility-
+    order issue :func:`_apply_if_newer` guards against, but for an ordered
+    history list rather than one current value.
+    """
+    points = history.setdefault(name, [])
+    point_keys = keys.setdefault(name, [])
+    if not point_keys or key >= point_keys[-1]:
+        points.append(point)
+        point_keys.append(key)
+        return
+    position = bisect.bisect_right(point_keys, key)
+    points.insert(position, point)
+    point_keys.insert(position, key)
+
+
 def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
     """Apply one validated observation to an existing snapshot."""
     observed_at = parse_time(event.time)
+    sort_key = _event_sort_key(event)
     producer_key = ProducerKey(event.source, event.rank)
     producer = snapshot.producers.setdefault(producer_key, ProducerState(producer_key))
     producer.sequence = event.sequence
@@ -464,9 +523,17 @@ def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
 
     if event.phase is not None:
         if event.event == "phase_started":
-            snapshot.phases[event.phase] = "running"
+            _apply_if_newer(
+                snapshot._phase_keys, snapshot.phases, event.phase, "running", sort_key
+            )
         elif event.event in _TERMINAL_SCOPE_STATUS and event.event.startswith("phase_"):
-            snapshot.phases[event.phase] = _TERMINAL_SCOPE_STATUS[event.event]
+            _apply_if_newer(
+                snapshot._phase_keys,
+                snapshot.phases,
+                event.phase,
+                _TERMINAL_SCOPE_STATUS[event.event],
+                sort_key,
+            )
 
     if event.task_id is not None:
         task_key = (producer_key, event.task_id)
@@ -502,8 +569,12 @@ def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
     if event.display_metrics:
         coordinates = combined_coordinates(event)
         for name, value in event.display_metrics.items():
-            snapshot.metric_history.setdefault(name, []).append(
-                MetricPoint(observed_at, value, producer_key, coordinates)
+            _insert_metric_point(
+                snapshot.metric_history,
+                snapshot._metric_keys,
+                name,
+                MetricPoint(observed_at, value, producer_key, coordinates),
+                sort_key,
             )
 
 
@@ -582,15 +653,25 @@ class ExecutionMonitor:
     (:attr:`~mammoth.core.events.ExecutionEvent.is_terminal`) are kept, in
     :attr:`MonitorSnapshot.events`, since that is the only subset any reader
     of that field consumes (:meth:`MonitorSnapshot.terminal_event_time` and
-    the dashboard's phase-history and terminal-event rendering). Each poll's
-    newly read events, across every stream, are sorted among themselves
-    before being applied, then applied strictly after everything already
-    folded — matching :func:`fold_events`'s full-history fold exactly for
-    the realistic case this reader's flush-per-write, read-every-available-
-    byte-per-poll contract guarantees: an event only becomes readable once
-    its write has completed, so a later poll cannot make visible an event
-    that predates (in the same total order) one already applied from an
-    earlier poll of the same or another stream of this same execution.
+    the dashboard's phase-history and terminal-event rendering).
+
+    Each poll's newly read events, across every stream, are sorted among
+    themselves before being applied, then applied after everything already
+    folded — but *application* order is not the same as *event-time* order
+    across producers: a later poll can make a chronologically-earlier event
+    visible only after a chronologically-later event from a different
+    producer was already applied from an earlier poll (a stalled writer
+    flush or cross-host clock skew, not merely a slow poller). Fields scoped
+    to one producer or one producer's task are unaffected regardless — each
+    producer's own stream is always read and applied in that producer's own
+    strict order, matching :func:`fold_events` exactly no matter how polls
+    are batched. Fields a phase name or a metric name can share *across*
+    producers (:attr:`MonitorSnapshot.phases`, :attr:`MonitorSnapshot.
+    metric_history`) apply each event only if it is newer, by true event
+    order, than whatever last set that name (see ``_apply_if_newer`` /
+    ``_insert_metric_point``), which is what keeps those exactly equivalent
+    to a full re-fold regardless of poll batching — not merely appending or
+    overwriting in the order events happened to become visible.
 
     ``tail_window_bytes``, when set, bounds only the *first* read of each
     underlying stream (see
