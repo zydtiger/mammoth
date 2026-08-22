@@ -9,7 +9,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from mammoth.core.identity import validate_execution_id, validate_group_id, validate_run_name
+from mammoth.core.identity import (
+    validate_device_spec,
+    validate_execution_id,
+    validate_group_id,
+    validate_run_name,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,4 +120,67 @@ class GroupLayout:
     def prepare(self) -> GroupLayout:
         """Create the stable group directory without creating manifest or events."""
         self.group_dir.mkdir(parents=True, exist_ok=True)
+        return self
+
+
+@dataclass(frozen=True, slots=True)
+class QueueLayout:
+    """Resolve the stable ``<entry>/.mammoth/queue`` device-aware job queue contract.
+
+    The queue is an optional entry-level spool sharing :class:`GroupLayout`'s
+    ``.mammoth/`` root. It is produced and consumed only by
+    :mod:`mammoth.queue`; nothing elsewhere requires it to exist, and an entry
+    that never queued a job remains fully valid without a ``.mammoth/queue/``
+    subtree. See ``docs/ARCHITECTURE.md`` for the full spool and lease
+    contract this layout resolves paths for.
+    """
+
+    entry: Path
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "entry", Path(self.entry))
+
+    @property
+    def queue_root(self) -> Path:
+        """Return the entry-level container for the job queue."""
+        return self.entry / ".mammoth" / "queue"
+
+    @property
+    def pending_dir(self) -> Path:
+        """Return the directory holding unclaimed job spool files, FIFO by filename."""
+        return self.queue_root / "pending"
+
+    @property
+    def claimed_dir(self) -> Path:
+        """Return the directory holding every lane's claimed-job subdirectory."""
+        return self.queue_root / "claimed"
+
+    def claimed_lane_dir(self, device: str) -> Path:
+        """Return one device lane's claimed-job subdirectory."""
+        return self.claimed_dir / validate_device_spec(device)
+
+    @property
+    def lanes_dir(self) -> Path:
+        """Return the directory holding per-device exclusive lease files."""
+        return self.queue_root / "lanes"
+
+    def lane_lease_path(self, device: str) -> Path:
+        """Return one device lane's exclusive lease-file path."""
+        return self.lanes_dir / f"{validate_device_spec(device)}.lock"
+
+    @property
+    def journal_path(self) -> Path:
+        """Return the append-only completion-journal path."""
+        return self.queue_root / "journal.jsonl"
+
+    @property
+    def sequence_lock_path(self) -> Path:
+        """Return the monotonic submission-sequence counter's lease file."""
+        return self.queue_root / ".sequence.lock"
+
+    def prepare(self) -> QueueLayout:
+        """Create the stable queue, pending, claimed, and lane directories."""
+        self.pending_dir.mkdir(parents=True, exist_ok=True)
+        self.claimed_dir.mkdir(parents=True, exist_ok=True)
+        self.lanes_dir.mkdir(parents=True, exist_ok=True)
         return self

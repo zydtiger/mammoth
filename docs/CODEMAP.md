@@ -38,6 +38,10 @@ src/mammoth/
 │   ├── rich_ui.py
 │   ├── telemetry.py
 │   └── textual_ui.py
+├── queue/
+│   ├── __init__.py
+│   ├── serve.py
+│   └── spool.py
 ├── workflow/
 │   ├── __init__.py
 │   ├── launch.py
@@ -62,7 +66,8 @@ src/mammoth/
 | Import path | Symbols |
 | --- | --- |
 | `mammoth` | `__version__` |
-| `mammoth.core` | `RunLayout`, `ExecutionContext`, `ExecutionMetadata`, `LogicalRunLease`, unitless `ExecutionEvent` and `ExecutionEventWriter` APIs with schema-v1 legacy-unit reading, `ExecutionEventTailReader`, `ExecutionEventReadError`, `BoundedBackgroundPipeline`, typed background submissions/results, attributed background failures, `ArtifactReceipt`, `inspect_artifact`, `verify_artifact`, descriptor-bound `ArtifactReadSession` / `open_artifact_session` parsing, atomic and prepared artifact publication helpers, high-level `TransactionArtifactSpec` / `build_artifact_transaction_plan` plus exclusive file and directory staging helpers, and retained low-level `ArtifactTransactionPlan` / `TransactionArtifact` planning, sealing, per-root leasing, local publication, coordinated journal recovery with an optional `missing_ok` no-journal outcome, a `transaction_journal_exists` convenience, and typed result APIs for several local file or directory targets across declared non-overlapping roots; explicit-only execution lifecycle functions, event readers, sanitizers, resume-checkpoint SHA-256 validation, `is_immutable_log_entry` consumer-facing immutable-log-entry classification, identity validators, `validate_group_id`, and `derive_run_name` stable path-derived run-name construction; canonical workflow-child contract constants `EXECUTION_ID_ENV`, `RUN_NAME_ENV`, `INVOCATION_KIND_ENV`, `PHASE_ENV`, `LOGICAL_RUN_LEASE_FILENAME`, `EventName`, and `EXECUTION_EVENT_SCHEMA_VERSION`; optional entry-level `GroupLayout` path resolution, `GroupManifest` / `GroupMember` immutable group provenance, `generate_group_id`, `publish_group_manifest` / `load_group_manifest` atomic manifest publication and reload, schema-v1-style `GroupEvent` / `GroupEventWriter` / `read_group_events` append-only group event streams, incremental `GroupEventTailReader` / `GroupEventReadError` group-event tailing, and the `GROUP_SCHEMA_VERSION` / `GROUP_EVENT_SCHEMA_VERSION` / `GroupEventName` constants; framework-neutral recoverable chunked `WorkStoreSession` claim/commit/verify/cleanup lifecycle with verified-journal `completed_chunk_ids` / `completed_chunks` chunk-ID-to-marker read-back, `claim_work_store_lease`, `inspect_work_store` fail-closed prior-state classification (`WorkStoreInspection` with the same `completed_chunk_ids` / `completed_chunks` read-back, `WorkStoreStatus`), `cleanup_work_store`, the `mammoth-work-store-jsonl-v1` journal format constants, and the `WorkStoreError` family |
+| `mammoth.core` | `RunLayout`, `ExecutionContext`, `ExecutionMetadata`, `LogicalRunLease`, unitless `ExecutionEvent` and `ExecutionEventWriter` APIs with schema-v1 legacy-unit reading, `ExecutionEventTailReader`, `ExecutionEventReadError`, `BoundedBackgroundPipeline`, typed background submissions/results, attributed background failures, `ArtifactReceipt`, `inspect_artifact`, `verify_artifact`, descriptor-bound `ArtifactReadSession` / `open_artifact_session` parsing, atomic and prepared artifact publication helpers, high-level `TransactionArtifactSpec` / `build_artifact_transaction_plan` plus exclusive file and directory staging helpers, and retained low-level `ArtifactTransactionPlan` / `TransactionArtifact` planning, sealing, per-root leasing, local publication, coordinated journal recovery with an optional `missing_ok` no-journal outcome, a `transaction_journal_exists` convenience, and typed result APIs for several local file or directory targets across declared non-overlapping roots; explicit-only execution lifecycle functions, event readers, sanitizers, resume-checkpoint SHA-256 validation, `is_immutable_log_entry` consumer-facing immutable-log-entry classification, identity validators, `validate_group_id`, and `derive_run_name` stable path-derived run-name construction; canonical workflow-child contract constants `EXECUTION_ID_ENV`, `RUN_NAME_ENV`, `INVOCATION_KIND_ENV`, `PHASE_ENV`, `LOGICAL_RUN_LEASE_FILENAME`, `EventName`, and `EXECUTION_EVENT_SCHEMA_VERSION`; optional entry-level `GroupLayout` path resolution, `GroupManifest` / `GroupMember` immutable group provenance, `generate_group_id`, `publish_group_manifest` / `load_group_manifest` atomic manifest publication and reload, schema-v1-style `GroupEvent` / `GroupEventWriter` / `read_group_events` append-only group event streams, incremental `GroupEventTailReader` / `GroupEventReadError` group-event tailing, and the `GROUP_SCHEMA_VERSION` / `GROUP_EVENT_SCHEMA_VERSION` / `GroupEventName` constants; framework-neutral recoverable chunked `WorkStoreSession` claim/commit/verify/cleanup lifecycle with verified-journal `completed_chunk_ids` / `completed_chunks` chunk-ID-to-marker read-back, `claim_work_store_lease`, `inspect_work_store` fail-closed prior-state classification (`WorkStoreInspection` with the same `completed_chunk_ids` / `completed_chunks` read-back, `WorkStoreStatus`), `cleanup_work_store`, the `mammoth-work-store-jsonl-v1` journal format constants, and the `WorkStoreError` family; `validate_device_spec` opaque device-lane identity validation, and optional entry-level `QueueLayout` device-queue path resolution |
+| `mammoth.queue` | `Job`, `JobOutcome`, `JobStatus`, `QueueSnapshot`, `QueueError` family (`JobNotFoundError`, `JobAlreadyClaimedError`), `submit_job`, `list_jobs`, `cancel_job`, `append_job_outcome`, `read_job_journal`, `journal_job_ids`, `load_job`, `job_filename` spool primitives; `DeviceLease`, `DeviceLeaseConflictError`, `claim_device_lease` exclusive per-device leasing; `reconcile_interrupted_jobs`, `serve_once`, `run_serve_loop` FIFO device-lane runner; `QUEUE_SCHEMA_VERSION`, `QUEUE_JOURNAL_SCHEMA_VERSION` |
 | `mammoth.execution` | Immutable `ExecutionSpec` plus context-managed direct `ExecutionSession` creation and strict single-process workflow-child attachment; framework-neutral process/phase lifecycle, observability, generic observer/pipeline ownership, lease/logging cleanup, and terminal-outcome handling; `ExecutionObserver` detached no-op phase/task/progress/heartbeat call surface, its shared `NULL_EXECUTION_OBSERVER` instance, and `SessionExecutionObserver` forwarding the same call surface onto a live session |
 | `mammoth.logging` | `Observation`, `Media`, `ObservationSink`, `RunObserver`, `JsonlEventSink`, `ExecutionObservability`, `ExecutionLogging`, `ProcessTextLogHandler`, `ProcessTextLogLease`, `claim_process_text_log`, `create_execution_observability`, `create_execution_logging`, `create_process_text_handler` |
 | `mammoth.logging.tensorboard` | `TensorBoardSink` |
@@ -74,19 +79,27 @@ src/mammoth/
 
 ```text
 mammoth.cli.app (Typer)
-└── mammoth monitor [RUN_NAME] [--entry] [--group] [--match] ...
-    └── mammoth.cli.run_monitor
-        ├── RUN_NAME given → unchanged single-run route
-        │   ├── redirected/plain → mammoth.monitor.ExecutionMonitor
-        │   └── interactive TTY → mammoth.monitor.RunMonitor
-        │       └── mammoth.monitor.textual_ui.MonitorApp
-        └── RUN_NAME omitted → mammoth.cli._run_fleet_monitor
-            ├── redirected/plain → mammoth.monitor.fleet.FleetMonitor
-            │   └── render_fleet_snapshot / render_group_snapshot (--group)
-            └── interactive TTY → mammoth.monitor.fleet.FleetMonitor
-                └── mammoth.monitor.textual_ui.FleetApp
-                    └── FleetScreen → GroupScreen → RunScreen (screen stack)
-                        └── presentation contract → docs/MONITOR.md
+├── mammoth monitor [RUN_NAME] [--entry] [--group] [--match] ...
+│   └── mammoth.cli.run_monitor
+│       ├── RUN_NAME given → unchanged single-run route
+│       │   ├── redirected/plain → mammoth.monitor.ExecutionMonitor
+│       │   └── interactive TTY → mammoth.monitor.RunMonitor
+│       │       └── mammoth.monitor.textual_ui.MonitorApp
+│       └── RUN_NAME omitted → mammoth.cli._run_fleet_monitor
+│           ├── redirected/plain → mammoth.monitor.fleet.FleetMonitor
+│           │   └── render_fleet_snapshot / render_group_snapshot (--group)
+│           └── interactive TTY → mammoth.monitor.fleet.FleetMonitor
+│               └── mammoth.monitor.textual_ui.FleetApp
+│                   └── FleetScreen → GroupScreen → RunScreen (screen stack)
+│                       └── presentation contract → docs/MONITOR.md
+└── mammoth queue (Typer sub-app)
+    ├── submit → mammoth.queue.submit_job
+    ├── list   → mammoth.queue.list_jobs
+    ├── cancel → mammoth.queue.cancel_job
+    └── serve  → mammoth.queue.run_serve_loop
+        ├── claim_device_lease (exclusive per-device flock)
+        ├── reconcile_interrupted_jobs (fail-closed crash classification)
+        └── serve_once (FIFO claim + mammoth.workflow.launch.launch_process + journal)
 
 caller-owned Python
     └── mammoth.workflow.Workflow
@@ -107,7 +120,11 @@ caller-owned Python
 mammoth
 ├── mammoth.cli
 │   ├── Typer
-│   └── mammoth.monitor
+│   ├── mammoth.monitor
+│   └── mammoth.queue
+├── mammoth.queue
+│   ├── mammoth.core
+│   └── mammoth.workflow (launch_process only)
 ├── mammoth.execution
 │   ├── mammoth.core
 │   └── mammoth.logging
