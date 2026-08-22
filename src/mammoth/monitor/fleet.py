@@ -18,6 +18,7 @@ section rather than an error, matching the monitor's passivity contract.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from fnmatch import fnmatch
@@ -41,6 +42,7 @@ from mammoth.monitor.model import (
     ExecutionMonitor,
     MonitorSnapshot,
     ScopeStatus,
+    parse_time,
     select_execution,
 )
 
@@ -114,6 +116,12 @@ class GroupSnapshot:
     ``manifest`` and ``order`` are ``None`` only for an ad-hoc ``--match``
     cohort, which has no recorded schedule or group event stream; its members
     carry no step schedule and its status is derived from run tails alone.
+
+    ``finished_at`` is the terminal group event's own timestamp, distinct
+    from ``updated_at`` (newest member activity, or manifest creation when no
+    member has one yet): it is ``None`` until a terminal group event is
+    recorded, including for every ad-hoc cohort. :meth:`FleetMonitor.poll`
+    uses ``finished_at or updated_at`` as the fleet view's recency sort key.
     """
 
     group_id: str
@@ -124,6 +132,7 @@ class GroupSnapshot:
     terminal_status: str | None
     created_at: datetime | None
     updated_at: datetime | None
+    finished_at: datetime | None = None
     warnings: tuple[str, ...] = ()
 
     @property
@@ -190,24 +199,69 @@ class GroupSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class LooseRunSnapshot:
-    """Folded state for one run not claimed by any group."""
+    """Folded state for one run not claimed by any group.
+
+    ``finished_at`` is the newest execution's terminal event time, distinct
+    from ``updated_at`` (the newest observed event or heartbeat time); it is
+    ``None`` while the run has not yet reached a terminal outcome, or has no
+    execution tail at all. :meth:`FleetMonitor.poll` uses
+    ``finished_at or updated_at`` as the fleet view's recency sort key.
+    """
 
     run_name: str
     status: MemberStatus
     progress: MemberProgress | None
     updated_at: datetime | None
+    finished_at: datetime | None = None
     warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class FleetSnapshot:
-    """Complete entry-level roll-up: every group plus every loose run."""
+    """Complete entry-level roll-up: every group plus every loose run.
+
+    ``groups`` and ``loose_runs`` are each independently ordered most-recent
+    finish (or, absent one, most-recent activity) first by
+    :meth:`FleetMonitor.poll`; an entry with no usable timestamp in either
+    sorts last, order among those tied on the sort key by name.
+    """
 
     entry: Path
     groups: tuple[GroupSnapshot, ...]
     loose_runs: tuple[LooseRunSnapshot, ...]
     match_pattern: str | None
     warnings: tuple[str, ...] = ()
+
+
+def _sorted_by_recency[Row](
+    rows: Sequence[Row],
+    *,
+    key: Callable[[Row], tuple[datetime | None, datetime | None, str]],
+) -> list[Row]:
+    """Sort rows most-recent-first by ``(finished_at, updated_at, name)``.
+
+    Each row's sort timestamp is ``finished_at`` when recorded, else
+    ``updated_at``. A row with neither sorts last. Ties (including two rows
+    with no timestamp) break on ``name`` so a repeated poll never reshuffles
+    otherwise-equal rows.
+    """
+
+    def sort_key(row: Row) -> tuple[bool, float, str]:
+        finished_at, updated_at, name = key(row)
+        timestamp = finished_at or updated_at
+        if timestamp is None:
+            return (True, 0.0, name)
+        return (False, -timestamp.timestamp(), name)
+
+    return sorted(rows, key=sort_key)
+
+
+def _group_recency_key(group: GroupSnapshot) -> tuple[datetime | None, datetime | None, str]:
+    return (group.finished_at, group.updated_at, group.group_id)
+
+
+def _loose_run_recency_key(run: LooseRunSnapshot) -> tuple[datetime | None, datetime | None, str]:
+    return (run.finished_at, run.updated_at, run.run_name)
 
 
 @dataclass
@@ -348,8 +402,8 @@ class FleetMonitor:
 
         return FleetSnapshot(
             entry=self.entry,
-            groups=tuple(groups),
-            loose_runs=loose_runs,
+            groups=tuple(_sorted_by_recency(groups, key=_group_recency_key)),
+            loose_runs=tuple(_sorted_by_recency(loose_runs, key=_loose_run_recency_key)),
             match_pattern=self.match,
             warnings=tuple(self._warnings),
         )
@@ -398,12 +452,14 @@ def _fold_group(
 ) -> GroupSnapshot:
     """Fold one manifest plus its group event stream into a full group row set."""
     terminal_status: str | None = None
+    terminal_at: datetime | None = None
     started_runs: set[str] = set()
     latest_run_event: dict[str, GroupEvent] = {}
     latest_step_event: dict[tuple[str, str], GroupEvent] = {}
     for event in events:
         if event.event in _TERMINAL_GROUP_EVENT_STATUS:
             terminal_status = _TERMINAL_GROUP_EVENT_STATUS[event.event]
+            terminal_at = parse_time(event.time)
         elif event.event == "run_started" and event.run_name is not None:
             started_runs.add(event.run_name)
         elif event.run_name is not None and event.step_name is not None:
@@ -457,8 +513,9 @@ def _fold_group(
         order=manifest.order,
         members=tuple(members),
         terminal_status=terminal_status,
-        created_at=_parse_manifest_time(manifest.created_at),
-        updated_at=newest_heartbeat or _parse_manifest_time(manifest.created_at),
+        created_at=parse_time(manifest.created_at),
+        updated_at=newest_heartbeat or parse_time(manifest.created_at),
+        finished_at=terminal_at,
         warnings=tuple(warnings),
     )
 
@@ -526,6 +583,7 @@ def _fold_loose_run(
             status="pending",
             progress=None,
             updated_at=None,
+            finished_at=None,
             warnings=(),
         )
     return LooseRunSnapshot(
@@ -533,6 +591,7 @@ def _fold_loose_run(
         status=_tail_status(tail, now, stale_after_seconds),
         progress=_member_progress(tail),
         updated_at=tail.updated_at,
+        finished_at=tail.terminal_event_time,
         warnings=tuple(tail.warnings),
     )
 
@@ -629,10 +688,3 @@ def _step_status(
 ) -> ScopeStatus:
     event = latest_step_event.get((run_name, step_name))
     return _STEP_EVENT_STATUS[event.event] if event is not None else "pending"
-
-
-def _parse_manifest_time(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)

@@ -75,6 +75,16 @@ reconstruction:
    newest member heartbeat's recency and staleness, and the terminal group
    status where one was recorded. An entry with no `.mammoth/` subtree, or no
    runs at all, renders an empty-but-valid fleet rather than an error.
+   Groups and loose runs are each independently ordered most-recent-first:
+   a group's or run's sort timestamp is its terminal event time (the group's
+   own terminal event, or the run's newest execution's terminal event) when
+   one is recorded, otherwise its newest observed activity (member activity
+   for a group, heartbeat for a run) — so a still-active entry sorts by its
+   most recent activity rather than dropping to the bottom. An entry with no
+   usable timestamp at all sorts last; ties break on name so a repeated poll
+   never reshuffles otherwise-equal rows. Plain-mode rendering shows the same
+   order. A group's member rows (see level 2 below) keep their manifest
+   schedule order regardless of this fleet-level ordering.
 2. **Group** (selecting one group from the fleet view, or `--group <id>`
    directly). Shows one row per member run in the group manifest's recorded
    schedule order: each declared step's folded status, the member's overall
@@ -89,6 +99,62 @@ reconstruction:
    single-run dashboard described in the sections below, unchanged. Back
    navigation (`Esc`/`Backspace`) pops the Textual screen stack and returns to
    the fleet or group view the operator drilled in from.
+
+Both the fleet screen (its groups table and its loose-runs table
+independently) and the group screen window their row table to the terminal's
+actual height instead of rendering every row unconditionally: rather than
+scrolling, each render computes and shows only a band of rows around the
+`j`/`k`-selected one, with "... N more above ..." / "... N more below ..."
+markers in place of the rows that do not fit. `j`/`k` still walk the entire
+row set — every group and loose run on the fleet screen, every member on the
+group screen — not only the currently visible band. Plain-mode snapshot
+rendering is unaffected: it keeps printing every row unconditionally.
+
+The selected row is guaranteed visible whenever the viewport can physically
+fit its chrome (headers, section labels, the table's own header row) plus at
+least one data row, and the total rendered height never exceeds the
+viewport. The budget available to each table is the real, wrap-aware
+rendered height of everything around it at the terminal's actual width, not
+a fixed line-count guess or piecewise arithmetic that can drift from what a
+real, assembled render actually produces — a summary line wrapping at a
+narrow width, or a table's own header row wrapping (for example the fleet
+group table's "Members (done/failed/total)" column), is accounted for
+exactly.
+
+The table region is sized first and has priority, since it carries the
+selected-row guarantee; the trailing warnings and footer, which render
+*after* it, are fitted to whatever room genuinely remains once the table
+region's real height is known, rather than reserved at a fixed guessed
+height and trusted to fit. On an ultra-small viewport the guarantee can
+still floor the table region taller than a first guess at that remaining
+room predicted, so trailing content is measured again against the table
+region's actual height and, if it no longer fits, drops least-essential
+content first (warnings, then the footer) — disappearing entirely rather
+than ever pushing the total past the viewport. The row's priority over the
+footer always holds.
+
+An unfocused table (the unselected one, whether it renders before or after
+the focused table) uses as many rows as genuinely fit, not an artificial
+cap: a small guaranteed floor exists only to protect the focused table's
+budget on a genuinely scarce viewport, so a large viewport with only a
+handful of groups and loose runs shows every row of both tables with no
+overflow markers, instead of an unfocused table stopping early while
+surplus rows of screen space sit empty.
+
+On a viewport too small even for the selected row's own minimum, optional
+chrome is dropped before the selected row ever would be, richest to
+sparsest:
+
+1. The group screen drops its summary line, then its "MEMBERS" label.
+2. The fleet screen drops the *unfocused* table's whole section (its label
+   and its table together, never just one) when that section renders
+   *before* the focused table — content that renders after the focused table
+   never threatens the guarantee, so it is only capped, never force-dropped.
+   If still tight, the focused table's own section label goes too.
+3. As an absolute last resort, if even the focused table's own header row
+   cannot fit alongside its one guaranteed data row, the header row itself
+   is suppressed (the table renders with no column headers) rather than the
+   row.
 
 `mammoth monitor <run_name>` without `--group` or `--match` is unaffected by
 any of this: it keeps its original single-run behavior exactly, entering
@@ -185,7 +251,15 @@ row followed by edge-aligned live metrics.
 - DIMM identity is sampled once per monitor process. The interactive monitor
   first runs `sudo -n dmidecode --type memory`. If cached sudo authentication is
   unavailable, it permits sudo to request a password from the local terminal
-  once before the Textual app starts. A failed probe leaves hardware identity
+  once before the Textual app starts. This holds at every interactive entry
+  point, including the fleet view (which has no `HOST RESOURCES` panel of its
+  own): the initial telemetry sample is always taken before any Textual app
+  is constructed or run, never from inside a running screen stack, so the
+  prompt never erupts mid-navigation. Drilling from the fleet into a run
+  reuses that same pre-UI sample for the first run screen instead of
+  sampling again; later drill-ins and periodic refreshes sample again
+  through the same sampler, which never reprompts since it retries cached
+  sudo credentials first. A failed probe leaves hardware identity
   unavailable without blocking later refreshes.
 - NVIDIA telemetry queries `nvidia-smi` on every refresh. Every reported GPU
   receives its own block whose identity includes index and model name and whose

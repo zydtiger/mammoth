@@ -7,7 +7,9 @@ from datetime import UTC, datetime
 from itertools import count
 from pathlib import Path
 
+import pytest
 from rich.console import Console
+from textual.widgets import Static
 from typer.testing import CliRunner
 
 from mammoth.cli import app
@@ -30,6 +32,8 @@ from mammoth.monitor import (
     select_execution,
 )
 from mammoth.monitor.dashboard import (
+    _rendered_height,
+    _row_window,
     braille_line_chart,
     dashboard_layout,
     fleet_dashboard_layout,
@@ -43,7 +47,28 @@ from mammoth.monitor.psutil_telemetry import (
     PsutilViewerTelemetrySampler,
     sample_psutil_viewer_telemetry,
 )
-from mammoth.monitor.textual_ui import FleetApp, FleetScreen, GroupScreen, MonitorApp, RunScreen
+from mammoth.monitor.textual_ui import (
+    FleetApp,
+    FleetScreen,
+    GroupScreen,
+    MonitorApp,
+    RunScreen,
+    run_fleet_textual,
+)
+
+
+def _composited_lines(body: Static) -> list[str]:
+    """Return the actual visible rows a mounted Static widget shows.
+
+    Reads ``Widget.render_line(y)`` for each row Textual's scrollable
+    ``#body`` container actually composites, rather than printing the
+    widget's full (possibly taller-than-viewport) renderable. A row that
+    the layout function windowed in but the container then clips off screen
+    would still show up in the unclipped renderable, so a visibility
+    assertion must read this composited reality, not the pre-composite
+    content, to be a genuine regression guard.
+    """
+    return [body.render_line(y).text for y in range(body.size.height)]
 
 
 def create_context(
@@ -1057,3 +1082,722 @@ def test_fleet_textual_selecting_a_run_with_no_executions_does_not_navigate(
             assert len(app.screen_stack) == 2
 
     asyncio.run(exercise())
+
+
+def test_run_fleet_textual_samples_telemetry_before_the_app_runs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Regression for the fleet sudo-prompt-inside-the-TUI defect.
+
+    ``run_fleet_textual`` must sample viewer-host telemetry (and take any
+    sudo password prompt it needs) on the plain terminal before the Textual
+    app is even constructed, mirroring ``run_textual``'s single-run
+    ordering. A recording fake sampler and fake ``FleetApp`` pin the exact
+    call order without spinning up a real Textual application.
+    """
+    entry = tmp_path / "runs"
+    RunLayout(entry, "loose").prepare()
+    fleet_monitor = FleetMonitor(entry)
+    snapshot = fleet_monitor.poll()
+
+    events: list[str] = []
+
+    class RecordingSampler:
+        def __init__(self, *, allow_sudo_password_prompt: bool = False) -> None:
+            events.append("sampler-constructed")
+            self.allow_sudo_password_prompt = allow_sudo_password_prompt
+
+        def sample(self) -> str:
+            events.append("sampled")
+            return "host-sample"
+
+    class RecordingFleetApp:
+        def __init__(self, *_args, **kwargs) -> None:
+            events.append("app-constructed")
+            self.kwargs = kwargs
+
+        def run(self) -> None:
+            events.append("app-run")
+
+    monkeypatch.setattr(
+        "mammoth.monitor.textual_ui.PsutilViewerTelemetrySampler", RecordingSampler
+    )
+    monkeypatch.setattr("mammoth.monitor.textual_ui.FleetApp", RecordingFleetApp)
+
+    run_fleet_textual(
+        entry,
+        fleet_monitor,
+        snapshot,
+        watch=False,
+        telemetry=True,
+        interval_seconds=2.0,
+        stale_after_seconds=90.0,
+    )
+
+    assert events == ["sampler-constructed", "sampled", "app-constructed", "app-run"]
+
+
+def test_run_fleet_textual_disabled_telemetry_builds_no_sampler_or_host(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    entry = tmp_path / "runs"
+    RunLayout(entry, "loose").prepare()
+    fleet_monitor = FleetMonitor(entry)
+    snapshot = fleet_monitor.poll()
+
+    def fail_if_constructed(*_args, **_kwargs):
+        raise AssertionError("no sampler should be constructed when telemetry is disabled")
+
+    captured: dict = {}
+
+    class RecordingFleetApp:
+        def __init__(self, *_args, **kwargs) -> None:
+            captured.update(kwargs)
+
+        def run(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "mammoth.monitor.textual_ui.PsutilViewerTelemetrySampler", fail_if_constructed
+    )
+    monkeypatch.setattr("mammoth.monitor.textual_ui.FleetApp", RecordingFleetApp)
+
+    run_fleet_textual(
+        entry,
+        fleet_monitor,
+        snapshot,
+        watch=False,
+        telemetry=False,
+        interval_seconds=2.0,
+        stale_after_seconds=90.0,
+    )
+
+    assert captured["telemetry_sampler"] is None
+    assert captured["initial_host"] is None
+
+
+def test_fleet_app_next_run_screen_host_reuses_the_pre_ui_sample_once(tmp_path: Path) -> None:
+    """The pre-UI telemetry sample is spent on the first drill-in, not wasted.
+
+    ``push_run_screen`` never constructs its own sampler; it either consumes
+    the initial pre-UI sample once or delegates to the already-shared
+    sampler, which is exactly what ``FleetApp`` receives from
+    ``run_fleet_textual``.
+    """
+    entry = tmp_path / "runs"
+    fleet_monitor = FleetMonitor(entry)
+
+    class CountingSampler:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def sample(self) -> str:
+            self.calls += 1
+            return f"sampled-{self.calls}"
+
+    sampler = CountingSampler()
+    app = FleetApp(
+        entry,
+        fleet_monitor,
+        fleet_monitor.poll(),
+        watch=False,
+        telemetry=True,
+        telemetry_sampler=sampler,
+        initial_host="pre-ui-sample",
+    )
+
+    assert app._next_run_screen_host() == "pre-ui-sample"
+    assert sampler.calls == 0
+    assert app._next_run_screen_host() == "sampled-1"
+    assert sampler.calls == 1
+    assert app._next_run_screen_host() == "sampled-2"
+    assert sampler.calls == 2
+
+
+def test_fleet_textual_run_screen_receives_the_fleet_apps_shared_sampler(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Drilling into a run must reuse the injected sampler, not build a new one."""
+    entry = tmp_path / "runs"
+    run_layout = RunLayout(entry, "loose").prepare()
+    create_context(run_layout, "attempt", "2026-01-01T00:00:00Z")
+
+    def fail_if_constructed(*_args, **_kwargs):
+        raise AssertionError("FleetApp/RunScreen must not construct their own sampler")
+
+    monkeypatch.setattr(
+        "mammoth.monitor.textual_ui.PsutilViewerTelemetrySampler", fail_if_constructed
+    )
+
+    class FakeSampler:
+        def __init__(self) -> None:
+            self.sample_calls = 0
+
+        def sample(self) -> PsutilViewerTelemetry:
+            self.sample_calls += 1
+            return PsutilViewerTelemetry(
+                host_role="viewer",
+                hostname="refreshed",
+                sampled_at="2026-01-01T00:00:05Z",
+                cpu_percent=None,
+                memory_percent=None,
+                load_average_1m=None,
+            )
+
+    fake_sampler = FakeSampler()
+    initial_host = PsutilViewerTelemetry(
+        host_role="viewer",
+        hostname="pre-ui",
+        sampled_at="2026-01-01T00:00:00Z",
+        cpu_percent=None,
+        memory_percent=None,
+        load_average_1m=None,
+    )
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(
+        entry,
+        fleet_monitor,
+        fleet_monitor.poll(),
+        watch=False,
+        telemetry=True,
+        telemetry_sampler=fake_sampler,
+        initial_host=initial_host,
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, RunScreen)
+            assert app.screen.telemetry_sampler is fake_sampler
+
+    asyncio.run(exercise())
+
+
+def test_fleet_dashboard_layout_windows_loose_runs_around_the_selection(tmp_path: Path) -> None:
+    """Regression for the fleet-view overflow defect: window, don't dump everything.
+
+    With 20 loose runs and a viewport too small to show them all, only a
+    band around the selected row renders, bounded by "N more above/below"
+    markers instead of every row overflowing the terminal.
+    """
+    entry = tmp_path / "runs"
+    for index in range(20):
+        RunLayout(entry, f"run-{index:02d}").prepare()
+    snapshot = FleetMonitor(entry).poll()
+
+    console = Console(width=120, record=True, color_system=None)
+    console.print(
+        fleet_dashboard_layout(
+            snapshot,
+            selected_index=10,
+            compact=False,
+            now=datetime.now(UTC),
+            viewport_rows=20,
+        )
+    )
+    rendered = console.export_text()
+
+    assert "run-10" in rendered
+    assert "run-00" not in rendered
+    assert "run-19" not in rendered
+    assert "6 more above" in rendered
+    assert "5 more below" in rendered
+
+
+def test_fleet_dashboard_layout_reaches_first_and_last_rows_without_a_dangling_marker(
+    tmp_path: Path,
+) -> None:
+    entry = tmp_path / "runs"
+    for index in range(20):
+        RunLayout(entry, f"run-{index:02d}").prepare()
+    snapshot = FleetMonitor(entry).poll()
+
+    def rendered_for(selected_index: int) -> str:
+        console = Console(width=120, record=True, color_system=None)
+        console.print(
+            fleet_dashboard_layout(
+                snapshot,
+                selected_index=selected_index,
+                compact=False,
+                now=datetime.now(UTC),
+                viewport_rows=20,
+            )
+        )
+        return console.export_text()
+
+    first = rendered_for(0)
+    assert "run-00" in first
+    assert "more above" not in first
+    assert "10 more below" in first
+
+    last = rendered_for(19)
+    assert "run-19" in last
+    assert "more below" not in last
+    assert "10 more above" in last
+
+
+def test_group_dashboard_layout_windows_members_around_the_selection(tmp_path: Path) -> None:
+    entry = tmp_path / "runs"
+    manifest = publish_group_manifest(
+        entry,
+        order="run-major",
+        members=[GroupMember(f"member-{index:02d}", ("prepare",)) for index in range(20)],
+    )
+    snapshot = FleetMonitor(entry).poll()
+    group = snapshot.groups[0]
+    assert group.group_id == manifest.group_id
+
+    console = Console(width=120, record=True, color_system=None)
+    console.print(
+        group_dashboard_layout(
+            group,
+            selected_index=10,
+            compact=False,
+            now=datetime.now(UTC),
+            viewport_rows=20,
+        )
+    )
+    rendered = console.export_text()
+
+    assert "member-10" in rendered
+    assert "member-00" not in rendered
+    assert "member-19" not in rendered
+    assert "5 more above" in rendered
+    assert "4 more below" in rendered
+
+
+def test_row_window_never_exceeds_budget_and_always_shows_the_selected_row() -> None:
+    """P1-1 regression: the reviewed standalone repro, plus its general invariant.
+
+    The old ``budget = max(1, max_visible - 2)`` reservation could still
+    render one data row plus two marker lines against a budget of 1 (three
+    rendered lines for a one-row budget). The fixed function must always
+    keep the selected row inside the window and never let the window plus
+    whichever markers it actually shows exceed ``max_visible``.
+    """
+    start, end, hidden_above, hidden_below = _row_window(
+        total=5, selected_local_index=2, max_visible=1
+    )
+    assert start <= 2 < end
+    footprint = (end - start) + (1 if hidden_above else 0) + (1 if hidden_below else 0)
+    assert footprint <= 1
+
+    for total in (1, 2, 5, 11, 40, 227):
+        for max_visible in (1, 2, 3, 7, 9, 15):
+            for index in (0, total // 2, total - 1):
+                start, end, hidden_above, hidden_below = _row_window(total, index, max_visible)
+                assert start <= index < end
+                footprint = (
+                    (end - start) + (1 if hidden_above else 0) + (1 if hidden_below else 0)
+                )
+                assert footprint <= max_visible
+
+
+def test_fleet_textual_windows_many_loose_runs_and_keeps_selection_visible(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: a small terminal windows the fleet screen and j/k reach both ends."""
+    entry = tmp_path / "runs"
+    for index in range(40):
+        RunLayout(entry, f"run-{index:03d}").prepare()
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    def visible_lines() -> list[str]:
+        return _composited_lines(app.screen.query_one("#body", Static))
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 16)) as pilot:
+            await pilot.pause()
+            rows = fleet_rows(app.screen.snapshot)
+            last_index = len(rows) - 1
+
+            lines = visible_lines()
+            assert any("run-000" in line for line in lines)
+            assert not any("more above" in line for line in lines)
+            assert any("more below" in line for line in lines)
+
+            for _ in range(last_index + 5):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == last_index
+            lines = visible_lines()
+            assert any("run-039" in line for line in lines)
+            assert not any("more below" in line for line in lines)
+
+            for _ in range(last_index + 5):
+                await pilot.press("k")
+            await pilot.pause()
+            assert app.screen.selected_index == 0
+            lines = visible_lines()
+            assert any("run-000" in line for line in lines)
+            assert not any("more above" in line for line in lines)
+
+    asyncio.run(exercise())
+
+
+def test_group_textual_windows_many_members_and_keeps_selection_visible(
+    tmp_path: Path,
+) -> None:
+    entry = tmp_path / "runs"
+    manifest = publish_group_manifest(
+        entry,
+        order="run-major",
+        members=[GroupMember(f"member-{index:03d}", ("prepare",)) for index in range(40)],
+    )
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(
+        entry,
+        fleet_monitor,
+        fleet_monitor.poll(),
+        watch=False,
+        telemetry=False,
+        open_group_id=manifest.group_id,
+    )
+
+    def visible_lines() -> list[str]:
+        return _composited_lines(app.screen.query_one("#body", Static))
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 16)) as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, GroupScreen)
+
+            lines = visible_lines()
+            assert any("member-000" in line for line in lines)
+            assert not any("more above" in line for line in lines)
+            assert any("more below" in line for line in lines)
+
+            for _ in range(45):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == 39
+            lines = visible_lines()
+            assert any("member-039" in line for line in lines)
+            assert not any("more below" in line for line in lines)
+
+            for _ in range(45):
+                await pilot.press("k")
+            await pilot.pause()
+            assert app.screen.selected_index == 0
+            lines = visible_lines()
+            assert any("member-000" in line for line in lines)
+            assert not any("more above" in line for line in lines)
+
+    asyncio.run(exercise())
+
+
+def test_group_textual_keeps_the_selected_row_visible_at_the_named_benchmark(
+    tmp_path: Path,
+) -> None:
+    """P1-1 regression, named benchmark: GroupScreen at size (80, 7).
+
+    Reproduces the reviewed failure directly: 20 members, selection moved to
+    index 10, terminal size (80, 7) -- small enough that a fixed chrome
+    estimate would have left no room for the table header, let alone the
+    selected row, once the summary line wraps at this width. Asserts on the
+    actual composited output (``render_line``), not the unclipped
+    renderable, so a still-broken screen cannot pass by accident.
+    """
+    entry = tmp_path / "runs"
+    manifest = publish_group_manifest(
+        entry,
+        order="run-major",
+        members=[GroupMember(f"member-{index:02d}", ("prepare",)) for index in range(20)],
+    )
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(
+        entry,
+        fleet_monitor,
+        fleet_monitor.poll(),
+        watch=False,
+        telemetry=False,
+        open_group_id=manifest.group_id,
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(80, 7)) as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, GroupScreen)
+            for _ in range(10):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == 10
+
+            lines = _composited_lines(app.screen.query_one("#body", Static))
+            assert any("member-10" in line for line in lines)
+
+    asyncio.run(exercise())
+
+
+def test_fleet_textual_keeps_the_selected_row_visible_at_the_named_benchmark(
+    tmp_path: Path,
+) -> None:
+    """P1-1 regression, named benchmark: FleetScreen at size (80, 8)."""
+    entry = tmp_path / "runs"
+    for index in range(20):
+        RunLayout(entry, f"run-{index:02d}").prepare()
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(80, 8)) as pilot:
+            await pilot.pause()
+            for _ in range(10):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == 10
+
+            lines = _composited_lines(app.screen.query_one("#body", Static))
+            assert any("run-10" in line for line in lines)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("width,height", [(60, 4), (78, 6), (80, 8), (100, 12), (120, 16)])
+def test_fleet_textual_keeps_a_groups_focused_selection_visible_at_small_sizes(
+    tmp_path: Path,
+    width: int,
+    height: int,
+) -> None:
+    """Coverage (a): groups-focused fleet windowing, no loose runs at all."""
+    entry = tmp_path / "runs"
+    for index in range(20):
+        publish_group_manifest(
+            entry,
+            group_id=f"group-{index:02d}",
+            order="run-major",
+            members=[GroupMember(f"g{index:02d}-member", ("prepare",))],
+        )
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(width, height)) as pilot:
+            await pilot.pause()
+            rows = fleet_rows(app.screen.snapshot)
+            index = min(10, len(rows) - 1)
+            for _ in range(index):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == index
+
+            lines = _composited_lines(app.screen.query_one("#body", Static))
+            assert any(rows[index].key in line for line in lines)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("width,height", [(60, 4), (78, 6), (80, 8), (100, 15), (120, 19)])
+@pytest.mark.parametrize("fixture", ["loose", "groups", "mixed"])
+def test_fleet_textual_keeps_the_last_row_visible_at_small_sizes(
+    tmp_path: Path,
+    fixture: str,
+    width: int,
+    height: int,
+) -> None:
+    """Coverage (b): last-row selection, the header-wrap failure mode, across shapes."""
+    entry = tmp_path / "runs"
+    if fixture in ("loose", "mixed"):
+        for index in range(20 if fixture == "loose" else 12):
+            RunLayout(entry, f"run-{index:02d}").prepare()
+    if fixture in ("groups", "mixed"):
+        count = 20 if fixture == "groups" else 10
+        for index in range(count):
+            publish_group_manifest(
+                entry,
+                group_id=f"group-{index:02d}",
+                order="run-major",
+                members=[GroupMember(f"g{index:02d}-member", ("prepare",))],
+            )
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(width, height)) as pilot:
+            await pilot.pause()
+            rows = fleet_rows(app.screen.snapshot)
+            last_index = len(rows) - 1
+            for _ in range(last_index + 5):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == last_index
+
+            lines = _composited_lines(app.screen.query_one("#body", Static))
+            assert any(rows[last_index].key in line for line in lines)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("width,height", [(60, 4), (78, 6), (80, 8), (100, 12)])
+def test_fleet_textual_keeps_selection_visible_in_a_mixed_fleet_both_directions(
+    tmp_path: Path,
+    width: int,
+    height: int,
+) -> None:
+    """Coverage (c): mixed groups + loose runs, selection tested in each table."""
+    entry = tmp_path / "runs"
+    for index in range(8):
+        publish_group_manifest(
+            entry,
+            group_id=f"group-{index:02d}",
+            order="run-major",
+            members=[GroupMember(f"g{index:02d}-member", ("prepare",))],
+        )
+    for index in range(10):
+        RunLayout(entry, f"run-{index:02d}").prepare()
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(width, height)) as pilot:
+            await pilot.pause()
+            rows = fleet_rows(app.screen.snapshot)
+            group_count = sum(1 for row in rows if row.kind == "group")
+            assert 0 < group_count < len(rows)
+
+            # A selection inside the groups table.
+            groups_index = group_count // 2
+            for _ in range(groups_index):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == groups_index
+            lines = _composited_lines(app.screen.query_one("#body", Static))
+            assert any(rows[groups_index].key in line for line in lines)
+
+            # A selection inside the loose-runs table.
+            loose_index = group_count + (len(rows) - group_count) // 2
+            for _ in range(loose_index - groups_index):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == loose_index
+            lines = _composited_lines(app.screen.query_one("#body", Static))
+            assert any(rows[loose_index].key in line for line in lines)
+
+    asyncio.run(exercise())
+
+
+def test_fleet_textual_shows_the_footer_with_groups_focused_at_an_ordinary_size(
+    tmp_path: Path,
+) -> None:
+    """Round-4 P1 regression: the loose section's own label was never budgeted.
+
+    With groups focused, `_fleet_tables_within_viewport` measured
+    `header + groups_table` for the room left over for the loose table but
+    then unconditionally appended `loose_label` too, so the real render
+    always ran about two rows taller than computed -- clipping the footer
+    at a perfectly ordinary size (120x16 with 5 groups + 5 loose runs; the
+    footer reappeared only at 120x18).
+    """
+    entry = tmp_path / "runs"
+    for index in range(5):
+        publish_group_manifest(
+            entry,
+            group_id=f"group-{index:02d}",
+            order="run-major",
+            members=[GroupMember(f"g{index:02d}-member", ("prepare",))],
+        )
+    for index in range(5):
+        RunLayout(entry, f"run-{index:02d}").prepare()
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 16)) as pilot:
+            await pilot.pause()
+            assert app.screen.selected_index == 0  # a group: groups are focused
+
+            lines = _composited_lines(app.screen.query_one("#body", Static))
+            assert any("Enter drill in" in line for line in lines)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("width", [60, 78, 80, 100, 120])
+@pytest.mark.parametrize("focus", ["groups", "loose"])
+def test_fleet_dashboard_layout_never_exceeds_its_viewport_rows_budget(
+    tmp_path: Path,
+    focus: str,
+    width: int,
+) -> None:
+    """General invariant behind the round-4 fix: rendered height <= viewport_rows.
+
+    Sweeps a range of heights for both the groups-focused and loose-focused
+    branches of ``_fleet_tables_within_viewport``, which is the exact claim
+    the fix's commit message makes -- this test is what enforces it instead
+    of leaving it as an unverified assertion in prose.
+    """
+    entry = tmp_path / "runs"
+    for index in range(5):
+        publish_group_manifest(
+            entry,
+            group_id=f"group-{index:02d}",
+            order="run-major",
+            members=[GroupMember(f"g{index:02d}-member", ("prepare",))],
+        )
+    for index in range(5):
+        RunLayout(entry, f"run-{index:02d}").prepare()
+    snapshot = FleetMonitor(entry).poll()
+    rows = fleet_rows(snapshot)
+    group_count = sum(1 for row in rows if row.kind == "group")
+    selected_index = 0 if focus == "groups" else len(rows) - 1
+
+    avail_width = max(1, width - 2)
+    for height in range(4, 21):
+        avail_height = max(1, height - 1)
+        renderable = fleet_dashboard_layout(
+            snapshot,
+            selected_index=selected_index,
+            compact=avail_width < 80,
+            viewport_rows=avail_height,
+            width=avail_width,
+        )
+        actual_height = _rendered_height(renderable, width=avail_width)
+        assert actual_height <= avail_height, (
+            f"width={width} height={height} focus={focus}: "
+            f"rendered {actual_height} rows against a budget of {avail_height}"
+        )
+    assert 0 < group_count < len(rows)
+
+
+def test_fleet_dashboard_layout_uses_full_room_at_a_large_viewport(tmp_path: Path) -> None:
+    """Round-4 P2 regression: the unfocused table must not waste surplus room.
+
+    A fixed cap of 3 rows for the unfocused table meant a 120x40 viewport
+    with only 5 groups and 5 loose runs still showed an overflow marker and
+    hid rows despite ~20 empty rows of surplus space. The cap should only
+    bind when room is genuinely scarce, not unconditionally.
+    """
+    entry = tmp_path / "runs"
+    for index in range(5):
+        publish_group_manifest(
+            entry,
+            group_id=f"group-{index:02d}",
+            order="run-major",
+            members=[GroupMember(f"g{index:02d}-member", ("prepare",))],
+        )
+    for index in range(5):
+        RunLayout(entry, f"run-{index:02d}").prepare()
+    snapshot = FleetMonitor(entry).poll()
+    rows = fleet_rows(snapshot)
+
+    for selected_index in (0, len(rows) - 1):
+        renderable = fleet_dashboard_layout(
+            snapshot,
+            selected_index=selected_index,
+            compact=False,
+            viewport_rows=39,
+            width=118,
+        )
+        console = Console(width=118, record=True, color_system=None)
+        console.print(renderable)
+        text = console.export_text()
+        assert "more above" not in text
+        assert "more below" not in text
+        for row in rows:
+            assert row.key in text
