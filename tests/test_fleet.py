@@ -16,13 +16,14 @@ from mammoth.core import (
     create_execution_context,
     publish_group_manifest,
 )
-from mammoth.core.events import ExecutionEventWriter
+from mammoth.core.events import ExecutionEventTailReader, ExecutionEventWriter
 from mammoth.monitor import fleet as fleet_module
 from mammoth.monitor.fleet import (
     FleetMonitor,
     discover_group_ids,
     discover_run_names,
 )
+from mammoth.monitor.model import FLEET_TAIL_WINDOW_BYTES
 from mammoth.monitor.render import render_fleet_snapshot, render_group_snapshot
 
 
@@ -38,6 +39,38 @@ def create_context(layout: RunLayout, execution_id: str, created_at: str):
         execution_id=execution_id,
         created_at=created_at,
     )
+
+
+def _write_large_progress_stream(
+    context: Any,
+    *,
+    steps: int,
+    terminal: bool,
+) -> None:
+    """Write a single-rank stream far larger than ``FLEET_TAIL_WINDOW_BYTES``.
+
+    Each progress record uses ``final=True`` to bypass the writer's default
+    throttling, so ``steps`` records are actually written. A padded
+    ``message`` keeps each line comfortably over a hundred bytes so a few
+    thousand steps reliably exceeds the fleet tail window by several times.
+    """
+    writer = ExecutionEventWriter.for_process(context, rank=0, world_size=1)
+    writer.emit("process_started", phase="train")
+    writer.emit("task_started", phase="train", task_id="epoch")
+    for step in range(1, steps + 1):
+        writer.emit_progress(
+            phase="train",
+            task_id="epoch",
+            completed=step,
+            total=steps,
+            final=True,
+            throughput=2.0,
+            message="padding-" + "x" * 160,
+        )
+    if terminal:
+        writer.emit("task_completed", phase="train", task_id="epoch")
+        writer.emit("process_completed", phase="train", exit_code=0)
+    writer.close()
 
 
 def _clock(*values: str) -> Any:
@@ -703,3 +736,160 @@ def test_fleet_monitor_sorts_an_untimestamped_ad_hoc_cohort_last_among_groups(
     assert snapshot.groups[1].updated_at is None
     rendered = render_fleet_snapshot(snapshot)
     assert "match:sweep-*" in rendered
+
+
+def test_fleet_monitor_bounded_tail_reports_terminal_status_from_a_large_stream(
+    tmp_path: Path,
+) -> None:
+    """A stream far larger than the tail window still folds correctly.
+
+    The terminal record sits at the true end of a stream several times
+    larger than ``FLEET_TAIL_WINDOW_BYTES``; the bounded tail must still
+    resolve status, newest heartbeat, terminal time, and progress from
+    exactly that tail, matching what a full read of the same stream would
+    report.
+    """
+    entry = tmp_path / "runs"
+    layout = RunLayout(entry, "big-finished").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    _write_large_progress_stream(context, steps=3000, terminal=True)
+    stream_size = (context.execution_dir / "rank-0.jsonl").stat().st_size
+    assert stream_size > FLEET_TAIL_WINDOW_BYTES * 3, "fixture must dwarf the tail window"
+
+    snapshot = FleetMonitor(entry).poll()
+
+    assert len(snapshot.loose_runs) == 1
+    run = snapshot.loose_runs[0]
+    assert run.status == "completed"
+    assert run.finished_at is not None
+    assert run.progress is not None
+    assert run.progress.completed == 3000
+    assert run.progress.total == 3000
+
+
+def test_fleet_monitor_bounded_tail_reports_running_status_from_a_large_stream(
+    tmp_path: Path,
+) -> None:
+    """A large, still-running stream's roll-up reflects the *latest* progress.
+
+    Confirms the bounded tail is not merely "some data" but genuinely the
+    newest state: ``completed`` must be the last written value (3000), not
+    an early one that happened to fall within an undersized window.
+    """
+    entry = tmp_path / "runs"
+    layout = RunLayout(entry, "big-running").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    _write_large_progress_stream(context, steps=3000, terminal=False)
+    stream_size = (context.execution_dir / "rank-0.jsonl").stat().st_size
+    assert stream_size > FLEET_TAIL_WINDOW_BYTES * 3, "fixture must dwarf the tail window"
+
+    snapshot = FleetMonitor(entry).poll(stale_after_seconds=10**9)
+
+    assert len(snapshot.loose_runs) == 1
+    run = snapshot.loose_runs[0]
+    assert run.status == "running"
+    assert run.finished_at is None
+    assert run.progress is not None
+    assert run.progress.completed == 3000
+    assert run.progress.total == 3000
+
+
+def test_fleet_monitor_bounded_tail_resolves_multirank_all_terminal_from_large_streams(
+    tmp_path: Path,
+) -> None:
+    """Multi-rank all-ranks-terminal resolution holds under bounded windows.
+
+    Each rank's own stream is independently far larger than the tail window.
+    Overall status must still require every rank's own terminal record,
+    which the docstring in ``docs/MONITOR.md`` argues is always inside that
+    rank's own bounded tail regardless of window size.
+    """
+    entry = tmp_path / "runs"
+    layout = RunLayout(entry, "big-multirank").prepare()
+    context = create_execution_context(
+        layout.run_dir,
+        run_name=layout.run_name,
+        invocation_kind="test",
+        intended_phases=("opaque",),
+        world_size=2,
+        execution_mode="distributed",
+        command=("python", "job.py"),
+        execution_id="attempt",
+        created_at="2026-01-01T00:00:00Z",
+    )
+    rank0_writer = ExecutionEventWriter.for_process(context, rank=0, world_size=2)
+    rank0_writer.emit("execution_started")
+    for step in range(1, 2000):
+        rank0_writer.emit_progress(
+            phase="train",
+            task_id="epoch",
+            completed=step,
+            total=2000,
+            final=True,
+            message="padding-" + "x" * 160,
+        )
+    rank0_writer.emit("process_completed", phase="train")
+    rank0_writer.close()
+    assert (context.execution_dir / "rank-0.jsonl").stat().st_size > FLEET_TAIL_WINDOW_BYTES * 2
+
+    rank1_writer = ExecutionEventWriter.for_process(context, rank=1, world_size=2)
+    rank1_writer.emit("execution_started")
+    rank1_writer.emit("process_started", phase="train")
+    rank1_writer.close()
+
+    running_snapshot = FleetMonitor(entry).poll(stale_after_seconds=10**9)
+    running = running_snapshot.loose_runs[0]
+    assert running.status == "running", "rank 0's own completion must not finish the whole run"
+
+    rank1_writer = ExecutionEventWriter.for_process(context, rank=1, world_size=2)
+    rank1_writer.emit("process_completed", phase="train")
+    rank1_writer.close()
+
+    finished_snapshot = FleetMonitor(entry).poll()
+    finished = finished_snapshot.loose_runs[0]
+    assert finished.status == "completed"
+
+
+def test_fleet_monitor_initial_poll_reads_are_bounded_at_scale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The initial fleet poll performs bounded, not full-history, reads.
+
+    Constructs many runs each with a stream several times larger than the
+    tail window, counts every byte actually read off disk across the whole
+    initial poll, and asserts that total stays close to
+    ``run_count * FLEET_TAIL_WINDOW_BYTES`` rather than scaling with the
+    (much larger) total on-disk size.
+    """
+    entry = tmp_path / "runs"
+    run_count = 15
+    steps_per_run = 2500
+    total_on_disk = 0
+    for index in range(run_count):
+        layout = RunLayout(entry, f"scale-{index:03d}").prepare()
+        context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+        _write_large_progress_stream(context, steps=steps_per_run, terminal=True)
+        total_on_disk += (context.execution_dir / "rank-0.jsonl").stat().st_size
+    assert total_on_disk > run_count * FLEET_TAIL_WINDOW_BYTES * 3
+
+    bytes_read = 0
+    original_read_from = ExecutionEventTailReader._read_from
+
+    def counting_read_from(self: Any, descriptor: int, offset: int, file_size: int) -> bytes:
+        nonlocal bytes_read
+        data = original_read_from(self, descriptor, offset, file_size)
+        bytes_read += len(data)
+        return data
+
+    monkeypatch.setattr(ExecutionEventTailReader, "_read_from", counting_read_from)
+
+    snapshot = FleetMonitor(entry).poll()
+
+    assert len(snapshot.loose_runs) == run_count
+    assert all(run.status == "completed" for run in snapshot.loose_runs)
+    # A generous multiple of the per-run window budget: real headroom for the
+    # append-guard/short-read mechanics, while still being far below what a
+    # full read of every stream would cost.
+    assert bytes_read < run_count * FLEET_TAIL_WINDOW_BYTES * 2
+    assert bytes_read < total_on_disk / 4
