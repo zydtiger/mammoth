@@ -185,6 +185,32 @@ class MonitorSnapshot:
         return max(0.0, (self.updated_at - self.created_at).total_seconds())
 
     @property
+    def terminal_event_time(self) -> datetime | None:
+        """Return when this execution reached a terminal outcome, if it has.
+
+        Prefers a runner-emitted terminal event; without one, falls back to
+        an interrupted, then failed, then any process-terminal event. Mirrors
+        the terminal-event selection dashboard rendering uses, exposed here
+        as a timestamp for folding sources (such as fleet recency ordering)
+        that need "when did this finish" without the full event object.
+        """
+        runner_terminal = next(
+            (
+                event
+                for event in reversed(self.events)
+                if event.event in _TERMINAL_RUN_STATUS
+            ),
+            None,
+        )
+        if runner_terminal is not None:
+            return parse_time(runner_terminal.time)
+        process_terminals = [event for event in self.events if event.event == "process_completed"]
+        interrupted = [event for event in process_terminals if event.signal is not None]
+        failed = [event for event in process_terminals if event.exit_code not in {None, 0}]
+        preferred = interrupted or failed or process_terminals
+        return parse_time(preferred[-1].time) if preferred else None
+
+    @property
     def current_task(self) -> TaskState | None:
         """Return the newest running task, or the newest observed task."""
         tasks = sorted(
