@@ -1370,6 +1370,162 @@ def test_fleet_textual_run_screen_shows_loading_state_before_first_poll(
     asyncio.run(exercise())
 
 
+def test_fleet_textual_run_screen_ignores_navigation_before_first_poll(
+    tmp_path: Path,
+) -> None:
+    """P3-3(a) regression: navigation/detail keys while still loading must
+    no-op, not crash, since ``RunScreen.snapshot`` is ``None`` until the
+    background worker's first poll completes.
+    """
+    entry = tmp_path / "runs"
+    run_layout = RunLayout(entry, "loose").prepare()
+    create_context(run_layout, "attempt", "2026-01-01T00:00:00Z")
+
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    release = threading.Event()
+    original_poll = RunMonitor.poll
+
+    def gated_poll(self: RunMonitor, selected_execution_id: str | None = None) -> object:
+        release.wait(timeout=5)
+        return original_poll(self, selected_execution_id)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            with mock.patch.object(RunMonitor, "poll", gated_poll):
+                await pilot.press("enter")
+                await pilot.pause()
+                assert isinstance(app.screen, RunScreen)
+                run_screen = app.screen
+                assert run_screen.snapshot is None
+
+                # Next/previous execution and the detail toggle must all
+                # no-op while there is nothing to navigate or toggle yet.
+                await pilot.press("j")
+                await pilot.press("k")
+                await pilot.press("down")
+                await pilot.press("up")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert isinstance(app.screen, RunScreen)
+                assert run_screen.snapshot is None
+                assert run_screen.detail is False
+
+                release.set()
+                await _wait_until(pilot, lambda: run_screen.snapshot is not None)
+
+            assert run_screen.snapshot is not None
+            assert run_screen.snapshot.layout.run_name == "loose"
+            # Navigation works normally once loaded.
+            await pilot.press("enter")
+            assert run_screen.detail is True
+
+    asyncio.run(exercise())
+
+
+def test_fleet_textual_stale_worker_from_a_popped_run_screen_never_leaks_forward(
+    tmp_path: Path,
+) -> None:
+    """P3-3(b) regression: a popped screen's slow worker must not leak into
+    whatever screen is active when it finally completes.
+
+    Pushes a run screen, pops it before its gated first poll ever finishes,
+    and only then releases that stale poll. Textual routes a background
+    worker's result back through the *screen instance* that started it
+    (``self.app.call_from_thread`` from inside ``_refresh_state``); once
+    that screen is popped, Textual itself refuses to deliver the result
+    (``NoActiveAppError``) rather than silently applying it anywhere,
+    including back onto the popped screen. This test pins that safety
+    property — the stale worker's completion is a no-op, never a crash and
+    never a leak — rather than merely asserting on
+    ``RunScreen._refresh_generation`` in isolation. A fresh drill-down into a
+    second run afterward confirms its own independent poll still produces
+    the correct snapshot, unaffected by the earlier stale worker.
+    """
+    entry = tmp_path / "runs"
+    for name in ("loose-a", "loose-b"):
+        layout = RunLayout(entry, name).prepare()
+        create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    release_by_run: dict[str, threading.Event] = {
+        "loose-a": threading.Event(),
+        "loose-b": threading.Event(),
+    }
+    completed_by_run: dict[str, threading.Event] = {
+        "loose-a": threading.Event(),
+        "loose-b": threading.Event(),
+    }
+    original_poll = RunMonitor.poll
+
+    def gated_poll(self: RunMonitor, selected_execution_id: str | None = None) -> object:
+        release_by_run[self.layout.run_name].wait(timeout=5)
+        result = original_poll(self, selected_execution_id)
+        completed_by_run[self.layout.run_name].set()
+        return result
+
+    async def exercise() -> None:
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, FleetScreen)
+            rows = fleet_rows(app.screen.snapshot)
+            names = [row.key for row in rows]
+
+            with mock.patch.object(RunMonitor, "poll", gated_poll):
+                # Drill into "loose-a" and pop back out before its gated
+                # poll ever completes.
+                app.screen.selected_index = names.index("loose-a")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert isinstance(app.screen, RunScreen)
+                stale_screen = app.screen
+                assert stale_screen.snapshot is None
+
+                await pilot.press("escape")
+                await pilot.pause()
+                assert isinstance(app.screen, FleetScreen)
+
+                # Release the now-orphaned poll and wait for the underlying
+                # RunMonitor.poll call itself (not any UI callback, which
+                # this stale worker can no longer deliver) to finish, so the
+                # background thread genuinely ran its course rather than the
+                # assertions below merely racing it.
+                release_by_run["loose-a"].set()
+                assert completed_by_run["loose-a"].wait(timeout=5)
+                await pilot.pause()
+
+                # The stale result was never applied anywhere: not back onto
+                # the popped screen, and not onto whatever is now active.
+                assert stale_screen.snapshot is None
+                assert isinstance(app.screen, FleetScreen)
+
+                # A fresh drill-down into a different run gets its own
+                # independent, correct snapshot, unaffected by the earlier
+                # stale worker.
+                app.screen.selected_index = names.index("loose-b")
+                await pilot.press("enter")
+                await pilot.pause()
+                assert isinstance(app.screen, RunScreen)
+                new_screen = app.screen
+                assert new_screen is not stale_screen
+                assert new_screen.snapshot is None
+
+                release_by_run["loose-b"].set()
+                await _wait_until(pilot, lambda: new_screen.snapshot is not None)
+
+            assert new_screen.snapshot is not None
+            assert new_screen.snapshot.layout.run_name == "loose-b"
+            # The popped screen's own snapshot is still untouched: its
+            # worker's result was discarded, not queued or replayed later.
+            assert stale_screen.snapshot is None
+
+    asyncio.run(exercise())
+
+
 def test_fleet_textual_opens_a_group_directly_via_open_group_id(tmp_path: Path) -> None:
     entry = tmp_path / "runs"
     manifest = publish_group_manifest(
