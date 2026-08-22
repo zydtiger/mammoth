@@ -75,6 +75,16 @@ reconstruction:
    newest member heartbeat's recency and staleness, and the terminal group
    status where one was recorded. An entry with no `.mammoth/` subtree, or no
    runs at all, renders an empty-but-valid fleet rather than an error.
+   Groups and loose runs are each independently ordered most-recent-first:
+   a group's or run's sort timestamp is its terminal event time (the group's
+   own terminal event, or the run's newest execution's terminal event) when
+   one is recorded, otherwise its newest observed activity (member activity
+   for a group, heartbeat for a run) — so a still-active entry sorts by its
+   most recent activity rather than dropping to the bottom. An entry with no
+   usable timestamp at all sorts last; ties break on name so a repeated poll
+   never reshuffles otherwise-equal rows. Plain-mode rendering shows the same
+   order. A group's member rows (see level 2 below) keep their manifest
+   schedule order regardless of this fleet-level ordering.
 2. **Group** (selecting one group from the fleet view, or `--group <id>`
    directly). Shows one row per member run in the group manifest's recorded
    schedule order: each declared step's folded status, the member's overall
