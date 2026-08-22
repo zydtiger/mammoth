@@ -22,6 +22,12 @@ small presentation conventions stated below.
   stale tasks previously folded for that producer.
 - A running producer becomes stale after the configured observation horizon;
   the public CLI default is 90 seconds.
+- `ExecutionMonitor` folds incrementally: each poll applies only newly read
+  events to one persistent folded state instead of re-folding the complete
+  accumulated history, and it never retains the complete raw event list.
+  This is an internal optimization only — its observable snapshots are
+  exactly equivalent to a full re-fold of the same event sequence, pinned by
+  a property test in `tests/test_monitor.py`.
 
 ## Attempts, Identity, And Resume State
 
@@ -94,11 +100,35 @@ reconstruction:
    total and a positive throughput; when a member's rate is unknown, the view
    omits the synthetic aggregate rather than guessing and lets each member's
    own progress speak for itself — member durations can diverge widely across
-   a group, and a summed estimate would otherwise mislead.
+   a group, and a summed estimate would otherwise mislead. The same honesty
+   rule applies to one member's own ETA (and a loose run's): it is shown only
+   when that member's task currently reports throughput; otherwise it is
+   withheld rather than falling back to an elapsed-time estimate, because
+   under the bounded tail window (see below) a task's recorded start is only
+   the first event the window happened to capture, not its true start, and
+   an elapsed-time ETA derived from it can be wrong by an arbitrary factor.
 3. **Run** (selecting one member or loose run). Pushes the existing
    single-run dashboard described in the sections below, unchanged. Back
    navigation (`Esc`/`Backspace`) pops the Textual screen stack and returns to
    the fleet or group view the operator drilled in from.
+
+Pushing the run screen never blocks the Textual UI thread on that run's
+first full-history read. The screen is pushed immediately, showing a loading
+state, while `RunMonitor` construction and its first `poll()` run in the same
+exclusive background-worker pattern (`@work(thread=True)`, generation-stamped)
+the fleet, group, and run screens already use for their periodic refreshes;
+the loading state is replaced once that first snapshot arrives. That first
+poll also only fully folds the selected (by default, newest) execution —
+every other attempt in the run's history gets a cheap unfolded placeholder
+(immutable metadata only, no event-stream read) for that one call, so a run
+with many historical attempts does not make the first paint wait on all of
+them. Every poll after that first one folds every attempt exactly as
+`mammoth monitor <run_name>` always has, so the attempt-history panel is
+complete again from the very next scheduled refresh (or immediately once an
+operator navigates to a not-yet-folded attempt, at which point it becomes the
+selected execution for that poll). Standalone single-run monitoring
+(`mammoth monitor <run_name>`, with no fleet or group screen beneath it)
+never uses this lazy first poll, so its behavior and output are unaffected.
 
 Both the fleet screen (its groups table and its loose-runs table
 independently) and the group screen window their row table to the terminal's
@@ -180,7 +210,9 @@ directly at the run view with no fleet or group screen beneath it.
     supplies live task progress, heartbeat recency, and staleness detection
     for runs (or run-major segments) the group event stream has not yet
     recorded a terminal outcome for, including a crashed workflow that never
-    wrote one.
+    wrote one. This tail is *bounded*: see "Bounded Fleet-Level Folding"
+    below. No fleet- or group-level source ever performs a full-history read
+    of a run's event streams.
 - **Run view**, once drilled into, folds exactly as described in the rest of
   this document: a full `RunMonitor` reconstructs every valid attempt in that
   run's lineage. This is the only point in the hierarchy where a full
@@ -195,6 +227,66 @@ directly at the run view with no fleet or group screen beneath it.
   contact, no control actions. A group directory whose manifest failed to
   publish (or fails to parse) is skipped with one warning rather than
   breaking the fleet view.
+
+### Bounded Fleet-Level Folding
+
+A fleet or group roll-up only ever needs a run's *current* state — status,
+newest heartbeat, terminal outcome, displayed progress — not its full
+history, which the run view alone reconstructs. Reading and folding each
+member's complete event streams on every poll is what made an entry with
+hundreds of runs and large streams take tens of seconds to open and several
+seconds per steady-state refresh. Instead, the newest-execution tail each
+fleet or group row folds from (see above) bounds its *first* read of every
+underlying stream to the last `FLEET_TAIL_WINDOW_BYTES` (128 KiB) bytes,
+discarding the partial line straddling the seek point, instead of reading
+from byte 0; every read after that first one is unaffected and reads only
+newly appended bytes exactly like the unbounded reader `mammoth monitor
+<run_name>` uses. 128 KiB comfortably covers ordinary tails: a schema-v1
+JSONL record is on the order of a few hundred bytes, so the window holds
+hundreds of records per stream — far more than one heartbeat interval (30s
+default) or one terminal record's worth of trailing history. A stream
+smaller than the window is read from its true start, identically to the
+unbounded reader. A window too small to contain even one complete line (an
+oversized single record) falls back to a full read from the true start for
+that stream, so the bound never silently starves a roll-up of events; this
+is expected to be unreachable at the configured window size in practice.
+
+**The approximation this bound introduces**: a fleet or group row cannot see
+task or metric history older than the window, only the *current* value of
+each field once fully written. This costs nothing observable, because every
+roll-up field a fleet or group row displays is itself a "what is true right
+now" value, not a history: `TaskState.completed`/`total`/`throughput` are
+overwritten (not accumulated) by each new `progress` event, so the latest one
+within the window is the same value the field would hold under a full read.
+The only roll-up field that *is* order-sensitive across producers rather than
+current-value-only is a group's own `run_started`/`run_completed`/... status
+from its group event stream — and that stream is read via
+`GroupEventTailReader`, never bounded (see below), so it is unaffected.
+
+**Multi-rank all-ranks-terminal resolution under the window**: a run's
+overall status only reports `completed` once every expected rank's own
+process has completed (`_finalize_run_status` in `model.py`), which could
+seem to need each rank's *entire* history to confirm none is still pending.
+It does not, because each rank (and the runner) writes to its own reserved
+stream file (`rank-N.jsonl`, `runner.jsonl`), and a bounded read always seeks
+from the *current end* of that specific file backward — so whatever that
+rank's most recently written record is (its own terminal `process_completed`
+if it has one, or its latest heartbeat/progress if it is still running) is
+always inside the window, regardless of window size, as long as the window
+holds at least one complete line (guaranteed by the fallback above). A rank's
+terminal record is therefore never pushed out of view by bounding: the bound
+only ever discards that rank's *earlier* history, which the roll-up does not
+need. This means fleet-level status resolution is exact, not approximate,
+under the window; only task/metric *history depth* (not needed by any
+roll-up field) is bounded.
+
+**Group event streams remain unbounded.** They are already fully
+incremental (`GroupEventTailReader` never re-reads history), and they carry
+only control-plane run/step lifecycle records rather than per-step training
+telemetry, so they stay orders of magnitude smaller than an execution's own
+streams even for a long-running group; bounding their first read was not
+worth the added complexity. If a future producer ever made a single group's
+event stream large, this choice should be revisited.
 
 ## Dashboard Information Hierarchy
 
@@ -291,9 +383,12 @@ row followed by edge-aligned live metrics.
   the run, fleet, and group views.
 - `tests/test_monitor.py` pins single-run reconstruction, layout, telemetry,
   responsive width, and interaction behavior, plus fleet/group presentation
-  and navigation.
+  and navigation; also pins `ExecutionMonitor`'s incremental-fold/full-fold
+  equivalence and the fleet drill-down's non-blocking loading state.
 - `tests/test_fleet.py` pins fleet and group folding, ad-hoc `--match`
-  grouping, and their plain-mode rendering.
+  grouping, and their plain-mode rendering; also pins bounded-tail-window
+  status/heartbeat/terminal/progress extraction and bounded initial-poll
+  read cost at scale.
 
 Any change to the behavior above updates this document and the owning tests in
 the same change. Presentation changes should also be smoke-tested at wide and

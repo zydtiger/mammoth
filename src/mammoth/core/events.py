@@ -821,17 +821,38 @@ class ExecutionEventReadError(ValueError):
 
 
 class ExecutionEventTailReader:
-    """Poll an append-only event stream while retaining an incomplete final line."""
+    """Poll an append-only event stream while retaining an incomplete final line.
 
-    def __init__(self, path: Path, *, allow_missing: bool = True) -> None:
+    ``tail_window_bytes`` is an optional bound on the *first* read: instead of
+    starting at byte 0, the first poll seeks to within ``tail_window_bytes``
+    of the current end of file and discards the leading partial line (the
+    line straddling the seek point, whose start was not read). Every poll
+    after that first one is unaffected and reads only newly appended bytes,
+    exactly like the unbounded reader. This trades exact per-stream sequence
+    validation from record 1 (skipped once, for the first record actually
+    read) for a bounded first read, which is the fleet/group roll-up folding
+    source; single-run folding never sets this option, so its behavior is
+    completely unchanged. See ``docs/MONITOR.md`` for the window-size
+    rationale and the approximation it introduces.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        *,
+        allow_missing: bool = True,
+        tail_window_bytes: int | None = None,
+    ) -> None:
         self.path = Path(path)
         self.allow_missing = allow_missing
+        self.tail_window_bytes = tail_window_bytes
         self._file_identity: tuple[int, int] | None = None
         self._offset = 0
         self._append_guard = b""
         self._buffer = b""
         self._line_number = 0
         self._next_sequence = 1
+        self._sequence_baseline_synced = True
         self._stream_identity: (
             tuple[
                 str,
@@ -904,6 +925,10 @@ class ExecutionEventTailReader:
                     self._line_number + 1,
                     f"active stream was truncated from offset {self._offset}",
                 )
+            first_read = self._file_identity is None
+            read_offset = self._offset
+            if first_read and self.tail_window_bytes is not None:
+                read_offset = max(self._offset, descriptor_stat.st_size - self.tail_window_bytes)
             guard_offset = self._offset - len(self._append_guard)
             if (
                 self._append_guard
@@ -918,30 +943,67 @@ class ExecutionEventTailReader:
                     self._line_number + 1,
                     "consumed stream prefix changed",
                 )
-            os.lseek(descriptor, self._offset, os.SEEK_SET)
-            chunks: list[bytes] = []
-            remaining = descriptor_stat.st_size - self._offset
-            while remaining:
-                chunk = os.read(descriptor, min(64 * 1024, remaining))
-                if not chunk:
-                    self._fail(
-                        self._line_number + 1,
-                        "active stream changed while polling",
-                    )
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            appended = b"".join(chunks)
+            appended = self._read_from(descriptor, read_offset, descriptor_stat.st_size)
+            seek_ahead = read_offset > self._offset
+            mid_stream_start = False
+            if seek_ahead:
+                landed_on_line_start = os.pread(descriptor, 1, read_offset - 1) == b"\n"
+                if landed_on_line_start:
+                    # The seek point happened to land exactly on a line
+                    # boundary (the byte immediately before it is the
+                    # previous line's terminator): the window's first line
+                    # is already complete, not a partial line straddling the
+                    # seek point, so there is nothing to discard.
+                    mid_stream_start = True
+                else:
+                    # An oversized single line spanning the whole window (or
+                    # a window so small it captures no complete line beyond
+                    # the discarded leading partial one) would otherwise
+                    # starve the reader of any events; fall back to a full
+                    # read from the true start in that rare case instead.
+                    newline_index = appended.find(b"\n")
+                    remainder = appended[newline_index + 1 :] if newline_index != -1 else b""
+                    if not remainder:
+                        read_offset = 0
+                        appended = self._read_from(descriptor, 0, descriptor_stat.st_size)
+                    else:
+                        read_offset = read_offset + newline_index + 1
+                        appended = remainder
+                        mid_stream_start = True
         except BaseException:
             with suppress(Exception):
                 os.close(descriptor)
             raise
         os.close(descriptor)
         self._file_identity = identity
-        self._offset += len(appended)
+        self._offset = read_offset + len(appended)
+        if mid_stream_start:
+            self._sequence_baseline_synced = False
         self._append_guard = (self._append_guard + appended)[-_APPEND_GUARD_BYTES:]
         return appended
 
+    def _read_from(self, descriptor: int, offset: int, file_size: int) -> bytes:
+        """Read every byte from ``offset`` to ``file_size`` on an open descriptor."""
+        os.lseek(descriptor, offset, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = file_size - offset
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                self._fail(self._line_number + 1, "active stream changed while polling")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
     def _validate_stream_record(self, event: ExecutionEvent) -> None:
+        if not self._sequence_baseline_synced:
+            # A bounded first read starts mid-stream: the first record read
+            # seeds the expected sequence instead of being checked against
+            # the unconditional value 1, since earlier records were never
+            # read. Every record after this one is checked normally, so
+            # corruption within the read window is still caught.
+            self._next_sequence = event.sequence
+            self._sequence_baseline_synced = True
         if event.sequence != self._next_sequence:
             raise ValueError(
                 f"sequence {event.sequence} does not match expected {self._next_sequence}"
