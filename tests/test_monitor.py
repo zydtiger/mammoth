@@ -31,6 +31,7 @@ from mammoth.monitor import (
     select_execution,
 )
 from mammoth.monitor.dashboard import (
+    _row_window,
     braille_line_chart,
     dashboard_layout,
     fleet_dashboard_layout,
@@ -1299,8 +1300,8 @@ def test_fleet_dashboard_layout_windows_loose_runs_around_the_selection(tmp_path
     assert "run-10" in rendered
     assert "run-00" not in rendered
     assert "run-19" not in rendered
-    assert "6 more above" in rendered
-    assert "5 more below" in rendered
+    assert "5 more above" in rendered
+    assert "4 more below" in rendered
 
 
 def test_fleet_dashboard_layout_reaches_first_and_last_rows_without_a_dangling_marker(
@@ -1327,12 +1328,12 @@ def test_fleet_dashboard_layout_reaches_first_and_last_rows_without_a_dangling_m
     first = rendered_for(0)
     assert "run-00" in first
     assert "more above" not in first
-    assert "11 more below" in first
+    assert "8 more below" in first
 
     last = rendered_for(19)
     assert "run-19" in last
     assert "more below" not in last
-    assert "11 more above" in last
+    assert "8 more above" in last
 
 
 def test_group_dashboard_layout_windows_members_around_the_selection(tmp_path: Path) -> None:
@@ -1361,8 +1362,35 @@ def test_group_dashboard_layout_windows_members_around_the_selection(tmp_path: P
     assert "member-10" in rendered
     assert "member-00" not in rendered
     assert "member-19" not in rendered
-    assert "5 more above" in rendered
-    assert "4 more below" in rendered
+    assert "4 more above" in rendered
+    assert "3 more below" in rendered
+
+
+def test_row_window_never_exceeds_budget_and_always_shows_the_selected_row() -> None:
+    """P1-1 regression: the reviewed standalone repro, plus its general invariant.
+
+    The old ``budget = max(1, max_visible - 2)`` reservation could still
+    render one data row plus two marker lines against a budget of 1 (three
+    rendered lines for a one-row budget). The fixed function must always
+    keep the selected row inside the window and never let the window plus
+    whichever markers it actually shows exceed ``max_visible``.
+    """
+    start, end, hidden_above, hidden_below = _row_window(
+        total=5, selected_local_index=2, max_visible=1
+    )
+    assert start <= 2 < end
+    footprint = (end - start) + (1 if hidden_above else 0) + (1 if hidden_below else 0)
+    assert footprint <= 1
+
+    for total in (1, 2, 5, 11, 40, 227):
+        for max_visible in (1, 2, 3, 7, 9, 15):
+            for index in (0, total // 2, total - 1):
+                start, end, hidden_above, hidden_below = _row_window(total, index, max_visible)
+                assert start <= index < end
+                footprint = (
+                    (end - start) + (1 if hidden_above else 0) + (1 if hidden_below else 0)
+                )
+                assert footprint <= max_visible
 
 
 def test_fleet_textual_windows_many_loose_runs_and_keeps_selection_visible(
@@ -1461,5 +1489,76 @@ def test_group_textual_windows_many_members_and_keeps_selection_visible(
             text = rendered_text()
             assert "member-000" in text
             assert "more above" not in text
+
+    asyncio.run(exercise())
+
+
+def test_group_textual_keeps_the_selected_row_visible_at_a_very_small_height(
+    tmp_path: Path,
+) -> None:
+    """P1-1 regression: an ultra-small viewport must not hide the selected row.
+
+    Reproduces the reviewed failure directly: 20 members, selection moved to
+    index 10, terminal size (80, 7) -- small enough that a fixed chrome
+    estimate would have left no room for the table header, let alone the
+    selected row, once the summary line wraps at this width.
+    """
+    entry = tmp_path / "runs"
+    manifest = publish_group_manifest(
+        entry,
+        order="run-major",
+        members=[GroupMember(f"member-{index:02d}", ("prepare",)) for index in range(20)],
+    )
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(
+        entry,
+        fleet_monitor,
+        fleet_monitor.poll(),
+        watch=False,
+        telemetry=False,
+        open_group_id=manifest.group_id,
+    )
+
+    async def exercise() -> None:
+        async with app.run_test(size=(80, 7)) as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, GroupScreen)
+            for _ in range(10):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == 10
+
+            body = app.screen.query_one("#body", Static)
+            console = Console(width=80, record=True, color_system=None)
+            console.print(_static_content(body))
+            rendered = console.export_text()
+            assert "member-10" in rendered
+
+    asyncio.run(exercise())
+
+
+def test_fleet_textual_keeps_the_selected_row_visible_at_a_very_small_height(
+    tmp_path: Path,
+) -> None:
+    """P1-1 regression: the same ultra-small-viewport guarantee on the fleet screen."""
+    entry = tmp_path / "runs"
+    for index in range(20):
+        RunLayout(entry, f"run-{index:02d}").prepare()
+    fleet_monitor = FleetMonitor(entry)
+    app = FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    async def exercise() -> None:
+        async with app.run_test(size=(80, 8)) as pilot:
+            await pilot.pause()
+            for _ in range(10):
+                await pilot.press("j")
+            await pilot.pause()
+            assert app.screen.selected_index == 10
+
+            body = app.screen.query_one("#body", Static)
+            console = Console(width=80, record=True, color_system=None)
+            console.print(_static_content(body))
+            rendered = console.export_text()
+            assert "run-10" in rendered
 
     asyncio.run(exercise())

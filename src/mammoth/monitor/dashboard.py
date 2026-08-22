@@ -55,15 +55,10 @@ _COORDINATE_ORDER = (
 )
 _LIGHT_LOAD_PERCENT = 40.0
 _HEAVY_LOAD_PERCENT = 80.0
-# Fixed non-table line counts for windowing (see `_split_table_budget` and
-# `_row_window`): the fleet screen's header, its two section labels, each
-# table's own header row, and its footer; the group screen's header,
-# summary, one section label, and its member table's own header row plus
-# footer. Both figures are a deliberately conservative overestimate (they do
-# not shrink for a warnings-free render), trading a little unused headroom
-# for never overflowing the viewport.
-_FLEET_CHROME_ROWS = 9
-_GROUP_CHROME_ROWS = 7
+# Preferred row cap for whichever fleet-screen table does not hold the
+# current selection (see `_fleet_tables_within_viewport`); always further
+# bounded by the viewport's actually-measured remaining room, so it can
+# never crowd out the focused table's one guaranteed row.
 _UNFOCUSED_TABLE_CAP = 3
 
 
@@ -200,19 +195,42 @@ def _row_window(
     and any call site that has not measured a viewport), which renders every
     row (``start=0, end=total``, nothing hidden). Otherwise the returned
     ``[start, end)`` slice always contains ``selected_local_index`` when one
-    is given, reserving up to two of ``max_visible`` for the "N more
-    above/below" marker lines :func:`_with_overflow_markers` adds so the
-    windowed table plus its markers still fits the budget.
+    is given, and the window plus whichever "N more above/below" marker
+    lines :func:`_with_overflow_markers` would add never exceeds
+    ``max_visible`` rows: markers are reserved only when the resulting
+    window actually needs them (never both unconditionally), and on a
+    viewport too small to fit even one data row alongside its markers, the
+    markers are dropped rather than the selected row.
     """
     if max_visible is None or total <= max_visible:
         return 0, total, 0, 0
-    budget = max(1, max_visible - 2)
-    if total <= budget:
-        return 0, total, 0, 0
+    max_visible = max(1, max_visible)
     index = 0 if selected_local_index is None else min(max(0, selected_local_index), total - 1)
-    start = min(max(0, index - budget // 2), total - budget)
-    end = start + budget
-    return start, end, start, total - end
+
+    def window(visible: int) -> tuple[int, int]:
+        visible = max(1, min(visible, total))
+        start = min(max(0, index - visible // 2), total - visible)
+        return start, start + visible
+
+    visible = max_visible
+    start, end = window(visible)
+    # A smaller window can only need the same or fewer markers than a
+    # bigger one, never more, so reserving exactly what the current window
+    # needs and shrinking to fit always converges in at most two steps.
+    for _ in range(2):
+        markers_needed = (1 if start > 0 else 0) + (1 if end < total else 0)
+        if visible + markers_needed <= max_visible:
+            return start, end, start, total - end
+        if visible <= 1:
+            break
+        visible = max(1, max_visible - markers_needed)
+        start, end = window(visible)
+    # Ultra-small viewport: even the selected row plus its markers does not
+    # fit. Keep the row, drop the markers.
+    markers_needed = (1 if start > 0 else 0) + (1 if end < total else 0)
+    if visible + markers_needed <= max_visible:
+        return start, end, start, total - end
+    return start, end, 0, 0
 
 
 def _with_overflow_markers(
@@ -232,30 +250,103 @@ def _with_overflow_markers(
     return Group(*pieces)
 
 
-def _split_table_budget(
-    viewport_rows: int | None,
+def _rendered_height(renderable: RenderableType, *, width: int) -> int:
+    """Return how many terminal rows ``renderable`` occupies at ``width`` columns.
+
+    Used to size windowed tables against a scrolling terminal's actual
+    height instead of a fixed line-count guess, so text wrapping (for
+    example a summary line wrapping at a narrow width) is accounted for
+    exactly rather than approximated.
+    """
+    console = Console(width=max(1, width), color_system=None, legacy_windows=False)
+    options = console.options.update(width=max(1, width))
+    return len(console.render_lines(renderable, options, pad=False))
+
+
+def _budget_with_fallback(
+    mandatory_prefix: list[RenderableType],
+    optional_prefix: list[RenderableType],
+    *,
+    viewport_rows: int,
+    width: int,
+    table_header_rows: int,
+) -> tuple[list[RenderableType], int]:
+    """Return ``(kept_optional_pieces, data_row_budget)`` for one table.
+
+    Measures the real rendered height of ``mandatory_prefix`` plus however
+    much of ``optional_prefix`` survives, dropping pieces from
+    ``optional_prefix`` in order (least essential first) whenever the
+    remaining viewport cannot fit at least one data row. ``data_row_budget``
+    is always at least 1: the selected row is never sacrificed to keep an
+    optional piece such as a summary line or section label.
+    """
+    kept = list(optional_prefix)
+    while True:
+        prefix_height = _rendered_height(Group(*mandatory_prefix, *kept), width=width)
+        budget = viewport_rows - prefix_height - table_header_rows
+        if budget >= 1 or not kept:
+            return kept, max(1, budget)
+        kept.pop(0)
+
+
+def _fleet_tables_within_viewport(
+    fleet: FleetSnapshot,
+    selected_index: int,
+    now: datetime,
+    stale_after_seconds: float,
+    *,
+    header: RenderableType,
+    groups_label: RenderableType,
+    loose_label: RenderableType | None,
+    loose_shown: bool,
     group_count: int,
     loose_count: int,
-    *,
     focus_groups: bool,
-) -> tuple[int | None, int | None]:
-    """Split the fleet screen's data-row budget between its two tables.
+    viewport_rows: int,
+    width: int,
+) -> tuple[RenderableType, RenderableType | None]:
+    """Size the fleet screen's two tables so the selected row always fits.
 
-    Returns ``(None, None)`` when ``viewport_rows`` is ``None``, meaning
-    render every row (the plain-mode and legacy-call contract). Otherwise the
-    table holding the current selection (``focus_groups``) gets the budget
-    left after reserving up to :data:`_UNFOCUSED_TABLE_CAP` rows for the
-    other table, so the two windowed tables together never exceed the
-    viewport.
+    The table holding the current selection gets whatever the viewport has
+    left after the real (wrap-aware) measured height of everything rendered
+    before it, including the other, unfocused table when that one renders
+    first; the unfocused table is bounded the same way so it can never
+    crowd out the focused table's one guaranteed row.
     """
-    if viewport_rows is None:
-        return None, None
-    available = max(2, viewport_rows - _FLEET_CHROME_ROWS)
+    groups_header_rows = 1 if group_count > 0 else 0
+    prefix_before_groups = _rendered_height(Group(header, groups_label), width=width)
+    groups_room = max(0, viewport_rows - prefix_before_groups - groups_header_rows)
+
     if focus_groups:
-        loose_budget = min(_UNFOCUSED_TABLE_CAP, loose_count, max(0, available - 1))
-        return max(1, available - loose_budget), loose_budget
-    group_budget = min(_UNFOCUSED_TABLE_CAP, group_count, max(0, available - 1))
-    return group_budget, max(1, available - group_budget)
+        groups_table = _group_roll_up_table(
+            fleet, selected_index, now, stale_after_seconds, max(1, groups_room)
+        )
+        loose_table: RenderableType | None = None
+        if loose_shown:
+            groups_table_height = _rendered_height(groups_table, width=width)
+            loose_room = max(0, viewport_rows - prefix_before_groups - groups_table_height)
+            loose_budget = min(_UNFOCUSED_TABLE_CAP, loose_count, loose_room)
+            loose_table = _loose_run_table(
+                fleet, group_count, selected_index, now, stale_after_seconds, loose_budget
+            )
+        return groups_table, loose_table
+
+    groups_budget = min(_UNFOCUSED_TABLE_CAP, group_count, groups_room)
+    groups_table = _group_roll_up_table(
+        fleet, selected_index, now, stale_after_seconds, groups_budget
+    )
+    loose_table = None
+    if loose_shown:
+        assert loose_label is not None
+        prefix_before_loose = _rendered_height(
+            Group(header, groups_label, groups_table, loose_label), width=width
+        )
+        loose_header_rows = 1 if loose_count > 0 else 0
+        loose_budget = max(1, viewport_rows - prefix_before_loose - loose_header_rows)
+        loose_table = _loose_run_table(
+            fleet, group_count, selected_index, now, stale_after_seconds, loose_budget
+        )
+    return groups_table, loose_table
 
 
 def fleet_dashboard_layout(
@@ -267,6 +358,7 @@ def fleet_dashboard_layout(
     refresh_seconds: float = 2.0,
     now: datetime | None = None,
     viewport_rows: int | None = None,
+    width: int = 120,
 ) -> RenderableType:
     """Build the entry-level fleet overview: every group, then every loose run.
 
@@ -274,10 +366,15 @@ def fleet_dashboard_layout(
     height instead of rendering every group and loose run unconditionally: it
     is the interactive screen's rendered row count, and stays ``None`` for
     plain-mode and other non-windowed callers, which keep printing every row.
-    When given, each table is windowed around ``selected_index`` (whichever
-    table currently holds the selection) with "... N more above/below"
-    markers; the non-selected table is capped to a small preview instead of
-    also claiming scarce rows, since only one table can hold the selection.
+    ``width`` is the terminal column count windowing measures wrapping
+    against (for example the header bar's path, or a summary line); it is
+    only meaningful together with ``viewport_rows``. When windowing, each
+    table is sized around ``selected_index`` (whichever table currently
+    holds the selection) with "... N more above/below" markers where room
+    allows; see :func:`_fleet_tables_within_viewport` for exactly how the
+    two tables' budgets are derived from real measured heights, and
+    :func:`_row_window` for the guarantee that the selected row itself is
+    never dropped to make room for markers.
     """
     observed_at = now or datetime.now(UTC)
     rows = fleet_rows(fleet)
@@ -290,34 +387,49 @@ def fleet_dashboard_layout(
         Text(str(fleet.entry)),
         Text(f"refresh {refresh_seconds:g}s"),
     )
-    loose_count = len(fleet.loose_runs) if fleet.match_pattern is None else 0
-    groups_max_visible, loose_max_visible = _split_table_budget(
-        viewport_rows,
-        len(fleet.groups),
-        loose_count,
-        focus_groups=selected_index < len(fleet.groups),
+    groups_label = _section("GROUPS") if not compact else Text("\nGROUPS", style="bold")
+    loose_shown = fleet.match_pattern is None
+    loose_label = (
+        (_section("LOOSE RUNS") if not compact else Text("\nLOOSE RUNS", style="bold"))
+        if loose_shown
+        else None
     )
-    pieces: list[RenderableType] = [
-        header,
-        _section("GROUPS") if not compact else Text("\nGROUPS", style="bold"),
-        _group_roll_up_table(
-            fleet, selected_index, observed_at, stale_after_seconds, groups_max_visible
-        ),
-    ]
-    if fleet.match_pattern is None:
-        pieces.extend(
-            (
-                _section("LOOSE RUNS") if not compact else Text("\nLOOSE RUNS", style="bold"),
-                _loose_run_table(
-                    fleet,
-                    len(fleet.groups),
-                    selected_index,
-                    observed_at,
-                    stale_after_seconds,
-                    loose_max_visible,
-                ),
-            )
+    group_count = len(fleet.groups)
+    loose_count = len(fleet.loose_runs) if loose_shown else 0
+
+    if viewport_rows is None:
+        groups_table = _group_roll_up_table(
+            fleet, selected_index, observed_at, stale_after_seconds, None
         )
+        loose_table = (
+            _loose_run_table(
+                fleet, group_count, selected_index, observed_at, stale_after_seconds, None
+            )
+            if loose_shown
+            else None
+        )
+    else:
+        groups_table, loose_table = _fleet_tables_within_viewport(
+            fleet,
+            selected_index,
+            observed_at,
+            stale_after_seconds,
+            header=header,
+            groups_label=groups_label,
+            loose_label=loose_label,
+            loose_shown=loose_shown,
+            group_count=group_count,
+            loose_count=loose_count,
+            focus_groups=selected_index < group_count,
+            viewport_rows=viewport_rows,
+            width=width,
+        )
+
+    pieces: list[RenderableType] = [header, groups_label, groups_table]
+    if loose_shown:
+        assert loose_label is not None
+        assert loose_table is not None
+        pieces.extend((loose_label, loose_table))
     if fleet.warnings:
         pieces.extend(
             (
@@ -340,14 +452,18 @@ def group_dashboard_layout(
     refresh_seconds: float = 2.0,
     now: datetime | None = None,
     viewport_rows: int | None = None,
+    width: int = 120,
 ) -> RenderableType:
     """Build the group-level view: one row per member in schedule order.
 
     ``viewport_rows`` bounds the member table to a scrolling terminal's
-    actual height, windowed around ``selected_index`` with "... N more
-    above/below" markers; see :func:`fleet_dashboard_layout` for the same
-    contract on the fleet screen. ``None`` (plain-mode and other non-windowed
-    callers) renders every member unconditionally.
+    actual height; ``width`` is the column count windowing measures
+    wrapping against (the summary line can wrap at a narrow width) and is
+    only meaningful together with ``viewport_rows``. When windowing, the
+    summary line and then the "MEMBERS" section label are dropped, in that
+    order, if the remaining room cannot otherwise fit the selected member
+    row — see :func:`_budget_with_fallback`. ``None`` (plain-mode and other
+    non-windowed callers) renders every member unconditionally.
     """
     observed_at = now or datetime.now(UTC)
     header = Table.grid(expand=True, padding=(0, 1), pad_edge=False)
@@ -367,13 +483,24 @@ def group_dashboard_layout(
         f"terminal={group.terminal_status or 'unknown'}  "
         f"aggregate eta={aggregate_eta or '--'}"
     )
-    member_max_visible = (
-        None if viewport_rows is None else max(1, viewport_rows - _GROUP_CHROME_ROWS)
-    )
+    members_label = _section("MEMBERS") if not compact else Text("\nMEMBERS", style="bold")
+    total_members = len(group.members)
+
+    if viewport_rows is None:
+        kept_optional = [summary, members_label]
+        member_max_visible = None
+    else:
+        kept_optional, member_max_visible = _budget_with_fallback(
+            [header],
+            [summary, members_label],
+            viewport_rows=viewport_rows,
+            width=width,
+            table_header_rows=1 if total_members > 0 else 0,
+        )
+
     pieces: list[RenderableType] = [
         header,
-        summary,
-        _section("MEMBERS") if not compact else Text("\nMEMBERS", style="bold"),
+        *kept_optional,
         _member_table(group, selected_index, observed_at, stale_after_seconds, member_max_visible),
     ]
     if group.warnings:

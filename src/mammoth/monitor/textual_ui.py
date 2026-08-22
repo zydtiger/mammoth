@@ -500,6 +500,7 @@ class GroupScreen(Screen[None]):
             stale_after_seconds=self.stale_after_seconds,
             refresh_seconds=self.interval_seconds,
             viewport_rows=max(1, available_height),
+            width=max(1, available_width),
         )
         if self.error is not None:
             renderable = Group(
@@ -636,6 +637,7 @@ class FleetScreen(Screen[None]):
             stale_after_seconds=self.stale_after_seconds,
             refresh_seconds=self.interval_seconds,
             viewport_rows=max(1, available_height),
+            width=max(1, available_width),
         )
         if self.error is not None:
             renderable = Group(

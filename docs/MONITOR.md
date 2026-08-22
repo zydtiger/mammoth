@@ -102,13 +102,27 @@ reconstruction:
 
 Both the fleet screen (its groups table and its loose-runs table
 independently) and the group screen window their row table to the terminal's
-actual height instead of rendering every row unconditionally: the table
-scrolls to keep the `j`/`k`-selected row visible, showing a band of rows
-around the selection with "... N more above ..." / "... N more below ..."
+actual height instead of rendering every row unconditionally: rather than
+scrolling, each render computes and shows only a band of rows around the
+`j`/`k`-selected one, with "... N more above ..." / "... N more below ..."
 markers in place of the rows that do not fit. `j`/`k` still walk the entire
 row set — every group and loose run on the fleet screen, every member on the
 group screen — not only the currently visible band. Plain-mode snapshot
 rendering is unaffected: it keeps printing every row unconditionally.
+
+The selected row is guaranteed visible whenever the viewport can physically
+fit its chrome (headers, section labels, the table's own header row) plus at
+least one data row: the budget available to each table is the real,
+wrap-aware rendered height of everything around it at the terminal's actual
+width, not a fixed line-count guess, so a summary line wrapping at a narrow
+width is accounted for exactly. On a viewport too small even for that
+minimum, optional chrome is dropped before the selected row ever would be —
+the group screen drops its summary line, then its "MEMBERS" label, in that
+order; the fleet screen's unfocused table (the one not currently holding the
+selection) is capped small enough that it can never crowd out the focused
+table's guaranteed row. Only as an absolute last resort, when a table's own
+markers would not fit alongside its single guaranteed row, are the "N more"
+markers themselves dropped rather than the row.
 
 `mammoth monitor <run_name>` without `--group` or `--match` is unaffected by
 any of this: it keeps its original single-run behavior exactly, entering
