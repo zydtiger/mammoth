@@ -190,6 +190,92 @@ def test_tail_reader_holds_partial_record_and_detects_prefix_mutation(tmp_path: 
         reader.poll()
 
 
+def test_tail_reader_bounded_first_read_discards_partial_leading_line(tmp_path: Path) -> None:
+    """A bounded first read seeks near the end and drops the straddling line."""
+    context = execution_context(tmp_path)
+    stream = context.execution_dir / "rank-0.jsonl"
+    writer = ExecutionEventWriter.for_process(context, rank=0)
+    writer.emit("execution_started")
+    for _ in range(30):
+        writer.emit_heartbeat(phase="work", force=True)
+    writer.close()
+
+    full = read_execution_events(stream)
+    assert len(full) == 31
+    size = stream.stat().st_size
+    average_line = size / len(full)
+    window = int(average_line * 10)  # comfortably spans several, not all, lines
+    assert window < size
+
+    reader = ExecutionEventTailReader(stream, tail_window_bytes=window)
+    bounded_events = reader.poll()
+
+    assert 0 < len(bounded_events) < len(full)
+    assert [event.sequence for event in bounded_events] == [
+        event.sequence for event in full[-len(bounded_events) :]
+    ]
+    # Later polls are unaffected: no new bytes yields no new events.
+    assert reader.poll() == []
+
+
+def test_tail_reader_bounded_window_landing_exactly_on_a_line_boundary_keeps_the_first_line(
+    tmp_path: Path,
+) -> None:
+    """P3-1 regression: a seek landing exactly on a line start must not drop it.
+
+    The window is sized so the seek point coincides exactly with a record's
+    own start (not merely somewhere inside it), which used to be
+    misidentified as a partial line straddling the seek point and wrongly
+    discarded, silently losing one valid record.
+    """
+    context = execution_context(tmp_path)
+    stream = context.execution_dir / "rank-0.jsonl"
+    writer = ExecutionEventWriter.for_process(context, rank=0)
+    writer.emit("execution_started")
+    for _ in range(20):
+        writer.emit_heartbeat(phase="work", force=True)
+    writer.close()
+
+    full = read_execution_events(stream)
+    assert len(full) == 21
+    lines = stream.read_bytes().splitlines(keepends=True)
+    assert len(lines) == 21
+    boundary_offset = sum(len(line) for line in lines[:5])
+    window = stream.stat().st_size - boundary_offset
+    assert 0 < window < stream.stat().st_size
+
+    reader = ExecutionEventTailReader(stream, tail_window_bytes=window)
+    bounded_events = reader.poll()
+
+    assert [event.sequence for event in bounded_events] == [event.sequence for event in full[5:]]
+
+
+def test_tail_reader_bounded_window_smaller_than_one_record_falls_back_to_full_read(
+    tmp_path: Path,
+) -> None:
+    """P3-2: a window too small for even one complete record recovers everything.
+
+    An oversized single record (or, as here, simply a window narrower than
+    any line) must never silently starve the reader of events; it falls
+    back to reading from the true start instead.
+    """
+    context = execution_context(tmp_path)
+    stream = context.execution_dir / "rank-0.jsonl"
+    writer = ExecutionEventWriter.for_process(context, rank=0)
+    writer.emit("execution_started")
+    for _ in range(5):
+        writer.emit_heartbeat(phase="work", force=True)
+    writer.close()
+
+    full = read_execution_events(stream)
+    assert len(full) == 6
+
+    reader = ExecutionEventTailReader(stream, tail_window_bytes=1)
+    recovered = reader.poll()
+
+    assert [event.sequence for event in recovered] == [event.sequence for event in full]
+
+
 def test_malformed_complete_record_has_precise_line_context(tmp_path: Path) -> None:
     path = tmp_path / "rank-0.jsonl"
     path.write_bytes(b"{}\n")
