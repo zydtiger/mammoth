@@ -188,12 +188,21 @@ class MonitorSnapshot:
     def terminal_event_time(self) -> datetime | None:
         """Return when this execution reached a terminal outcome, if it has.
 
-        Prefers a runner-emitted terminal event; without one, falls back to
-        an interrupted, then failed, then any process-terminal event. Mirrors
+        Returns ``None`` unless ``status`` itself is terminal (``completed``,
+        ``failed``, or ``interrupted``). A multi-rank execution can have one
+        rank's own ``process_completed`` event long before every rank
+        finishes, while ``status`` correctly stays ``running`` until they
+        all have (see ``_finalize_run_status``); a folding source that used
+        one rank's local terminal timestamp regardless of overall status
+        would treat a still-running execution as finished. Prefers a
+        runner-emitted terminal event; without one, falls back to an
+        interrupted, then failed, then any process-terminal event. Mirrors
         the terminal-event selection dashboard rendering uses, exposed here
         as a timestamp for folding sources (such as fleet recency ordering)
         that need "when did this finish" without the full event object.
         """
+        if self.status not in {"completed", "failed", "interrupted"}:
+            return None
         runner_terminal = next(
             (
                 event

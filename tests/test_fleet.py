@@ -533,6 +533,74 @@ def test_fleet_monitor_orders_loose_runs_by_descending_recency_then_name(tmp_pat
     assert rendered_order == expected_order
 
 
+def test_fleet_monitor_treats_a_still_running_multirank_execution_as_not_finished(
+    tmp_path: Path,
+) -> None:
+    """P2-1 regression: one rank's completion must not finish the whole run.
+
+    A multi-rank execution has staggered rank completion: rank 0 can emit
+    its own process_completed well before every other rank does. Overall
+    ``status`` correctly stays "running" until all ranks finish (see
+    ``_finalize_run_status``); ``terminal_event_time`` must agree, so a
+    still-active run sorts by its newest activity rather than an older,
+    genuinely finished run appearing more recent than it.
+    """
+    entry = tmp_path / "runs"
+
+    # Older, but genuinely finished: must sort below the still-active run.
+    older_finished = RunLayout(entry, "loose-older-finished").prepare()
+    with ExecutionEventWriter.for_runner(
+        create_context(older_finished, "attempt", "2026-01-01T00:00:00Z"),
+        utc_clock=_clock("2026-01-01T00:05:00Z", "2026-01-01T00:20:00Z"),
+    ) as writer:
+        writer.emit("execution_started")
+        writer.emit("execution_completed")
+
+    # Two-rank run: rank 0 completed at 00:10, rank 1 is still running with
+    # a fresh 00:30 heartbeat. The run as a whole has not finished.
+    active_layout = RunLayout(entry, "loose-active-multirank").prepare()
+    active_context = create_execution_context(
+        active_layout.run_dir,
+        run_name=active_layout.run_name,
+        invocation_kind="test",
+        intended_phases=("opaque",),
+        world_size=2,
+        execution_mode="distributed",
+        command=("python", "job.py"),
+        execution_id="attempt",
+        created_at="2026-01-01T00:00:00Z",
+    )
+    with ExecutionEventWriter.for_process(
+        active_context,
+        rank=0,
+        world_size=2,
+        utc_clock=_clock("2026-01-01T00:05:00Z", "2026-01-01T00:10:00Z"),
+    ) as writer:
+        writer.emit("execution_started")
+        writer.emit("process_completed", phase="train")
+    with ExecutionEventWriter.for_process(
+        active_context,
+        rank=1,
+        world_size=2,
+        utc_clock=_clock("2026-01-01T00:29:00Z", "2026-01-01T00:30:00Z"),
+    ) as writer:
+        writer.emit("execution_started")
+        writer.emit("process_started", phase="train")
+
+    # Poll shortly after rank 1's heartbeat so it reads as a fresh, live run
+    # rather than merely non-terminal; the sort behavior under test does not
+    # depend on this, but it keeps the fixture honest about "still running".
+    snapshot = FleetMonitor(entry).poll(now=datetime.fromisoformat("2026-01-01T00:30:30+00:00"))
+
+    assert [run.run_name for run in snapshot.loose_runs] == [
+        "loose-active-multirank",
+        "loose-older-finished",
+    ]
+    active = next(run for run in snapshot.loose_runs if run.run_name == "loose-active-multirank")
+    assert active.status == "running"
+    assert active.finished_at is None
+
+
 def test_fleet_monitor_orders_groups_by_descending_recency_then_name(tmp_path: Path) -> None:
     entry = tmp_path / "runs"
 
