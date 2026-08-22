@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from mammoth.monitor.fleet import FleetSnapshot, GroupMemberSnapshot, GroupSnapshot, MemberProgress
 from mammoth.monitor.model import MonitorSnapshot
 
 
@@ -78,6 +79,123 @@ def render_snapshot(
         lines.append("Warnings:")
         lines.extend(f"  {warning}" for warning in snapshot.warnings)
     return "\n".join(lines) + "\n"
+
+
+def render_fleet_snapshot(
+    fleet: FleetSnapshot,
+    *,
+    now: datetime | None = None,
+    stale_after_seconds: float = 90.0,
+) -> str:
+    """Render one deterministic plain-text entry overview without terminal escapes.
+
+    Lists every group's roll-up (members completed/failed/total, the
+    currently active member, newest heartbeat recency, and terminal group
+    status where recorded) followed by every loose run, or by one ad-hoc
+    ``--match`` cohort when ``fleet.match_pattern`` is set.
+    """
+    current_time = now or datetime.now(UTC)
+    lines = [f"Entry: {fleet.entry}"]
+    if fleet.match_pattern is not None:
+        lines.append(f"Match: {fleet.match_pattern}")
+
+    lines.append("Groups:")
+    if fleet.groups:
+        for group in fleet.groups:
+            active = group.active_member or "--"
+            heartbeat = _heartbeat_text(group.updated_at, current_time, stale_after_seconds)
+            terminal = group.terminal_status or "unknown"
+            lines.append(
+                f"  {group.group_id}: members={group.completed_count}/"
+                f"{group.failed_count}/{group.total_count} (completed/failed/total) "
+                f"active={active} heartbeat={heartbeat} terminal={terminal}"
+            )
+    else:
+        lines.append("  (none observed)")
+
+    if fleet.match_pattern is None:
+        lines.append("Loose runs:")
+        if fleet.loose_runs:
+            for run in fleet.loose_runs:
+                heartbeat = _heartbeat_text(run.updated_at, current_time, stale_after_seconds)
+                lines.append(f"  {run.run_name}: {run.status} heartbeat={heartbeat}")
+        else:
+            lines.append("  (none observed)")
+
+    if fleet.warnings:
+        lines.append("Warnings:")
+        lines.extend(f"  {warning}" for warning in fleet.warnings)
+    return "\n".join(lines) + "\n"
+
+
+def render_group_snapshot(
+    group: GroupSnapshot,
+    *,
+    now: datetime | None = None,
+    stale_after_seconds: float = 90.0,
+) -> str:
+    """Render one deterministic plain-text group view without terminal escapes.
+
+    Lists one row per member in the group's recorded schedule order with its
+    step statuses and progress, highlights failed members, and reports an
+    aggregate ETA only when every pending member's own progress makes one
+    honestly derivable.
+    """
+    current_time = now or datetime.now(UTC)
+    lines = [f"Group: {group.group_id}"]
+    lines.append(f"Order: {group.order or '--'}")
+    lines.append(f"Terminal: {group.terminal_status or 'unknown'}")
+    aggregate_eta = format_duration(group.aggregate_eta_seconds)
+    lines.append(f"Aggregate ETA: {aggregate_eta or '--'}")
+
+    lines.append("Members:")
+    if group.members:
+        for member in group.members:
+            lines.extend(_render_member_lines(member, current_time, stale_after_seconds))
+    else:
+        lines.append("  (none observed)")
+
+    if group.warnings:
+        lines.append("Warnings:")
+        lines.extend(f"  {warning}" for warning in group.warnings)
+    return "\n".join(lines) + "\n"
+
+
+def _render_member_lines(
+    member: GroupMemberSnapshot,
+    now: datetime,
+    stale_after_seconds: float,
+) -> list[str]:
+    heartbeat = _heartbeat_text(member.updated_at, now, stale_after_seconds)
+    marker = "! " if member.status in {"failed", "interrupted", "blocked"} else "  "
+    lines = [f"{marker}{member.run_name}: {member.status} heartbeat={heartbeat}"]
+    if member.steps:
+        steps_text = " ".join(f"{step.name}={step.status}" for step in member.steps)
+        lines.append(f"    steps: {steps_text}")
+    lines.append(f"    progress: {_progress_text(member.progress)}")
+    return lines
+
+
+def _progress_text(progress: MemberProgress | None) -> str:
+    if progress is None:
+        return "--"
+    counts = (
+        f"{progress.completed}"
+        if progress.total is None
+        else f"{progress.completed}/{progress.total}"
+    )
+    rate = f" rate={progress.throughput:.1f} b/s" if progress.throughput is not None else " rate=--"
+    eta = format_duration(progress.eta_seconds)
+    eta_text = f" eta={eta}" if eta is not None else ""
+    return f"{counts}{rate}{eta_text}"
+
+
+def _heartbeat_text(value: datetime | None, now: datetime, stale_after_seconds: float) -> str:
+    if value is None:
+        return "--"
+    age_seconds = max(0.0, (now - value).total_seconds())
+    age = format_duration(age_seconds) or "0s"
+    return f"{age} ago (stale)" if age_seconds > stale_after_seconds else f"{age} ago"
 
 
 def format_duration(seconds: float | None) -> str | None:

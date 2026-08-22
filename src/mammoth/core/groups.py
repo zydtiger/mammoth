@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+import stat
 import threading
 import uuid
 from collections.abc import Mapping, Sequence
@@ -38,6 +39,7 @@ GROUPS_RELATIVE_DIR = Path(".mammoth") / "groups"
 GROUP_MANIFEST_FILENAME = "manifest.json"
 GROUP_EVENT_STREAM_FILENAME = "events.jsonl"
 _GENERATED_ID_ATTEMPTS = 32
+_GROUP_EVENT_APPEND_GUARD_BYTES = 4096
 
 logger = logging.getLogger(__name__)
 
@@ -616,6 +618,154 @@ def read_group_events(path: Path) -> list[GroupEvent]:
         next_sequence += 1
         events.append(event)
     return events
+
+
+class GroupEventReadError(ValueError):
+    """A complete JSONL group event record failed with precise stream context."""
+
+    def __init__(
+        self,
+        path: Path,
+        line_number: int,
+        detail: str,
+        *,
+        valid_events: tuple[GroupEvent, ...] = (),
+    ) -> None:
+        self.path = path
+        self.line_number = line_number
+        self.detail = detail
+        self.valid_events = valid_events
+        super().__init__(f"Malformed group event in {path} at line {line_number}: {detail}")
+
+
+class GroupEventTailReader:
+    """Poll one append-only group event stream while retaining an incomplete final line.
+
+    Mirrors :class:`mammoth.core.events.ExecutionEventTailReader`'s incremental
+    contract at group scope: each :meth:`poll` returns only newly appended
+    complete records, an incomplete trailing line is retained for the next
+    poll, and a changed or truncated file identity fails loudly instead of
+    silently reinterpreting history. This is the passive folding source a
+    fleet or group monitor uses instead of re-reading the whole stream with
+    :func:`read_group_events` on every refresh.
+    """
+
+    def __init__(self, path: Path, *, allow_missing: bool = True) -> None:
+        self.path = Path(path)
+        self.allow_missing = allow_missing
+        self._file_identity: tuple[int, int] | None = None
+        self._offset = 0
+        self._append_guard = b""
+        self._buffer = b""
+        self._line_number = 0
+        self._next_sequence = 1
+        self._group_id: str | None = None
+        self._error: GroupEventReadError | None = None
+
+    @property
+    def line_number(self) -> int:
+        """Return the number of complete records consumed, including a failed line."""
+        return self._line_number
+
+    @property
+    def offset(self) -> int:
+        """Return the byte offset already read from the active file identity."""
+        return self._offset
+
+    def poll(self) -> list[GroupEvent]:
+        """Return records appended since the previous poll without blocking."""
+        if self._error is not None:
+            raise self._error
+        try:
+            appended = self._read_appended_bytes()
+        except FileNotFoundError:
+            if self.allow_missing and self._file_identity is None:
+                return []
+            raise
+        if not appended:
+            return []
+
+        raw = self._buffer + appended
+        parts = raw.split(b"\n")
+        complete_lines, self._buffer = parts[:-1], parts[-1]
+        events: list[GroupEvent] = []
+        for line in complete_lines:
+            self._line_number += 1
+            try:
+                payload = json.loads(line.decode("utf-8"))
+                event = GroupEvent.from_dict(payload)
+                self._validate_stream_record(event)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                self._fail(self._line_number, str(error), valid_events=tuple(events))
+            events.append(event)
+        return events
+
+    def _read_appended_bytes(self) -> bytes:
+        flags = os.O_RDONLY | os.O_NONBLOCK
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(self.path, flags)
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(descriptor_stat.st_mode):
+                raise OSError(f"Group event stream must be a regular file: {self.path}")
+            identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            if self._file_identity is not None and identity != self._file_identity:
+                self._fail(self._line_number + 1, "active stream file identity changed")
+            if descriptor_stat.st_size < self._offset:
+                self._fail(
+                    self._line_number + 1,
+                    f"active stream was truncated from offset {self._offset}",
+                )
+            guard_offset = self._offset - len(self._append_guard)
+            if (
+                self._append_guard
+                and os.pread(descriptor, len(self._append_guard), guard_offset)
+                != self._append_guard
+            ):
+                self._fail(self._line_number + 1, "consumed stream prefix changed")
+            os.lseek(descriptor, self._offset, os.SEEK_SET)
+            chunks: list[bytes] = []
+            remaining = descriptor_stat.st_size - self._offset
+            while remaining:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    self._fail(self._line_number + 1, "active stream changed while polling")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            appended = b"".join(chunks)
+        except BaseException:
+            with suppress(Exception):
+                os.close(descriptor)
+            raise
+        os.close(descriptor)
+        self._file_identity = identity
+        self._offset += len(appended)
+        self._append_guard = (self._append_guard + appended)[-_GROUP_EVENT_APPEND_GUARD_BYTES:]
+        return appended
+
+    def _validate_stream_record(self, event: GroupEvent) -> None:
+        if event.sequence != self._next_sequence:
+            raise ValueError(
+                f"group event sequence {event.sequence} does not match expected "
+                f"{self._next_sequence}"
+            )
+        if self._group_id is None:
+            self._group_id = event.group_id
+        elif event.group_id != self._group_id:
+            raise ValueError("group event identity differs from earlier records in the stream")
+        self._next_sequence += 1
+
+    def _fail(
+        self,
+        line_number: int,
+        detail: str,
+        *,
+        valid_events: tuple[GroupEvent, ...] = (),
+    ) -> None:
+        error = GroupEventReadError(self.path, line_number, detail, valid_events=valid_events)
+        self._error = error
+        raise error
 
 
 def _validate_json_compatible(value: Any) -> JsonValue:
