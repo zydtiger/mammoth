@@ -237,6 +237,7 @@ def test_neutral_cleanup_failure_records_terminal_outcome(tmp_path: Path) -> Non
     spec = spec_for(tmp_path, "cleanup-failure")
     session = ExecutionSession.create(spec)
     session.start_phase("train")
+
     def fail_pipeline(_: str) -> str:
         raise OSError("flush failed")
 

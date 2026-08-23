@@ -37,9 +37,7 @@ def render_snapshot(
 
     lines.append("Producers:")
     if snapshot.producers:
-        for key, producer in sorted(
-            snapshot.producers.items(), key=lambda item: item[0].label
-        ):
+        for key, producer in sorted(snapshot.producers.items(), key=lambda item: item[0].label):
             status = producer.effective_status(current_time, stale_after_seconds)
             detail = f" phase={producer.phase}" if producer.phase is not None else ""
             lines.append(f"  {key.label}: {status}{detail} sequence={producer.sequence}")
@@ -54,11 +52,7 @@ def render_snapshot(
             progress = str(task.completed)
             if task.total is not None:
                 progress = f"{progress}/{task.total}"
-            rate = (
-                f" rate={task.throughput:.1f} b/s"
-                if task.throughput is not None
-                else " rate=--"
-            )
+            rate = f" rate={task.throughput:.1f} b/s" if task.throughput is not None else " rate=--"
             eta = format_duration(task.eta_seconds)
             eta_text = f" eta={eta}" if eta is not None else ""
             lines.append(

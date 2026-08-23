@@ -66,9 +66,12 @@ def test_backend_config_applies_persistent_caller_selected_values() -> None:
 def test_configured_backend_restores_state_after_failure() -> None:
     before = current_torch_backend_state()
 
-    with pytest.raises(RuntimeError, match="backend failed"), configured_torch_backend(
-        TorchBackendConfig(cudnn_benchmark=not before.cudnn_benchmark)
-    ) as state:
+    with (
+        pytest.raises(RuntimeError, match="backend failed"),
+        configured_torch_backend(
+            TorchBackendConfig(cudnn_benchmark=not before.cudnn_benchmark)
+        ) as state,
+    ):
         assert state.cudnn_benchmark is not before.cudnn_benchmark
         raise RuntimeError("backend failed")
 

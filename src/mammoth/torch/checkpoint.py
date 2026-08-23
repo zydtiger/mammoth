@@ -202,9 +202,9 @@ class TrainerCheckpointRestore:
             frozenset,
         ):
             raise TypeError("restored and reset components must be frozensets")
-        invalid_components = (
-            self.restored_components | self.reset_components
-        ).difference(_CHECKPOINT_COMPONENTS)
+        invalid_components = (self.restored_components | self.reset_components).difference(
+            _CHECKPOINT_COMPONENTS
+        )
         if invalid_components:
             raise ValueError(f"unsupported checkpoint components: {invalid_components}")
         overlap = self.restored_components & self.reset_components
@@ -605,9 +605,7 @@ class AsyncCheckpointPublisher:
             validated = validate_checkpoint_plan(plan)
             anchored = anchor_checkpoint_plan(validated)
             self._await_submission_slot()
-            return self._submit_operation(
-                partial(publish_anchored_checkpoint_plan, anchored)
-            )
+            return self._submit_operation(partial(publish_anchored_checkpoint_plan, anchored))
 
     def flush(self) -> None:
         """Wait for and surface every pending publication result."""
@@ -644,9 +642,7 @@ class AsyncCheckpointPublisher:
                             f"{type(cleanup_error).__name__}: {cleanup_error}"
                         )
                         for note in getattr(cleanup_error, "__notes__", ()):
-                            deferred_interrupt.add_note(
-                                f"Checkpoint cleanup detail: {note}"
-                            )
+                            deferred_interrupt.add_note(f"Checkpoint cleanup detail: {note}")
                     self._deferred_interrupt = None
                     self._closing = False
                     self._closed = True
@@ -988,9 +984,7 @@ def validate_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPlan:
             or not isinstance(artifact.mode, int)
             or not 0 <= artifact.mode <= 0o777
         ):
-            raise ValueError(
-                "checkpoint artifact mode must be None or from 0o000 through 0o777"
-            )
+            raise ValueError("checkpoint artifact mode must be None or from 0o000 through 0o777")
         destinations.add(resolved)
         normalized_artifacts.append(
             CheckpointArtifact(
@@ -1403,9 +1397,7 @@ def require_descriptor_relative_filesystem() -> None:
     """Reject platforms without the operations required for confined durability."""
     required = (os.mkdir, os.open, os.rename, os.stat, os.unlink)
     unsupported = [
-        operation.__name__
-        for operation in required
-        if operation not in os.supports_dir_fd
+        operation.__name__ for operation in required if operation not in os.supports_dir_fd
     ]
     if unsupported:
         names = ", ".join(sorted(unsupported))

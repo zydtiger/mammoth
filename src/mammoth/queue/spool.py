@@ -330,9 +330,7 @@ def list_jobs(entry: Path) -> QueueSnapshot:
                 malformed.append(str(path))
         return jobs
 
-    pending = tuple(
-        sorted(_load_all(_glob_json(layout.pending_dir)), key=lambda job: job.sequence)
-    )
+    pending = tuple(sorted(_load_all(_glob_json(layout.pending_dir)), key=lambda job: job.sequence))
     claimed: list[Job] = []
     if layout.claimed_dir.is_dir():
         for lane_dir in sorted(layout.claimed_dir.iterdir()):

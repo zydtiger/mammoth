@@ -142,9 +142,7 @@ class MetricAccumulator:
                 list() for _ in range(torch.distributed.get_world_size())
             ]
             torch.distributed.all_gather_object(gathered_names, local_names)
-            union_names = sorted(
-                {name for rank_names in gathered_names for name in rank_names}
-            )
+            union_names = sorted({name for rank_names in gathered_names for name in rank_names})
             local_specs = {
                 name: (
                     self.specs.get(name, self.default).reduction,
@@ -162,9 +160,7 @@ class MetricAccumulator:
                 name for name in union_names if self.specs.get(name, self.default).distributed
             ]
             local_only_names = [
-                name
-                for name in local_names
-                if not self.specs.get(name, self.default).distributed
+                name for name in local_names if not self.specs.get(name, self.default).distributed
             ]
             names = distributed_names + local_only_names
         for name in names:
@@ -270,9 +266,9 @@ def compute_stateful_metrics(
         if any(names != metric_names for names in gathered_metric_names):
             raise ValueError("stateful metric registrations differ across distributed ranks")
         local_metadata = stateful_metric_metadata(snapshot)
-        gathered_metadata: list[
-            dict[str, dict[str, tuple[tuple[int, ...], str, str]]]
-        ] = [{} for _ in range(torch.distributed.get_world_size())]
+        gathered_metadata: list[dict[str, dict[str, tuple[tuple[int, ...], str, str]]]] = [
+            {} for _ in range(torch.distributed.get_world_size())
+        ]
         torch.distributed.all_gather_object(gathered_metadata, local_metadata)
         if any(metadata != local_metadata for metadata in gathered_metadata):
             raise ValueError("stateful metric tensor metadata differs across ranks")
@@ -317,14 +313,10 @@ def compute_stateful_metrics(
     compute_error: BaseException | None = None
     try:
         for metric_name in metric_names:
-            computed = scalar_metrics(
-                metrics[metric_name].compute(prepared[metric_name])
-            )
+            computed = scalar_metrics(metrics[metric_name].compute(prepared[metric_name]))
             overlap = sorted(set(results).intersection(computed))
             if overlap:
-                raise ValueError(
-                    f"stateful metrics returned duplicate names: {overlap}"
-                )
+                raise ValueError(f"stateful metrics returned duplicate names: {overlap}")
             results.update(computed)
     except BaseException as error:
         compute_error = error
@@ -347,20 +339,12 @@ def raise_stateful_distributed_failure(
         if local_error is not None:
             raise local_error
         return
-    local_status = (
-        None
-        if local_error is None
-        else f"{type(local_error).__name__}: {local_error}"
-    )
-    gathered_statuses: list[str | None] = [
-        None for _ in range(torch.distributed.get_world_size())
-    ]
+    local_status = None if local_error is None else f"{type(local_error).__name__}: {local_error}"
+    gathered_statuses: list[str | None] = [None for _ in range(torch.distributed.get_world_size())]
     torch.distributed.all_gather_object(gathered_statuses, local_status)
     failure = next((status for status in gathered_statuses if status is not None), None)
     if failure is not None:
-        raise RuntimeError(
-            f"stateful metric {operation} failed: {failure}"
-        ) from local_error
+        raise RuntimeError(f"stateful metric {operation} failed: {failure}") from local_error
 
 
 def snapshot_stateful_metrics(
@@ -459,9 +443,7 @@ def scalar_metrics(
     required = prepared_scalar_metrics(required_finite or {})
     return _materialize_scalar_metrics(
         metrics,
-        validities={
-            name: _metric_scalar_is_finite(value) for name, value in required.items()
-        },
+        validities={name: _metric_scalar_is_finite(value) for name, value in required.items()},
     )
 
 
@@ -520,10 +502,15 @@ def _materialize_scalar_metrics(
 
 def _scale_metric_scalar(value: MetricScalar, weight: float) -> MetricScalar:
     """Multiply one detached scalar while preserving host-accumulator precision."""
-    if isinstance(value, torch.Tensor) and not value.is_complex() and value.device.type in {
-        "cpu",
-        "cuda",
-    }:
+    if (
+        isinstance(value, torch.Tensor)
+        and not value.is_complex()
+        and value.device.type
+        in {
+            "cpu",
+            "cuda",
+        }
+    ):
         return value.to(dtype=torch.float64) * weight
     return value * weight
 

@@ -62,9 +62,7 @@ class RunObserver:
         )
         self._disabled: set[int] = set()
         self._closed = False
-        self._heartbeat_interval_seconds = _validate_heartbeat_interval(
-            heartbeat_interval_seconds
-        )
+        self._heartbeat_interval_seconds = _validate_heartbeat_interval(heartbeat_interval_seconds)
         self._monotonic_clock = monotonic_clock
         self._state_lock = threading.Lock()
         self._dispatch_lock = threading.RLock()

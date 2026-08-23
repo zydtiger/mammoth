@@ -270,8 +270,10 @@ class AsyncObservationSink:
         )
 
     def _is_replaceable_progress(self, observation: Observation) -> bool:
-        return self.coalesce_progress and observation.event == "progress" and not bool(
-            observation.fields.get("final", False)
+        return (
+            self.coalesce_progress
+            and observation.event == "progress"
+            and not bool(observation.fields.get("final", False))
         )
 
     @staticmethod

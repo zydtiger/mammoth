@@ -105,9 +105,7 @@ class GroupMember:
             raise ValueError(f"Group member {self.run_name!r} steps must be a sequence")
         steps = tuple(self.steps)
         if not steps or any(not isinstance(step, str) or not step for step in steps):
-            raise ValueError(
-                f"Group member {self.run_name!r} steps must contain non-empty strings"
-            )
+            raise ValueError(f"Group member {self.run_name!r} steps must contain non-empty strings")
         if len(steps) != len(set(steps)):
             raise ValueError(f"Group member {self.run_name!r} step names must be unique")
         object.__setattr__(self, "steps", steps)

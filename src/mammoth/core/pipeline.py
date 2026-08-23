@@ -236,8 +236,7 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
         self,
         input_value: InputT,
         *,
-        on_done: Callable[[BackgroundPipelineSubmission[InputT, ResultT]], object]
-        | None = None,
+        on_done: Callable[[BackgroundPipelineSubmission[InputT, ResultT]], object] | None = None,
     ) -> BackgroundPipelineSubmission[InputT, ResultT]:
         """Transfer one input to the ordered worker after bounded backpressure."""
         if on_done is not None and not callable(on_done):
@@ -465,10 +464,7 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
         )
 
     def _active_count(self) -> int:
-        return sum(
-            submission._state in {"queued", "running"}
-            for submission in self._submissions
-        )
+        return sum(submission._state in {"queued", "running"} for submission in self._submissions)
 
     def _await_submission_slot(self) -> None:
         self._raise_next_failure()

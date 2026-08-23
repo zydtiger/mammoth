@@ -43,9 +43,7 @@ from mammoth.workflow.launch import launch_process
 def successful_step(name: str, *, marker: Path | None = None) -> Step:
     """Return one small successful child command for workflow tests."""
     source = (
-        "pass"
-        if marker is None
-        else f"from pathlib import Path; Path({str(marker)!r}).touch()"
+        "pass" if marker is None else f"from pathlib import Path; Path({str(marker)!r}).touch()"
     )
     return Step(name, (sys.executable, "-c", source))
 
@@ -90,9 +88,7 @@ def test_models_freeze_caller_inputs_and_step_has_only_final_argv_policy(
 def test_workflow_freezes_caller_collections_and_canonical_dispatch(tmp_path: Path) -> None:
     """Workflow construction detaches its ordering inputs before planning or execution."""
     root = tmp_path / "runs"
-    runs = UserList(
-        [Run("run", (Step("prepare", ("prepare",)), Step("train", ("train",))))]
-    )
+    runs = UserList([Run("run", (Step("prepare", ("prepare",)), Step("train", ("train",))))])
     step_order = UserList(["prepare", "train"])
 
     workflow = Workflow(
@@ -513,13 +509,11 @@ def test_child_signal_interrupts_only_its_run_and_blocks_undispatched_runs(
     expected_dispatch: tuple[tuple[str, str], ...],
 ) -> None:
     """A child signal is run-local rather than a workflow-level interruption."""
+
     def launch_in_order(*args: Any, **kwargs: Any) -> ProcessResult:
         del args
         environment = kwargs["environment"]
-        if (
-            environment["MAMMOTH_RUN_NAME"] == "beta"
-            and environment["MAMMOTH_PHASE"] == "prepare"
-        ):
+        if environment["MAMMOTH_RUN_NAME"] == "beta" and environment["MAMMOTH_PHASE"] == "prepare":
             return ProcessResult(-signal.SIGKILL, 0.1, signal=signal.SIGKILL)
         return ProcessResult(0, 0.1)
 
@@ -553,9 +547,7 @@ def test_child_signal_interrupts_only_its_run_and_blocks_undispatched_runs(
     assert result.run("gamma").outcome == "blocked"
     assert result.run("gamma").execution_id is None
     assert not (root / "gamma").exists()
-    assert tuple(
-        (item.run_name, item.step.name) for item in result.dispatch
-    ) == expected_dispatch
+    assert tuple((item.run_name, item.step.name) for item in result.dispatch) == expected_dispatch
 
 
 def test_parent_signal_during_launch_interrupts_active_runs_only(
@@ -563,13 +555,11 @@ def test_parent_signal_during_launch_interrupts_active_runs_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A signal caught by the workflow process remains workflow-scoped."""
+
     def launch_with_parent_signal(*args: Any, **kwargs: Any) -> ProcessResult:
         del args
         environment = kwargs["environment"]
-        if (
-            environment["MAMMOTH_RUN_NAME"] == "beta"
-            and environment["MAMMOTH_PHASE"] == "prepare"
-        ):
+        if environment["MAMMOTH_RUN_NAME"] == "beta" and environment["MAMMOTH_PHASE"] == "prepare":
             return ProcessResult(
                 -signal.SIGTERM,
                 0.1,

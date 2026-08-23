@@ -567,9 +567,8 @@ class ExecutionEventWriter:
                 observed_at=observed_at,
                 fields=payload,
             )
-            if (
-                self._pending_progress is not None
-                and not _same_progress_scope(self._pending_progress, candidate)
+            if self._pending_progress is not None and not _same_progress_scope(
+                self._pending_progress, candidate
             ):
                 self.flush_progress(final=False)
                 if not self.enabled:
@@ -1221,9 +1220,7 @@ def _validated_coordinates(
     for name, value in coordinates.items():
         _validate_nonempty_string("coordinate name", name)
         if isinstance(value, bool) or not isinstance(value, int | float | str):
-            raise ValueError(
-                f"coordinates[{name!r}] must be an integer, finite number, or string."
-            )
+            raise ValueError(f"coordinates[{name!r}] must be an integer, finite number, or string.")
         if isinstance(value, float):
             _validate_finite_number(f"coordinates[{name!r}]", value)
         if isinstance(value, str):

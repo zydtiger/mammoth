@@ -50,8 +50,10 @@ class ArtifactReceipt:
             or self.size_bytes < 0
         ):
             raise ValueError("artifact receipt size_bytes must be non-negative")
-        if not isinstance(self.sha256, str) or len(self.sha256) != 64 or any(
-            character not in "0123456789abcdef" for character in self.sha256
+        if (
+            not isinstance(self.sha256, str)
+            or len(self.sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.sha256)
         ):
             raise ValueError("artifact receipt sha256 must be lowercase hexadecimal")
 
@@ -153,9 +155,7 @@ class ArtifactReadSession:
                 with suppress(OSError, ValueError):
                     reader.close()
                 if exception_type is None:
-                    raise RuntimeError(
-                        "artifact read session cannot exit while a reader is active"
-                    )
+                    raise RuntimeError("artifact read session cannot exit while a reader is active")
                 return
             if exception_type is None:
                 _validate_artifact_session_binding(
@@ -175,9 +175,7 @@ class ArtifactReadSession:
                     expected_stat=expected_stat,
                 )
                 if final_receipt != self.receipt:
-                    raise ArtifactChangedError(
-                        f"artifact changed while being read: {self._path}"
-                    )
+                    raise ArtifactChangedError(f"artifact changed while being read: {self._path}")
         finally:
             if exception_type is None:
                 os.close(descriptor)
@@ -278,9 +276,7 @@ def inspect_artifact(
         )
         final_path_stat = os.lstat(artifact_path)
         if not artifact_stats_match(descriptor_stat, final_path_stat):
-            raise ArtifactChangedError(
-                f"artifact changed while being inspected: {artifact_path}"
-            )
+            raise ArtifactChangedError(f"artifact changed while being inspected: {artifact_path}")
         return receipt
     finally:
         os.close(descriptor)
@@ -344,9 +340,7 @@ def verify_artifact(
         raise TypeError("receipt must be an ArtifactReceipt")
     observed = inspect_artifact(receipt.path, chunk_size=chunk_size)
     if observed.size_bytes != receipt.size_bytes or observed.sha256 != receipt.sha256:
-        raise ArtifactVerificationError(
-            f"artifact does not match receipt: {receipt.path}"
-        )
+        raise ArtifactVerificationError(f"artifact does not match receipt: {receipt.path}")
 
 
 def inspect_artifact_descriptor(
@@ -524,22 +518,14 @@ def atomic_publish(
         try:
             temporary_mode = os.lstat(temporary).st_mode
         except FileNotFoundError:
-            raise FileNotFoundError(
-                f"artifact writer did not create {temporary}"
-            ) from None
+            raise FileNotFoundError(f"artifact writer did not create {temporary}") from None
         if not stat.S_ISREG(temporary_mode):
             raise FileNotFoundError(f"artifact writer did not create {temporary}")
-        open_flags = (
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-        )
+        open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         serialized_descriptor = os.open(temporary, open_flags)
         try:
             if not stat.S_ISREG(os.fstat(serialized_descriptor).st_mode):
-                raise FileNotFoundError(
-                    f"artifact writer did not create {temporary}"
-                )
+                raise FileNotFoundError(f"artifact writer did not create {temporary}")
             if inspect_serialized is not None:
                 inspect_serialized(serialized_descriptor)
             os.fsync(serialized_descriptor)
@@ -617,9 +603,7 @@ def prepare_artifact_in_directory(
             pass
         else:
             if not stat.S_ISREG(destination_stat.st_mode):
-                raise ValueError(
-                    f"artifact destination must be a regular file: {destination}"
-                )
+                raise ValueError(f"artifact destination must be a regular file: {destination}")
             if preserve_permissions:
                 destination_mode = stat.S_IMODE(destination_stat.st_mode) & 0o777
                 mode = destination_mode
@@ -640,11 +624,7 @@ def prepare_artifact_in_directory(
             raise RuntimeError(
                 f"artifact parent changed during serialization: {destination.parent}"
             )
-        open_flags = (
-            os.O_RDONLY
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-        )
+        open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         serialized_descriptor = os.open(
             artifact_name,
             open_flags,
@@ -652,9 +632,7 @@ def prepare_artifact_in_directory(
         )
         try:
             if not stat.S_ISREG(os.fstat(serialized_descriptor).st_mode):
-                raise FileNotFoundError(
-                    f"artifact writer did not create a file for {destination}"
-                )
+                raise FileNotFoundError(f"artifact writer did not create a file for {destination}")
             if inspect_serialized is not None:
                 inspect_serialized(serialized_descriptor)
             if mode is not None:
@@ -698,8 +676,7 @@ def descriptor_filesystem_path(descriptor: int) -> Path:
             continue
         return anchored_path
     raise NotImplementedError(
-        "prepared artifact operations require a descriptor filesystem at "
-        "/proc/self/fd or /dev/fd"
+        "prepared artifact operations require a descriptor filesystem at /proc/self/fd or /dev/fd"
     )
 
 
@@ -782,9 +759,7 @@ def replace_prepared_artifact(
     else:
         supports_descriptors = any(
             parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
-        ) or {"src_dir_fd", "dst_dir_fd"}.issubset(
-            parameter.name for parameter in parameters
-        )
+        ) or {"src_dir_fd", "dst_dir_fd"}.issubset(parameter.name for parameter in parameters)
     if supports_descriptors:
         os.replace(
             source_name,

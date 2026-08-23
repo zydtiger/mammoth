@@ -43,13 +43,10 @@ class Observation:
     logical_step: int | None = None
 
     def __post_init__(self) -> None:
-        if (
-            self.logical_step is not None
-            and (
-                isinstance(self.logical_step, bool)
-                or not isinstance(self.logical_step, int)
-                or self.logical_step < 0
-            )
+        if self.logical_step is not None and (
+            isinstance(self.logical_step, bool)
+            or not isinstance(self.logical_step, int)
+            or self.logical_step < 0
         ):
             raise ValueError("logical_step must be a non-negative integer or None")
         object.__setattr__(self, "fields", MappingProxyType(dict(self.fields)))

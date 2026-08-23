@@ -335,9 +335,7 @@ def test_is_immutable_log_entry_covers_known_immutable_entries(tmp_path: Path) -
     # Nested entries under the execution-attempt container stay immutable too.
     assert is_immutable_log_entry(log_dir, log_dir / "executions" / "attempt-1") is True
     assert (
-        is_immutable_log_entry(
-            log_dir, log_dir / "executions" / "attempt-1" / "execution.json"
-        )
+        is_immutable_log_entry(log_dir, log_dir / "executions" / "attempt-1" / "execution.json")
         is True
     )
 

@@ -235,8 +235,7 @@ def build_artifact_transaction_plan(
                 key=artifact.key,
                 target=artifact.target,
                 stage=(
-                    artifact.target.parent
-                    / f".mammoth-txn-{transaction_id}-{artifact.key}.stage"
+                    artifact.target.parent / f".mammoth-txn-{transaction_id}-{artifact.key}.stage"
                 ),
                 kind=artifact.kind,
                 validator=artifact.validator,
@@ -568,12 +567,7 @@ def stage_transaction_file(plan: ArtifactTransactionPlan, key: str, payload: byt
     if object_exists(stage):
         validate_existing_object(stage, "file", "stage")
         raise FileExistsError(f"transaction stage already exists: {stage}")
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_CLOEXEC", 0)
-    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     if not hasattr(os, "O_NOFOLLOW"):
         raise NotImplementedError("artifact transactions require os.O_NOFOLLOW")
     descriptor: int | None = None
@@ -663,8 +657,7 @@ def move_directory_into_transaction_stage(
         adopted_identity = inspect_transaction_object(stage, "directory", synchronize=True)
         if adopted_identity != source_identity:
             raise ArtifactTransactionRecoveryError(
-                "adopted directory stage is identity-mismatched; preserving evidence: "
-                f"{stage}"
+                f"adopted directory stage is identity-mismatched; preserving evidence: {stage}"
             )
         _remove_owned_empty_directory(source, root, reservation)
         return stage
@@ -764,10 +757,7 @@ def _validate_directory_source_topology(plan: ArtifactTransactionPlan, source: P
             (candidate.stage, candidate.kind),
             (transaction_backup_path(plan, candidate), candidate.kind),
         )
-        if any(
-            transaction_paths_overlap(source, "directory", path, kind)
-            for path, kind in paths
-        ):
+        if any(transaction_paths_overlap(source, "directory", path, kind) for path, kind in paths):
             raise ArtifactTransactionValidationError(
                 f"transaction directory source overlaps a transaction path: {source}"
             )
@@ -1055,9 +1045,7 @@ def transaction_root_for_path(path: Path, roots: tuple[Path, ...], label: str) -
     return matches[0]
 
 
-def transaction_artifact_root(
-    plan: ArtifactTransactionPlan, artifact: TransactionArtifact
-) -> Path:
+def transaction_artifact_root(plan: ArtifactTransactionPlan, artifact: TransactionArtifact) -> Path:
     """Return the declared local root that owns one artifact's durable mutations."""
     roots = plan.artifact_roots or (Path(plan.lease_root),)
     return transaction_root_for_path(Path(artifact.target), roots, "target")
@@ -1926,9 +1914,7 @@ def journal_artifact_records(
         key = require_string(record["key"], "journal artifact key")
         artifact = artifacts_by_key.get(key)
         if artifact is None:
-            raise ArtifactTransactionRecoveryError(
-                "journal artifact topology does not match plan"
-            )
+            raise ArtifactTransactionRecoveryError("journal artifact topology does not match plan")
         pairs.append((artifact, record))
     if len(pairs) != len(plan.artifacts) or len({record["key"] for _, record in pairs}) != len(
         pairs
@@ -2007,9 +1993,7 @@ def publish_journal_record(
         )
     record["status"] = "publishing"
     update_transaction_journal(journal_handle, journal, lease_root=plan.lease_root)
-    rename_without_overwrite(
-        artifact.stage, artifact.target, lease_root=root
-    )
+    rename_without_overwrite(artifact.stage, artifact.target, lease_root=root)
     sync_directory_strict(artifact.target.parent, lease_root=root)
     require_matching_object(artifact.target, stage_identity, "published target")
     run_artifact_validator(artifact, artifact.target, "published")
@@ -2153,9 +2137,7 @@ def rollback_journaled_transaction(
                         plan, artifact, "rollback-backup", backup, original_identity
                     )
                 else:
-                    rename_without_overwrite(
-                        backup, artifact.target, lease_root=root
-                    )
+                    rename_without_overwrite(backup, artifact.target, lease_root=root)
                     sync_directory_strict(artifact.target.parent, lease_root=root)
                     require_matching_object(artifact.target, original_identity, "restored target")
                     restored.append(artifact.target)

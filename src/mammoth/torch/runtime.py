@@ -219,10 +219,7 @@ class Runtime:
         self.rank, self.local_rank, self.world_size = _distributed_identity(self.config)
         if self.world_size < 2:
             raise RuntimeError("DDP strategy requires a world size of at least two")
-        if (
-            self.config.require_global_local_rank_match
-            and self.rank != self.local_rank
-        ):
+        if self.config.require_global_local_rank_match and self.rank != self.local_rank:
             raise RuntimeError(
                 "This runtime requires global rank and local rank to match; "
                 f"got rank={self.rank}, local_rank={self.local_rank}"
@@ -299,8 +296,7 @@ class Runtime:
         local_values = tuple(sorted(set(values)))
         gathered = self.all_gather_object(local_values)
         if not all(
-            isinstance(rank_values, tuple)
-            and all(isinstance(value, str) for value in rank_values)
+            isinstance(rank_values, tuple) and all(isinstance(value, str) for value in rank_values)
             for rank_values in gathered
         ):
             raise RuntimeError("Distributed string union received an invalid payload")
@@ -584,9 +580,7 @@ class Runtime:
                 intended_phases=spec.intended_phases,
                 command=sanitize_command(tuple(sys.argv)),
                 config_reference=(
-                    ""
-                    if spec.config_reference == ""
-                    else sanitize_reference(spec.config_reference)
+                    "" if spec.config_reference == "" else sanitize_reference(spec.config_reference)
                 ),
                 execution_id=spec.execution_id,
                 resume_checkpoint=(
@@ -916,9 +910,7 @@ class Runtime:
                 f"Canonical phase {environment.phase!r} is absent from immutable metadata"
             )
         expected_config_reference = (
-            ""
-            if expected.config_reference == ""
-            else sanitize_reference(expected.config_reference)
+            "" if expected.config_reference == "" else sanitize_reference(expected.config_reference)
         )
         if metadata.config_reference != expected_config_reference:
             raise ValueError("Attached execution has an unexpected config reference")

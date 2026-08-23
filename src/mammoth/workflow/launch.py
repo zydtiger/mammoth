@@ -217,9 +217,7 @@ def launch_process(
             process_started = True
         if on_started is not None:
             on_started(process.pid)
-        remaining_timeout = (
-            None if deadline is None else max(0.0, deadline - time.monotonic())
-        )
+        remaining_timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
         return_code = process.wait(timeout=remaining_timeout)
     except _DeferredProcessSignal as interruption:
         if _supervisor_started(process, acknowledged=process_started):

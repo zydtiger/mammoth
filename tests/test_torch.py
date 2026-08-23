@@ -208,9 +208,7 @@ def test_warmup_linear_lr_rebases_extended_horizon() -> None:
     assert restored_scheduler.last_epoch == 4
     assert restored_scheduler.total_steps == 8
     assert restored_scheduler.get_last_lr() == pytest.approx([0.5, 0.05])
-    assert [group["lr"] for group in restored_optimizer.param_groups] == pytest.approx(
-        [0.5, 0.05]
-    )
+    assert [group["lr"] for group in restored_optimizer.param_groups] == pytest.approx([0.5, 0.05])
 
 
 def test_warmup_linear_lr_rejects_shorter_resume_horizon() -> None:
@@ -901,9 +899,7 @@ def _resume_join_mismatch_worker(
                     starting_epoch=4,
                     starting_global_step=12,
                     runtime={
-                        "caller": (
-                            "other" if mismatch == "runtime" and rank == 1 else "shared"
-                        )
+                        "caller": ("other" if mismatch == "runtime" and rank == 1 else "shared")
                     },
                 )
             )
@@ -1262,9 +1258,7 @@ def _uneven_accumulation_worker(
             ) as trainer:
                 result = trainer.fit()
             progress = [
-                observation
-                for observation in sink.observations
-                if observation.event == "progress"
+                observation for observation in sink.observations if observation.event == "progress"
             ]
             partial_count = 4 if rank == 0 else 2
             partial_value = 1.0 if rank == 0 else 3.0
@@ -1299,9 +1293,7 @@ def _uneven_accumulation_worker(
             ) as partial_trainer:
                 partial_initial_weight = partial_model.weight.detach().item()
                 partial_trainer.fit()
-            partial_weight_delta = (
-                partial_model.weight.detach().item() - partial_initial_weight
-            )
+            partial_weight_delta = partial_model.weight.detach().item() - partial_initial_weight
             last_accumulator = MetricAccumulator({"rank1": MetricSpec("last")})
             if rank == 1:
                 last_accumulator.update({"rank1": 7.0})
@@ -1311,22 +1303,16 @@ def _uneven_accumulation_worker(
                 last_error = str(error)
             else:
                 last_error = None
-            primary_last_accumulator = MetricAccumulator(
-                {"primary": MetricSpec("last")}
-            )
+            primary_last_accumulator = MetricAccumulator({"primary": MetricSpec("last")})
             if rank == 0:
                 primary_last_accumulator.update({"primary": 9.0})
             primary_last_metrics = primary_last_accumulator.compute(
                 device=runtime.device,
                 distributed=True,
             )
-            sticky_last_accumulator = MetricAccumulator(
-                {"sticky": MetricSpec("last")}
-            )
+            sticky_last_accumulator = MetricAccumulator({"sticky": MetricSpec("last")})
             if rank == 1:
-                sticky_last_accumulator.update(
-                    {"sticky": torch.tensor(float("nan"))}
-                )
+                sticky_last_accumulator.update({"sticky": torch.tensor(float("nan"))})
             sticky_last_accumulator.update({"sticky": torch.tensor(1.0)})
             try:
                 sticky_last_accumulator.compute(
@@ -1337,9 +1323,7 @@ def _uneven_accumulation_worker(
                 sticky_last_error = str(error)
             else:
                 sticky_last_error = None
-            local_accumulator = MetricAccumulator(
-                {"local": MetricSpec("mean", distributed=False)}
-            )
+            local_accumulator = MetricAccumulator({"local": MetricSpec("mean", distributed=False)})
             if rank == 1:
                 local_accumulator.update({"local": 7.0})
             local_metrics = local_accumulator.compute(
@@ -1810,9 +1794,7 @@ def _validation_epoch_metric_worker(
             ) as trainer:
                 summary = trainer.validate_epoch(0)
             progress = [
-                observation
-                for observation in sink.observations
-                if observation.event == "progress"
+                observation for observation in sink.observations if observation.event == "progress"
             ]
             completed = [
                 observation
@@ -1908,10 +1890,7 @@ def test_uneven_ddp_validation_materializes_only_epoch_summary(tmp_path: Path) -
 
     assert [result[0] for result in results] == [0, 1]
     assert all(
-        result[1]
-        == pytest.approx(
-            {"count": 4.0, "last": 1.0, "mean": 1.5, "sum": 6.0}
-        )
+        result[1] == pytest.approx({"count": 4.0, "last": 1.0, "mean": 1.5, "sum": 6.0})
         for result in results
     )
     assert [len(result[2]) for result in results] == [3, 1]
@@ -1996,8 +1975,7 @@ def test_uneven_ddp_accumulation_reduces_each_logical_batch(tmp_path: Path) -> N
     )
     assert all("accumulation planning failed" in result[11] for result in results)
     assert all(
-        "train step failed: ValueError: rank-one step failed" in result[12]
-        for result in results
+        "train step failed: ValueError: rank-one step failed" in result[12] for result in results
     )
     assert all(
         "train sampler epoch failed: ValueError: rank-one sampler failed" in result[13]
@@ -2014,8 +1992,7 @@ def test_uneven_ddp_accumulation_reduces_each_logical_batch(tmp_path: Path) -> N
     assert all(result[19] == [1, 2] for result in results)
     assert all("checkpoint restore payload contract failed" in result[20] for result in results)
     assert all(
-        "checkpoint restore request differs across ranks" in result[21]
-        for result in results
+        "checkpoint restore request differs across ranks" in result[21] for result in results
     )
     assert all("metric 'sticky' must be finite" in result[22] for result in results)
     assert all(result[23] is None for result in results)
@@ -2295,18 +2272,14 @@ def test_stateful_metrics_and_routes_remain_project_named() -> None:
         train_step=step,
         config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
         train_stateful_metrics={"project": AdditiveCountMetric()},
-        train_metric_routes={
-            "count": MetricRoute(batch_name=None, epoch_name="project/count")
-        },
+        train_metric_routes={"count": MetricRoute(batch_name=None, epoch_name="project/count")},
         observer=RunObserver((sink,)),
     ) as trainer:
         result = trainer.fit()
 
     assert result.training_history == ({"count": 4.0, "loss": 0.0},)
     completed = [
-        observation
-        for observation in sink.observations
-        if observation.event == "task_completed"
+        observation for observation in sink.observations if observation.event == "task_completed"
     ]
     assert completed[-1].metrics == {"project/count": 4.0}
 
@@ -2360,16 +2333,14 @@ def test_validation_progress_omits_metrics_and_preserves_epoch_route() -> None:
     progress = [
         observation
         for observation in sink.observations
-        if observation.event == "progress"
-        and observation.fields.get("phase") == "validation"
+        if observation.event == "progress" and observation.fields.get("phase") == "validation"
     ]
     assert [observation.metrics for observation in progress] == [{}, {}]
     assert [observation.display_metrics for observation in progress] == [{}, {}]
     validation_completed = [
         observation
         for observation in sink.observations
-        if observation.event == "task_completed"
-        and observation.fields.get("phase") == "validation"
+        if observation.event == "task_completed" and observation.fields.get("phase") == "validation"
     ]
     assert validation_completed[-1].metrics == {"validation/score_epoch": 2.0}
 
@@ -2511,17 +2482,18 @@ def test_stateful_reset_failure_balances_task_and_phase_events() -> None:
     model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
     sink = RecordingSink()
-    with pytest.raises(RuntimeError, match="reset failed"), Trainer(
-        model=model,
-        optimizer=optimizer,
-        train_loader=loader,
-        train_step=lambda module, batch, context: StepOutput(
-            loss=module(batch[0]).sum() * 0
-        ),
-        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
-        train_stateful_metrics={"broken": RaisingResetMetric()},
-        observer=RunObserver((sink,)),
-    ) as trainer:
+    with (
+        pytest.raises(RuntimeError, match="reset failed"),
+        Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=loader,
+            train_step=lambda module, batch, context: StepOutput(loss=module(batch[0]).sum() * 0),
+            config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+            train_stateful_metrics={"broken": RaisingResetMetric()},
+            observer=RunObserver((sink,)),
+        ) as trainer,
+    ):
         trainer.fit()
 
     assert [observation.event for observation in sink.observations] == [
@@ -2538,17 +2510,18 @@ def test_callback_failure_reports_phase_failed_without_phase_completed(hook: str
     model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
     sink = RecordingSink()
-    with pytest.raises(RuntimeError, match=f"{hook} callback failed"), Trainer(
-        model=model,
-        optimizer=optimizer,
-        train_loader=loader,
-        train_step=lambda module, batch, context: StepOutput(
-            loss=module(batch[0]).sum() * 0
-        ),
-        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
-        callbacks=(RaisingCallback(hook),),
-        observer=RunObserver((sink,)),
-    ) as trainer:
+    with (
+        pytest.raises(RuntimeError, match=f"{hook} callback failed"),
+        Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=loader,
+            train_step=lambda module, batch, context: StepOutput(loss=module(batch[0]).sum() * 0),
+            config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+            callbacks=(RaisingCallback(hook),),
+            observer=RunObserver((sink,)),
+        ) as trainer,
+    ):
         trainer.fit()
 
     events = [observation.event for observation in sink.observations]
@@ -2565,9 +2538,7 @@ def test_trainer_can_leave_outer_fit_phase_lifecycle_to_its_caller() -> None:
         model=model,
         optimizer=optimizer,
         train_loader=loader,
-        train_step=lambda module, batch, context: StepOutput(
-            loss=module(batch[0]).sum() * 0
-        ),
+        train_step=lambda module, batch, context: StepOutput(loss=module(batch[0]).sum() * 0),
         config=TrainerConfig(
             epochs=1,
             device="cpu",
@@ -2579,8 +2550,7 @@ def test_trainer_can_leave_outer_fit_phase_lifecycle_to_its_caller() -> None:
         trainer.fit()
 
     assert not any(
-        observation.event.startswith("phase_")
-        and observation.fields.get("phase") == "train"
+        observation.event.startswith("phase_") and observation.fields.get("phase") == "train"
         for observation in sink.observations
     )
     assert [observation.event for observation in sink.observations] == [
@@ -2611,15 +2581,18 @@ def test_duplicate_train_epoch_routes_fail_with_balanced_task_events() -> None:
         "a": MetricRoute(batch_name=None, epoch_name="duplicate"),
         "b": MetricRoute(batch_name=None, epoch_name="duplicate"),
     }
-    with pytest.raises(ValueError, match="multiple metrics route"), Trainer(
-        model=model,
-        optimizer=optimizer,
-        train_loader=loader,
-        train_step=step,
-        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
-        train_metric_routes=duplicate_routes,
-        observer=RunObserver((sink,)),
-    ) as trainer:
+    with (
+        pytest.raises(ValueError, match="multiple metrics route"),
+        Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=loader,
+            train_step=step,
+            config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+            train_metric_routes=duplicate_routes,
+            observer=RunObserver((sink,)),
+        ) as trainer,
+    ):
         trainer.fit()
 
     assert [observation.event for observation in sink.observations][-2:] == [
@@ -2654,17 +2627,20 @@ def test_duplicate_validation_epoch_routes_balance_both_lifecycle_scopes() -> No
         "a": MetricRoute(batch_name=None, epoch_name="duplicate"),
         "b": MetricRoute(batch_name=None, epoch_name="duplicate"),
     }
-    with pytest.raises(ValueError, match="multiple metrics route"), Trainer(
-        model=model,
-        optimizer=optimizer,
-        train_loader=loader,
-        train_step=train_step,
-        validation_loader=loader,
-        validation_step=validation_step,
-        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
-        validation_metric_routes=duplicate_routes,
-        observer=RunObserver((sink,)),
-    ) as trainer:
+    with (
+        pytest.raises(ValueError, match="multiple metrics route"),
+        Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=loader,
+            train_step=train_step,
+            validation_loader=loader,
+            validation_step=validation_step,
+            config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+            validation_metric_routes=duplicate_routes,
+            observer=RunObserver((sink,)),
+        ) as trainer,
+    ):
         trainer.fit()
 
     events = [observation.event for observation in sink.observations]
@@ -2951,9 +2927,7 @@ def test_checkpoint_save_policy_owns_resumable_retention(
     policy = CheckpointSavePolicy(mode=mode, save_best=False)
     for epoch in range(2):
         writers = TrainerCheckpointWriters(
-            resumable=lambda path, epoch=epoch: path.write_text(
-                str(epoch), encoding="utf-8"
-            )
+            resumable=lambda path, epoch=epoch: path.write_text(str(epoch), encoding="utf-8")
         )
         publish_checkpoint_plan(
             checkpoint_module.build_trainer_checkpoint_plan(
@@ -3024,12 +2998,8 @@ def test_best_checkpoint_follows_improvement_independent_of_cadence(
     ) as trainer:
         trainer.fit()
 
-    assert (tmp_path / "best.safetensors").read_text(encoding="utf-8") == (
-        "best_epoch=1\n"
-    )
-    assert (tmp_path / "latest_epoch_2.pt").read_text(encoding="utf-8") == (
-        "epoch=2\n"
-    )
+    assert (tmp_path / "best.safetensors").read_text(encoding="utf-8") == ("best_epoch=1\n")
+    assert (tmp_path / "latest_epoch_2.pt").read_text(encoding="utf-8") == ("epoch=2\n")
     assert [context.epoch for context in policy.contexts] == [0, 1, 2]
 
 
@@ -3134,9 +3104,7 @@ def test_early_stopping_epoch_does_not_replace_best_checkpoint(tmp_path: Path) -
 
     assert result.state.stopped_early
     assert result.state.epoch == 1
-    assert (tmp_path / "best.safetensors").read_text(encoding="utf-8") == (
-        "best_epoch=0\n"
-    )
+    assert (tmp_path / "best.safetensors").read_text(encoding="utf-8") == ("best_epoch=0\n")
 
 
 def test_typed_checkpoint_inspection_selects_generic_restore_and_reset(
@@ -3302,14 +3270,17 @@ def test_mixed_optimizer_scheduler_restore_actions_synchronize_learning_rate(
 def test_checkpoint_policy_cannot_pre_report_generic_resets(tmp_path: Path) -> None:
     model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-    with Trainer(
-        model=model,
-        optimizer=optimizer,
-        train_loader=DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1),
-        train_step=regression_step,
-        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
-        checkpoint_policy=FalseResetReportingPolicy(tmp_path),
-    ) as trainer, pytest.raises(ValueError, match="cannot pre-report Mammoth-managed"):
+    with (
+        Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1),
+            train_step=regression_step,
+            config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+            checkpoint_policy=FalseResetReportingPolicy(tmp_path),
+        ) as trainer,
+        pytest.raises(ValueError, match="cannot pre-report Mammoth-managed"),
+    ):
         trainer.load_checkpoint(tmp_path / "typed.pt")
 
 
@@ -3395,17 +3366,20 @@ def test_fit_publishes_interrupted_checkpoint_before_reraising(tmp_path: Path) -
             del state
             raise KeyboardInterrupt("stop training")
 
-    with Trainer(
-        model=model,
-        optimizer=optimizer,
-        train_loader=loader,
-        train_step=regression_step,
-        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
-        checkpoint_dir=checkpoint_dir,
-        checkpoint_policy=policy,
-        checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
-        callbacks=(InterruptingCallback(),),
-    ) as trainer, pytest.raises(KeyboardInterrupt, match="stop training"):
+    with (
+        Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=loader,
+            train_step=regression_step,
+            config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_policy=policy,
+            checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
+            callbacks=(InterruptingCallback(),),
+        ) as trainer,
+        pytest.raises(KeyboardInterrupt, match="stop training"),
+    ):
         trainer.all_gather_object = lambda value: pytest.fail(
             f"interruption checkpoint entered a collective with {value!r}"
         )
@@ -3442,21 +3416,24 @@ def test_fit_can_disable_interrupted_checkpoint_publication(tmp_path: Path) -> N
         del model, batch, context
         raise KeyboardInterrupt("stop training")
 
-    with Trainer(
-        model=model,
-        optimizer=optimizer,
-        train_loader=loader,
-        train_step=interrupt_step,
-        config=TrainerConfig(
-            epochs=1,
-            device="cpu",
-            checkpoint_every_epochs=None,
-            checkpoint_on_interrupt=False,
-        ),
-        checkpoint_dir=tmp_path / "disabled-interrupted-checkpoint",
-        checkpoint_policy=policy,
-        checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
-    ) as trainer, pytest.raises(KeyboardInterrupt, match="stop training"):
+    with (
+        Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=loader,
+            train_step=interrupt_step,
+            config=TrainerConfig(
+                epochs=1,
+                device="cpu",
+                checkpoint_every_epochs=None,
+                checkpoint_on_interrupt=False,
+            ),
+            checkpoint_dir=tmp_path / "disabled-interrupted-checkpoint",
+            checkpoint_policy=policy,
+            checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
+        ) as trainer,
+        pytest.raises(KeyboardInterrupt, match="stop training"),
+    ):
         trainer.fit()
 
     assert policy.contexts == []
@@ -3476,17 +3453,20 @@ def test_nonprimary_interruption_does_not_enter_checkpoint_collectives(
             del state
             raise KeyboardInterrupt("stop nonprimary training")
 
-    with Trainer(
-        model=model,
-        optimizer=optimizer,
-        train_loader=loader,
-        train_step=regression_step,
-        config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
-        checkpoint_dir=tmp_path / "nonprimary-interrupted-checkpoint",
-        checkpoint_policy=policy,
-        checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
-        callbacks=(InterruptingCallback(),),
-    ) as trainer, pytest.raises(KeyboardInterrupt, match="stop nonprimary training"):
+    with (
+        Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=loader,
+            train_step=regression_step,
+            config=TrainerConfig(epochs=1, device="cpu", checkpoint_every_epochs=None),
+            checkpoint_dir=tmp_path / "nonprimary-interrupted-checkpoint",
+            checkpoint_policy=policy,
+            checkpoint_save_policy=CheckpointSavePolicy(save_best=False),
+            callbacks=(InterruptingCallback(),),
+        ) as trainer,
+        pytest.raises(KeyboardInterrupt, match="stop nonprimary training"),
+    ):
         trainer.rank = 1
         trainer.all_gather_object = lambda value: pytest.fail(
             f"nonprimary interruption entered a collective with {value!r}"
@@ -3846,9 +3826,7 @@ def test_metric_accumulator_preserves_weighted_tensor_and_numeric_reductions(
     )
     accumulator.update({"mean": 4.0, "sum": 4.0, "last": 4.0}, weight=3)
 
-    assert accumulator.compute() == pytest.approx(
-        {"mean": 3.5, "sum": 14.0, "last": 4.0}
-    )
+    assert accumulator.compute() == pytest.approx({"mean": 3.5, "sum": 14.0, "last": 4.0})
 
 
 def test_metric_accumulator_rejects_sticky_non_finite_tensor_values() -> None:
@@ -4045,11 +4023,7 @@ def test_validation_reduces_scalar_metrics_only_at_epoch_boundary(
     ) as trainer:
         summary = trainer.validate_epoch(0)
 
-    progress = [
-        observation
-        for observation in sink.observations
-        if observation.event == "progress"
-    ]
+    progress = [observation for observation in sink.observations if observation.event == "progress"]
     assert summary.keys() == {"loss", "mae"}
     assert len(progress) == len(loader)
     assert all(observation.metrics == {} for observation in progress)
@@ -4132,8 +4106,7 @@ def test_duplicate_loss_metric_fails_at_validation_epoch_boundary() -> None:
     validation_progress = [
         observation
         for observation in sink.observations
-        if observation.event == "progress"
-        and observation.fields.get("phase") == "validation"
+        if observation.event == "progress" and observation.fields.get("phase") == "validation"
     ]
     assert len(validation_progress) == 1
     assert validation_progress[0].metrics == {}
@@ -4141,8 +4114,7 @@ def test_duplicate_loss_metric_fails_at_validation_epoch_boundary() -> None:
     validation_completions = [
         observation
         for observation in sink.observations
-        if observation.event == "task_completed"
-        and observation.fields.get("phase") == "validation"
+        if observation.event == "task_completed" and observation.fields.get("phase") == "validation"
     ]
     assert validation_completions == []
 
@@ -4208,13 +4180,9 @@ def test_cuda_metric_transfers_occur_only_at_observation_boundaries(
     ) as trainer:
         trainer.fit()
 
-    outside_metric_boundaries = [
-        extraction for extraction in extractions if extraction[1] == 0
-    ]
+    outside_metric_boundaries = [extraction for extraction in extractions if extraction[1] == 0]
     assert outside_metric_boundaries == [("item", 0)]  # DataLoader iterator seed.
-    metric_extractions = [
-        extraction for extraction in extractions if extraction[1] != 0
-    ]
+    metric_extractions = [extraction for extraction in extractions if extraction[1] != 0]
     assert {observed_boundary for _kind, observed_boundary in metric_extractions} == {
         1,
         2,
@@ -4344,15 +4312,9 @@ def test_cuda_validation_metric_transfers_occur_only_at_epoch_boundary(
         trainer.validate_epoch(0)
 
     assert boundaries == ["scalar", "stateful"]
-    outside_boundary = [
-        extraction for extraction in extractions if not extraction[1]
-    ]
+    outside_boundary = [extraction for extraction in extractions if not extraction[1]]
     assert outside_boundary == [("item", False)]  # DataLoader iterator seed.
-    assert all(
-        at_boundary
-        for kind, at_boundary in extractions
-        if kind in {"cpu", "tolist"}
-    )
+    assert all(at_boundary for kind, at_boundary in extractions if kind in {"cpu", "tolist"})
     assert all(kind in {"cpu", "tolist"} for kind, at_boundary in extractions if at_boundary)
 
 
@@ -4983,8 +4945,7 @@ def test_checkpoint_plan_syncs_each_new_directory_link(
     )
 
     required_directories = {
-        (path.stat().st_dev, path.stat().st_ino)
-        for path in (tmp_path, checkpoint_root, nested)
+        (path.stat().st_dev, path.stat().st_ino) for path in (tmp_path, checkpoint_root, nested)
     }
     assert required_directories <= synced_directories
     assert destination.read_bytes() == b"latest"
@@ -5670,9 +5631,7 @@ def test_checkpoint_future_callbacks_observe_final_pipeline_state(
     publication = future.result(timeout=5.0)
     assert callback_completed.wait(timeout=5.0)
     assert publication.published[0].path == checkpoint_root / "complete.pt"
-    assert second_future.result(timeout=5.0).published[0].path == (
-        checkpoint_root / "second.pt"
-    )
+    assert second_future.result(timeout=5.0).published[0].path == (checkpoint_root / "second.pt")
 
 
 def test_checkpoint_close_retains_handoff_interrupt_across_cleanup_interrupt(
@@ -5833,9 +5792,7 @@ def test_concurrent_checkpoint_flush_and_close_wait_for_shutdown(
         )
     )
     assert started.wait(timeout=5.0)
-    first_closer = threading.Thread(
-        target=lambda: (publisher.close(), first_close_done.set())
-    )
+    first_closer = threading.Thread(target=lambda: (publisher.close(), first_close_done.set()))
     first_closer.start()
     with publisher._lifecycle_condition:
         assert publisher._lifecycle_condition.wait_for(
@@ -5843,9 +5800,7 @@ def test_concurrent_checkpoint_flush_and_close_wait_for_shutdown(
             timeout=5.0,
         )
     flusher = threading.Thread(target=lambda: (publisher.flush(), flush_done.set()))
-    second_closer = threading.Thread(
-        target=lambda: (publisher.close(), second_close_done.set())
-    )
+    second_closer = threading.Thread(target=lambda: (publisher.close(), second_close_done.set()))
     flusher.start()
     second_closer.start()
 
@@ -6698,8 +6653,7 @@ def test_optimizer_step_metrics_observe_post_scheduler_state() -> None:
     completed = [
         observation
         for observation in sink.observations
-        if observation.event == "task_completed"
-        and observation.fields.get("phase") == "train"
+        if observation.event == "task_completed" and observation.fields.get("phase") == "train"
     ]
     assert completed[-1].metrics == {
         "Learning_Rate": pytest.approx(0.025),
@@ -6728,18 +6682,21 @@ def test_trainer_flushes_each_logged_optimizer_window_to_jsonl(tmp_path: Path) -
     model = torch.nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
 
-    with RunObserver((JsonlEventSink(writer),)) as observer, Trainer(
-        model=model,
-        optimizer=optimizer,
-        train_loader=loader,
-        train_step=regression_step,
-        observer=observer,
-        config=TrainerConfig(
-            epochs=1,
-            device="cpu",
-            checkpoint_every_epochs=None,
-        ),
-    ) as trainer:
+    with (
+        RunObserver((JsonlEventSink(writer),)) as observer,
+        Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=loader,
+            train_step=regression_step,
+            observer=observer,
+            config=TrainerConfig(
+                epochs=1,
+                device="cpu",
+                checkpoint_every_epochs=None,
+            ),
+        ) as trainer,
+    ):
         trainer.fit()
 
     progress = [
@@ -6773,11 +6730,7 @@ def test_zero_based_optimizer_logical_clock_preserves_resume_history() -> None:
         trainer.state.optimizer_step = 4
         trainer.fit()
 
-    progress = [
-        observation
-        for observation in sink.observations
-        if observation.event == "progress"
-    ]
+    progress = [observation for observation in sink.observations if observation.event == "progress"]
     assert progress[0].logical_step == 4
     assert progress[0].fields["coordinates"]["optimizer_step"] == 5
 
@@ -7598,9 +7551,7 @@ def test_single_runtime_owns_weighted_helpers_and_execution_lifecycle(
     tmp_path: Path,
 ) -> None:
     run_dir = tmp_path / "runtime-session"
-    runtime = initialize_runtime(
-        RuntimeConfig(device="cpu", workload_weights=(2,))
-    )
+    runtime = initialize_runtime(RuntimeConfig(device="cpu", workload_weights=(2,)))
     start_created_execution(
         runtime,
         ExecutionSpec(
@@ -8259,9 +8210,7 @@ def test_execution_session_destroys_only_runtime_owned_process_group(
     assert borrowed_runtime._owns_process_group is False
     assert destroyed == []
 
-    owned_runtime, owned_session = _create_test_execution_session(
-        tmp_path, "owned-process-group"
-    )
+    owned_runtime, owned_session = _create_test_execution_session(tmp_path, "owned-process-group")
     owned_runtime._owns_process_group = True
     owned_session.close()
     assert destroyed == ["destroyed"]
@@ -8302,11 +8251,7 @@ def test_execution_session_scope_derives_terminal_process_state(
     session.close(error=raised.value)
 
     events = read_execution_events(
-        run_dir
-        / "logs"
-        / "executions"
-        / f"session-{type(error).__name__.lower()}"
-        / "rank-0.jsonl"
+        run_dir / "logs" / "executions" / f"session-{type(error).__name__.lower()}" / "rank-0.jsonl"
     )
     assert [event.event for event in events] == [
         "process_started",
@@ -8370,11 +8315,7 @@ def test_execution_session_reraises_late_runtime_cleanup_failure(
         session.close()
 
     events = read_execution_events(
-        run_dir
-        / "logs"
-        / "executions"
-        / "cleanup-failed-session-attempt"
-        / "rank-0.jsonl"
+        run_dir / "logs" / "executions" / "cleanup-failed-session-attempt" / "rank-0.jsonl"
     )
     assert events[-1].event == "process_completed"
     assert events[-1].exit_code == 0
@@ -8406,11 +8347,7 @@ def test_execution_session_derives_interrupt_from_presentation_cleanup(
         session.close(before_close=interrupt_cleanup)
 
     events = read_execution_events(
-        run_dir
-        / "logs"
-        / "executions"
-        / "cleanup-interrupted-session-attempt"
-        / "rank-0.jsonl"
+        run_dir / "logs" / "executions" / "cleanup-interrupted-session-attempt" / "rank-0.jsonl"
     )
     assert events[-2].event == "phase_failed"
     assert events[-2].extensions["status"] == "interrupted"
@@ -8424,9 +8361,7 @@ def test_runtime_validates_launch_and_weight_topology(
 ) -> None:
     monkeypatch.setenv("WORLD_SIZE", "2")
     with pytest.raises(RuntimeError, match="multi-process launch"):
-        initialize_runtime(
-            RuntimeConfig(device="cpu", strict_launch_environment=True)
-        )
+        initialize_runtime(RuntimeConfig(device="cpu", strict_launch_environment=True))
 
     with pytest.raises(RuntimeError, match="one value per rank"):
         initialize_runtime(

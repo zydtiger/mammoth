@@ -697,8 +697,10 @@ def _summarize_value(value: Any) -> dict[str, Any]:
         }
         if detached.layout == torch.strided:
             summary["stride"] = list(detached.stride())
-        if detached.layout == torch.strided and detached.numel() > 0 and (
-            torch.is_floating_point(detached) or torch.is_complex(detached)
+        if (
+            detached.layout == torch.strided
+            and detached.numel() > 0
+            and (torch.is_floating_point(detached) or torch.is_complex(detached))
         ):
             finite = bool(torch.isfinite(detached).all().item())
             summary["finite"] = finite

@@ -570,7 +570,6 @@ with BoundedBackgroundPipeline(render_artifact, max_pending=1) as pipeline:
     assert first.result() == completed[0].result
     for item in completed:
         pipeline.acknowledge(item.submission)
-
 ```
 
 Results and attributed failures remain pipeline-owned until

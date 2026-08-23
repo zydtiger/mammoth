@@ -51,11 +51,7 @@ class WarmupLinearLR(LRScheduler):
         total_steps: int,
         last_epoch: int = -1,
     ) -> None:
-        if (
-            isinstance(total_steps, bool)
-            or not isinstance(total_steps, int)
-            or total_steps <= 0
-        ):
+        if isinstance(total_steps, bool) or not isinstance(total_steps, int) or total_steps <= 0:
             raise ValueError("total_steps must be a positive integer")
         if (
             isinstance(warmup_ratio, bool)
@@ -75,9 +71,7 @@ class WarmupLinearLR(LRScheduler):
         if step < warmup_steps:
             multiplier = float(step) / float(max(1, warmup_steps))
         else:
-            progress = float(step - warmup_steps) / float(
-                max(1, self.total_steps - warmup_steps)
-            )
+            progress = float(step - warmup_steps) / float(max(1, self.total_steps - warmup_steps))
             multiplier = max(0.0, 1.0 - progress)
         return [base_lr * multiplier for base_lr in self.base_lrs]
 
@@ -273,9 +267,7 @@ class WeightedDistributedBatchSampler(Sampler[list[int]]):
         if not isinstance(shuffle, bool):
             raise ValueError("shuffle must be a boolean")
         if shuffle and not _TORCH_MIN_SEED <= seed <= _TORCH_MAX_SEED:
-            raise ValueError(
-                "seed must be between -(2**63) and 2**64 - 1 when shuffling"
-            )
+            raise ValueError("seed must be between -(2**63) and 2**64 - 1 when shuffling")
 
         self.dataset_size = dataset_size
         self.batch_size = batch_size
@@ -372,18 +364,12 @@ class AccumulationPlan:
             self.local_microbatches_per_step,
         )
         if remainder and self.incomplete_window == "error":
-            raise ValueError(
-                "local batch count does not fill the configured accumulation windows"
-            )
+            raise ValueError("local batch count does not fill the configured accumulation windows")
         sizes = [self.local_microbatches_per_step] * full_windows
         if remainder:
             sizes.append(remainder)
-        if self.window_loss_scales is not None and len(self.window_loss_scales) != len(
-            sizes
-        ):
-            raise ValueError(
-                "window_loss_scales must contain one scale per optimizer step"
-            )
+        if self.window_loss_scales is not None and len(self.window_loss_scales) != len(sizes):
+            raise ValueError("window_loss_scales must contain one scale per optimizer step")
         return tuple(sizes)
 
     def scale_for_window(

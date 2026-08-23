@@ -38,9 +38,7 @@ def move_batch_to_device(
             move_batch_to_device(value, device, non_blocking=non_blocking) for value in batch
         )
     if isinstance(batch, list):
-        return [
-            move_batch_to_device(value, device, non_blocking=non_blocking) for value in batch
-        ]
+        return [move_batch_to_device(value, device, non_blocking=non_blocking) for value in batch]
     return batch
 
 

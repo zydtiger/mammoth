@@ -381,9 +381,7 @@ def test_directory_staging_rejects_source_replaced_during_exchange(
     (replacement / "replacement.txt").write_text("replacement payload")
     original_exchange = transactions.rename_exchange
 
-    def exchange_then_replace(
-        first: Path, second: Path, *, lease_root: Path | None = None
-    ) -> None:
+    def exchange_then_replace(first: Path, second: Path, *, lease_root: Path | None = None) -> None:
         original_exchange(first, second, lease_root=lease_root)
         original_exchange(replacement, first, lease_root=lease_root)
 
@@ -1343,9 +1341,7 @@ def test_publication_rejects_an_ancestor_symlink_created_after_validation(
     original_open_parent = transactions.open_confined_parent
     redirected = False
 
-    def redirect_before_open(
-        path: Path, *, lease_root: Path | None = None
-    ) -> tuple[int, str]:
+    def redirect_before_open(path: Path, *, lease_root: Path | None = None) -> tuple[int, str]:
         nonlocal redirected
         if path == file_stage and not redirected:
             redirected = True
@@ -1439,9 +1435,7 @@ def create_multi_root_plan(
                 TransactionArtifact("payload", payload_stage, payload_target, "directory"),
             ),
             mode=mode,  # type: ignore[arg-type]
-            recovery_policy=(
-                "roll_forward" if mode == "create_only" else "rollback_before_commit"
-            ),
+            recovery_policy=("roll_forward" if mode == "create_only" else "rollback_before_commit"),
         ),
         payload_root,
     )

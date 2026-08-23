@@ -988,8 +988,7 @@ def braille_line_chart(
         cell_y, dot_y = divmod(y_coordinate, 4)
         cells[cell_y][cell_x] |= 1 << dot_bits[dot_x][dot_y]
     return "\n".join(
-        "".join(chr(0x2800 + dots) if dots else " " for dots in row).rstrip()
-        for row in cells
+        "".join(chr(0x2800 + dots) if dots else " " for dots in row).rstrip() for row in cells
     )
 
 
@@ -1158,11 +1157,7 @@ def _logical_panel(snapshot: RunSnapshot, *, compact: bool) -> RenderableType:
         fields.insert(0, f"Phase {_current_phase(selected)}")
 
     if compact:
-        primary = [
-            field
-            for field in fields
-            if not field.startswith("ETA ")
-        ]
+        primary = [field for field in fields if not field.startswith("ETA ")]
         lines = [" | ".join(field.lower() for field in primary)]
         if eta_text is not None:
             lines.append(f"eta {eta_text}")
@@ -1453,9 +1448,7 @@ def _overview_task(selected: MonitorSnapshot) -> TaskState | None:
     if task is None:
         return None
     by_id = {
-        item.task_id: item
-        for item in selected.tasks.values()
-        if item.producer == task.producer
+        item.task_id: item for item in selected.tasks.values() if item.producer == task.producer
     }
     current = task
     seen = {task.task_id}
@@ -1591,9 +1584,7 @@ def _attempt_history(
             lines.append(marker)
             lines.append(f"{_short_execution_id(execution.execution_id):<10}")
             lines.append(f"{state.upper():<12}", style=_STATE_STYLE[state])
-            lines.append(
-                f"{_lineage_text(execution):<22} phase={_current_phase(execution)}\n"
-            )
+            lines.append(f"{_lineage_text(execution):<22} phase={_current_phase(execution)}\n")
         return lines
 
     table = Table(
@@ -1632,9 +1623,7 @@ def _producer_current_task(
     tasks = [task for task in selected.tasks.values() if task.producer == producer]
     tasks.sort(key=lambda task: task.updated_at or selected.created_at)
     running = [task for task in tasks if task.status == "running"]
-    active_parent_ids = {
-        task.parent_task_id for task in running if task.parent_task_id is not None
-    }
+    active_parent_ids = {task.parent_task_id for task in running if task.parent_task_id is not None}
     active_leaves = [task for task in running if task.task_id not in active_parent_ids]
     return (active_leaves or running or tasks)[-1] if tasks else None
 
@@ -1642,9 +1631,7 @@ def _producer_current_task(
 def _task_scope(selected: MonitorSnapshot, task: TaskState) -> str:
     """Render a bounded same-producer parent chain for one generic task."""
     tasks = {
-        item.task_id: item
-        for item in selected.tasks.values()
-        if item.producer == task.producer
+        item.task_id: item for item in selected.tasks.values() if item.producer == task.producer
     }
     names = [task.task_id]
     parent = task.parent_task_id
@@ -1676,16 +1663,13 @@ def _terminal_event(selected: MonitorSnapshot) -> ExecutionEvent | None:
         (
             event
             for event in reversed(selected.events)
-            if event.event
-            in {"execution_completed", "execution_failed", "execution_interrupted"}
+            if event.event in {"execution_completed", "execution_failed", "execution_interrupted"}
         ),
         None,
     )
     if runner_terminal is not None:
         return runner_terminal
-    process_terminals = [
-        event for event in selected.events if event.event == "process_completed"
-    ]
+    process_terminals = [event for event in selected.events if event.event == "process_completed"]
     interrupted = [event for event in process_terminals if event.signal is not None]
     failed = [event for event in process_terminals if event.exit_code not in {None, 0}]
     preferred = interrupted or failed or process_terminals
@@ -1769,9 +1753,10 @@ def _downtime_before(executions: tuple[MonitorSnapshot, ...], index: int) -> str
         return "--"
     previous = executions[index - 1]
     current = executions[index]
-    return format_duration(
-        max(0.0, (current.created_at - previous.updated_at).total_seconds())
-    ) or "0s"
+    return (
+        format_duration(max(0.0, (current.created_at - previous.updated_at).total_seconds()))
+        or "0s"
+    )
 
 
 def _display_time(value: str) -> str:
@@ -1783,9 +1768,7 @@ def _task_counts(task: TaskState | None) -> str:
     if task is None:
         return "--"
     return (
-        f"{task.completed:,}/{task.total:,}"
-        if task.total is not None
-        else f"{task.completed:,}/?"
+        f"{task.completed:,}/{task.total:,}" if task.total is not None else f"{task.completed:,}/?"
     )
 
 
@@ -1807,11 +1790,7 @@ def _progress_text(progress: _ProgressView) -> str:
         if progress.total is not None
         else f"{progress.completed:,}/?"
     )
-    rate = (
-        f" · {progress.throughput:.1f} b/s"
-        if progress.throughput is not None
-        else " · --"
-    )
+    rate = f" · {progress.throughput:.1f} b/s" if progress.throughput is not None else " · --"
     eta = format_duration(progress.eta_seconds)
     eta_text = f" · ETA {eta}" if eta is not None else ""
     return f"{counts}{rate}{eta_text}"

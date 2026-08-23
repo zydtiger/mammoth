@@ -89,9 +89,7 @@ class ExecutionSpec:
         validate_run_name(self.run_name)
         if not isinstance(self.invocation_kind, str) or not self.invocation_kind:
             raise ValueError("invocation_kind must be a non-empty string")
-        if isinstance(self.intended_phases, str) or not isinstance(
-            self.intended_phases, Sequence
-        ):
+        if isinstance(self.intended_phases, str) or not isinstance(self.intended_phases, Sequence):
             raise ValueError("intended_phases must be a sequence of phase names")
         phases = tuple(self.intended_phases)
         if not phases or any(not isinstance(phase, str) or not phase for phase in phases):
@@ -737,9 +735,7 @@ def _canonical_join_environment(expected: ExecutionSpec) -> _JoinEnvironment:
             f"expected invocation {expected.invocation_kind!r}"
         )
     if environment.phase not in expected.intended_phases:
-        raise ValueError(
-            f"{PHASE_ENV}={environment.phase!r} is not one of the expected phases"
-        )
+        raise ValueError(f"{PHASE_ENV}={environment.phase!r} is not one of the expected phases")
     if expected.execution_id is not None and environment.execution_id != expected.execution_id:
         raise ValueError(
             f"{EXECUTION_ID_ENV}={environment.execution_id!r} does not match expected "
@@ -782,13 +778,10 @@ def _validate_attached_context(
     missing_phases = set(expected.intended_phases).difference(metadata.intended_phases)
     if missing_phases:
         raise ValueError(
-            f"Execution {metadata.execution_id!r} omits phases: "
-            f"{', '.join(sorted(missing_phases))}"
+            f"Execution {metadata.execution_id!r} omits phases: {', '.join(sorted(missing_phases))}"
         )
     if environment.phase not in metadata.intended_phases:
-        raise ValueError(
-            f"Canonical phase {environment.phase!r} is absent from immutable metadata"
-        )
+        raise ValueError(f"Canonical phase {environment.phase!r} is absent from immutable metadata")
     expected_config_reference = (
         "" if expected.config_reference == "" else sanitize_reference(expected.config_reference)
     )
@@ -825,9 +818,7 @@ def _validate_resume_metadata(metadata: Any, expected: ExecutionSpec) -> None:
 
 def _validate_resume_coordinate(name: str, value: int | None) -> None:
     """Reject non-integral resume coordinates before exact metadata comparison."""
-    if value is not None and (
-        not isinstance(value, int) or isinstance(value, bool) or value < 0
-    ):
+    if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
         raise ValueError(f"{name} must be a non-negative integer or None, got {value!r}.")
 
 
@@ -849,9 +840,7 @@ def _validate_resume_facts(
         }
         unexpected = sorted(name for name, value in populated.items() if value is not None)
         if unexpected:
-            raise ValueError(
-                "resume facts require resume_checkpoint: " + ", ".join(unexpected)
-            )
+            raise ValueError("resume facts require resume_checkpoint: " + ", ".join(unexpected))
         return
     try:
         checkpoint_reference = os.fspath(resume_checkpoint)
@@ -870,9 +859,7 @@ def _validate_resume_facts(
 
 def _freeze_runtime_mapping(runtime: Mapping[str, Any]) -> Mapping[str, Any]:
     """Recursively detach JSON-shaped runtime metadata from caller-owned values."""
-    return MappingProxyType(
-        {name: _freeze_runtime_value(value) for name, value in runtime.items()}
-    )
+    return MappingProxyType({name: _freeze_runtime_value(value) for name, value in runtime.items()})
 
 
 def _freeze_runtime_value(value: Any) -> Any:

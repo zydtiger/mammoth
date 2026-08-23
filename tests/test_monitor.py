@@ -1300,7 +1300,6 @@ def test_fleet_textual_navigates_fleet_group_run_and_back(tmp_path: Path) -> Non
     asyncio.run(exercise())
 
 
-
 def test_fleet_textual_quits_from_every_screen_level(tmp_path: Path) -> None:
     """`q` must exit the app from the fleet, group, and drilled-in run screens.
 
@@ -1671,9 +1670,7 @@ def test_run_fleet_textual_samples_telemetry_before_the_app_runs(
         def run(self) -> None:
             events.append("app-run")
 
-    monkeypatch.setattr(
-        "mammoth.monitor.textual_ui.PsutilViewerTelemetrySampler", RecordingSampler
-    )
+    monkeypatch.setattr("mammoth.monitor.textual_ui.PsutilViewerTelemetrySampler", RecordingSampler)
     monkeypatch.setattr("mammoth.monitor.textual_ui.FleetApp", RecordingFleetApp)
 
     run_fleet_textual(
@@ -1943,9 +1940,7 @@ def test_row_window_never_exceeds_budget_and_always_shows_the_selected_row() -> 
             for index in (0, total // 2, total - 1):
                 start, end, hidden_above, hidden_below = _row_window(total, index, max_visible)
                 assert start <= index < end
-                footprint = (
-                    (end - start) + (1 if hidden_above else 0) + (1 if hidden_below else 0)
-                )
+                footprint = (end - start) + (1 if hidden_above else 0) + (1 if hidden_below else 0)
                 assert footprint <= max_visible
 
 

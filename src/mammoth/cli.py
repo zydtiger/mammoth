@@ -406,6 +406,8 @@ def _render_queue_snapshot(snapshot: QueueSnapshot) -> str:
         lines.append(f"malformed job files: {len(snapshot.malformed_job_files)}")
         lines.extend(f"  {path}" for path in snapshot.malformed_job_files)
     return "\n".join(lines)
+
+
 def _run_fleet_monitor(
     entry: Path,
     *,

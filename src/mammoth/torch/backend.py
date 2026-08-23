@@ -110,9 +110,7 @@ class TorchBackendConfig:
         if not isinstance(self.deterministic_warn_only, bool):
             raise ValueError("deterministic_warn_only must be a boolean")
         if self.deterministic_warn_only and self.deterministic_algorithms is None:
-            raise ValueError(
-                "deterministic_warn_only requires deterministic_algorithms to be set"
-            )
+            raise ValueError("deterministic_warn_only requires deterministic_algorithms to be set")
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,9 +144,7 @@ class TorchSeedPolicy:
         if (self.torch_cpu or self.torch_cuda) and not (
             _TORCH_MIN_SEED <= self.seed <= _TORCH_MAX_SEED
         ):
-            raise ValueError(
-                "seed must be between -(2**63) and 2**64 - 1 when seeding Torch"
-            )
+            raise ValueError("seed must be between -(2**63) and 2**64 - 1 when seeding Torch")
 
 
 def apply_torch_seed_policy(policy: TorchSeedPolicy) -> None:

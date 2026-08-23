@@ -229,9 +229,7 @@ def test_artifact_read_session_preserves_initial_input_errors(tmp_path: Path) ->
     target.write_bytes(b"target")
     symlink = tmp_path / "link.bin"
     symlink.symlink_to(target)
-    with pytest.raises(
-        ValueError, match="must not be a symlink"
-    ), open_artifact_session(symlink):
+    with pytest.raises(ValueError, match="must not be a symlink"), open_artifact_session(symlink):
         pass
 
 

@@ -90,8 +90,10 @@ class TorchCompileConfig:
             raise ValueError("compile dynamic must be a boolean or None")
         if isinstance(self.backend, str) and not self.backend:
             raise ValueError("compile backend must be a non-empty string")
-        if self.backend is not None and not isinstance(self.backend, str) and not callable(
-            self.backend
+        if (
+            self.backend is not None
+            and not isinstance(self.backend, str)
+            and not callable(self.backend)
         ):
             raise ValueError("compile backend must be a string, callable, or None")
         if self.options is not None and not isinstance(self.options, Mapping):
@@ -194,9 +196,7 @@ class TrainerConfig:
         if self.scheduler_interval not in {"optimizer", "epoch", "validation"}:
             raise ValueError(f"Unsupported scheduler interval: {self.scheduler_interval!r}")
         if self.optimizer_step_logical_clock not in {"completed", "zero_based"}:
-            raise ValueError(
-                "optimizer_step_logical_clock must be 'completed' or 'zero_based'"
-            )
+            raise ValueError("optimizer_step_logical_clock must be 'completed' or 'zero_based'")
         if self.max_gradient_norm is not None and (
             isinstance(self.max_gradient_norm, bool)
             or not math.isfinite(self.max_gradient_norm)
@@ -268,17 +268,13 @@ class Trainer:
         if checkpoint_save_policy is not None and (
             checkpoint_dir is None or checkpoint_policy is None
         ):
-            raise ValueError(
-                "checkpoint_save_policy requires checkpoint_dir and checkpoint_policy"
-            )
+            raise ValueError("checkpoint_save_policy requires checkpoint_dir and checkpoint_policy")
         if (
             checkpoint_dir is not None
             and checkpoint_policy is not None
             and checkpoint_save_policy is None
         ):
-            raise ValueError(
-                "project checkpoint publication requires checkpoint_save_policy"
-            )
+            raise ValueError("project checkpoint publication requires checkpoint_save_policy")
         self.config = config
         self.runtime = runtime
         if runtime is not None and runtime.strategy != config.strategy:
@@ -329,9 +325,7 @@ class Trainer:
             if validation_loader is None:
                 raise ValueError("save_best requires validation")
             if len(early_stopping_callbacks) != 1:
-                raise ValueError(
-                    "save_best requires exactly one Mammoth EarlyStopping callback"
-                )
+                raise ValueError("save_best requires exactly one Mammoth EarlyStopping callback")
         self._checkpoint_early_stopping = (
             early_stopping_callbacks[0] if len(early_stopping_callbacks) == 1 else None
         )
@@ -385,9 +379,7 @@ class Trainer:
             capture_mode=config.checkpoint_capture_mode,
             cuda_headroom_bytes=config.checkpoint_cuda_headroom_bytes,
         )
-        self._checkpoint_publication_futures: deque[
-            Future[CheckpointPublication]
-        ] = deque()
+        self._checkpoint_publication_futures: deque[Future[CheckpointPublication]] = deque()
         self._closed = False
 
     def fit(self) -> TrainerResult:
@@ -451,9 +443,7 @@ class Trainer:
 
                 local_should_stop = self.coordinate(
                     "stop callbacks",
-                    lambda: any(
-                        callback.should_stop(self.state) for callback in self.callbacks
-                    ),
+                    lambda: any(callback.should_stop(self.state) for callback in self.callbacks),
                 )
                 stop_decisions = self.all_gather_object(local_should_stop)
                 if not isinstance(stop_decisions[0], bool):
@@ -481,8 +471,7 @@ class Trainer:
                     self.publish_interrupted_checkpoint()
                 except BaseException as checkpoint_error:
                     error.add_note(
-                        "Interrupted checkpoint publication also failed: "
-                        f"{checkpoint_error}"
+                        f"Interrupted checkpoint publication also failed: {checkpoint_error}"
                     )
             if self.config.emit_fit_phase_events:
                 self.observer.emit(
@@ -530,9 +519,7 @@ class Trainer:
             planning_error = error
         self.raise_distributed_failure("accumulation planning", planning_error)
         assert plan is not None
-        global_window_sizes, rank_window_offsets = self.distributed_window_layout(
-            window_sizes
-        )
+        global_window_sizes, rank_window_offsets = self.distributed_window_layout(window_sizes)
         task_id = f"epoch-{epoch}"
         self.observer.emit(
             "task_started",
@@ -545,9 +532,7 @@ class Trainer:
         try:
             window_stateful_baseline = self.coordinate(
                 "training metric setup",
-                lambda: reset_and_snapshot_stateful_metrics(
-                    self.train_stateful_metrics
-                ),
+                lambda: reset_and_snapshot_stateful_metrics(self.train_stateful_metrics),
             )
             with self.observer.periodic_heartbeats(
                 phase=self.config.train_phase,
@@ -594,9 +579,7 @@ class Trainer:
                                 with self.autocast_context():
                                     output = self.train_step(self.execution_model, moved, context)
                                     if output.loss is None:
-                                        raise ValueError(
-                                            "train step must return a scalar loss"
-                                        )
+                                        raise ValueError("train step must return a scalar loss")
                                     scaled = output.loss * plan.scale_for_window(
                                         window_size,
                                         window_index=window_offset,
@@ -695,6 +678,7 @@ class Trainer:
                             final=window_index == len(window_sizes),
                         )
                         self.observer.flush()
+
             def compute_summary() -> tuple[dict[str, float], dict[str, float]]:
                 scalar_summary = accumulator.compute(
                     device=self.device,
@@ -750,20 +734,21 @@ class Trainer:
         )
         task_id = f"epoch-{epoch}"
         self.observer.emit("phase_started", phase=self.config.validation_phase)
-        self.observer.emit(
-            "task_started", phase=self.config.validation_phase, task_id=task_id
-        )
+        self.observer.emit("task_started", phase=self.config.validation_phase, task_id=task_id)
         batch_iterator: CudaPrefetchingBatchIterator | None = None
         try:
             self.coordinate(
                 "validation metric setup",
                 lambda: reset_stateful_metrics(self.validation_stateful_metrics),
             )
-            with self.observer.periodic_heartbeats(
-                phase=self.config.validation_phase,
-                task_id=task_id,
-                message="Validation epoch is still active.",
-            ), torch.no_grad():
+            with (
+                self.observer.periodic_heartbeats(
+                    phase=self.config.validation_phase,
+                    task_id=task_id,
+                    message="Validation epoch is still active.",
+                ),
+                torch.no_grad(),
+            ):
                 validation_error: BaseException | None = None
                 validation_iterator = self.coordinate(
                     "validation loader setup",
@@ -788,9 +773,7 @@ class Trainer:
                         ):
                             output = self.validation_step(self.execution_model, moved, context)
                         metrics = output_metrics(output)
-                        required_finite = (
-                            {} if output.loss is None else {"loss": output.loss}
-                        )
+                        required_finite = {} if output.loss is None else {"loss": output.loss}
                         accumulator.update(
                             metrics,
                             weight=output.weight,
@@ -992,9 +975,7 @@ class Trainer:
             scheduler.step()
             return
         if self.config.scheduler_monitor not in metrics:
-            raise KeyError(
-                f"Scheduler metric {self.config.scheduler_monitor!r} was not reported"
-            )
+            raise KeyError(f"Scheduler metric {self.config.scheduler_monitor!r} was not reported")
         scheduler.step(metrics[self.config.scheduler_monitor])
 
     def checkpoint_selection(
@@ -1095,9 +1076,7 @@ class Trainer:
                 )
             )
             if not isinstance(writers, TrainerCheckpointWriters):
-                raise TypeError(
-                    "checkpoint policy must return TrainerCheckpointWriters"
-                )
+                raise TypeError("checkpoint policy must return TrainerCheckpointWriters")
             plan = build_trainer_checkpoint_plan(
                 self.checkpoint_dir,
                 epoch=epoch,
@@ -1169,9 +1148,7 @@ class Trainer:
             None,
             reason="interrupted",
         )
-        self.flush_local_checkpoints(
-            message="Interrupted checkpoint publication is still active."
-        )
+        self.flush_local_checkpoints(message="Interrupted checkpoint publication is still active.")
 
     def checkpoint_publication_configured(self) -> bool:
         """Return whether this trainer has a complete checkpoint save contract."""
@@ -1228,10 +1205,7 @@ class Trainer:
                 not isinstance(request, tuple)
                 or len(request) != 3
                 or not isinstance(request[0], str)
-                or (
-                    request[1] is not None
-                    and not isinstance(request[1], RestoreOptions)
-                )
+                or (request[1] is not None and not isinstance(request[1], RestoreOptions))
                 or not isinstance(request[2], bool)
             ):
                 raise TypeError(
@@ -1600,9 +1574,7 @@ class Trainer:
             (
                 status
                 for status in statuses
-                if isinstance(status, tuple)
-                and len(status) == 2
-                and status[0] == "interrupted"
+                if isinstance(status, tuple) and len(status) == 2 and status[0] == "interrupted"
             ),
             None,
         )
@@ -1611,11 +1583,7 @@ class Trainer:
                 raise local_error
             raise KeyboardInterrupt(f"{operation} interrupted: {interruption[1]}")
         failure = next(
-            (
-                status
-                for status in statuses
-                if isinstance(status, tuple) and len(status) == 2
-            ),
+            (status for status in statuses if isinstance(status, tuple) and len(status) == 2),
             None,
         )
         if failure is not None:
@@ -1641,8 +1609,7 @@ class Trainer:
         if any(
             not isinstance(sizes, tuple)
             or any(
-                not isinstance(size, int) or isinstance(size, bool) or size < 1
-                for size in sizes
+                not isinstance(size, int) or isinstance(size, bool) or size < 1 for size in sizes
             )
             for sizes in gathered
         ):
@@ -1654,8 +1621,7 @@ class Trainer:
                 f"received {window_counts}"
             )
         global_sizes = tuple(
-            sum(sizes[index] for sizes in gathered)
-            for index in range(window_counts[0])
+            sum(sizes[index] for sizes in gathered) for index in range(window_counts[0])
         )
         rank_offsets = tuple(
             sum(gathered[rank][index] for rank in range(self.rank))
@@ -1771,9 +1737,7 @@ def reset_and_snapshot_stateful_metrics(
     return snapshot_stateful_metrics(metrics)
 
 
-def display_metrics(
-    metrics: Mapping[str, float], names: Sequence[str]
-) -> dict[str, float]:
+def display_metrics(metrics: Mapping[str, float], names: Sequence[str]) -> dict[str, float]:
     """Select the explicitly configured bounded live metric subset."""
     selected = {name: metrics[name] for name in names if name in metrics}
     if len(selected) > 16:

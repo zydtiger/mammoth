@@ -87,9 +87,7 @@ class Step:
             try:
                 object.__setattr__(self, "cwd", Path(self.cwd))
             except TypeError as error:
-                raise ValueError(
-                    f"Step {self.name!r} cwd must be path-like or None"
-                ) from error
+                raise ValueError(f"Step {self.name!r} cwd must be path-like or None") from error
         timeout = self.timeout_seconds
         if timeout is not None and (
             isinstance(timeout, bool)
@@ -479,9 +477,7 @@ def _derive_dispatch(workflow: Workflow) -> tuple[tuple[Run, Step], ...]:
             )
         run_positions = tuple(positions[name] for name in run_names)
         if run_positions != tuple(sorted(run_positions)):
-            raise ValueError(
-                f"Run {run.name!r} steps must be a subsequence of step_order"
-            )
+            raise ValueError(f"Run {run.name!r} steps must be a subsequence of step_order")
     by_phase = {run.name: {step.name: step for step in run.steps} for run in workflow.runs}
     return tuple(
         (run, by_phase[run.name][phase])
@@ -698,8 +694,7 @@ def _run_workflow(
     if original_error is not None:
         if cleanup_error is not None:
             original_error.add_note(
-                "Workflow cleanup failure: "
-                f"{type(cleanup_error).__name__}: {cleanup_error}"
+                f"Workflow cleanup failure: {type(cleanup_error).__name__}: {cleanup_error}"
             )
         raise original_error
     if cleanup_error is not None:
@@ -744,9 +739,7 @@ def _start_run(
             except KeyboardInterrupt as error:
                 raise _WorkflowInterrupted(signal.SIGINT) from error
             if not isinstance(spec, Execution):
-                raise ValueError(
-                    f"Run {run.name!r} resolve_execution must return an Execution"
-                )
+                raise ValueError(f"Run {run.name!r} resolve_execution must return an Execution")
         with _blocked_interruption_signals():
             context = create_execution_context(
                 layout.run_dir,
@@ -905,9 +898,7 @@ def _failure_for_workflow_interruption(
         with _blocked_interruption_signals(deliver_deferred=False):
             _record_pending_result(pending, results_by_run, dispatch_results)
     step_failure = (
-        _failure_from_step(result)
-        if result is not None and result.outcome != "completed"
-        else None
+        _failure_from_step(result) if result is not None and result.outcome != "completed" else None
     )
     return _prefer_failure(step_failure, _signal_failure(signal_number))
 
@@ -1109,10 +1100,7 @@ def _finalize_runs(
                         current.terminal_result = terminal_result
                     else:
                         current.terminal_event_attempts += 1
-                        if (
-                            current.terminal_event_attempts
-                            < _FINALIZATION_STAGE_ATTEMPTS
-                        ):
+                        if current.terminal_event_attempts < _FINALIZATION_STAGE_ATTEMPTS:
                             retry_pending = True
                         else:
                             current.terminal_event_failed = True
@@ -1331,9 +1319,7 @@ def _validate_phase_name(name: str) -> None:
 
 def _validate_resume_coordinate(name: str, value: int | None) -> None:
     """Reject negative, boolean, and non-integral resume coordinates."""
-    if value is not None and (
-        not isinstance(value, int) or isinstance(value, bool) or value < 0
-    ):
+    if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
         raise ValueError(f"Execution {name} must be a non-negative integer or None")
 
 
@@ -1364,9 +1350,7 @@ def _validate_resume_facts(execution: Execution) -> None:
 
 def _freeze_runtime_mapping(runtime: Mapping[str, Any]) -> Mapping[str, Any]:
     """Recursively freeze sanitized JSON-compatible runtime metadata."""
-    return MappingProxyType(
-        {name: _freeze_runtime_value(value) for name, value in runtime.items()}
-    )
+    return MappingProxyType({name: _freeze_runtime_value(value) for name, value in runtime.items()})
 
 
 def _freeze_runtime_value(value: Any) -> Any:
@@ -1463,11 +1447,7 @@ def _blocked_interruption_signals(
     finally:
         if state is not None:
             state.critical_depth -= 1
-            if (
-                deliver_deferred
-                and state.critical_depth == 0
-                and state.deferred_signal is not None
-            ):
+            if deliver_deferred and state.critical_depth == 0 and state.deferred_signal is not None:
                 signal_number = state.deferred_signal
                 state.deferred_signal = None
                 raise _WorkflowInterrupted(signal_number)

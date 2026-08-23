@@ -444,9 +444,7 @@ class WorkStoreSession:
             try:
                 written = handle.write(line)
                 if written != len(line):
-                    raise OSError(
-                        f"short journal append: wrote {written!r} of {len(line)} bytes"
-                    )
+                    raise OSError(f"short journal append: wrote {written!r} of {len(line)} bytes")
                 handle.flush()
                 os.fsync(handle.fileno())
             except OSError as append_error:
@@ -798,11 +796,7 @@ def _validate_chunk_markers(chunk_markers: Mapping[str, str]) -> tuple[tuple[str
     for chunk_id, marker in chunk_markers.items():
         if not isinstance(chunk_id, str) or not chunk_id or len(chunk_id) > MAX_CHUNK_ID_LENGTH:
             raise WorkStoreValidationError(f"Invalid work-store chunk ID: {chunk_id!r}.")
-        if (
-            not isinstance(marker, str)
-            or not marker
-            or len(marker) > MAX_CHUNK_MARKER_LENGTH
-        ):
+        if not isinstance(marker, str) or not marker or len(marker) > MAX_CHUNK_MARKER_LENGTH:
             raise WorkStoreValidationError(f"Invalid work-store chunk marker for {chunk_id!r}.")
         normalized.append((chunk_id, marker))
     ids = tuple(chunk_id for chunk_id, _marker in normalized)
@@ -1148,8 +1142,7 @@ def _load_existing_store(store_path: Path, *, raw_payload_bytes: bytes) -> _Load
                 store_path=store_path,
             ) from exc
         raise WorkStoreIncompatibleError(
-            f"Work-store path lacks Mammoth's metadata and is treated as legacy: "
-            f"{store_path}.",
+            f"Work-store path lacks Mammoth's metadata and is treated as legacy: {store_path}.",
             store_path=store_path,
             status="legacy",
         ) from exc

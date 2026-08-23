@@ -219,11 +219,7 @@ class MonitorSnapshot:
         if self.status not in {"completed", "failed", "interrupted"}:
             return None
         runner_terminal = next(
-            (
-                event
-                for event in reversed(self.events)
-                if event.event in _TERMINAL_RUN_STATUS
-            ),
+            (event for event in reversed(self.events) if event.event in _TERMINAL_RUN_STATUS),
             None,
         )
         if runner_terminal is not None:
@@ -523,9 +519,7 @@ def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
 
     if event.phase is not None:
         if event.event == "phase_started":
-            _apply_if_newer(
-                snapshot._phase_keys, snapshot.phases, event.phase, "running", sort_key
-            )
+            _apply_if_newer(snapshot._phase_keys, snapshot.phases, event.phase, "running", sort_key)
         elif event.event in _TERMINAL_SCOPE_STATUS and event.event.startswith("phase_"):
             _apply_if_newer(
                 snapshot._phase_keys,
@@ -622,9 +616,7 @@ def _finalize_run_status(
     if has_runner_terminal:
         return
     processes = [
-        producer
-        for key, producer in snapshot.producers.items()
-        if key.source == "process"
+        producer for key, producer in snapshot.producers.items() if key.source == "process"
     ]
     if not processes:
         return
@@ -635,9 +627,7 @@ def _finalize_run_status(
         snapshot.status = "failed"
         return
     expected = snapshot.context.metadata.world_size
-    if len(processes) >= expected and all(
-        producer.status == "completed" for producer in processes
-    ):
+    if len(processes) >= expected and all(producer.status == "completed" for producer in processes):
         snapshot.status = "completed"
     elif any(producer.status == "running" for producer in processes):
         snapshot.status = "running"
@@ -771,8 +761,7 @@ class RunMonitor:
             )
         if self.execution_id is not None and self.execution_id not in execution_ids:
             raise FileNotFoundError(
-                f"Execution {self.execution_id!r} is no longer available for "
-                f"{self.layout.run_dir}"
+                f"Execution {self.execution_id!r} is no longer available for {self.layout.run_dir}"
             )
         requested = self.execution_id or selected_execution_id
         selected = requested if requested in execution_ids else contexts[-1].metadata.execution_id

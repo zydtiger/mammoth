@@ -176,8 +176,7 @@ def test_profile_callable_supports_custom_summary_trace_and_json(tmp_path: Path)
     assert payload["output_summary"] == {"kind": "matrix_product", "sum": 30.0}
     assert payload["top_operations"]
     assert any(
-        operation["input_shapes"] == [[2, 3], [3, 2]]
-        for operation in payload["top_operations"]
+        operation["input_shapes"] == [[2, 3], [3, 2]] for operation in payload["top_operations"]
     )
 
 
@@ -377,6 +376,7 @@ def test_legacy_tf32_only_uses_new_api_and_restores_medium_state(
         assert current_torch_runtime_state() == before
     finally:
         torch.set_float32_matmul_precision(original.matmul_precision)
+
 
 def test_disabled_operation_profile_is_explicit_in_report() -> None:
     report = profile_callable(
