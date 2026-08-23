@@ -1300,6 +1300,69 @@ def test_fleet_textual_navigates_fleet_group_run_and_back(tmp_path: Path) -> Non
     asyncio.run(exercise())
 
 
+
+def test_fleet_textual_quits_from_every_screen_level(tmp_path: Path) -> None:
+    """`q` must exit the app from the fleet, group, and drilled-in run screens.
+
+    The screens bind `q` to the app-qualified `app.quit` action: an
+    unqualified `quit` in a `Screen` binding does not resolve to
+    `App.action_quit` and silently does nothing.
+    """
+    entry = tmp_path / "runs"
+    manifest = publish_group_manifest(
+        entry,
+        order="run-major",
+        members=[GroupMember("alpha", ("prepare",))],
+    )
+    group_layout = GroupLayout(entry, manifest.group_id)
+    writer = GroupEventWriter(group_layout.events_path, group_id=manifest.group_id)
+    writer.emit("group_started")
+    writer.emit("run_started", run_name="alpha")
+    writer.close()
+    run_layout = RunLayout(entry, "alpha").prepare()
+    create_context(run_layout, "attempt", "2026-01-01T00:00:00Z")
+
+    def build_app() -> FleetApp:
+        fleet_monitor = FleetMonitor(entry)
+        return FleetApp(entry, fleet_monitor, fleet_monitor.poll(), watch=False, telemetry=False)
+
+    async def quit_from_fleet() -> None:
+        app = build_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, FleetScreen)
+            await pilot.press("q")
+            await _wait_until(pilot, lambda: not app.is_running)
+
+    async def quit_from_group() -> None:
+        app = build_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, GroupScreen)
+            await pilot.press("q")
+            await _wait_until(pilot, lambda: not app.is_running)
+
+    async def quit_from_run() -> None:
+        app = build_app()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert isinstance(app.screen, RunScreen)
+            run_screen = app.screen
+            await _wait_until(pilot, lambda: run_screen.snapshot is not None)
+            await pilot.press("q")
+            await _wait_until(pilot, lambda: not app.is_running)
+
+    asyncio.run(quit_from_fleet())
+    asyncio.run(quit_from_group())
+    asyncio.run(quit_from_run())
+
+
 def test_fleet_textual_drills_directly_into_a_loose_run(tmp_path: Path) -> None:
     entry = tmp_path / "runs"
     run_layout = RunLayout(entry, "loose").prepare()
