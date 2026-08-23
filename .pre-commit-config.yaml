@@ -13,11 +13,16 @@ repos:
         language: system
         pass_filenames: false
         files: ^(pyproject\.toml|uv\.lock)$
-      - id: ruff-check-fix
-        name: ruff check --fix .
-        entry: uv run ruff check --fix .
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check
         language: system
         pass_filenames: false
+        types_or: [python, pyi]
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
         types_or: [python, pyi]
       - id: mypy
         name: mypy
