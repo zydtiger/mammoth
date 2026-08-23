@@ -240,7 +240,7 @@ class RunScreen(Screen[None]):
     CSS = MonitorApp.CSS
 
     BINDINGS = [
-        Binding("q", "quit", "Quit"),
+        Binding("q", "app.quit", "Quit"),
         Binding("j,down", "next_execution", "Next"),
         Binding("k,up", "previous_execution", "Previous"),
         Binding("enter", "toggle_detail", "Overview / detail"),
@@ -391,7 +391,7 @@ class GroupScreen(Screen[None]):
     """
 
     BINDINGS = [
-        Binding("q", "quit", "Quit"),
+        Binding("q", "app.quit", "Quit"),
         Binding("j,down", "next_row", "Next"),
         Binding("k,up", "previous_row", "Previous"),
         Binding("enter", "open_selected", "Open run"),
@@ -528,7 +528,7 @@ class FleetScreen(Screen[None]):
     """Show every group and loose run beneath one entry, the fleet root view."""
 
     BINDINGS = [
-        Binding("q", "quit", "Quit"),
+        Binding("q", "app.quit", "Quit"),
         Binding("j,down", "next_row", "Next"),
         Binding("k,up", "previous_row", "Previous"),
         Binding("enter", "open_selected", "Open"),
