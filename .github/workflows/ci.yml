@@ -21,7 +21,7 @@ jobs:
       - name: Sync all extras
         run: uv sync --locked --all-extras
       - name: Commit hooks
-        run: uvx prek run --all-files
+        run: uvx prek@0.4.14 run --all-files
 
   test:
     runs-on: ubuntu-latest
