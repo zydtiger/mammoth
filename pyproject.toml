@@ -24,7 +24,7 @@ tensorboard = [
     "tensorboardX>=2.6.2.2",
 ]
 torch = [
-    "torch>=2.2,<2.13",
+    "torch>=2.13.0,<2.14",
 ]
 
 [dependency-groups]
