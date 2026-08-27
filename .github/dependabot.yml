@@ -18,3 +18,8 @@ updates:
       dependencies:
         patterns:
           - "*"
+
+  - package-ecosystem: pre-commit
+    directory: /
+    schedule:
+      interval: monthly
