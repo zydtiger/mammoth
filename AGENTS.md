@@ -48,8 +48,8 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `uv.lock` | Exact uv resolution generated from `pyproject.toml`. Never edit manually. | Regenerate with uv whenever dependency metadata changes. |
 | `.python-version` | uv/Python development baseline. | The supported development interpreter changes deliberately. |
 | `.gitignore` | Generated-file and local-environment exclusions. | A new reproducible build, cache, environment, or local artifact needs an exclusion. |
-| `.pre-commit-config.yaml` | The mechanical gate: lock consistency, Ruff, mypy, and file-level checks, run by `prek` at commit time and by CI over every file. | A mechanically checkable rule is added, removed, or rescoped. |
-| `.github/workflows/ci.yml` | GitHub Actions validation: the commit hooks over every file, then full pytest with coverage reporting and `uv build` across the supported Python matrix. | CI triggers, jobs, the tested Python versions, or validation coverage change. |
+| `.pre-commit-config.yaml` | The mechanical gate: lock consistency, Ruff, mypy, and file-level checks at the commit stage, and pytest at the `pre-push` stage. Run by `prek` locally and by CI over every file. | A mechanically checkable rule is added, removed, or rescoped. |
+| `.github/workflows/ci.yml` | GitHub Actions validation: a `lint` job running the commit-stage hooks once, and a matrixed `test` job running the `pre-push` stage across the supported Python versions, then `uv build` and an install smoke test on the lowest one. Invokes the hook runner rather than restating hook commands. | CI triggers, jobs, the tested Python versions, or validation coverage change. |
 | `src/mammoth/__init__.py` | Lightweight root package metadata and intentionally small stable exports. | Package version or a truly root-level stable export changes. |
 | `src/mammoth/__main__.py` | `python -m mammoth` forwarding entry point. | Module execution behavior changes. |
 | `src/mammoth/cli.py` | Public Typer application, typed commands, and console exit routing. | A public command, option, or exit behavior changes. |
@@ -168,8 +168,9 @@ same change.
 
 ## Validation
 
-Lock consistency, Ruff, and mypy are enforced by the commit hooks, which are
-also what CI runs over every file. Install the runner once per machine:
+Lock consistency, Ruff, and mypy are enforced by the commit-stage hooks and
+pytest by the `pre-push` stage hook; both stages are what CI runs over every
+file. Install the runner once per machine:
 
 ```bash
 uv tool install prek
@@ -180,11 +181,11 @@ After every Python change, run what the hooks do not cover:
 
 ```bash
 uv sync
-uv run pytest
 uv build
 ```
 
-Run `prek run --all-files` to apply the hooks outside a commit.
+Apply the hooks outside a commit with `prek run --all-files`, and the test
+stage with `prek run --all-files --hook-stage pre-push`.
 
 Use `uv run pytest --cov=mammoth --cov-report=term-missing` for completion and
 release audits. For documentation-only changes, inspect the diff and run

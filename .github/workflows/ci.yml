@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -12,37 +16,54 @@ concurrency:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           python-version: "3.12"
       - name: Sync all extras
         run: uv sync --locked --all-extras
       - name: Commit hooks
-        run: uvx prek@0.4.14 run --all-files
+        uses: j178/prek-action@4e14d07f9231acabce116ccfca13b13dd9755ece # v3.0.0
+        with:
+          prek-version: "0.4.x"
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           cache-suffix: py${{ matrix.python-version }}
           python-version: ${{ matrix.python-version }}
       - name: Sync all extras
         run: uv sync --locked --all-extras
-      - name: Pytest with coverage
-        # Rich force-enables terminal styling when it sees GITHUB_ACTIONS, which
-        # breaks plain-substring CLI output assertions; unset it so captured CLI
-        # output matches local runs. GITHUB_* variables cannot be overridden via
-        # the env mapping, so unset at the shell level.
-        run: env -u GITHUB_ACTIONS uv run pytest --cov=mammoth --cov-report=term-missing
+      - name: Run push-stage hooks
+        uses: j178/prek-action@4e14d07f9231acabce116ccfca13b13dd9755ece # v3.0.0
+        with:
+          prek-version: "0.4.x"
+          extra-args: --all-files --hook-stage pre-push
+      # The wheel does not vary by interpreter, so build and smoke-test it on
+      # the lowest supported version only.
       - name: Build distributions
+        if: matrix.python-version == '3.12'
         run: uv build
+
+      - name: Install smoke test
+        if: matrix.python-version == '3.12'
+        run: |
+          uv venv "$RUNNER_TEMP/smoke"
+          uv pip install --python "$RUNNER_TEMP/smoke" dist/*.whl
+          "$RUNNER_TEMP/smoke/bin/mammoth" --help

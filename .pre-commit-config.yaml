@@ -1,9 +1,24 @@
+minimum_prek_version: "0.4.14"
+default_install_hook_types: [pre-commit, pre-push, commit-msg]
+default_stages: [pre-commit]
+
 repos:
   - repo: builtin
     hooks:
       - id: check-added-large-files
+      - id: check-executables-have-shebangs
       - id: check-merge-conflict
+      - id: check-shebang-scripts-are-executable
+      - id: check-toml
       - id: check-yaml
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+      - id: require-pattern
+        name: commit message prefix
+        stages: [commit-msg]
+        args: ['^(Merge |(feat|fix|refactor|docs|test|conf|perf|build|ci): [a-z])']
 
   - repo: local
     hooks:
@@ -30,3 +45,10 @@ repos:
         language: system
         pass_filenames: false
         types_or: [python, pyi]
+      - id: pytest
+        name: pytest
+        entry: uv run pytest
+        language: system
+        pass_filenames: false
+        types_or: [python, pyi]
+        stages: [pre-push]
