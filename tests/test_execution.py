@@ -330,15 +330,40 @@ def test_logical_run_lease_closes_descriptor_after_lock_interruption(
 def test_is_immutable_log_entry_covers_known_immutable_entries(tmp_path: Path) -> None:
     layout = RunLayout(tmp_path, "immutable-run").prepare()
     log_dir = layout.logs_dir
+    lease_container = log_dir / ".mammoth-leases"
 
     assert is_immutable_log_entry(log_dir, log_dir / "executions") is True
     assert is_immutable_log_entry(log_dir, log_dir / LOGICAL_RUN_LEASE_FILENAME) is True
+    assert is_immutable_log_entry(log_dir, lease_container) is True
+    assert is_immutable_log_entry(log_dir, lease_container / "logical-run") is True
+    assert (
+        is_immutable_log_entry(log_dir, lease_container / "logical-run" / "metadata.json") is True
+    )
     # Nested entries under the execution-attempt container stay immutable too.
     assert is_immutable_log_entry(log_dir, log_dir / "executions" / "attempt-1") is True
     assert (
         is_immutable_log_entry(log_dir, log_dir / "executions" / "attempt-1" / "execution.json")
         is True
     )
+
+
+def test_log_reset_preserves_active_logical_run_lease_namespace(tmp_path: Path) -> None:
+    """A consumer reset retains the active namespace until terminal retirement."""
+    layout = RunLayout(tmp_path, "reset-run").prepare()
+    log_dir = layout.logs_dir
+    mutable_log = log_dir / "events.out.tfevents.1"
+    mutable_log.write_text("tensorboard")
+    lease = claim_logical_run_lease(layout.run_dir)
+
+    for child in log_dir.iterdir():
+        if not is_immutable_log_entry(log_dir, child):
+            child.unlink()
+
+    assert not mutable_log.exists()
+    assert (log_dir / ".mammoth-leases" / "logical-run").is_dir()
+    lease.retire()
+
+    assert not (log_dir / ".mammoth-leases").exists()
 
 
 def test_is_immutable_log_entry_rejects_arbitrary_consumer_entries(tmp_path: Path) -> None:
