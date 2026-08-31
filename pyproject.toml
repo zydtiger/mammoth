@@ -8,7 +8,7 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "typer-slim>=0.21.2,<0.22",
+    "typer-slim>=0.24.0,<0.25",
 ]
 
 [project.scripts]
@@ -24,17 +24,17 @@ tensorboard = [
     "tensorboardX>=2.6.2.2",
 ]
 torch = [
-    "torch>=2.2,<2.13",
+    "torch>=2.13.0,<2.14",
 ]
 
 [dependency-groups]
 dev = [
-    "mypy>=1.14",
+    "mypy>=2.3.1",
     "psutil>=6.1",
     "pytest>=8.3",
     "pytest-cov>=6.0",
     "rich>=14.3.2",
-    "ruff>=0.9",
+    "ruff>=0.16.5",
     "textual>=8.2.8",
 ]
 
