@@ -107,8 +107,22 @@ def test_direct_create_records_lifecycle_and_releases_lease(tmp_path: Path) -> N
         "process_completed",
     ]
     assert events[-1].exit_code == 0
+    assert not (spec.run_dir / "logs" / ".mammoth-leases").exists()
     with claim_logical_run_lease(spec.run_dir):
         pass
+
+
+def test_legacy_logical_run_sentinel_blocks_namespace_migration(tmp_path: Path) -> None:
+    spec = spec_for(tmp_path, "legacy-run")
+    legacy_path = spec.run_dir / "logs" / ".logical-run.lock"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.touch()
+
+    with pytest.raises(RuntimeError, match="Legacy logical-run lease state"):
+        claim_logical_run_lease(spec.run_dir)
+
+    assert legacy_path.is_file()
+    assert not (spec.run_dir / "logs" / ".mammoth-leases").exists()
 
 
 def test_direct_attach_strictly_validates_workflow_child_identity(
@@ -181,28 +195,32 @@ def test_neutral_session_records_skip_failure_and_interruption(
     assert events[-1].exit_code == expected_exit_code
     if action == "interrupt":
         assert events[-1].signal == 2
+    if action in {"fail", "interrupt"}:
+        assert (spec.run_dir / "logs" / ".mammoth-leases" / "logical-run").is_dir()
 
 
 def test_neutral_session_cleanup_is_ordered_idempotent_and_preserves_failure(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Pipelines, observers, logging, and lease finalizers close once in order."""
     spec = spec_for(tmp_path, "cleanup-run")
     session = ExecutionSession.create(spec)
     order: list[str] = []
     original_logging_close = session.execution_logging.close
-    original_lease_close = session._close_callbacks[0][1]
+    assert session._logical_run_lease is not None
+    original_lease_retire = type(session._logical_run_lease).retire
 
     def close_logging() -> None:
         order.append("logging")
         original_logging_close()
 
-    def close_lease() -> None:
+    def retire_lease(lease: Any) -> None:
         order.append("lease")
-        original_lease_close()
+        original_lease_retire(lease)
 
     session.execution_logging.close = close_logging
-    session._close_callbacks = (("logical-run lease", close_lease),)
+    monkeypatch.setattr(type(session._logical_run_lease), "retire", retire_lease)
     session.create_observer((RecordingSink(order),))
     pipeline = session.create_background_pipeline(lambda value: order.append(value) or value)
     pipeline.submit("pipeline")
@@ -212,6 +230,34 @@ def test_neutral_session_cleanup_is_ordered_idempotent_and_preserves_failure(
     session.close()
 
     assert order == ["pipeline", "observer", "logging", "lease"]
+
+
+def test_terminalization_failure_releases_logical_run_lease(tmp_path: Path) -> None:
+    spec = spec_for(tmp_path, "retirement-failure")
+    session = ExecutionSession.create(spec)
+    session.start_phase("train")
+    session.complete_phase()
+    logical_lease = session._logical_run_lease
+    assert logical_lease is not None
+    namespace = spec.run_dir / "logs" / ".mammoth-leases" / "logical-run"
+    retired = namespace.parent / ".logical-run.mammoth-retired"
+    retired.mkdir(mode=0o700)
+
+    with pytest.raises(RuntimeError, match="retired lease namespace"):
+        session.close()
+
+    assert logical_lease._namespace._closed is True
+
+
+def test_nonzero_requested_exit_preserves_logical_run_namespace(tmp_path: Path) -> None:
+    spec = spec_for(tmp_path, "nonzero-exit")
+    session = ExecutionSession.create(spec)
+    session.start_phase("train")
+    session.complete_phase()
+
+    session.close(exit_code=1)
+
+    assert (spec.run_dir / "logs" / ".mammoth-leases" / "logical-run").is_dir()
 
 
 def test_neutral_create_logging_failure_releases_lease(

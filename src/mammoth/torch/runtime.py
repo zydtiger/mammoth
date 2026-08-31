@@ -197,6 +197,7 @@ class Runtime:
         self.strategy = self.config.strategy
         self._owns_process_group = False
         self._logical_run_lease: LogicalRunLease | None = None
+        self._terminalize_logical_run_lease = False
         self.execution_logging: ExecutionLogging | None = None
         self.execution_context: ExecutionContext | None = None
         self._execution_session: ExecutionSession | None = None
@@ -982,7 +983,11 @@ class Runtime:
         if lease is None:
             return
         self._logical_run_lease = None
-        lease.close()
+        if self._terminalize_logical_run_lease:
+            self._terminalize_logical_run_lease = False
+            lease.retire()
+        else:
+            lease.close()
 
     def provenance(self) -> dict[str, Any]:
         """Return allowlisted framework facts safe for immutable execution metadata."""
@@ -993,6 +998,25 @@ class Runtime:
             "backend": self.backend,
             "device_type": self.device.type,
         }
+
+
+class _RuntimeLogicalRunLease(LogicalRunLease):
+    """Route neutral-session lease cleanup through the runtime's single seam."""
+
+    __slots__ = ("_runtime",)
+
+    def __init__(self, runtime: Runtime) -> None:
+        self._runtime = runtime
+
+    def close(self) -> None:
+        """Preserve recoverable state through the runtime cleanup owner."""
+        self._runtime._terminalize_logical_run_lease = False
+        self._runtime._release_logical_run_lease()
+
+    def retire(self) -> None:
+        """Request terminal retirement through the runtime cleanup owner."""
+        self._runtime._terminalize_logical_run_lease = True
+        self._runtime._release_logical_run_lease()
 
 
 class ExecutionSession:
@@ -1009,14 +1033,17 @@ class ExecutionSession:
         if logging_bundle is None:
             raise RuntimeError("Execution logging is required for an execution session")
         self.runtime = runtime
+        logical_run_lease = (
+            _RuntimeLogicalRunLease(runtime) if runtime._logical_run_lease is not None else None
+        )
         self._neutral = NeutralExecutionSession.from_established(
             logging_bundle.context,
             logging_bundle,
             close_callbacks=(
-                ("logical-run lease", lambda: runtime._release_logical_run_lease()),
                 ("process group", lambda: runtime.close_process_group()),
                 ("torch runtime", self._mark_runtime_closed),
             ),
+            logical_run_lease=logical_run_lease,
         )
         self.context = self._neutral.context
         self.execution_logging = self._neutral.execution_logging

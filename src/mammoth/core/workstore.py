@@ -40,6 +40,12 @@ from types import MappingProxyType
 from typing import Any, BinaryIO, Literal, cast
 
 from mammoth.core.execution import sanitize_metadata_fields
+from mammoth.core.leases import (
+    LeaseNamespaceConflictError,
+    LeaseNamespaceError,
+    RetireableLeaseNamespace,
+    claim_lease_namespace,
+)
 
 WORK_STORE_SCHEMA_VERSION = 1
 WORK_STORE_FORMAT = "mammoth-work-store-jsonl-v1"
@@ -159,18 +165,42 @@ class WorkStoreLease:
     """Hold the exclusive advisory lease for one work-store path."""
 
     path: Path
-    _descriptor: int
+    _descriptor: int | None = None
+    _namespaces: tuple[RetireableLeaseNamespace, ...] = ()
     _closed: bool = False
 
     def close(self) -> None:
         """Release this lease exactly once."""
         if self._closed:
             return
-        try:
-            fcntl.flock(self._descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(self._descriptor)
-            self._closed = True
+        if self._descriptor is not None:
+            try:
+                fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(self._descriptor)
+        for namespace in reversed(self._namespaces):
+            namespace.close()
+        self._closed = True
+
+    def retire(self) -> None:
+        """Retire organized lease state after caller-validated publication."""
+        if self._closed:
+            return
+        if self._descriptor is not None:
+            self.close()
+            return
+        errors: list[BaseException] = []
+        for namespace in reversed(self._namespaces):
+            try:
+                namespace.retire()
+            except BaseException as error:
+                errors.append(error)
+        self._closed = True
+        if errors:
+            first = errors[0]
+            for later in errors[1:]:
+                first.add_note(f"Additional lease retirement failure: {later!r}")
+            raise first
 
     def __enter__(self) -> WorkStoreLease:
         """Return this lease for context-manager use."""
@@ -181,13 +211,25 @@ class WorkStoreLease:
         self.close()
 
 
-def claim_work_store_lease(store_path: Path) -> WorkStoreLease:
+def claim_work_store_lease(
+    store_path: Path,
+    *,
+    lease_namespace: Path | None = None,
+) -> WorkStoreLease:
     """Claim the exclusive advisory lease for one work-store path without waiting.
 
     Failing closed here turns a concurrent second owner into an explicit
     :class:`WorkStoreConflictError` instead of racing writers.
     """
     path = Path(store_path)
+    if lease_namespace is not None:
+        return _claim_namespaced_work_store_lease(path, Path(lease_namespace))
+    coordinator_path = _work_store_coordinator_path(Path(os.path.abspath(path)))
+    if _lease_namespace_state_exists(coordinator_path):
+        raise WorkStoreConflictError(
+            f"Work store {path} is owned through a namespaced lease.",
+            store_path=path,
+        )
     lease_path = _lease_path(path)
     flags = os.O_RDWR | os.O_CREAT | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
@@ -227,6 +269,12 @@ def claim_work_store_lease(store_path: Path) -> WorkStoreLease:
                 f"Work-store lease could not be locked: {lease_path}.",
                 store_path=path,
             ) from error
+        if _lease_namespace_state_exists(coordinator_path):
+            _remove_current_legacy_lease(lease_path, descriptor, store_path=path)
+            raise WorkStoreConflictError(
+                f"Work store {path} became owned through a namespaced lease.",
+                store_path=path,
+            )
     except BaseException:
         os.close(descriptor)
         raise
@@ -236,6 +284,8 @@ def claim_work_store_lease(store_path: Path) -> WorkStoreLease:
 def inspect_work_store(
     store_path: Path,
     identity_payload: Mapping[str, Any],
+    *,
+    lease_namespace: Path | None = None,
 ) -> WorkStoreInspection:
     """Classify existing store state under a short-held exclusive lease.
 
@@ -246,7 +296,7 @@ def inspect_work_store(
     path = Path(store_path)
     _sanitized, raw_payload_bytes = _sanitize_identity(identity_payload)
     try:
-        lease = claim_work_store_lease(path)
+        lease = claim_work_store_lease(path, lease_namespace=lease_namespace)
     except WorkStoreConflictError as error:
         return WorkStoreInspection(store_path=path, status=error.status, detail=str(error))
     try:
@@ -324,11 +374,13 @@ class WorkStoreSession:
         cls,
         store_path: Path,
         identity_payload: Mapping[str, Any],
+        *,
+        lease_namespace: Path | None = None,
     ) -> WorkStoreSession:
         """Claim exclusive ownership, resume a matching store, or create a new one."""
         path = Path(store_path)
         sanitized, raw_payload_bytes = _sanitize_identity(identity_payload)
-        lease = claim_work_store_lease(path)
+        lease = claim_work_store_lease(path, lease_namespace=lease_namespace)
         created = False
         try:
             loaded = _load_existing_store(path, raw_payload_bytes=raw_payload_bytes)
@@ -540,8 +592,13 @@ class WorkStoreSession:
         try:
             if self.store_path.exists():
                 _retire_and_remove_store(self.store_path)
-        finally:
+        except BaseException:
             self.close()
+            raise
+        try:
+            self._lease.retire()
+        finally:
+            self._closed = True
 
     def __enter__(self) -> WorkStoreSession:
         """Return this session for context-manager use."""
@@ -557,6 +614,7 @@ def cleanup_work_store(
     identity_payload: Mapping[str, Any],
     *,
     validate_publication: Callable[[], object],
+    lease_namespace: Path | None = None,
 ) -> None:
     """Revalidate a store under a fresh exclusive lease, then delete it.
 
@@ -567,15 +625,22 @@ def cleanup_work_store(
     """
     path = Path(store_path)
     _sanitized, raw_payload_bytes = _sanitize_identity(identity_payload)
-    lease = claim_work_store_lease(path)
+    lease = claim_work_store_lease(path, lease_namespace=lease_namespace)
+    terminal = False
     try:
         loaded = _load_existing_store(path, raw_payload_bytes=raw_payload_bytes)
         if loaded is None:
+            if lease_namespace is not None:
+                terminal = True
             return
         validate_publication()
         _retire_and_remove_store(path)
+        terminal = True
     finally:
-        lease.close()
+        if terminal:
+            lease.retire()
+        else:
+            lease.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -603,6 +668,157 @@ class _StoredMetadata:
 def _lease_path(store_path: Path) -> Path:
     """Return the deterministic sibling lease path for one store path."""
     return store_path.parent / f".{store_path.name}.mammoth-work-store.lock"
+
+
+def _claim_namespaced_work_store_lease(
+    store_path: Path,
+    lease_namespace: Path,
+) -> WorkStoreLease:
+    """Claim a deterministic coordinator before one caller-selected namespace."""
+    path = Path(os.path.abspath(store_path))
+    legacy_path = _lease_path(path)
+    if os.path.lexists(legacy_path):
+        raise WorkStoreConflictError(
+            "Legacy work-store lease state is present. Stop every pre-namespace "
+            "owner and remove the stale sentinel only after confirming that none is "
+            f"active: {legacy_path}",
+            store_path=path,
+        )
+    coordinator_path = _work_store_coordinator_path(path)
+    coordinator_parent = coordinator_path.parent
+    selected_root = Path(os.path.abspath(lease_namespace))
+    selected_path = selected_root / "leases"
+    try:
+        if not _paths_share_filesystem(path.parent, selected_root):
+            raise WorkStoreValidationError(
+                "lease_namespace must be on the same filesystem as the work store."
+            )
+    except WorkStoreValidationError:
+        raise
+    except (OSError, NotImplementedError) as error:
+        raise WorkStoreDamagedError(
+            "Work-store or lease-namespace ancestry is not safely accessible.",
+            store_path=path,
+        ) from error
+    try:
+        coordinator = claim_lease_namespace(
+            coordinator_path,
+            owned_parents=(coordinator_parent,),
+        )
+    except LeaseNamespaceConflictError as error:
+        raise WorkStoreConflictError(
+            f"Work store {path} is owned by another process.",
+            store_path=path,
+        ) from error
+    except (LeaseNamespaceError, OSError) as error:
+        raise WorkStoreDamagedError(
+            f"Work-store coordinator is not safely acquirable: {coordinator_path}.",
+            store_path=path,
+        ) from error
+    if os.path.lexists(legacy_path):
+        coordinator.retire()
+        raise WorkStoreConflictError(
+            "Legacy work-store lease state appeared during namespace acquisition. "
+            f"Stop the legacy owner before retrying: {legacy_path}",
+            store_path=path,
+        )
+    try:
+        selected = claim_lease_namespace(selected_path)
+    except LeaseNamespaceConflictError as error:
+        coordinator.retire()
+        raise WorkStoreConflictError(
+            f"Work store {path} is owned through another lease session.",
+            store_path=path,
+        ) from error
+    except (LeaseNamespaceError, OSError) as error:
+        coordinator.retire()
+        raise WorkStoreDamagedError(
+            f"Caller-selected work-store lease namespace is unsafe: {selected_path}.",
+            store_path=path,
+        ) from error
+    return WorkStoreLease(
+        path=selected.path / ".mammoth-lease.lock",
+        _namespaces=(coordinator, selected),
+    )
+
+
+def _paths_share_filesystem(first: Path, second: Path) -> bool:
+    """Compare devices of the nearest existing no-follow ancestors."""
+    return _prospective_filesystem_device(first) == _prospective_filesystem_device(second)
+
+
+def _work_store_coordinator_path(store_path: Path) -> Path:
+    """Return the stable namespace that coordinates every placement for a store."""
+    path = Path(os.path.abspath(store_path))
+    digest = hashlib.sha256(str(path).encode()).hexdigest()
+    return path.parent / ".mammoth-work-store-leases" / digest
+
+
+def _remove_current_legacy_lease(lease_path: Path, descriptor: int, *, store_path: Path) -> None:
+    """Remove the descriptor-bound legacy sentinel after a cross-mode race."""
+    parent_descriptor = -1
+    try:
+        flags = os.O_RDONLY | os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        parent_descriptor = os.open(lease_path.parent, flags)
+        current_stat = os.stat(lease_path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        held_stat = os.fstat(descriptor)
+        if (current_stat.st_dev, current_stat.st_ino) != (
+            held_stat.st_dev,
+            held_stat.st_ino,
+        ):
+            raise WorkStoreDamagedError(
+                f"Work-store legacy lease changed during conflict cleanup: {lease_path}.",
+                store_path=store_path,
+            )
+        _require_owned(current_stat, path=lease_path, store_path=store_path)
+        os.unlink(lease_path.name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    except WorkStoreDamagedError:
+        raise
+    except OSError as error:
+        raise WorkStoreDamagedError(
+            f"Work-store legacy lease could not be cleaned after conflict: {lease_path}.",
+            store_path=store_path,
+        ) from error
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+
+
+def _lease_namespace_state_exists(path: Path) -> bool:
+    """Detect every generic namespace state that excludes legacy ownership."""
+    parent = path.parent
+    return any(
+        os.path.lexists(candidate)
+        for candidate in (
+            path,
+            parent / f".{path.name}.mammoth-creating",
+            parent / f".{path.name}.mammoth-retired",
+            parent / f".{path.name}.mammoth-retired-proof",
+        )
+    )
+
+
+def _prospective_filesystem_device(path: Path) -> int:
+    """Return the device on which an anchored missing descendant would be created."""
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise NotImplementedError("namespaced work stores require os.O_NOFOLLOW")
+    absolute = Path(os.path.abspath(path))
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(absolute.anchor, flags)
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                return os.fstat(descriptor).st_dev
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return os.fstat(descriptor).st_dev
+    finally:
+        os.close(descriptor)
 
 
 def _retired_store_path(store_path: Path) -> Path:

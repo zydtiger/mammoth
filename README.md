@@ -619,10 +619,48 @@ stage_transaction_file(plan, "report", rendered_json_bytes)
 publish_artifact_transaction(plan)
 ```
 
+Transaction target leases live in deterministic shared namespaces keyed by
+protected path, so different transaction IDs still exclude overlapping
+targets. Each operation also owns a readable lifecycle namespace at
+`<lease-root>/.mammoth-transactions/<transaction-id>/leases/`. A committed or
+fully recovered transaction retires both kinds of namespace and removes empty
+Mammoth metadata parents; an interrupted transaction preserves them for the
+explicit recovery call.
+
 The lower-level `TransactionArtifact` and `ArtifactTransactionPlan` APIs
 remain available when a caller already owns a complete plan. Recovery always
 requires the expected plan explicitly so Mammoth can bind an interrupted
 journal to the caller's current topology and validators.
+
+Projects with their own publication lifecycle can use the same primitive
+directly:
+
+```python
+from mammoth.core import claim_lease_namespace
+
+lease = claim_lease_namespace(output_root / ".staging" / output_identity / "leases")
+try:
+    publish_and_validate_complete_bundle()
+except BaseException:
+    lease.close()          # preserve crash-resumable state
+    raise
+else:
+    lease.terminalize()    # atomically retire, then reclaim the namespace
+```
+
+The namespace must be on the publication filesystem. Mammoth owns only its
+fixed metadata and lock children and refuses to delete unknown or ambiguous
+state. A process paused after opening an old generation cannot become owner
+after retirement because acquisition revalidates both the canonical directory
+inode and the locked inode after `flock` succeeds.
+
+Upgrading an existing logical run, work store, or artifact target is an explicit
+migration boundary. If Mammoth finds the historical `logs/.logical-run.lock`,
+`.<store>.mammoth-work-store.lock`, or `.mammoth-txn-lease-*.lock` sentinel, it
+refuses to create the replacement namespace. Stop every older Mammoth producer
+or publisher first, confirm that no process still owns the sentinel, and then
+remove that legacy file manually. Do not run pre-namespace and namespace-aware
+Mammoth versions concurrently against the same outputs.
 
 The lower-level bounded publisher remains available outside the trainer. A
 plan stages every artifact before committing its destinations in the declared

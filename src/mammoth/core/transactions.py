@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ctypes
 import errno
-import fcntl
 import hashlib
 import json
 import os
@@ -24,6 +23,12 @@ from pathlib import Path
 from typing import Any, Literal, overload
 
 from mammoth.core.artifacts import ArtifactReceipt, inspect_artifact
+from mammoth.core.leases import (
+    LeaseNamespaceConflictError,
+    LeaseNamespaceError,
+    RetireableLeaseNamespace,
+    claim_lease_namespace,
+)
 
 type ArtifactKind = Literal["file", "directory"]
 type PublicationMode = Literal["create_only", "replace"]
@@ -148,14 +153,15 @@ class _TransactionLease:
     """One held advisory target lease managed by a transaction operation."""
 
     path: Path
-    descriptor: int
+    namespace: RetireableLeaseNamespace
 
     def close(self) -> None:
         """Release this lock while preserving its harmless lease inode."""
-        try:
-            fcntl.flock(self.descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(self.descriptor)
+        self.namespace.close()
+
+    def retire(self) -> None:
+        """Retire this target lease after a terminal transaction outcome."""
+        self.namespace.retire()
 
 
 @dataclass(slots=True)
@@ -347,7 +353,9 @@ def publish_artifact_transaction(plan: ArtifactTransactionPlan) -> ArtifactTrans
     interrupted operation cannot be mistaken for a new invocation.
     """
     normalized = validate_artifact_transaction_plan(plan, allow_missing_stages=True)
-    with claim_artifact_transaction_leases(normalized):
+    leases = claim_artifact_transaction_leases(normalized)
+    try:
+        leases.__enter__()
         journal_path = transaction_journal_path(normalized)
         if object_exists(journal_path) or object_exists(
             transaction_retired_journal_path(normalized)
@@ -359,11 +367,14 @@ def publish_artifact_transaction(plan: ArtifactTransactionPlan) -> ArtifactTrans
         records = create_transaction_records(validated)
         journal = create_journal_payload(validated, records)
         journal_handle = create_transaction_journal(journal_path, journal)
-        try:
-            publish_journaled_transaction(validated, journal_handle, journal)
-            return cleanup_committed_transaction(validated, journal_handle, journal)
-        except BaseException:
-            raise
+        publish_journaled_transaction(validated, journal_handle, journal)
+        result = cleanup_committed_transaction(validated, journal_handle, journal)
+    except BaseException:
+        leases.close()
+        raise
+    leases.retire()
+    cleanup_empty_transaction_metadata(normalized)
+    return result
 
 
 @overload
@@ -385,24 +396,37 @@ def recover_artifact_transaction(
     still raises.
     """
     validated = validate_artifact_transaction_plan(plan, allow_missing_stages=True)
-    with claim_artifact_transaction_leases(validated):
+    leases = claim_artifact_transaction_leases(validated)
+    try:
+        leases.__enter__()
         try:
             journal_path = locate_transaction_journal(validated)
         except FileNotFoundError:
             if missing_ok:
-                return None
+                result = None
+                leases.retire()
+                cleanup_empty_transaction_metadata(validated)
+                return result
             raise
         journal, journal_handle = read_transaction_journal(journal_path)
         validate_journal_matches_plan(journal, validated)
         cleanup_transaction_journal_swap(validated)
         if journal["state"] == "committed":
             validate_committed_generation(validated, journal)
-            return cleanup_committed_transaction(validated, journal_handle, journal)
-        preflight_recovery_stages(validated, journal)
-        if validated.recovery_policy == "roll_forward":
-            publish_journaled_transaction(validated, journal_handle, journal)
-            return cleanup_committed_transaction(validated, journal_handle, journal)
-        return rollback_journaled_transaction(validated, journal_handle, journal)
+            result = cleanup_committed_transaction(validated, journal_handle, journal)
+        else:
+            preflight_recovery_stages(validated, journal)
+            if validated.recovery_policy == "roll_forward":
+                publish_journaled_transaction(validated, journal_handle, journal)
+                result = cleanup_committed_transaction(validated, journal_handle, journal)
+            else:
+                result = rollback_journaled_transaction(validated, journal_handle, journal)
+    except BaseException:
+        leases.close()
+        raise
+    leases.retire()
+    cleanup_empty_transaction_metadata(validated)
+    return result
 
 
 def validate_artifact_transaction_plan(
@@ -1119,18 +1143,53 @@ def claim_artifact_transaction_leases(plan: ArtifactTransactionPlan) -> _Transac
         roots = tuple(dict.fromkeys((validated.lease_root, *validated.artifact_roots)))
         for root in roots:
             root_descriptors.append((root, open_absolute_directory_without_symlinks(root)))
-        for protected_path, _root in transaction_protected_paths(validated):
+        protected_paths = transaction_protected_paths(validated)
+        for protected_path, _root in protected_paths:
             digest = hashlib.sha256(str(protected_path).encode("utf-8")).hexdigest()
-            lease_path = protected_path.parent / f".mammoth-txn-lease-{digest}.lock"
-            descriptor = open_transaction_lease(lease_path)
+            legacy_path = protected_path.parent / f".mammoth-txn-lease-{digest}.lock"
+            if os.path.lexists(legacy_path):
+                raise ArtifactTransactionValidationError(
+                    "legacy transaction lease state is present; stop every older Mammoth "
+                    "publisher and remove the stale sentinel only after confirming that none "
+                    f"is active: {legacy_path}"
+                )
+        transaction_metadata = validated.lease_root / _TRANSACTION_DIRECTORY_NAME
+        transaction_parent = transaction_metadata / validated.transaction_id
+        lifecycle_path = transaction_parent / "leases"
+        try:
+            lifecycle_namespace = claim_lease_namespace(
+                lifecycle_path,
+                owned_parents=(transaction_parent, transaction_metadata),
+            )
+        except LeaseNamespaceConflictError as error:
+            raise ArtifactTransactionConflictError(
+                "another transaction holds an overlapping lifecycle lease: "
+                f"{validated.transaction_id!r}"
+            ) from error
+        except LeaseNamespaceError as error:
+            raise ArtifactTransactionValidationError(
+                f"transaction lifecycle lease namespace is unsafe: {lifecycle_path}"
+            ) from error
+        leases.append(_TransactionLease(path=lifecycle_path, namespace=lifecycle_namespace))
+        for protected_path, _root in protected_paths:
+            digest = hashlib.sha256(str(protected_path).encode("utf-8")).hexdigest()
+            metadata_parent = protected_path.parent / _TRANSACTION_DIRECTORY_NAME
+            lease_parent = metadata_parent / "leases"
+            lease_path = lease_parent / digest
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                os.close(descriptor)
+                namespace = claim_lease_namespace(
+                    lease_path,
+                    owned_parents=(lease_parent, metadata_parent),
+                )
+            except LeaseNamespaceConflictError as error:
                 raise ArtifactTransactionConflictError(
                     f"another transaction holds an overlapping target lease: {protected_path}"
                 ) from error
-            leases.append(_TransactionLease(path=lease_path, descriptor=descriptor))
+            except LeaseNamespaceError as error:
+                raise ArtifactTransactionValidationError(
+                    f"transaction target lease namespace is unsafe: {lease_path}"
+                ) from error
+            leases.append(_TransactionLease(path=lease_path, namespace=namespace))
     except BaseException:
         for lease in reversed(leases):
             lease.close()
@@ -1155,6 +1214,10 @@ class _TransactionLeases:
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         """Release every lease in reverse order after the operation boundary."""
+        self.close()
+
+    def close(self) -> None:
+        """Release leases while preserving recoverable namespace generations."""
         if self.context_token is not None:
             _ACTIVE_TRANSACTION_ROOTS.reset(self.context_token)
             self.context_token = None
@@ -1162,6 +1225,32 @@ class _TransactionLeases:
             lease.close()
         for _root, descriptor in reversed(self.root_descriptors):
             os.close(descriptor)
+        self.root_descriptors.clear()
+        self.leases.clear()
+
+    def retire(self) -> None:
+        """Retire all target lease namespaces after terminal cleanup."""
+        if self.context_token is not None:
+            _ACTIVE_TRANSACTION_ROOTS.reset(self.context_token)
+            self.context_token = None
+        errors: list[BaseException] = []
+        for lease in reversed(self.leases):
+            try:
+                lease.retire()
+            except BaseException as error:
+                errors.append(error)
+        for _root, descriptor in reversed(self.root_descriptors):
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                errors.append(error)
+        self.root_descriptors.clear()
+        self.leases.clear()
+        if errors:
+            first = errors[0]
+            for later in errors[1:]:
+                first.add_note(f"Additional transaction lease cleanup failure: {later!r}")
+            raise first
 
 
 def transaction_protected_paths(plan: ArtifactTransactionPlan) -> tuple[tuple[Path, Path], ...]:
@@ -1183,6 +1272,53 @@ def ensure_transaction_metadata_directory(lease_root: Path) -> Path:
     metadata_directory = lease_root / _TRANSACTION_DIRECTORY_NAME
     ensure_confined_directory(metadata_directory, lease_root)
     return metadata_directory
+
+
+def cleanup_empty_transaction_metadata(plan: ArtifactTransactionPlan) -> None:
+    """Remove only known empty metadata parents after terminal lease retirement."""
+    roots = tuple(dict.fromkeys((plan.lease_root, *plan.artifact_roots)))
+    for root in roots:
+        metadata = root / _TRANSACTION_DIRECTORY_NAME
+        candidates = (
+            metadata / _JOURNAL_DIRECTORY_NAME,
+            metadata / "retired" / plan.transaction_id,
+            metadata / "retired",
+            metadata / plan.transaction_id,
+            metadata / "leases",
+            metadata,
+        )
+        for candidate in candidates:
+            try:
+                parent_descriptor, name = open_confined_parent(candidate, lease_root=root)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise ArtifactTransactionRecoveryError(
+                    f"transaction metadata parent is unsafe; preserving evidence: {candidate}"
+                ) from error
+            try:
+                try:
+                    candidate_stat = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if (
+                    not stat.S_ISDIR(candidate_stat.st_mode)
+                    or candidate_stat.st_uid != os.geteuid()
+                ):
+                    raise ArtifactTransactionRecoveryError(
+                        f"transaction metadata parent is unsafe; preserving evidence: {candidate}"
+                    )
+                try:
+                    os.rmdir(name, dir_fd=parent_descriptor)
+                except OSError as error:
+                    if error.errno in {errno.ENOTEMPTY, errno.EEXIST}:
+                        continue
+                    raise ArtifactTransactionRecoveryError(
+                        f"empty transaction metadata parent could not be removed: {candidate}"
+                    ) from error
+                os.fsync(parent_descriptor)
+            finally:
+                os.close(parent_descriptor)
 
 
 def ensure_transaction_journal_directory(lease_root: Path) -> Path:

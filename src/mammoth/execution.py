@@ -136,6 +136,7 @@ class ExecutionSession:
         execution_logging: ExecutionLogging,
         *,
         close_callbacks: Sequence[tuple[str, Callable[[], None]]] = (),
+        logical_run_lease: LogicalRunLease | None = None,
     ) -> None:
         """Create a lifecycle owner for already-established execution resources."""
         if execution_logging.context != context:
@@ -145,6 +146,7 @@ class ExecutionSession:
         self.observer = execution_logging.observer
         self.event_writer = execution_logging.event_writer
         self._close_callbacks = tuple(close_callbacks)
+        self._logical_run_lease = logical_run_lease
         self._phase: str | None = None
         self._phase_terminal = False
         self._phase_outcome: Literal["completed", "failed", "interrupted", "skipped"] | None = None
@@ -220,7 +222,7 @@ class ExecutionSession:
         return cls(
             context,
             logging_bundle,
-            close_callbacks=(("logical-run lease", lease.close),),
+            logical_run_lease=lease,
         )
 
     @classmethod
@@ -263,9 +265,15 @@ class ExecutionSession:
         execution_logging: ExecutionLogging,
         *,
         close_callbacks: Sequence[tuple[str, Callable[[], None]]] = (),
+        logical_run_lease: LogicalRunLease | None = None,
     ) -> Self:
         """Wrap framework-established context and logging without importing it."""
-        return cls(context, execution_logging, close_callbacks=close_callbacks)
+        return cls(
+            context,
+            execution_logging,
+            close_callbacks=close_callbacks,
+            logical_run_lease=logical_run_lease,
+        )
 
     @property
     def phase(self) -> str | None:
@@ -482,6 +490,20 @@ class ExecutionSession:
             self.execution_logging.close()
         except BaseException as logging_error:
             cleanup_errors.append(("execution logging", logging_error))
+        if self._logical_run_lease is not None:
+            try:
+                if (
+                    error is None
+                    and not cleanup_errors
+                    and exit_code in {None, 0}
+                    and signal is None
+                    and self._phase_outcome in {"completed", "skipped"}
+                ):
+                    self._logical_run_lease.retire()
+                else:
+                    self._logical_run_lease.close()
+            except BaseException as callback_error:
+                cleanup_errors.append(("logical-run lease", callback_error))
         for label, callback in self._close_callbacks:
             try:
                 callback()

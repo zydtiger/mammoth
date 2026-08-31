@@ -1031,6 +1031,9 @@ def test_lease_close_failure_retries_before_reporting_cleanup_error(
                 raise lease_error
             self.inner.close()
 
+        def retire(self) -> None:
+            self.close()
+
     monkeypatch.setattr(
         workflow_runner,
         "claim_logical_run_lease",
