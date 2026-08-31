@@ -470,9 +470,10 @@ def is_immutable_log_entry(log_dir: Path, child: Path) -> bool:
 
     ``log_dir`` is one run's Mammoth-owned log directory (``RunLayout.logs_dir``).
     Returns ``True`` for the execution-attempt container (``EXECUTIONS_RELATIVE_DIR``'s
-    final component, plus everything nested beneath it) and for the logical-run
-    lease file (``LOGICAL_RUN_LEASE_FILENAME``); ``False`` for every other entry,
-    which is consumer-owned mutable content a log reset may delete.
+    final component, plus everything nested beneath it), the entire
+    ``.mammoth-leases/`` namespace tree, and the logical-run lease file
+    (``LOGICAL_RUN_LEASE_FILENAME``); ``False`` for every other entry, which is
+    consumer-owned mutable content a log reset may delete.
 
     Classification is purely by ``child``'s path identity relative to ``log_dir``
     -- derived from the same constants :func:`executions_dir_for` and
@@ -498,10 +499,11 @@ def is_immutable_log_entry(log_dir: Path, child: Path) -> bool:
     executions_dir = normalized_log_dir / EXECUTIONS_RELATIVE_DIR.name
     legacy_lease_path = normalized_log_dir / LOGICAL_RUN_LEASE_FILENAME
     lease_namespace = normalized_log_dir / LOGICAL_RUN_LEASE_RELATIVE_DIR.relative_to("logs")
+    lease_container = lease_namespace.parent
     return (
-        normalized_child in (executions_dir, legacy_lease_path, lease_namespace)
+        normalized_child in (executions_dir, legacy_lease_path, lease_container)
         or normalized_child.is_relative_to(executions_dir)
-        or normalized_child.is_relative_to(lease_namespace)
+        or normalized_child.is_relative_to(lease_container)
     )
 
 
