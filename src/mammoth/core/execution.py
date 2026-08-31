@@ -8,12 +8,10 @@ without introducing a dependency on PyTorch or PrettyTerm.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import math
 import os
 import re
-import stat
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
@@ -25,6 +23,12 @@ from typing import Any, Literal
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from mammoth.core.identity import validate_execution_id, validate_run_name
+from mammoth.core.leases import (
+    LeaseNamespaceConflictError,
+    LeaseNamespaceError,
+    RetireableLeaseNamespace,
+    claim_lease_namespace,
+)
 
 EXECUTION_SCHEMA_VERSION = 1
 EXECUTION_ID_ENV = "MAMMOTH_EXECUTION_ID"
@@ -34,6 +38,7 @@ PHASE_ENV = "MAMMOTH_PHASE"
 EXECUTION_METADATA_FILENAME = "execution.json"
 EXECUTIONS_RELATIVE_DIR = Path("logs") / "executions"
 LOGICAL_RUN_LEASE_FILENAME = ".logical-run.lock"
+LOGICAL_RUN_LEASE_RELATIVE_DIR = Path("logs") / ".mammoth-leases" / "logical-run"
 
 ExecutionMode = Literal["single", "distributed"]
 
@@ -160,18 +165,22 @@ class LogicalRunLease:
     """Hold exclusive producer ownership of one logical run until terminal state."""
 
     path: Path
-    _descriptor: int
+    _namespace: RetireableLeaseNamespace
     _closed: bool = False
 
     def close(self) -> None:
         """Release producer ownership while retaining the harmless lock inode."""
         if self._closed:
             return
-        try:
-            fcntl.flock(self._descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(self._descriptor)
-            self._closed = True
+        self._namespace.close()
+        self._closed = True
+
+    def retire(self) -> None:
+        """Remove terminal logical-run lease state after successful execution."""
+        if self._closed:
+            return
+        self._namespace.retire()
+        self._closed = True
 
     def __enter__(self) -> LogicalRunLease:
         """Return this lease for process-lifetime context-manager use."""
@@ -184,27 +193,30 @@ class LogicalRunLease:
 
 def claim_logical_run_lease(run_dir: Path) -> LogicalRunLease:
     """Claim the advisory lease before publishing a new execution attempt."""
-    logs_dir = run_dir / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    path = logs_dir / LOGICAL_RUN_LEASE_FILENAME
-    flags = os.O_RDWR | os.O_CREAT | os.O_NONBLOCK
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags, 0o600)
+    legacy_path = run_dir / "logs" / LOGICAL_RUN_LEASE_FILENAME
+    if os.path.lexists(legacy_path):
+        raise RuntimeError(
+            "Legacy logical-run lease state is present. Stop every older Mammoth "
+            "producer for this run and remove the stale sentinel only after confirming "
+            f"that none is active: {legacy_path}"
+        )
+    namespace_path = run_dir / LOGICAL_RUN_LEASE_RELATIVE_DIR
+    lease_parent = namespace_path.parent
     try:
-        descriptor_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(descriptor_stat.st_mode):
-            raise RuntimeError(f"Logical-run lease must be a regular file: {path}")
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise RuntimeError(
-                f"Another execution is already active for logical run {run_dir.name!r}: {path}"
-            ) from error
-    except BaseException:
-        os.close(descriptor)
-        raise
-    return LogicalRunLease(path=path, _descriptor=descriptor)
+        namespace = claim_lease_namespace(namespace_path, owned_parents=(lease_parent,))
+    except LeaseNamespaceConflictError as error:
+        raise RuntimeError(
+            f"Another execution is already active for logical run {run_dir.name!r}: "
+            f"{namespace_path}"
+        ) from error
+    except LeaseNamespaceError as error:
+        raise RuntimeError(
+            f"Logical-run lease is not safely acquirable: {namespace_path}"
+        ) from error
+    return LogicalRunLease(
+        path=namespace.path / ".mammoth-lease.lock",
+        _namespace=namespace,
+    )
 
 
 @dataclass(frozen=True)
@@ -484,9 +496,12 @@ def is_immutable_log_entry(log_dir: Path, child: Path) -> bool:
     ):
         raise ValueError(f"child {child!r} does not lie inside log_dir {log_dir!r}.")
     executions_dir = normalized_log_dir / EXECUTIONS_RELATIVE_DIR.name
-    lease_path = normalized_log_dir / LOGICAL_RUN_LEASE_FILENAME
-    return normalized_child in (executions_dir, lease_path) or normalized_child.is_relative_to(
-        executions_dir
+    legacy_lease_path = normalized_log_dir / LOGICAL_RUN_LEASE_FILENAME
+    lease_namespace = normalized_log_dir / LOGICAL_RUN_LEASE_RELATIVE_DIR.relative_to("logs")
+    return (
+        normalized_child in (executions_dir, legacy_lease_path, lease_namespace)
+        or normalized_child.is_relative_to(executions_dir)
+        or normalized_child.is_relative_to(lease_namespace)
     )
 
 

@@ -1142,7 +1142,14 @@ def _finalize_runs(
                 try:
                     with _blocked_interruption_signals():
                         try:
-                            current.lease.close()
+                            if (
+                                current.terminal_result.outcome == "completed"
+                                and not current.terminal_event_failed
+                                and not current.observer_close_failed
+                            ):
+                                current.lease.retire()
+                            else:
+                                current.lease.close()
                         except BaseException as error:
                             stage_error = error
                             current.lease_close_attempts += 1

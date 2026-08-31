@@ -12,6 +12,7 @@ from typing import cast
 
 import pytest
 
+import mammoth.core.leases as lease_module
 from mammoth.core import (
     ArtifactTransactionConflictError,
     ArtifactTransactionPlan,
@@ -1071,6 +1072,109 @@ def test_lease_contention_for_overlapping_target_is_deterministic(tmp_path: Path
         leases.__exit__(None, None, None)
     with claim_artifact_transaction_leases(plan):
         pass
+
+
+def test_legacy_target_lease_blocks_namespace_migration(tmp_path: Path) -> None:
+    plan = create_plan(tmp_path)
+    protected_path, _root = transactions.transaction_protected_paths(plan)[0]
+    digest = hashlib.sha256(str(protected_path).encode("utf-8")).hexdigest()
+    legacy_path = protected_path.parent / f".mammoth-txn-lease-{digest}.lock"
+    legacy_path.touch()
+
+    with pytest.raises(ArtifactTransactionValidationError, match="legacy transaction lease"):
+        claim_artifact_transaction_leases(plan)
+
+    assert legacy_path.is_file()
+    assert not list(tmp_path.rglob(".mammoth-lease.lock"))
+
+
+def test_same_targets_with_different_transaction_ids_contend(tmp_path: Path) -> None:
+    first = create_plan(tmp_path, transaction_id="first-generation")
+    root = first.lease_root
+    second_report_stage = root / ".mammoth-txn-second-generation-report.stage"
+    second_report_stage.write_text("second")
+    second_payload_stage = root / ".mammoth-txn-second-generation-payload.stage"
+    second_payload_stage.mkdir()
+    (second_payload_stage / "payload.txt").write_text("second")
+    second = ArtifactTransactionPlan(
+        transaction_id="second-generation",
+        lease_root=root,
+        artifacts=(
+            TransactionArtifact("report", second_report_stage, first.artifacts[0].target, "file"),
+            TransactionArtifact(
+                "payload", second_payload_stage, first.artifacts[1].target, "directory"
+            ),
+        ),
+        mode="create_only",
+        recovery_policy="roll_forward",
+    )
+
+    with (
+        claim_artifact_transaction_leases(first),
+        pytest.raises(ArtifactTransactionConflictError, match="overlapping"),
+    ):
+        claim_artifact_transaction_leases(second)
+
+
+def test_transaction_leases_use_shared_and_transaction_local_namespaces(
+    tmp_path: Path,
+) -> None:
+    plan = create_plan(tmp_path)
+    leases = claim_artifact_transaction_leases(plan)
+    try:
+        lifecycle = plan.lease_root / ".mammoth-transactions" / plan.transaction_id / "leases"
+        assert lifecycle.is_dir()
+        assert any(lease.path == lifecycle for lease in leases.leases)
+        target_namespaces = [lease.path for lease in leases.leases if lease.path != lifecycle]
+        assert target_namespaces
+        assert all(path.parent.name == "leases" for path in target_namespaces)
+        assert all(path.parent.parent.name == ".mammoth-transactions" for path in target_namespaces)
+    finally:
+        leases.close()
+
+
+def test_transaction_retire_failure_releases_all_leases_and_root_descriptors(
+    tmp_path: Path,
+) -> None:
+    plan = create_plan(tmp_path)
+    leases = claim_artifact_transaction_leases(plan)
+    failed = leases.leases[-1].namespace
+    lease_module._retired_path(failed.path).mkdir(mode=0o700)
+
+    with pytest.raises(RuntimeError, match="retired lease namespace"):
+        leases.retire()
+
+    assert not leases.leases
+    assert not leases.root_descriptors
+
+
+def test_committed_transaction_removes_all_lease_namespaces(tmp_path: Path) -> None:
+    plan = create_plan(tmp_path)
+
+    result = publish_artifact_transaction(plan)
+
+    assert result.cleanup_complete
+    assert not list(tmp_path.rglob(".mammoth-lease.lock"))
+    assert not list(tmp_path.rglob("*.mammoth-retired"))
+    assert not [path for path in tmp_path.rglob("leases") if path.is_dir()]
+    assert not [path for path in tmp_path.rglob(".mammoth-transactions") if path.is_dir()]
+
+
+def test_transaction_metadata_cleanup_rejects_intermediate_symlink(
+    tmp_path: Path,
+) -> None:
+    plan = create_plan(tmp_path)
+    outside = tmp_path / "outside-metadata"
+    outside.mkdir()
+    outside_journals = outside / "journals"
+    outside_journals.mkdir()
+    metadata = plan.lease_root / ".mammoth-transactions"
+    metadata.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ArtifactTransactionRecoveryError, match="unsafe"):
+        transactions.cleanup_empty_transaction_metadata(plan)
+
+    assert outside_journals.is_dir()
 
 
 def test_nested_lease_roots_contend_for_the_same_stable_targets(tmp_path: Path) -> None:

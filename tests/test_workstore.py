@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import mammoth.core.leases as lease_module
 import mammoth.core.workstore as workstore_module
 from mammoth.core import (
     WorkStoreConflictError,
@@ -922,6 +923,209 @@ def test_remove_after_publication_deletes_store_and_releases_lease_for_reuse(
     assert inspection.status == "absent"
     with claim_work_store_lease(store_path):
         pass
+
+
+def test_namespaced_store_prevents_different_namespace_split_ownership(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "store"
+    first_namespace = tmp_path / ".staging" / "first"
+    second_namespace = tmp_path / ".staging" / "second"
+    session = WorkStoreSession.open_or_create(
+        store_path,
+        _identity(),
+        lease_namespace=first_namespace,
+    )
+    try:
+        assert (first_namespace / "leases" / ".mammoth-lease.lock").is_file()
+        with pytest.raises(WorkStoreConflictError):
+            WorkStoreSession.open_or_create(
+                store_path,
+                _identity(),
+                lease_namespace=second_namespace,
+            )
+    finally:
+        session.close()
+
+
+def test_namespaced_store_rejects_legacy_lease_state(tmp_path: Path) -> None:
+    store_path = tmp_path / "store"
+    legacy = claim_work_store_lease(store_path)
+    try:
+        with pytest.raises(WorkStoreConflictError, match="Legacy work-store lease"):
+            claim_work_store_lease(
+                store_path,
+                lease_namespace=tmp_path / ".staging" / "output",
+            )
+    finally:
+        legacy.close()
+
+    assert workstore_module._lease_path(store_path).is_file()
+    assert not (tmp_path / ".mammoth-work-store-leases").exists()
+
+
+def test_default_store_rejects_active_namespaced_lease(tmp_path: Path) -> None:
+    store_path = tmp_path / "store"
+    namespaced = claim_work_store_lease(
+        store_path,
+        lease_namespace=tmp_path / ".staging" / "output",
+    )
+    try:
+        with pytest.raises(WorkStoreConflictError, match="namespaced lease"):
+            claim_work_store_lease(store_path)
+    finally:
+        namespaced.close()
+
+
+def test_default_race_conflict_removes_its_legacy_sentinel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_path = tmp_path / "store"
+    checks = iter((False, True))
+    original_check = workstore_module._lease_namespace_state_exists
+    monkeypatch.setattr(
+        workstore_module,
+        "_lease_namespace_state_exists",
+        lambda _path: next(checks),
+    )
+
+    with pytest.raises(WorkStoreConflictError, match="became owned"):
+        claim_work_store_lease(store_path)
+
+    assert not workstore_module._lease_path(store_path).exists()
+    monkeypatch.setattr(workstore_module, "_lease_namespace_state_exists", original_check)
+    namespaced = claim_work_store_lease(
+        store_path,
+        lease_namespace=tmp_path / ".staging" / "output",
+    )
+    namespaced.retire()
+
+
+def test_namespaced_store_rejects_intermediate_symlink_without_mutating_target(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(outside, target_is_directory=True)
+    store_path = linked_parent / "nested" / "store"
+
+    with pytest.raises(WorkStoreDamagedError, match="ancestry"):
+        claim_work_store_lease(
+            store_path,
+            lease_namespace=tmp_path / ".staging" / "output",
+        )
+
+    assert not (outside / "nested").exists()
+
+
+def test_unsafe_selected_namespace_does_not_leave_coordinator(tmp_path: Path) -> None:
+    store_path = tmp_path / "store"
+    namespace = tmp_path / ".staging" / "output"
+    namespace.mkdir(parents=True)
+    outside = tmp_path / "outside-selected"
+    outside.mkdir()
+    (namespace / "leases").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(WorkStoreDamagedError, match="Caller-selected"):
+        claim_work_store_lease(store_path, lease_namespace=namespace)
+
+    assert not (tmp_path / ".mammoth-work-store-leases").exists()
+    with claim_work_store_lease(store_path):
+        pass
+
+
+def test_namespaced_store_rejects_cross_filesystem_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        workstore_module,
+        "_paths_share_filesystem",
+        lambda _first, _second: False,
+    )
+
+    with pytest.raises(WorkStoreValidationError, match="same filesystem"):
+        claim_work_store_lease(
+            tmp_path / "store",
+            lease_namespace=tmp_path / ".staging" / "output",
+        )
+    assert not (tmp_path / ".mammoth-work-store-leases").exists()
+    assert not (tmp_path / ".staging").exists()
+
+
+def test_namespaced_store_terminal_cleanup_removes_all_lease_state(tmp_path: Path) -> None:
+    store_path = tmp_path / "store"
+    namespace = tmp_path / ".staging" / "output"
+    session = WorkStoreSession.open_or_create(
+        store_path,
+        _identity(),
+        lease_namespace=namespace,
+    )
+    session.commit({"chunk-0": "marker-0"})
+    session.remove_after_publication()
+
+    assert not store_path.exists()
+    assert not (namespace / "leases").exists()
+    assert not (tmp_path / ".mammoth-work-store-leases").exists()
+    assert not list(tmp_path.rglob("*.mammoth-retired"))
+
+
+def test_namespaced_store_retire_failure_releases_every_namespace(tmp_path: Path) -> None:
+    store_path = tmp_path / "store"
+    lease = claim_work_store_lease(
+        store_path,
+        lease_namespace=tmp_path / ".staging" / "output",
+    )
+    selected = lease._namespaces[-1]
+    lease_module._retired_path(selected.path).mkdir(mode=0o700)
+
+    with pytest.raises(RuntimeError, match="retired lease namespace"):
+        lease.retire()
+
+    assert lease._closed is True
+    assert all(namespace._closed for namespace in lease._namespaces)
+    assert not (tmp_path / ".mammoth-work-store-leases").exists()
+
+
+def test_remove_after_publication_failure_closes_session(tmp_path: Path) -> None:
+    store_path = tmp_path / "store"
+    session = WorkStoreSession.open_or_create(
+        store_path,
+        _identity(),
+        lease_namespace=tmp_path / ".staging" / "output",
+    )
+    session.commit({"chunk-0": "marker-0"})
+    selected = session._lease._namespaces[-1]
+    lease_module._retired_path(selected.path).mkdir(mode=0o700)
+
+    with pytest.raises(RuntimeError, match="retired lease namespace"):
+        session.remove_after_publication()
+
+    assert session._closed is True
+    with pytest.raises(RuntimeError, match="closed"):
+        session.commit({"chunk-1": "marker-1"})
+
+
+def test_namespaced_store_close_preserves_recoverable_lease_generation(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "store"
+    namespace = tmp_path / ".staging" / "output"
+    with WorkStoreSession.open_or_create(
+        store_path,
+        _identity(),
+        lease_namespace=namespace,
+    ) as first:
+        first.commit({"chunk-0": "marker-0"})
+
+    assert (namespace / "leases").is_dir()
+    with WorkStoreSession.open_or_create(
+        store_path,
+        _identity(),
+        lease_namespace=namespace,
+    ) as resumed:
+        assert resumed.recovered is True
+        assert resumed.completed_chunk_ids == ("chunk-0",)
 
 
 def test_remove_after_publication_quarantines_before_removing(

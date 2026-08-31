@@ -77,6 +77,16 @@ from mammoth.core.identity import (
     validate_run_name,
 )
 from mammoth.core.layout import GroupLayout, QueueLayout, RunLayout
+from mammoth.core.leases import (
+    LEASE_NAMESPACE_SCHEMA_VERSION,
+    LeaseNamespaceConflictError,
+    LeaseNamespaceError,
+    LeaseNamespaceRecoveryError,
+    LeaseNamespaceRecoveryStatus,
+    RetireableLeaseNamespace,
+    claim_lease_namespace,
+    reconcile_lease_namespace,
+)
 from mammoth.core.pipeline import (
     BackgroundPipelineError,
     BackgroundPipelineResult,
@@ -166,6 +176,11 @@ __all__ = [
     "GroupMember",
     "INVOCATION_KIND_ENV",
     "LOGICAL_RUN_LEASE_FILENAME",
+    "LEASE_NAMESPACE_SCHEMA_VERSION",
+    "LeaseNamespaceConflictError",
+    "LeaseNamespaceError",
+    "LeaseNamespaceRecoveryError",
+    "LeaseNamespaceRecoveryStatus",
     "LogicalRunLease",
     "PHASE_ENV",
     "PreparedArtifact",
@@ -174,6 +189,7 @@ __all__ = [
     "RUN_NAME_ENV",
     "RecoveryPolicy",
     "RunLayout",
+    "RetireableLeaseNamespace",
     "TransactionArtifact",
     "TransactionArtifactSpec",
     "TransactionObjectIdentity",
@@ -195,6 +211,7 @@ __all__ = [
     "atomic_write_text",
     "build_artifact_transaction_plan",
     "claim_logical_run_lease",
+    "claim_lease_namespace",
     "claim_artifact_transaction_leases",
     "claim_work_store_lease",
     "cleanup_work_store",
@@ -219,6 +236,7 @@ __all__ = [
     "publish_group_manifest",
     "read_execution_events",
     "read_group_events",
+    "reconcile_lease_namespace",
     "recover_artifact_transaction",
     "sanitize_command",
     "sanitize_metadata_fields",

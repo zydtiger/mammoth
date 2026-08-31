@@ -84,6 +84,38 @@ After a reader context closes, its binary handle is closed; after the one-use
 session closes, its immutable receipt remains available but opening another
 reader raises `RuntimeError`.
 
+`mammoth.core.leases` owns the standard-library-only lease namespace protocol
+used by publication-scoped lifecycles. `claim_lease_namespace()` creates or
+acquires one owner-only canonical directory generation containing fixed
+metadata, terminal, and lock files. It holds both the directory descriptor and
+the locked descriptor; after `flock` succeeds it revalidates the canonical
+directory inode, lock-path inode, and generation metadata. This post-lock fence
+prevents a contender paused between `open()` and `flock()` from adopting an old
+inode after another owner retires that generation.
+
+Ordinary `RetireableLeaseNamespace.close()` releases ownership but preserves
+the canonical generation for crash resume. Only caller-declared
+`terminalize()` writes and fsyncs the terminal marker, atomically renames the
+canonical directory to its deterministic retired sibling while the lock
+remains held, fsyncs the parent, releases descriptors against the retired
+generation, and removes authenticated fixed children. A terminal canonical
+generation or lone retired generation is idempotently reclaimed on the next
+claim or reconciliation. Active-plus-retired state, unknown children,
+symlinks, special files, ownership or permission failures, path substitution,
+and generation mismatch preserve evidence and fail closed. Callers may name
+empty Mammoth-owned parents for cleanup, but Mammoth never removes caller
+artifacts or unknown staging content. This requires a local POSIX filesystem
+and same-filesystem rename; network filesystems, object stores, hostile same-UID
+writers, and cross-host coordination are outside its contract.
+
+Namespace adoption is fail-closed across the legacy layout. Logical-run,
+work-store, and artifact-transaction claim paths reject their historical file
+sentinels rather than guessing whether an older process still holds the inode.
+Operators must stop all older producers for the affected outputs, verify that
+the legacy file is stale, and remove it manually before the first
+namespace-aware claim. Mixed old/new Mammoth processes are unsupported during
+this migration boundary.
+
 For one logical result that spans several local paths, `mammoth.core` owns a
 separate `ArtifactTransactionPlan` protocol. A caller supplies at least two
 prepared `TransactionArtifact` values and a pre-existing coordinator
@@ -111,11 +143,17 @@ that authenticate their own marker or payload semantics, while Mammoth never
 interprets them. The plan explicitly selects `create_only` plus roll-forward
 recovery or `replace` plus rollback-before-commit recovery.
 
-Publication first acquires deterministic advisory leases for all target paths
-and their ancestors within their individual roots, anchors the coordinator and
+Publication first acquires deterministic retireable namespaces for all target
+paths and their ancestors within their individual roots, anchors the coordinator and
 all declared roots with no-follow directory FDs, then writes a strict
 no-clobber schema-v2 journal below
-`<lease_root>/.mammoth-transactions/`. The journal records the canonical set of
+`<lease_root>/.mammoth-transactions/`. Authoritative target keys depend only on
+normalized protected paths, never transaction IDs or lease roots, so different
+IDs and nested-root plans still contend. Their namespaces live below the
+protected path's shared `.mammoth-transactions/leases/` hierarchy. Each
+operation additionally owns a transaction-local lifecycle namespace at
+`<lease_root>/.mammoth-transactions/<transaction-id>/leases/`; that readable
+location does not replace the shared exclusion key. The journal records the canonical set of
 artifact roots; schema-v1 journals remain recoverable only with the original
 one-root plan. Mammoth synchronizes every staged object before the journal and
 synchronizes each parent directory after a local backup move, target rename,
@@ -134,7 +172,9 @@ it authenticates and runs the current-plan validator for every still-visible
 stage. A visible target is never mistaken for a stage: an old replacement
 generation and a target-only new generation retain their normal state-specific
 recovery handling. Existing journals always require that explicit recovery
-call.
+call. Successful commit or recovery retires every lease namespace and removes
+empty transaction metadata parents. Any exception closes leases without
+terminalizing them, preserving stable generations for recovery.
 
 This is a Linux local-filesystem protocol: it requires no-follow opens,
 advisory `flock`, `renameat2(RENAME_NOREPLACE | RENAME_EXCHANGE)`,
@@ -205,12 +245,19 @@ independent processes are always safely excluded by the lease itself.
 Mammoth defines its own versioned store format,
 `mammoth-work-store-jsonl-v1`, structurally mirroring the transaction
 journal's proven hash-chained-JSONL approach rather than adopting any
-consumer's pre-existing on-disk format. `claim_work_store_lease()` acquires a
-non-blocking advisory lease at a deterministic sibling path next to the store
-directory; it authenticates ownership and permissions on the already-opened
-lease descriptor itself, not a separate path re-stat, so a lease path
-replaced between open and validation cannot slip past the check. A second
+consumer's pre-existing on-disk format. The unchanged
+`claim_work_store_lease()` default retains the pre-namespace deterministic
+sibling lock layout for existing callers. Callers that pass
+`lease_namespace=` to `claim_work_store_lease()`, `inspect_work_store()`,
+`WorkStoreSession.open_or_create()`, or `cleanup_work_store()` instead use
+`<lease_namespace>/leases/`. A store-path-derived coordinator namespace is
+held for the same lifetime, so two callers selecting different A/B namespaces
+for one store cannot become split owners. Both namespaces must share the store
+filesystem, and both use the generic post-lock generation fence. A second
 claim fails closed as `WorkStoreConflictError` instead of racing writers.
+The namespaced path also rejects the historical sibling lease sentinel; an
+operator must complete the documented legacy migration before opting a store
+into caller-selected lease placement.
 Any other `OSError` from creating the lease's parent, opening the lease
 path (for example a pre-existing symlink defeating `O_NOFOLLOW`), or
 locking it translates into the `WorkStoreError` family rather than
@@ -304,7 +351,12 @@ rename and the removal leaves the live path simply absent, never a
 half-deleted store that could be misread as a legitimate empty one or as
 foreign legacy content, and a stale retired remnant from an earlier
 interrupted deletion is reclaimed deterministically by the next call that
-retires a store at the same path.
+retires a store at the same path. In namespaced mode validated cleanup then
+terminalizes the caller namespace and deterministic coordinator, leaving no
+lease file, retired remnant, or empty coordinator directory. The legacy sibling
+sentinel is never automatically deleted because an older process may have
+opened its inode before locking it; migration requires stopping old processes
+before callers opt into a selected namespace.
 
 This module shares the transaction protocol's exact scope: local POSIX
 filesystems, no network filesystems, no cross-host coordination, and no
@@ -455,7 +507,8 @@ operational paths. The default contract is:
 ├── manifest.json
 ├── checkpoints/                 project-owned contents
 ├── logs/
-│   ├── .logical-run.lock        Mammoth producer lease
+│   ├── .mammoth-leases/
+│   │   └── logical-run/         active/recoverable producer lease namespace
 │   ├── events.out.tfevents.*    Mammoth TensorBoard sink
 │   └── executions/
 │       └── <execution-id>/
@@ -469,6 +522,14 @@ operational paths. The default contract is:
 
 The entry path is supplied by the caller. Mammoth does not assign semantic
 meaning to entry names.
+
+After a successful terminal execution, the `logical-run/` namespace and empty
+`.mammoth-leases/` parent are removed. Failure, interruption, or unsuccessful
+terminal logging closes ownership but preserves the namespace for recovery.
+The historical `logs/.logical-run.lock` path remains reserved for compatibility
+classification and is never automatically removed. Its presence blocks the new
+namespace claim until an operator has stopped older producers, confirmed that
+the sentinel is stale, and removed it manually.
 
 `GroupLayout(entry, group_id)` resolves the optional, entry-level group
 contract published only by `Workflow.run()`. The default contract is:
@@ -503,7 +564,8 @@ below.
 `mammoth.core.is_immutable_log_entry(log_dir, child)` classifies whether one
 child of a run's `logs/` directory is Mammoth-owned immutable state that a
 consumer log reset must preserve: the `executions/` container (and everything
-nested beneath it) and the `.logical-run.lock` lease file answer `True`; every
+nested beneath it), the `.mammoth-leases/` namespace tree, and the legacy
+`.logical-run.lock` lease file answer `True`; every
 other entry, including TensorBoard's own `logs/` contents, answers `False`.
 Classification is by `child`'s path identity relative to `log_dir`, derived
 from the same `EXECUTIONS_RELATIVE_DIR` and `LOGICAL_RUN_LEASE_FILENAME`
