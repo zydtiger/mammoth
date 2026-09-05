@@ -50,5 +50,5 @@ repos:
         entry: uv run pytest
         language: system
         pass_filenames: false
-        types_or: [python, pyi]
+        files: '(\.pyi?$|^(pyproject\.toml|uv\.lock)$)'
         stages: [pre-push]
