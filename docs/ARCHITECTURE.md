@@ -1016,7 +1016,13 @@ rank-local. `StepOutput.weight` controls weighted scalar means, with the default
 weight of one treating each DataLoader batch equally; callers supply a batch
 size when sample-weighted means are required. The trainer emits generic phase,
 task, progress, heartbeat, completion, and failure observations; projects
-select phase names, metric names, and display fields.
+select phase names, metric names, and display fields. Each training progress
+observation reports cumulative logical-batch throughput, where one logical
+batch is the complete accumulation window that produces an optimizer step.
+Each validation progress observation reports cumulative validation DataLoader
+batch throughput. At each observation boundary, CUDA producers synchronize the
+current stream before reading the task-local monotonic interval, so both rates
+describe the same completed work as their corresponding counters.
 When a surrounding command already owns the outer training phase, it disables
 the trainer's fit-level phase records while retaining Mammoth's nested task,
 progress, validation-phase, heartbeat, and metric observations.

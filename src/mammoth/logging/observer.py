@@ -133,6 +133,7 @@ class RunObserver:
         metrics: Mapping[str, float] | None = None,
         display_metrics: Mapping[str, float] | None = None,
         coordinates: Mapping[str, int | float | str] | None = None,
+        throughput: float | None = None,
         final: bool = False,
         message: str | None = None,
         media: Mapping[str, Media] | None = None,
@@ -149,6 +150,8 @@ class RunObserver:
             fields["total"] = total
         if coordinates:
             fields["coordinates"] = coordinates
+        if throughput is not None:
+            fields["throughput"] = throughput
         if message is not None:
             fields["message"] = message
         return self.emit(

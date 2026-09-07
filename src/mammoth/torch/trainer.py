@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import pickle
+import time
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future
@@ -262,6 +263,7 @@ class Trainer:
         extra_state: Mapping[str, Stateful] | None = None,
         batch_mover: BatchMover | None = None,
         runtime: Runtime | None = None,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if (validation_loader is None) != (validation_step is None):
             raise ValueError("validation_loader and validation_step must be provided together")
@@ -353,6 +355,7 @@ class Trainer:
         self.checkpoint_save_policy = checkpoint_save_policy
         self._uses_default_batch_mover = batch_mover is None
         self.batch_mover = batch_mover or self._default_batch_mover
+        self._monotonic_clock = monotonic_clock
         self.state = TrainerState()
         self.scaler = torch.GradScaler("cuda", enabled=config.precision == "fp16")
         self.registry = StateRegistry()
@@ -528,6 +531,7 @@ class Trainer:
             epoch=epoch,
             epoch_total=self.config.epochs,
         )
+        task_started_at = self._monotonic_clock()
         batch_iterator: CudaPrefetchingBatchIterator | None = None
         try:
             window_stateful_baseline = self.coordinate(
@@ -658,6 +662,11 @@ class Trainer:
                                 "batch",
                             ),
                         )
+                        self.coordinate(
+                            "training progress synchronization",
+                            partial(_synchronize_progress_device, self.device),
+                        )
+                        elapsed = self._monotonic_clock() - task_started_at
                         self.observer.progress(
                             phase=self.config.train_phase,
                             task_id=task_id,
@@ -674,6 +683,7 @@ class Trainer:
                                 "global_step": self.state.global_step,
                                 "optimizer_step": self.state.optimizer_step,
                             },
+                            throughput=window_index / elapsed if elapsed > 0 else None,
                             logical_step=self.optimizer_step_logical_step(),
                             final=window_index == len(window_sizes),
                         )
@@ -735,6 +745,7 @@ class Trainer:
         task_id = f"epoch-{epoch}"
         self.observer.emit("phase_started", phase=self.config.validation_phase)
         self.observer.emit("task_started", phase=self.config.validation_phase, task_id=task_id)
+        task_started_at = self._monotonic_clock()
         batch_iterator: CudaPrefetchingBatchIterator | None = None
         try:
             self.coordinate(
@@ -783,19 +794,22 @@ class Trainer:
                             self.validation_stateful_metrics,
                             output.metric_updates,
                         )
+                        _synchronize_progress_device(self.device)
+                        elapsed = self._monotonic_clock() - task_started_at
+                        self.observer.progress(
+                            phase=self.config.validation_phase,
+                            task_id=task_id,
+                            completed=batch_index + 1,
+                            total=total_batches,
+                            metrics={},
+                            display_metrics={},
+                            coordinates={"epoch": epoch, "batch": batch_index},
+                            throughput=(batch_index + 1) / elapsed if elapsed > 0 else None,
+                            final=batch_index + 1 == total_batches,
+                        )
                     except BaseException as error:
                         validation_error = error
                         break
-                    self.observer.progress(
-                        phase=self.config.validation_phase,
-                        task_id=task_id,
-                        completed=batch_index + 1,
-                        total=total_batches,
-                        metrics={},
-                        display_metrics={},
-                        coordinates={"epoch": epoch, "batch": batch_index},
-                        final=batch_index + 1 == total_batches,
-                    )
                 self.raise_distributed_failure(
                     "validation step",
                     validation_error,
@@ -1692,6 +1706,11 @@ class Trainer:
             enabled=prefetch,
             prefetch_mover=self._prefetch_batch_mover if prefetch else None,
         )
+
+
+def _synchronize_progress_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.current_stream(device).synchronize()
 
 
 def output_metrics(output: StepOutput) -> dict[str, float | torch.Tensor]:
