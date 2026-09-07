@@ -2345,6 +2345,70 @@ def test_validation_progress_omits_metrics_and_preserves_epoch_route() -> None:
     assert validation_completed[-1].metrics == {"validation/score_epoch": 2.0}
 
 
+def test_trainer_reports_progress_throughput_in_matching_work_units(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loader = DataLoader(MappingDataset(), batch_size=1)
+    model = torch.nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    sink = RecordingSink()
+    synchronized_devices: list[torch.device] = []
+    monkeypatch.setattr(
+        trainer_module,
+        "_synchronize_progress_device",
+        synchronized_devices.append,
+    )
+    clock_values = iter(
+        (0.0, 0.0, 4.0, 6.0, 8.0, 20.0, 20.0, 28.0, 32.0, 36.0, 40.0, 44.0, 48.0, 52.0)
+    )
+
+    with (
+        RunObserver((sink,)) as observer,
+        Trainer(
+            model=model,
+            optimizer=optimizer,
+            train_loader=loader,
+            train_step=regression_step,
+            validation_loader=loader,
+            validation_step=regression_step,
+            observer=observer,
+            config=TrainerConfig(
+                epochs=1,
+                device="cpu",
+                gradient_accumulation_steps=2,
+                checkpoint_every_epochs=None,
+            ),
+            monotonic_clock=clock_values.__next__,
+        ) as trainer,
+    ):
+        trainer.train_epoch(0)
+        trainer.validate_epoch(0)
+
+    training_progress = [
+        observation
+        for observation in sink.observations
+        if observation.event == "progress" and observation.fields.get("phase") == "train"
+    ]
+    validation_progress = [
+        observation
+        for observation in sink.observations
+        if observation.event == "progress" and observation.fields.get("phase") == "validation"
+    ]
+    assert [observation.fields["completed"] for observation in training_progress] == [1, 2, 3, 4]
+    assert [observation.fields.get("throughput") for observation in training_progress] == [
+        None,
+        *[pytest.approx(0.5)] * 3,
+    ]
+    assert [observation.fields["completed"] for observation in validation_progress] == list(
+        range(1, 9)
+    )
+    assert [observation.fields.get("throughput") for observation in validation_progress] == [
+        None,
+        *[pytest.approx(0.25)] * 7,
+    ]
+    assert synchronized_devices == [torch.device("cpu")] * 12
+
+
 def test_validation_metric_routes_reject_batch_names() -> None:
     loader = DataLoader(TensorDataset(torch.ones(1, 1)), batch_size=1)
     model = torch.nn.Linear(1, 1)

@@ -185,16 +185,19 @@ def test_progress_fans_out_distinct_jsonl_and_dense_history(tmp_path: Path) -> N
             metrics={"train/loss": 0.25, "train/lr": 0.001},
             display_metrics={"train/loss": 0.25},
             coordinates={"global_step": 7},
+            throughput=2.5,
         )
 
     event = read_execution_events(context.execution_dir / "rank-0.jsonl")[0]
     assert event.display_metrics == {"train/loss": 0.25}
+    assert event.throughput == 2.5
     assert "metrics" not in event.to_dict()
     assert "unit" not in event.to_dict()
     assert recording.observations[0].metrics == {
         "train/loss": 0.25,
         "train/lr": 0.001,
     }
+    assert recording.observations[0].fields["throughput"] == 2.5
 
 
 def test_observer_isolates_failed_sink_and_keeps_healthy_sinks() -> None:
