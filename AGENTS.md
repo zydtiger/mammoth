@@ -48,7 +48,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `uv.lock` | Exact uv resolution generated from `pyproject.toml`. Never edit manually. | Regenerate with uv whenever dependency metadata changes. |
 | `.python-version` | uv/Python development baseline. | The supported development interpreter changes deliberately. |
 | `.gitignore` | Generated-file and local-environment exclusions. | A new reproducible build, cache, environment, or local artifact needs an exclusion. |
-| `.pre-commit-config.yaml` | The mechanical gate: lock consistency, Ruff, mypy, and file-level checks at the commit stage, and pytest at the `pre-push` stage. Run by `prek` locally and by CI over every file. | A mechanically checkable rule is added, removed, or rescoped. |
+| `.pre-commit-config.yaml` | Sole definition of mechanical commands, scopes, and local Git-hook stages. Run by `prek` locally and by CI over every file. | A mechanically checkable rule is added, removed, or rescoped. |
 | `.github/workflows/ci.yml` | GitHub Actions validation: a `lint` job running the commit-stage hooks once, and a matrixed `test` job running the `pre-push` stage across the supported Python versions, then `uv build` and an install smoke test on the lowest one. Invokes the hook runner rather than restating hook commands. | CI triggers, jobs, the tested Python versions, or validation coverage change. |
 | `src/mammoth/__init__.py` | Lightweight root package metadata and intentionally small stable exports. | Package version or a truly root-level stable export changes. |
 | `src/mammoth/__main__.py` | `python -m mammoth` forwarding entry point. | Module execution behavior changes. |
@@ -170,36 +170,34 @@ same change.
 
 ## Validation
 
-Lock consistency, Ruff, and mypy are enforced by the commit-stage hooks and
-pytest by the `pre-push` stage hook; both stages are what CI runs over every
-file. Install the runner once per machine:
+Install the runner once per machine, then activate this clone:
 
 ```bash
 uv tool install prek
 prek install
 ```
 
-After every Python change, run what the hooks do not cover:
+- Full: `prek run --all-files && prek run --all-files --hook-stage pre-push`
+- Targeted: `prek run --files <changed-path>... && prek run --files <changed-path>... --hook-stage pre-push`
+- Documentation-only: `prek run --files <changed-document-path>... && git diff --check -- <changed-document-path>...`
+- Package changes: run the full validation, then `uv build`.
 
-```bash
-uv sync
-uv build
-```
-
-Apply the hooks outside a commit with `prek run --all-files`, and the test
-stage with `prek run --all-files --hook-stage pre-push`.
+`.pre-commit-config.yaml` is the sole definition of mechanical commands and
+their scope. Its `commit-msg` hook validates commit subjects separately from
+source-file validation. CI invokes the same source-file stages rather than
+restating their commands.
 
 Use `uv run pytest --cov=mammoth --cov-report=term-missing` for completion and
-release audits. For documentation-only changes, inspect the diff and run
-`git diff --check`. Do not claim a check passed unless it was actually run.
+release audits. Do not claim a check passed unless it was actually run.
 
 ## Git Policy
 
 Do not stage, commit, push, create branches, or open pull requests unless the
 user requests that Git operation. Keep unrelated changes unstaged.
 
-Every commit message must use exactly one of these pinned prefixes followed by
-a colon and an imperative summary:
+Except for Git-generated merge subjects beginning with `Merge `, every commit
+message must use exactly one of these pinned prefixes followed by a colon and
+an imperative summary:
 
 | Prefix | Use for |
 | --- | --- |

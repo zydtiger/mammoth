@@ -20,6 +20,12 @@ repos:
         stages: [commit-msg]
         args: ['^(Merge |(feat|fix|refactor|docs|test|conf|perf|build|ci): [a-z])']
 
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+        args: [-shellcheck=, -pyflakes=]
+
   - repo: local
     hooks:
       - id: uv-lock-check
