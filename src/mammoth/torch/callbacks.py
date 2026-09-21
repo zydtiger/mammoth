@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Union
 
 from mammoth.torch.state import TrainerState
 
@@ -74,7 +74,7 @@ class EarlyStopping(Callback):
         self.mode = mode
         self.patience = patience
         self.min_delta = float(min_delta)
-        self.best: float | None = None
+        self.best: Union[float, None] = None
         self.bad_checks = 0
         self.improved = False
         self._checked = False
@@ -116,7 +116,7 @@ class EarlyStopping(Callback):
         """Restore early-stopping checkpoint state."""
         best = state.get("best")
         if best is not None and (
-            isinstance(best, bool) or not isinstance(best, int | float) or not math.isfinite(best)
+            isinstance(best, bool) or not isinstance(best, (int, float)) or not math.isfinite(best)
         ):
             raise ValueError("early-stopping best must be finite or null")
         bad_checks = state.get("bad_checks")

@@ -10,14 +10,15 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, Union
 
+from mammoth.compat import DATACLASS_SLOTS
 from mammoth.core.events import EventName
 
 MediaKind = Literal["image", "text", "histogram"]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class Media:
     """One optional TensorBoard media value with backend keyword options."""
 
@@ -31,7 +32,7 @@ class Media:
         object.__setattr__(self, "options", MappingProxyType(dict(self.options)))
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class Observation:
     """A lifecycle record plus optional dense metrics and media."""
 
@@ -40,7 +41,7 @@ class Observation:
     metrics: Mapping[str, float] = field(default_factory=dict)
     display_metrics: Mapping[str, float] = field(default_factory=dict)
     media: Mapping[str, Media] = field(default_factory=dict)
-    logical_step: int | None = None
+    logical_step: Union[int, None] = None
 
     def __post_init__(self) -> None:
         if self.logical_step is not None and (
@@ -78,7 +79,7 @@ def validate_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
             raise ValueError("metric names must be non-empty strings")
         if (
             isinstance(value, bool)
-            or not isinstance(value, int | float)
+            or not isinstance(value, (int, float))
             or not math.isfinite(value)
         ):
             raise ValueError(f"metric {name!r} must be finite")

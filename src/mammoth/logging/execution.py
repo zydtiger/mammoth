@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Union
 
 from mammoth.core.events import (
     DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
@@ -54,7 +55,7 @@ class ExecutionLogging:
     rank: int
     observer: RunObserver
     text_handler: ProcessTextLogHandler
-    event_writer: ExecutionEventWriter | None = None
+    event_writer: Union[ExecutionEventWriter, None] = None
     _closed: bool = False
 
     def close(self) -> None:
@@ -78,7 +79,7 @@ def create_execution_logging(
     context: ExecutionContext,
     *,
     rank: int,
-    world_size: int | None = None,
+    world_size: Union[int, None] = None,
     additional_sinks: Sequence[ObservationSink] = (),
     text_level: int = logging.INFO,
     progress_interval_seconds: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
@@ -118,7 +119,7 @@ def create_execution_observability(
     context: ExecutionContext,
     *,
     rank: int,
-    world_size: int | None = None,
+    world_size: Union[int, None] = None,
     additional_sinks: Sequence[ObservationSink] = (),
     progress_interval_seconds: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
     heartbeat_interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,

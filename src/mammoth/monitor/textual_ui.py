@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 from threading import Lock
+from typing import Union
 
 from rich.console import Group
 from rich.text import Text
@@ -68,8 +69,8 @@ class MonitorApp(App[None]):
         telemetry: bool = True,
         interval_seconds: float = 2.0,
         stale_after_seconds: float = 90.0,
-        initial_host: PsutilViewerTelemetry | None = None,
-        telemetry_sampler: PsutilViewerTelemetrySampler | None = None,
+        initial_host: Union[PsutilViewerTelemetry, None] = None,
+        telemetry_sampler: Union[PsutilViewerTelemetrySampler, None] = None,
     ) -> None:
         """Bind the passive monitor and interactive default policies."""
         super().__init__()
@@ -84,7 +85,7 @@ class MonitorApp(App[None]):
             PsutilViewerTelemetrySampler() if telemetry else None
         )
         self.detail = monitor.execution_id is not None
-        self.error: str | None = None
+        self.error: Union[str, None] = None
         self._refresh_generation = 0
         self._refresh_lock = Lock()
 
@@ -127,7 +128,7 @@ class MonitorApp(App[None]):
         self,
         generation: int,
         snapshot: RunSnapshot,
-        host: PsutilViewerTelemetry | None,
+        host: Union[PsutilViewerTelemetry, None],
     ) -> None:
         """Publish one completed worker refresh on the Textual event loop."""
         if generation != self._refresh_generation:
@@ -247,13 +248,13 @@ class RunScreen(Screen[None]):
     def __init__(
         self,
         monitor: RunMonitor,
-        initial_snapshot: RunSnapshot | None,
+        initial_snapshot: Union[RunSnapshot, None],
         *,
         watch: bool = True,
         interval_seconds: float = 2.0,
         stale_after_seconds: float = 90.0,
-        host: PsutilViewerTelemetry | None = None,
-        telemetry_sampler: PsutilViewerTelemetrySampler | None = None,
+        host: Union[PsutilViewerTelemetry, None] = None,
+        telemetry_sampler: Union[PsutilViewerTelemetrySampler, None] = None,
     ) -> None:
         """Bind the passive run monitor drilled into from a fleet or group view."""
         super().__init__()
@@ -265,7 +266,7 @@ class RunScreen(Screen[None]):
         self.host = host
         self.telemetry_sampler = telemetry_sampler
         self.detail = False
-        self.error: str | None = None
+        self.error: Union[str, None] = None
         self._refresh_generation = 0
         self._refresh_lock = Lock()
 
@@ -309,7 +310,7 @@ class RunScreen(Screen[None]):
         self,
         generation: int,
         snapshot: RunSnapshot,
-        host: PsutilViewerTelemetry | None,
+        host: Union[PsutilViewerTelemetry, None],
     ) -> None:
         """Publish one completed worker refresh on the Textual event loop."""
         if generation != self._refresh_generation:
@@ -416,7 +417,7 @@ class GroupScreen(Screen[None]):
         self.interval_seconds = interval_seconds
         self.stale_after_seconds = stale_after_seconds
         self.selected_index = 0
-        self.error: str | None = None
+        self.error: Union[str, None] = None
         self._refresh_generation = 0
         self._refresh_lock = Lock()
 
@@ -458,7 +459,7 @@ class GroupScreen(Screen[None]):
         )
         self.app.call_from_thread(self._accept_refresh, generation, group)
 
-    def _accept_refresh(self, generation: int, group: GroupSnapshot | None) -> None:
+    def _accept_refresh(self, generation: int, group: Union[GroupSnapshot, None]) -> None:
         """Publish one completed worker refresh on the Textual event loop."""
         if generation != self._refresh_generation:
             return
@@ -550,7 +551,7 @@ class FleetScreen(Screen[None]):
         self.interval_seconds = interval_seconds
         self.stale_after_seconds = stale_after_seconds
         self.selected_index = 0
-        self.error: str | None = None
+        self.error: Union[str, None] = None
         self._refresh_generation = 0
         self._refresh_lock = Lock()
 
@@ -677,9 +678,9 @@ class FleetApp(App[None]):
         telemetry: bool = True,
         interval_seconds: float = 2.0,
         stale_after_seconds: float = 90.0,
-        open_group_id: str | None = None,
-        telemetry_sampler: PsutilViewerTelemetrySampler | None = None,
-        initial_host: PsutilViewerTelemetry | None = None,
+        open_group_id: Union[str, None] = None,
+        telemetry_sampler: Union[PsutilViewerTelemetrySampler, None] = None,
+        initial_host: Union[PsutilViewerTelemetry, None] = None,
     ) -> None:
         """Bind the entry-wide fleet monitor and optional direct group target.
 
@@ -768,7 +769,7 @@ class FleetApp(App[None]):
             )
         )
 
-    def _next_run_screen_host(self) -> PsutilViewerTelemetry | None:
+    def _next_run_screen_host(self) -> Union[PsutilViewerTelemetry, None]:
         """Reuse the pre-UI telemetry sample once, then sample fresh after.
 
         The first run drilled into after startup gets the sample already
@@ -792,7 +793,7 @@ def run_fleet_textual(
     telemetry: bool,
     interval_seconds: float,
     stale_after_seconds: float,
-    open_group_id: str | None = None,
+    open_group_id: Union[str, None] = None,
 ) -> None:
     """Run the Textual fleet application until the viewer quits.
 

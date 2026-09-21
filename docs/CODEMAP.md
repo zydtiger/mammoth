@@ -7,6 +7,7 @@ src/mammoth/
 ├── __init__.py
 ├── __main__.py
 ├── cli.py
+├── compat.py
 ├── execution.py
 ├── core/
 │   ├── __init__.py
@@ -116,6 +117,9 @@ caller-owned Python
 ```
 
 ## Current Import Graph
+
+`mammoth.compat` supplies interpreter-level dataclass options, exception notes,
+and strict iterable pairing to the framework-neutral and optional Torch layers.
 
 ```text
 mammoth

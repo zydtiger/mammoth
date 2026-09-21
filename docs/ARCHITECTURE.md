@@ -42,7 +42,8 @@ publication) and reuses `mammoth.workflow.launch.launch_process` as its child
 launcher; nothing imports `mammoth.queue`, so a project that never queues a
 job carries no additional runtime dependency.
 
-`mammoth.core` should use the Python standard library. TensorBoard, Rich,
+`mammoth.core` uses the Python standard library and `typing-extensions` for
+portable type annotations. TensorBoard, Rich,
 Textual, psutil, and PyTorch belong in optional dependency groups and must not
 be imported by the core package.
 
@@ -1172,6 +1173,14 @@ names and order, profiler lifecycles, workload semantics, report schemas, and
 any distributed aggregation policy.
 
 ## Compatibility policy
+
+The package supports Python 3.9 and newer. `mammoth.compat` contains the shared
+runtime adaptations used by core, workflow, logging, monitor, and Torch modules.
+Dataclasses retain slots on Python 3.10+ and use ordinary dataclass storage on
+Python 3.9; frozen fields and constructor contracts are preserved. Exception
+cleanup notes remain available through `__notes__` on Python 3.9–3.10, while
+Python 3.11+ also renders them in native tracebacks. Strict scheduler and metric
+pairing rejects unequal input lengths on every supported interpreter.
 
 Artifact readers preserve compatibility with schema-version-1 execution and
 event records from the originating project. Package and environment names may

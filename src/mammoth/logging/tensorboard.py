@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, Union
 
 from tensorboardX import SummaryWriter
 
@@ -82,7 +82,7 @@ class TensorBoardSink:
         primary_rank: int = 0,
         enabled_on_secondary: bool = False,
         flush_seconds: int = 10,
-        writer: SummaryWriterLike | None = None,
+        writer: Union[SummaryWriterLike, None] = None,
     ) -> None:
         self.log_dir = Path(log_dir)
         self.rank = rank
@@ -118,7 +118,7 @@ class TensorBoardSink:
         """Flush and close TensorBoard's event writer."""
         self.writer.close()
 
-    def _logical_step(self, explicit_step: int | None, coordinates: object) -> int:
+    def _logical_step(self, explicit_step: Union[int, None], coordinates: object) -> int:
         if explicit_step is not None:
             self._step = max(self._step, explicit_step + 1)
             return explicit_step

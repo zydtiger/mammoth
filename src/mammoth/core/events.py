@@ -18,10 +18,12 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, BinaryIO, Literal, Self, cast
+from typing import Any, BinaryIO, Literal, Union, cast
+
+from typing_extensions import Self
 
 from mammoth.core.execution import (
     ExecutionContext,
@@ -58,16 +60,16 @@ EventName = Literal[
     "heartbeat",
 ]
 EventSource = Literal["runner", "process"]
-JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
-ImmutableJsonValue = (
-    None
-    | bool
-    | int
-    | float
-    | str
-    | tuple["ImmutableJsonValue", ...]
-    | Mapping[str, "ImmutableJsonValue"]
-)
+JsonValue = Union[None, bool, int, float, str, list["JsonValue"], dict[str, "JsonValue"]]
+ImmutableJsonValue = Union[
+    None,
+    bool,
+    int,
+    float,
+    str,
+    tuple["ImmutableJsonValue", ...],
+    Mapping[str, "ImmutableJsonValue"],
+]
 
 EVENT_NAMES: frozenset[str] = frozenset(
     {
@@ -171,20 +173,20 @@ class ExecutionEvent:
     run_name: str
     source: EventSource
     event: EventName
-    rank: int | None = None
-    world_size: int | None = None
-    phase: str | None = None
-    task_id: str | None = None
-    parent_task_id: str | None = None
-    coordinates: Mapping[str, int | float | str] = field(default_factory=dict)
-    throughput: float | None = None
-    duration_seconds: float | None = None
-    exit_code: int | None = None
-    signal: int | str | None = None
-    completed: int | None = None
-    total: int | None = None
-    final: bool | None = None
-    message: str | None = None
+    rank: Union[int, None] = None
+    world_size: Union[int, None] = None
+    phase: Union[str, None] = None
+    task_id: Union[str, None] = None
+    parent_task_id: Union[str, None] = None
+    coordinates: Mapping[str, Union[int, float, str]] = field(default_factory=dict)
+    throughput: Union[float, None] = None
+    duration_seconds: Union[float, None] = None
+    exit_code: Union[int, None] = None
+    signal: Union[int, str, None] = None
+    completed: Union[int, None] = None
+    total: Union[int, None] = None
+    final: Union[bool, None] = None
+    message: Union[str, None] = None
     display_metrics: Mapping[str, float] = field(default_factory=dict)
     extensions: Mapping[str, ImmutableJsonValue] = field(default_factory=dict)
 
@@ -357,11 +359,11 @@ class ExecutionEvent:
 
     def _validate_optional_data(self) -> None:
         for name in ("message",):
-            text_value = cast(str | None, getattr(self, name))
+            text_value = cast(Union[str, None], getattr(self, name))
             if text_value is not None:
                 _validate_nonempty_string(name, text_value)
         for name in ("throughput", "duration_seconds"):
-            numeric_value = cast(float | None, getattr(self, name))
+            numeric_value = cast(Union[float, None], getattr(self, name))
             if numeric_value is not None:
                 _validate_finite_number(name, numeric_value, minimum=0.0)
                 object.__setattr__(self, name, float(numeric_value))
@@ -380,7 +382,7 @@ class ExecutionEvent:
             if self.event not in _TERMINAL_EVENTS:
                 raise ValueError("exit_code requires a terminal event.")
         if self.signal is not None:
-            if not isinstance(self.signal, int | str) or isinstance(self.signal, bool):
+            if not isinstance(self.signal, (int, str)) or isinstance(self.signal, bool):
                 raise ValueError("signal must be an integer or non-empty string.")
             if isinstance(self.signal, str):
                 _validate_nonempty_string("signal", self.signal)
@@ -402,12 +404,12 @@ class ExecutionEventWriter:
         execution_id: str,
         run_name: str,
         source: EventSource,
-        rank: int | None = None,
-        world_size: int | None = None,
+        rank: Union[int, None] = None,
+        world_size: Union[int, None] = None,
         progress_interval_seconds: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
         heartbeat_interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
         monotonic_clock: Callable[[], float] = time.monotonic,
-        utc_clock: Callable[[], str] | None = None,
+        utc_clock: Union[Callable[[], str], None] = None,
         failure_logger: logging.Logger = logger,
     ) -> None:
         """Validate writer identity and open its reserved process-local stream."""
@@ -432,16 +434,16 @@ class ExecutionEventWriter:
         self._monotonic_clock = monotonic_clock
         self._utc_clock = utc_clock or utc_event_time
         self._failure_logger = failure_logger
-        self._stream: BinaryIO | None = None
+        self._stream: Union[BinaryIO, None] = None
         self._sequence = 0
-        self._pending_progress: ExecutionEvent | None = None
-        self._last_progress_emitted: float | None = None
+        self._pending_progress: Union[ExecutionEvent, None] = None
+        self._last_progress_emitted: Union[float, None] = None
         self._last_activity = _monotonic_time(self._monotonic_clock)
         self._failure_logged = False
         self._closed = False
         self._lock = threading.RLock()
         self._validate_writer_identity()
-        opened_stream: BinaryIO | None = None
+        opened_stream: Union[BinaryIO, None] = None
         try:
             opened_stream = _open_event_stream(self.path)
             self._sequence = _existing_stream_sequence(
@@ -466,7 +468,7 @@ class ExecutionEventWriter:
         context: ExecutionContext,
         *,
         rank: int,
-        world_size: int | None = None,
+        world_size: Union[int, None] = None,
         **options: Any,
     ) -> Self:
         """Open the reserved ``rank-N.jsonl`` stream for one execution rank."""
@@ -508,7 +510,7 @@ class ExecutionEventWriter:
         with self._lock:
             return self._sequence
 
-    def emit(self, event: EventName, **fields: Any) -> ExecutionEvent | None:
+    def emit(self, event: EventName, **fields: Any) -> Union[ExecutionEvent, None]:
         """Validate and immediately flush a lifecycle or heartbeat event."""
         with self._lock:
             _reject_legacy_unit(fields)
@@ -540,10 +542,10 @@ class ExecutionEventWriter:
         phase: str,
         task_id: str,
         completed: int,
-        total: int | None = None,
+        total: Union[int, None] = None,
         final: bool = False,
         **fields: Any,
-    ) -> ExecutionEvent | None:
+    ) -> Union[ExecutionEvent, None]:
         """Emit, replace, or immediately finalize one throttled progress update."""
         with self._lock:
             _reject_legacy_unit(fields)
@@ -585,7 +587,7 @@ class ExecutionEventWriter:
             self._pending_progress = candidate
             return None
 
-    def flush_progress(self, *, final: bool = True) -> ExecutionEvent | None:
+    def flush_progress(self, *, final: bool = True) -> Union[ExecutionEvent, None]:
         """Immediately flush the latest replaceable progress observation, if any."""
         with self._lock:
             if not isinstance(final, bool):
@@ -608,10 +610,10 @@ class ExecutionEventWriter:
         self,
         *,
         phase: str,
-        task_id: str | None = None,
+        task_id: Union[str, None] = None,
         force: bool = False,
         **fields: Any,
-    ) -> ExecutionEvent | None:
+    ) -> Union[ExecutionEvent, None]:
         """Emit a heartbeat only after the configured idle interval unless forced."""
         with self._lock:
             if not self.enabled:
@@ -640,8 +642,8 @@ class ExecutionEventWriter:
         self,
         *,
         phase: str,
-        task_id: str | None = None,
-        message: str | None = None,
+        task_id: Union[str, None] = None,
+        message: Union[str, None] = None,
     ) -> Iterator[None]:
         """Emit idle heartbeats while the caller is blocked in long-running work."""
         stop = threading.Event()
@@ -759,7 +761,7 @@ class ExecutionEventWriter:
         event: ExecutionEvent,
         *,
         monotonic_now: float,
-    ) -> ExecutionEvent | None:
+    ) -> Union[ExecutionEvent, None]:
         stream = self._stream
         if stream is None or not self.enabled:
             return None
@@ -840,29 +842,22 @@ class ExecutionEventTailReader:
         path: Path,
         *,
         allow_missing: bool = True,
-        tail_window_bytes: int | None = None,
+        tail_window_bytes: Union[int, None] = None,
     ) -> None:
         self.path = Path(path)
         self.allow_missing = allow_missing
         self.tail_window_bytes = tail_window_bytes
-        self._file_identity: tuple[int, int] | None = None
+        self._file_identity: Union[tuple[int, int], None] = None
         self._offset = 0
         self._append_guard = b""
         self._buffer = b""
         self._line_number = 0
         self._next_sequence = 1
         self._sequence_baseline_synced = True
-        self._stream_identity: (
-            tuple[
-                str,
-                str,
-                EventSource,
-                int | None,
-                int | None,
-            ]
-            | None
-        ) = None
-        self._error: ExecutionEventReadError | None = None
+        self._stream_identity: Union[
+            tuple[str, str, EventSource, Union[int, None], Union[int, None]], None
+        ] = None
+        self._error: Union[ExecutionEventReadError, None] = None
 
     @property
     def line_number(self) -> int:
@@ -1067,7 +1062,7 @@ def process_event_stream_path(
     context: ExecutionContext,
     rank: int,
     *,
-    world_size: int | None = None,
+    world_size: Union[int, None] = None,
 ) -> Path:
     """Return the reserved process-owned JSONL path for one validated rank."""
     context.rank_log_path(rank, world_size=world_size)
@@ -1083,7 +1078,7 @@ def _with_sequence(
     event: ExecutionEvent,
     sequence: int,
     *,
-    final: bool | None = None,
+    final: Union[bool, None] = None,
 ) -> ExecutionEvent:
     changes: dict[str, Any] = {"sequence": sequence}
     if final is not None:
@@ -1151,8 +1146,8 @@ def _existing_stream_sequence(
     execution_id: str,
     run_name: str,
     source: EventSource,
-    rank: int | None,
-    world_size: int | None,
+    rank: Union[int, None],
+    world_size: Union[int, None],
 ) -> int:
     expected_sequence = 1
     stream.seek(0)
@@ -1195,7 +1190,7 @@ def _existing_stream_sequence(
 
 def utc_event_time() -> str:
     """Return a schema-compatible UTC timestamp for event producers."""
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _validated_display_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
@@ -1212,14 +1207,14 @@ def _validated_display_metrics(metrics: Mapping[str, float]) -> dict[str, float]
 
 
 def _validated_coordinates(
-    coordinates: Mapping[str, int | float | str],
-) -> dict[str, int | float | str]:
+    coordinates: Mapping[str, Union[int, float, str]],
+) -> dict[str, Union[int, float, str]]:
     if not isinstance(coordinates, Mapping):
         raise ValueError("coordinates must be a mapping.")
-    validated: dict[str, int | float | str] = {}
+    validated: dict[str, Union[int, float, str]] = {}
     for name, value in coordinates.items():
         _validate_nonempty_string("coordinate name", name)
-        if isinstance(value, bool) or not isinstance(value, int | float | str):
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
             raise ValueError(f"coordinates[{name!r}] must be an integer, finite number, or string.")
         if isinstance(value, float):
             _validate_finite_number(f"coordinates[{name!r}]", value)
@@ -1242,9 +1237,9 @@ def _validated_extensions(extensions: Mapping[str, Any]) -> dict[str, ImmutableJ
 def _freeze_json(value: Any) -> ImmutableJsonValue:
     if isinstance(value, Mapping):
         return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
-    if isinstance(value, list | tuple):
+    if isinstance(value, (list, tuple)):
         return tuple(_freeze_json(item) for item in value)
-    return cast(None | bool | int | float | str, value)
+    return cast(Union[None, bool, int, float, str], value)
 
 
 def _thaw_json(value: ImmutableJsonValue) -> JsonValue:
@@ -1261,7 +1256,7 @@ def _parse_utc_time(value: str) -> datetime:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as error:
         raise ValueError(f"Invalid UTC event timestamp: {value!r}.") from error
-    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
         raise ValueError(f"Event timestamp must use UTC: {value!r}.")
     return parsed
 
@@ -1272,7 +1267,7 @@ def _required_string(payload: Mapping[str, Any], key: str) -> str:
     return cast(str, value)
 
 
-def _optional_string(payload: Mapping[str, Any], key: str) -> str | None:
+def _optional_string(payload: Mapping[str, Any], key: str) -> Union[str, None]:
     value = payload.get(key)
     if value is None:
         return None
@@ -1280,15 +1275,15 @@ def _optional_string(payload: Mapping[str, Any], key: str) -> str | None:
     return cast(str, value)
 
 
-def _required_int(payload: Mapping[str, Any], key: str, *, minimum: int | None = None) -> int:
+def _required_int(payload: Mapping[str, Any], key: str, *, minimum: Union[int, None] = None) -> int:
     value = payload.get(key)
     _validate_int(key, value, minimum=minimum)
     return cast(int, value)
 
 
 def _optional_int(
-    payload: Mapping[str, Any], key: str, *, minimum: int | None = None
-) -> int | None:
+    payload: Mapping[str, Any], key: str, *, minimum: Union[int, None] = None
+) -> Union[int, None]:
     value = payload.get(key)
     if value is None:
         return None
@@ -1297,8 +1292,8 @@ def _optional_int(
 
 
 def _optional_number(
-    payload: Mapping[str, Any], key: str, *, minimum: float | None = None
-) -> float | None:
+    payload: Mapping[str, Any], key: str, *, minimum: Union[float, None] = None
+) -> Union[float, None]:
     value = payload.get(key)
     if value is None:
         return None
@@ -1306,7 +1301,7 @@ def _optional_number(
     return float(value)
 
 
-def _optional_bool(payload: Mapping[str, Any], key: str) -> bool | None:
+def _optional_bool(payload: Mapping[str, Any], key: str) -> Union[bool, None]:
     value = payload.get(key)
     if value is None:
         return None
@@ -1315,11 +1310,11 @@ def _optional_bool(payload: Mapping[str, Any], key: str) -> bool | None:
     return value
 
 
-def _optional_signal(payload: Mapping[str, Any]) -> int | str | None:
+def _optional_signal(payload: Mapping[str, Any]) -> Union[int, str, None]:
     value = payload.get("signal")
     if value is None:
         return None
-    if not isinstance(value, int | str) or isinstance(value, bool):
+    if not isinstance(value, (int, str)) or isinstance(value, bool):
         raise ValueError("signal must be an integer or non-empty string.")
     return value
 
@@ -1338,16 +1333,16 @@ def _validate_nonempty_string(name: str, value: Any) -> None:
         raise ValueError(f"{name} must be a non-empty string, got {value!r}.")
 
 
-def _validate_int(name: str, value: Any, *, minimum: int | None = None) -> None:
+def _validate_int(name: str, value: Any, *, minimum: Union[int, None] = None) -> None:
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"{name} must be an integer, got {value!r}.")
     if minimum is not None and value < minimum:
         raise ValueError(f"{name} must be at least {minimum}, got {value!r}.")
 
 
-def _validate_finite_number(name: str, value: Any, *, minimum: float | None = None) -> None:
+def _validate_finite_number(name: str, value: Any, *, minimum: Union[float, None] = None) -> None:
     is_finite = False
-    if isinstance(value, int | float) and not isinstance(value, bool):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
         with suppress(OverflowError):
             is_finite = math.isfinite(value)
     if not is_finite:

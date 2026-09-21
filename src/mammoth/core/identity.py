@@ -10,6 +10,7 @@ import hashlib
 import os
 import re
 from pathlib import Path
+from typing import Union
 
 RUN_NAME_MAX_LENGTH = 255
 EXECUTION_ID_MAX_LENGTH = 128
@@ -106,7 +107,7 @@ def validate_device_spec(device: str) -> str:
     return device
 
 
-def derive_run_name(prefix: str, target_path: str | Path) -> str:
+def derive_run_name(prefix: str, target_path: Union[str, Path]) -> str:
     """Derive a stable, collision-resistant, path-safe run name for one target.
 
     The result has the shape ``<prefix>-<target-stem>-<digest>``, where

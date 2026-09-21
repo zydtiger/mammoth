@@ -19,10 +19,11 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from threading import Condition, Lock, RLock, Thread
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Generic, Literal, Protocol, TypeVar, Union, cast
 
 import torch
 
+from mammoth.compat import DATACLASS_SLOTS, add_exception_note
 from mammoth.core.artifacts import (
     PreparedArtifact,
     atomic_publish,
@@ -38,6 +39,8 @@ from mammoth.core.pipeline import (
     BackgroundPipelineSubmission,
     BoundedBackgroundPipeline,
 )
+
+ResultT = TypeVar("ResultT")
 
 CHECKPOINT_SCHEMA_VERSION = 1
 CheckpointReason = Literal["scheduled", "manual", "interrupted"]
@@ -85,18 +88,18 @@ class _CudaEvent(Protocol):
         """Wait until the recorded CUDA work completes."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class _CheckpointCaptureDecision:
     """Describe the capture path selected for one generic checkpoint."""
 
     path: Literal["cpu", "gpu"]
     reason: str
     snapshot_bytes: int = 0
-    available_bytes: int | None = None
-    required_bytes: int | None = None
+    available_bytes: Union[int, None] = None
+    required_bytes: Union[int, None] = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class CheckpointSavePolicy:
     """Select generic resumable retention and metric-best publication."""
 
@@ -117,7 +120,7 @@ class CheckpointSavePolicy:
             raise ValueError("checkpoint every_epochs must be a positive integer")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class RestoreOptions:
     """Select whether generic mutable training state is restored or reset."""
 
@@ -132,7 +135,7 @@ class RestoreOptions:
                 raise ValueError(f"{name} restore action must be 'restore' or 'reset'")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class CheckpointInspection:
     """Project-neutral summary produced before checkpoint state is applied."""
 
@@ -152,16 +155,16 @@ class CheckpointInspection:
             raise TypeError("checkpoint inspection metadata must be a mapping")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class TrainerCheckpointRestore:
     """Normalized project checkpoint state and Mammoth's applied-state report."""
 
     epoch: int
-    optimizer_step: int | None = None
-    global_step: int | None = None
+    optimizer_step: Union[int, None] = None
+    global_step: Union[int, None] = None
     stopped_early: bool = False
-    optimizer_state_dict: Mapping[str, Any] | None = field(default=None, repr=False)
-    scheduler_state_dict: Mapping[str, Any] | None = field(default=None, repr=False)
+    optimizer_state_dict: Union[Mapping[str, Any], None] = field(default=None, repr=False)
+    scheduler_state_dict: Union[Mapping[str, Any], None] = field(default=None, repr=False)
     callback_state_dicts: Mapping[int, Mapping[str, Any]] = field(
         default_factory=dict,
         repr=False,
@@ -218,7 +221,7 @@ class CheckpointArtifact:
 
     destination: Path
     writer: Callable[[Path], object]
-    mode: int | None = 0o600
+    mode: Union[int, None] = 0o600
     preserve_permissions: bool = True
     role: CheckpointRole = "epoch"
     epoch: int = -1
@@ -229,7 +232,7 @@ class TrainerCheckpointWriters:
     """Project serializers closed over one immutable checkpoint snapshot."""
 
     resumable: Callable[[Path], object]
-    best: Callable[[Path], object] | None = None
+    best: Union[Callable[[Path], object], None] = None
 
     def __post_init__(self) -> None:
         if not callable(self.resumable):
@@ -255,7 +258,7 @@ class CheckpointPublication:
     retired: tuple[Path, ...]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class PublishedCheckpoint:
     """Identity and exact-byte provenance for one committed checkpoint artifact."""
 
@@ -282,7 +285,7 @@ class PublishedCheckpoint:
             raise ValueError("published checkpoint sha256 must be lowercase hexadecimal")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class ResumableCheckpointCandidate:
     """One filename-derived standard trainer checkpoint candidate.
 
@@ -304,7 +307,7 @@ class ResumableCheckpointCandidate:
             raise ValueError("checkpoint candidate epoch must be an integer >= -1")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class TrainerCheckpointContext:
     """Completed-epoch inputs supplied to a project checkpoint policy."""
 
@@ -313,9 +316,9 @@ class TrainerCheckpointContext:
     optimizer_step: int
     stopped_early: bool
     training_metrics: Mapping[str, float]
-    validation_metrics: Mapping[str, float] | None
+    validation_metrics: Union[Mapping[str, float], None]
     reason: CheckpointReason = "scheduled"
-    restore: TrainerCheckpointRestore | None = None
+    restore: Union[TrainerCheckpointRestore, None] = None
 
 
 class TrainerCheckpointPolicy(Protocol):
@@ -407,15 +410,15 @@ class StateRegistry:
             value.load_state_dict(item)
 
 
-@dataclass(frozen=True, slots=True)
-class _CheckpointPublicationTask[ResultT]:
+@dataclass(frozen=True, **DATACLASS_SLOTS)
+class _CheckpointPublicationTask(Generic[ResultT]):
     """Bridge one public checkpoint future to generic background execution."""
 
     operation: Callable[[], ResultT]
     future: _CheckpointPublicationFuture[ResultT]
 
 
-class _CheckpointPublicationFuture[ResultT](Future[ResultT]):
+class _CheckpointPublicationFuture(Future[ResultT], Generic[ResultT]):
     """Finalize results before dispatching user callbacks through the pipeline."""
 
     def __init__(self) -> None:
@@ -485,7 +488,7 @@ class _CheckpointPublicationFuture[ResultT](Future[ResultT]):
                 callback(self)
 
 
-def _run_checkpoint_publication[ResultT](
+def _run_checkpoint_publication(
     task: _CheckpointPublicationTask[ResultT],
 ) -> ResultT:
     """Run one checkpoint operation before generic state completes its future."""
@@ -532,7 +535,7 @@ class AsyncCheckpointPublisher:
         self._recorded_failure_submissions: set[
             BackgroundPipelineSubmission[_CheckpointPublicationTask[Any], Any]
         ] = set()
-        self._deferred_interrupt: KeyboardInterrupt | SystemExit | None = None
+        self._deferred_interrupt: Union[KeyboardInterrupt, SystemExit, None] = None
         self._closing = False
         self._closed = False
         self._gpu_snapshot_pending = False
@@ -637,12 +640,15 @@ class AsyncCheckpointPublisher:
             if deferred_interrupt is not None:
                 try:
                     if cleanup_error is not None:
-                        deferred_interrupt.add_note(
+                        add_exception_note(
+                            deferred_interrupt,
                             "Checkpoint cleanup failed: "
-                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                            f"{type(cleanup_error).__name__}: {cleanup_error}",
                         )
                         for note in getattr(cleanup_error, "__notes__", ()):
-                            deferred_interrupt.add_note(f"Checkpoint cleanup detail: {note}")
+                            add_exception_note(
+                                deferred_interrupt, f"Checkpoint cleanup detail: {note}"
+                            )
                     self._deferred_interrupt = None
                     self._closing = False
                     self._closed = True
@@ -683,7 +689,7 @@ class AsyncCheckpointPublisher:
             raise error.cause from None
         self._consume_completed()
 
-    def _submit_operation[ResultT](
+    def _submit_operation(
         self,
         operation: Callable[[], ResultT],
     ) -> Future[ResultT]:
@@ -706,7 +712,7 @@ class AsyncCheckpointPublisher:
             break
         return future
 
-    def _publish_mapping[ResultT](
+    def _publish_mapping(
         self,
         payload: Mapping[str, Any],
         operation_for_snapshot: Callable[[Mapping[str, Any]], Callable[[], ResultT]],
@@ -724,7 +730,7 @@ class AsyncCheckpointPublisher:
         if decision.path == "cpu":
             return self._submit_operation(operation_for_snapshot(snapshot_to_cpu(payload)))
 
-        snapshot: Mapping[str, Any] | None = None
+        snapshot: Union[Mapping[str, Any], None] = None
         try:
             snapshot = snapshot_to_gpu(payload)
             device = cuda_snapshot_device(snapshot)
@@ -806,7 +812,7 @@ class AsyncCheckpointPublisher:
             decision.required_bytes,
         )
 
-    def _gpu_transfer_operation[ResultT](
+    def _gpu_transfer_operation(
         self,
         snapshot: Mapping[str, Any],
         ready: _CudaEvent,
@@ -826,7 +832,7 @@ class AsyncCheckpointPublisher:
         return operation
 
     @staticmethod
-    def _complete_public_future[ResultT](
+    def _complete_public_future(
         future: _CheckpointPublicationFuture[ResultT],
         submission: BackgroundPipelineSubmission[
             _CheckpointPublicationTask[ResultT],
@@ -855,7 +861,7 @@ class AsyncCheckpointPublisher:
         *,
         close: bool,
         raise_error: bool = True,
-    ) -> BaseException | None:
+    ) -> Union[BaseException, None]:
         error_entries = list(self._deferred_failures)
         while True:
             try:
@@ -887,9 +893,10 @@ class AsyncCheckpointPublisher:
             if index == primary_index:
                 continue
             try:
-                first_error.add_note(
+                add_exception_note(
+                    first_error,
                     "Additional checkpoint publication failure: "
-                    f"{type(additional_error).__name__}: {additional_error}"
+                    f"{type(additional_error).__name__}: {additional_error}",
                 )
             except (KeyboardInterrupt, SystemExit):
                 raise
@@ -922,7 +929,7 @@ class AsyncCheckpointPublisher:
             self._deferred_interrupt = None
             raise deferred_interrupt
 
-    def _remember_deferred_interrupt(self) -> KeyboardInterrupt | SystemExit | None:
+    def _remember_deferred_interrupt(self) -> Union[KeyboardInterrupt, SystemExit, None]:
         if self._deferred_interrupt is None:
             self._deferred_interrupt = self._pipeline.take_deferred_interrupt()
         return self._deferred_interrupt
@@ -1100,7 +1107,7 @@ def resumable_checkpoint_filename(role: ResumableCheckpointRole, epoch: int) -> 
     return f"{prefix}{epoch}.pt"
 
 
-def parse_resumable_checkpoint(path: Path) -> ResumableCheckpointCandidate | None:
+def parse_resumable_checkpoint(path: Path) -> Union[ResumableCheckpointCandidate, None]:
     """Parse one standard resumable checkpoint path without opening it."""
     checkpoint_path = Path(path)
     if checkpoint_path.parent != Path("."):
@@ -1420,7 +1427,7 @@ def restore_checkpoint(
     registry: StateRegistry,
     *,
     strict: bool = True,
-    map_location: str | torch.device = "cpu",
+    map_location: Union[str, torch.device] = "cpu",
 ) -> None:
     """Load one Mammoth checkpoint into an existing registry."""
     state = load_checkpoint_state(path, map_location=map_location)
@@ -1430,7 +1437,7 @@ def restore_checkpoint(
 def load_checkpoint_state(
     path: Path,
     *,
-    map_location: str | torch.device = "cpu",
+    map_location: Union[str, torch.device] = "cpu",
 ) -> Mapping[str, Any]:
     """Load and validate one Mammoth registered-state checkpoint payload."""
     payload = torch.load(Path(path), map_location=map_location, weights_only=True)
@@ -1477,9 +1484,9 @@ def clone_checkpoint_value(value: Any) -> Any:
     return deepcopy(value)
 
 
-def inspect_cuda_snapshot(value: Any) -> tuple[int, torch.device] | None:
+def inspect_cuda_snapshot(value: Any) -> Union[tuple[int, torch.device], None]:
     """Return safe CUDA snapshot storage or reject ambiguous checkpoint state."""
-    cuda_device: torch.device | None = None
+    cuda_device: Union[torch.device, None] = None
     snapshot_bytes = 0
     seen_containers: set[int] = set()
     seen_storages: set[tuple[str, int]] = set()
@@ -1533,7 +1540,7 @@ def snapshot_to_gpu(value: Any) -> Any:
     return value
 
 
-def cuda_snapshot_device(value: Any) -> torch.device | None:
+def cuda_snapshot_device(value: Any) -> Union[torch.device, None]:
     """Find the sole CUDA device in a snapshot already validated for capture."""
     if isinstance(value, torch.Tensor):
         return value.device if value.device.type == "cuda" else None
@@ -1562,7 +1569,7 @@ def publish_torch_payload_with_receipt(
 ) -> CheckpointPublication:
     """Atomically publish one generic payload with pre-rename byte provenance."""
     destination = Path(path).absolute()
-    receipt: PublishedCheckpoint | None = None
+    receipt: Union[PublishedCheckpoint, None] = None
 
     def inspect(serialized_descriptor: int) -> None:
         nonlocal receipt

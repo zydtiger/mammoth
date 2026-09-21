@@ -19,11 +19,12 @@ from datetime import timedelta
 from pathlib import Path
 from threading import RLock
 from types import TracebackType
-from typing import Any, Literal, cast
+from typing import Any, Literal, TypeVar, Union, cast
 
 import torch
 import torch.distributed as dist
 
+from mammoth.compat import DATACLASS_SLOTS, add_exception_note
 from mammoth.core import (
     BoundedBackgroundPipeline,
     ExecutionContext,
@@ -55,22 +56,26 @@ from mammoth.torch.device import resolve_device
 from mammoth.torch.scheduling import weighted_partition_counts, weighted_partition_indices
 from mammoth.torch.trainer import Trainer
 
+InputT = TypeVar("InputT")
+ResultT = TypeVar("ResultT")
+T = TypeVar("T")
+
 Strategy = Literal["single", "ddp"]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class RuntimeConfig:
     """Framework-level process-group and device policy."""
 
     strategy: Strategy = "single"
     device: str = "auto"
-    backend: str | None = None
+    backend: Union[str, None] = None
     init_method: str = "env://"
     timeout_seconds: float = 1800.0
-    rank: int | None = None
-    local_rank: int | None = None
-    world_size: int | None = None
-    workload_weights: tuple[float, ...] | None = None
+    rank: Union[int, None] = None
+    local_rank: Union[int, None] = None
+    world_size: Union[int, None] = None
+    workload_weights: Union[tuple[float, ...], None] = None
     strict_launch_environment: bool = False
     require_global_local_rank_match: bool = False
 
@@ -123,25 +128,25 @@ class RuntimeConfig:
                 raise ValueError(f"{name} must be a boolean")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class _PrimaryResult:
-    execution_id: str | None
-    error: str | None
+    execution_id: Union[str, None]
+    error: Union[str, None]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class _PrimaryValue:
     value: Any
-    error: str | None
+    error: Union[str, None]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class _StartupStatus:
     rank: int
-    error: str | None
+    error: Union[str, None]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class _JoinEnvironment:
     """Canonical workflow-child environment shared by every attaching rank."""
 
@@ -151,7 +156,7 @@ class _JoinEnvironment:
     phase: str
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class _AttachmentIntent:
     """Rank-local strict attachment inputs that must agree before validation."""
 
@@ -161,16 +166,16 @@ class _AttachmentIntent:
     invocation_kind: str
     intended_phases: tuple[str, ...]
     config_reference: str
-    execution_id: str | None
-    resume_checkpoint: str | None
-    resume_checkpoint_sha256: str | None
-    parent_execution_id: str | None
-    starting_epoch: int | None
-    starting_global_step: int | None
+    execution_id: Union[str, None]
+    resume_checkpoint: Union[str, None]
+    resume_checkpoint_sha256: Union[str, None]
+    parent_execution_id: Union[str, None]
+    starting_epoch: Union[int, None]
+    starting_global_step: Union[int, None]
     runtime: dict[str, Any]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class _CreationIntent:
     """Normalized strict-creation inputs that must agree before publication."""
 
@@ -180,27 +185,27 @@ class _CreationIntent:
     intended_phases: tuple[str, ...]
     command: tuple[str, ...]
     config_reference: str
-    execution_id: str | None
-    resume_checkpoint: str | None
-    resume_checkpoint_sha256: str | None
-    parent_execution_id: str | None
-    starting_epoch: int | None
-    starting_global_step: int | None
+    execution_id: Union[str, None]
+    resume_checkpoint: Union[str, None]
+    resume_checkpoint_sha256: Union[str, None]
+    parent_execution_id: Union[str, None]
+    starting_epoch: Union[int, None]
+    starting_global_step: Union[int, None]
     runtime: dict[str, Any]
 
 
 class Runtime:
     """Own one process's PyTorch identity, collectives, and execution IO."""
 
-    def __init__(self, config: RuntimeConfig | None = None) -> None:
+    def __init__(self, config: Union[RuntimeConfig, None] = None) -> None:
         self.config = config or RuntimeConfig()
         self.strategy = self.config.strategy
         self._owns_process_group = False
-        self._logical_run_lease: LogicalRunLease | None = None
+        self._logical_run_lease: Union[LogicalRunLease, None] = None
         self._terminalize_logical_run_lease = False
-        self.execution_logging: ExecutionLogging | None = None
-        self.execution_context: ExecutionContext | None = None
-        self._execution_session: ExecutionSession | None = None
+        self.execution_logging: Union[ExecutionLogging, None] = None
+        self.execution_context: Union[ExecutionContext, None] = None
+        self._execution_session: Union[ExecutionSession, None] = None
         self._state_lock = RLock()
         self._closed = False
 
@@ -274,11 +279,11 @@ class Runtime:
         value: Any,
         *,
         destination_rank: int = 0,
-    ) -> list[Any] | None:
+    ) -> Union[list[Any], None]:
         """Gather one object per rank on ``destination_rank``."""
         if not self.enabled:
             return [value]
-        gathered: list[Any] | None = (
+        gathered: Union[list[Any], None] = (
             [None] * self.world_size if self.rank == destination_rank else None
         )
         dist.gather_object(value, gathered, dst=destination_rank)
@@ -323,7 +328,7 @@ class Runtime:
 
     def scatter_object(
         self,
-        values: Sequence[Any] | None,
+        values: Union[Sequence[Any], None],
         *,
         source_rank: int = 0,
     ) -> Any:
@@ -360,9 +365,9 @@ class Runtime:
         else:
             dist.barrier()
 
-    def coordinate_primary[T](self, operation_name: str, operation: Callable[[], T]) -> T:
+    def coordinate_primary(self, operation_name: str, operation: Callable[[], T]) -> T:
         """Run one fallible operation on rank zero and broadcast its result."""
-        result: _PrimaryValue | None = None
+        result: Union[_PrimaryValue, None] = None
         if self.is_primary:
             try:
                 result = _PrimaryValue(value=operation(), error=None)
@@ -375,7 +380,7 @@ class Runtime:
             raise RuntimeError(f"Primary operation {operation_name!r} failed: {result.error}")
         return cast(T, result.value)
 
-    def startup_consensus(self, stage: str, local_error: BaseException | str | None) -> None:
+    def startup_consensus(self, stage: str, local_error: Union[BaseException, str, None]) -> None:
         """Make every rank raise the same bounded startup failure decision."""
         error_text = (
             None
@@ -418,8 +423,8 @@ class Runtime:
         context = self.execution_context
         if context is None:
             raise RuntimeError("Establish an execution before starting execution logging")
-        logging_bundle: ExecutionLogging | None = None
-        local_error: BaseException | None = None
+        logging_bundle: Union[ExecutionLogging, None] = None
+        local_error: Union[BaseException, None] = None
         try:
             logging_bundle = create_execution_logging(
                 context,
@@ -505,7 +510,7 @@ class Runtime:
                 self._execution_session.close()
                 return
             self._closed = True
-            first_error: BaseException | None = None
+            first_error: Union[BaseException, None] = None
             if self.execution_logging is not None:
                 try:
                     self.execution_logging.close()
@@ -537,7 +542,7 @@ class Runtime:
 
     def _terminate_failed_logging_startup(
         self,
-        logging_bundle: ExecutionLogging | None,
+        logging_bundle: Union[ExecutionLogging, None],
         startup_error: BaseException,
     ) -> None:
         """Make a failed logging transition terminal without hiding its cause."""
@@ -557,8 +562,8 @@ class Runtime:
             cleanup_errors.append(("process group", error))
         self._closed = True
         for resource, cleanup_failure in cleanup_errors:
-            startup_error.add_note(
-                f"Later {resource} cleanup failure: {_error_text(cleanup_failure)}"
+            add_exception_note(
+                startup_error, f"Later {resource} cleanup failure: {_error_text(cleanup_failure)}"
             )
 
     def _create_execution(self, spec: ExecutionSpec) -> ExecutionContext:
@@ -571,8 +576,8 @@ class Runtime:
             else ValueError(f"{EXECUTION_ID_ENV} must not be set when creating an execution"),
         )
 
-        intent: _CreationIntent | None = None
-        intent_error: BaseException | None = None
+        intent: Union[_CreationIntent, None] = None
+        intent_error: Union[BaseException, None] = None
         try:
             intent = _CreationIntent(
                 run_dir=str(spec.run_dir.resolve()),
@@ -633,7 +638,7 @@ class Runtime:
                 + "; ".join(differences)
             )
 
-        primary_result: _PrimaryResult | None = None
+        primary_result: Union[_PrimaryResult, None] = None
         if self.is_primary:
             try:
                 run_dir = Path(intent.run_dir)
@@ -684,8 +689,8 @@ class Runtime:
                 f"{primary_result.error or 'missing execution ID'}"
             )
 
-        context: ExecutionContext | None = None
-        local_error: BaseException | None = None
+        context: Union[ExecutionContext, None] = None
+        local_error: Union[BaseException, None] = None
         try:
             context = join_execution_context(
                 spec.run_dir,
@@ -708,8 +713,8 @@ class Runtime:
     def _attach_execution(self, expected: ExecutionSpec) -> ExecutionContext:
         """Join and exactly validate one canonical environment-selected attempt."""
         environment = self._canonical_join_environment(expected)
-        context: ExecutionContext | None = None
-        local_error: BaseException | None = None
+        context: Union[ExecutionContext, None] = None
+        local_error: Union[BaseException, None] = None
         try:
             context = join_execution_context(
                 expected.run_dir,
@@ -726,8 +731,8 @@ class Runtime:
 
     def _canonical_join_environment(self, expected: ExecutionSpec) -> _JoinEnvironment:
         """Validate required canonical variables and their cross-rank consistency."""
-        local_environment: _JoinEnvironment | None = None
-        local_error: BaseException | None = None
+        local_environment: Union[_JoinEnvironment, None] = None
+        local_error: Union[BaseException, None] = None
         try:
             execution_id = execution_id_from_environment()
             if execution_id is None:
@@ -755,8 +760,8 @@ class Runtime:
             raise RuntimeError(
                 "Canonical MAMMOTH execution environment is inconsistent across ranks"
             )
-        intent: _AttachmentIntent | None = None
-        intent_error: BaseException | None = None
+        intent: Union[_AttachmentIntent, None] = None
+        intent_error: Union[BaseException, None] = None
         try:
             intent = _AttachmentIntent(
                 environment=local_environment,
@@ -1055,7 +1060,7 @@ class ExecutionSession:
         self._closed = False
 
     @property
-    def phase(self) -> str | None:
+    def phase(self) -> Union[str, None]:
         """Return the active or most recently completed neutral phase name."""
         return self._neutral.phase
 
@@ -1081,7 +1086,7 @@ class ExecutionSession:
             self._register_owned_resource(self._owned_trainers, "trainer", trainer.close)
             return trainer
 
-    def create_background_pipeline[InputT, ResultT](
+    def create_background_pipeline(
         self,
         worker: Callable[[InputT], ResultT],
         *,
@@ -1116,7 +1121,7 @@ class ExecutionSession:
         else:
             self.complete_phase()
 
-    def complete_phase(self, *, message: str | None = None) -> None:
+    def complete_phase(self, *, message: Union[str, None] = None) -> None:
         """Mark the active neutral phase successful."""
         with self.runtime._state_lock, self._resource_lock:
             self._require_open()
@@ -1137,11 +1142,11 @@ class ExecutionSession:
     def close(
         self,
         *,
-        error: BaseException | None = None,
-        exit_code: int | None = None,
-        signal: int | str | None = None,
-        message: str | None = None,
-        before_close: Callable[[], None] | None = None,
+        error: Union[BaseException, None] = None,
+        exit_code: Union[int, None] = None,
+        signal: Union[int, str, None] = None,
+        message: Union[str, None] = None,
+        before_close: Union[Callable[[], None], None] = None,
     ) -> None:
         """Close Torch trainers before the neutral lifecycle and runtime finalizers."""
         with self.runtime._state_lock, self._resource_lock:
@@ -1167,9 +1172,9 @@ class ExecutionSession:
 
     def __exit__(
         self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
+        exc_type: Union[type[BaseException], None],
+        exc_value: Union[BaseException, None],
+        traceback: Union[TracebackType, None],
     ) -> None:
         """Close the session without replacing a workload exception."""
         del exc_type, traceback
@@ -1201,7 +1206,7 @@ class ExecutionSession:
 
 
 def initialize_runtime(
-    config: RuntimeConfig | None = None,
+    config: Union[RuntimeConfig, None] = None,
 ) -> Runtime:
     """Initialize and return one generic PyTorch execution runtime."""
     return Runtime(config)

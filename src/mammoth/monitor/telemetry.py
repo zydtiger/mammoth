@@ -9,17 +9,20 @@ from __future__ import annotations
 import os
 import socket
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
+from typing import Union
+
+from mammoth.compat import DATACLASS_SLOTS
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class ViewerTelemetry:
     """One local viewer-host sample with no execution-host implication."""
 
     host_role: str
     hostname: str
     sampled_at: str
-    load_average_1m: float | None
+    load_average_1m: Union[float, None]
 
 
 def sample_viewer_telemetry() -> ViewerTelemetry:
@@ -31,6 +34,6 @@ def sample_viewer_telemetry() -> ViewerTelemetry:
     return ViewerTelemetry(
         host_role="viewer",
         hostname=socket.gethostname(),
-        sampled_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        sampled_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         load_average_1m=load_average,
     )

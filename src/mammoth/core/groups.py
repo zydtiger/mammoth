@@ -23,11 +23,12 @@ import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, BinaryIO, Literal, cast
+from typing import Any, BinaryIO, Literal, Union, cast
 
+from mammoth.compat import DATACLASS_SLOTS
 from mammoth.core.artifacts import atomic_write_json
 from mammoth.core.events import ImmutableJsonValue, JsonValue, utc_event_time
 from mammoth.core.execution import sanitize_metadata_fields
@@ -92,7 +93,7 @@ _TERMINAL_STEP_EVENTS = frozenset({"step_completed", "step_failed", "step_interr
 _INTERRUPTED_EVENTS = frozenset({"group_interrupted", "run_interrupted", "step_interrupted"})
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class GroupMember:
     """One workflow-declared run name and its ordered planned step names."""
 
@@ -210,7 +211,7 @@ class GroupManifest:
 
 def generate_group_id() -> str:
     """Generate a timestamped, filesystem-safe group ID with UUID4 collision resistance."""
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return f"{timestamp}-{uuid.uuid4().hex}"
 
 
@@ -224,9 +225,9 @@ def publish_group_manifest(
     *,
     order: GroupOrder,
     members: Sequence[GroupMember],
-    metadata: Mapping[str, Any] | None = None,
-    group_id: str | None = None,
-    created_at: str | None = None,
+    metadata: Union[Mapping[str, Any], None] = None,
+    group_id: Union[str, None] = None,
+    created_at: Union[str, None] = None,
 ) -> GroupManifest:
     """Create and atomically publish one immutable group manifest.
 
@@ -258,7 +259,7 @@ def publish_group_manifest(
     groups_root = groups_dir_for(entry_path)
     groups_root.mkdir(parents=True, exist_ok=True)
 
-    collision: FileExistsError | None = None
+    collision: Union[FileExistsError, None] = None
     for candidate_id in candidate_ids:
         group_dir = groups_root / candidate_id
         try:
@@ -338,10 +339,10 @@ class GroupEvent:
     time: str
     group_id: str
     event: GroupEventName
-    run_name: str | None = None
-    step_name: str | None = None
-    signal: int | None = None
-    message: str | None = None
+    run_name: Union[str, None] = None
+    step_name: Union[str, None] = None
+    signal: Union[int, None] = None
+    message: Union[str, None] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.schema_version, int) or isinstance(self.schema_version, bool):
@@ -476,11 +477,11 @@ class GroupEventWriter:
         self._closed = False
         self._failure_logged = False
         self._lock = threading.RLock()
-        self._stream: BinaryIO | None = None
+        self._stream: Union[BinaryIO, None] = None
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        opened_stream: BinaryIO | None = None
+        opened_stream: Union[BinaryIO, None] = None
         try:
             descriptor = os.open(self.path, flags, 0o600)
             opened_stream = cast(BinaryIO, os.fdopen(descriptor, "wb", buffering=0))
@@ -503,7 +504,7 @@ class GroupEventWriter:
         with self._lock:
             return self._sequence
 
-    def emit(self, event: GroupEventName, **fields: Any) -> GroupEvent | None:
+    def emit(self, event: GroupEventName, **fields: Any) -> Union[GroupEvent, None]:
         """Validate and immediately flush one group lifecycle event."""
         with self._lock:
             if not self.enabled:
@@ -541,7 +542,7 @@ class GroupEventWriter:
         """Close the stream without masking a computation error."""
         self.close()
 
-    def _write_event(self, event: GroupEvent) -> GroupEvent | None:
+    def _write_event(self, event: GroupEvent) -> Union[GroupEvent, None]:
         stream = self._stream
         if stream is None:
             return None
@@ -585,7 +586,7 @@ def read_group_events(path: Path) -> list[GroupEvent]:
     """
     events: list[GroupEvent] = []
     next_sequence = 1
-    stream_group_id: str | None = None
+    stream_group_id: Union[str, None] = None
     try:
         raw = Path(path).read_bytes()
     except FileNotFoundError:
@@ -651,14 +652,14 @@ class GroupEventTailReader:
     def __init__(self, path: Path, *, allow_missing: bool = True) -> None:
         self.path = Path(path)
         self.allow_missing = allow_missing
-        self._file_identity: tuple[int, int] | None = None
+        self._file_identity: Union[tuple[int, int], None] = None
         self._offset = 0
         self._append_guard = b""
         self._buffer = b""
         self._line_number = 0
         self._next_sequence = 1
-        self._group_id: str | None = None
-        self._error: GroupEventReadError | None = None
+        self._group_id: Union[str, None] = None
+        self._error: Union[GroupEventReadError, None] = None
 
     @property
     def line_number(self) -> int:
@@ -785,7 +786,7 @@ def _validate_json_compatible(value: Any) -> JsonValue:
                 raise ValueError("group metadata keys must be strings.")
             detached[key] = _validate_json_compatible(item)
         return detached
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_validate_json_compatible(item) for item in value]
     raise ValueError(
         f"group metadata must contain JSON-compatible values, got {type(value).__name__}."
@@ -795,9 +796,9 @@ def _validate_json_compatible(value: Any) -> JsonValue:
 def _freeze_json(value: Any) -> ImmutableJsonValue:
     if isinstance(value, Mapping):
         return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
-    if isinstance(value, list | tuple):
+    if isinstance(value, (list, tuple)):
         return tuple(_freeze_json(item) for item in value)
-    return cast(None | bool | int | float | str, value)
+    return cast(Union[None, bool, int, float, str], value)
 
 
 def _thaw_json(value: ImmutableJsonValue) -> JsonValue:
@@ -809,7 +810,7 @@ def _thaw_json(value: ImmutableJsonValue) -> JsonValue:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _parse_utc_time(value: str) -> datetime:
@@ -819,7 +820,7 @@ def _parse_utc_time(value: str) -> datetime:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as error:
         raise ValueError(f"Invalid UTC timestamp: {value!r}.") from error
-    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
         raise ValueError(f"Timestamp must use UTC: {value!r}.")
     return parsed
 
@@ -831,7 +832,7 @@ def _required_string(payload: Mapping[str, Any], key: str) -> str:
     return value
 
 
-def _optional_string(payload: Mapping[str, Any], key: str) -> str | None:
+def _optional_string(payload: Mapping[str, Any], key: str) -> Union[str, None]:
     value = payload.get(key)
     if value is None:
         return None
@@ -847,7 +848,7 @@ def _required_int(payload: Mapping[str, Any], key: str) -> int:
     return value
 
 
-def _optional_int(payload: Mapping[str, Any], key: str) -> int | None:
+def _optional_int(payload: Mapping[str, Any], key: str) -> Union[int, None]:
     value = payload.get(key)
     if value is None:
         return None

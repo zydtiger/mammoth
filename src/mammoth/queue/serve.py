@@ -31,8 +31,9 @@ import time
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Union
 
 from mammoth.core.identity import validate_device_spec
 from mammoth.core.layout import QueueLayout
@@ -55,9 +56,9 @@ _MAMMOTH_ENVIRONMENT_PREFIX = "MAMMOTH_"
 def _default_job_launcher(
     command: tuple[str, ...],
     *,
-    cwd: Path | None,
+    cwd: Union[Path, None],
     environment: Mapping[str, str],
-    timeout_seconds: float | None,
+    timeout_seconds: Union[float, None],
 ) -> ProcessResult:
     """Launch one job with a best-effort Linux parent-death SIGTERM armed.
 
@@ -195,7 +196,7 @@ def serve_once(
     device: str,
     *,
     launcher: Launcher = _default_job_launcher,
-) -> JobOutcome | None:
+) -> Union[JobOutcome, None]:
     """Claim, launch, and record the outcome of one FIFO-matching pending job.
 
     Returns ``None`` when no pending job currently matches ``device``.
@@ -243,7 +244,7 @@ def run_serve_loop(
     launcher: Launcher = _default_job_launcher,
     poll_interval_seconds: float = 1.0,
     sleep: Callable[[float], None] = time.sleep,
-    max_jobs: int | None = None,
+    max_jobs: Union[int, None] = None,
     stop_when_idle: bool = False,
 ) -> tuple[JobOutcome, ...]:
     """Run the foreground device-lane loop: lease, reconcile, then FIFO dispatch.
@@ -286,7 +287,7 @@ def run_serve_loop(
         return tuple(outcomes)
 
 
-def _claim_next_job(entry: Path, device: str) -> Job | None:
+def _claim_next_job(entry: Path, device: str) -> Union[Job, None]:
     """Atomically claim the oldest pending job whose device spec matches.
 
     Uses ``os.rename`` from the pending directory directly into this lane's
@@ -334,4 +335,4 @@ def _job_environment() -> dict[str, str]:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

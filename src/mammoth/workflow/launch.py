@@ -15,24 +15,28 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Never, Protocol
+from typing import Any, Protocol, Union
+
+from typing_extensions import Never
+
+from mammoth.compat import DATACLASS_SLOTS
 
 _PR_SET_PDEATHSIG = 1  # Linux <sys/prctl.h>; unavailable on other kernels.
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class CommandPlan:
     """Fully resolved but unexecuted child command."""
 
     run_name: str
     step_name: str
     command: tuple[str, ...]
-    cwd: Path | None
-    timeout_seconds: float | None
+    cwd: Union[Path, None]
+    timeout_seconds: Union[float, None]
     run_dir: Path
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class ProcessResult:
     """Terminal outcome from one supervised process group."""
 
@@ -40,7 +44,7 @@ class ProcessResult:
     duration_seconds: float
     timed_out: bool = False
     interrupted: bool = False
-    signal: int | None = None
+    signal: Union[int, None] = None
 
 
 class Launcher(Protocol):
@@ -55,15 +59,15 @@ class Launcher(Protocol):
         self,
         command: tuple[str, ...],
         *,
-        cwd: Path | None,
+        cwd: Union[Path, None],
         environment: Mapping[str, str],
-        timeout_seconds: float | None,
+        timeout_seconds: Union[float, None],
     ) -> ProcessResult:
         """Launch one already-final argv and return its terminal outcome."""
         ...
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class CapturedProcessResult:
     """Terminal facts and separate text streams from one supervised process."""
 
@@ -72,7 +76,7 @@ class CapturedProcessResult:
     return_code: int
     duration_seconds: float
     timed_out: bool = False
-    signal: int | None = None
+    signal: Union[int, None] = None
 
 
 class _DeferredProcessSignal(BaseException):
@@ -83,7 +87,7 @@ class _DeferredProcessSignal(BaseException):
         self.previous_handler = previous_handler
 
 
-@dataclass(slots=True)
+@dataclass(**DATACLASS_SLOTS)
 class SupervisedProcess:
     """Own one child launcher and bounded cleanup of its observable descendants.
 
@@ -93,17 +97,17 @@ class SupervisedProcess:
     """
 
     command: tuple[str, ...]
-    cwd: Path | None
+    cwd: Union[Path, None]
     environment: Mapping[str, str]
     start_new_session: bool = True
     terminate_grace_seconds: float = 5.0
     descendant_grace_seconds: float = 1.0
-    parent_death_signal: int | None = None
+    parent_death_signal: Union[int, None] = None
     process_factory: Callable[..., subprocess.Popen[Any]] = field(
         default=subprocess.Popen,
         repr=False,
     )
-    _process: subprocess.Popen[Any] | None = field(default=None, init=False, repr=False)
+    _process: Union[subprocess.Popen[Any], None] = field(default=None, init=False, repr=False)
 
     @property
     def pid(self) -> int:
@@ -111,7 +115,7 @@ class SupervisedProcess:
         return self.process.pid
 
     @property
-    def returncode(self) -> int | None:
+    def returncode(self) -> Union[int, None]:
         """Return the child status, or ``None`` before launch or while running."""
         return None if self._process is None else self._process.returncode
 
@@ -158,11 +162,11 @@ class SupervisedProcess:
         self._process = self.process_factory(self.command, **options)
         return self
 
-    def wait(self, timeout: float | None = None) -> int:
+    def wait(self, timeout: Union[float, None] = None) -> int:
         """Wait for the child and return its terminal status."""
         return self.process.wait(timeout=timeout)
 
-    def stop(self) -> int | None:
+    def stop(self) -> Union[int, None]:
         """Terminate, escalate, and reap the launcher and observable descendants."""
         return terminate_process_tree(
             self.process,
@@ -175,12 +179,12 @@ class SupervisedProcess:
 def launch_process(
     command: tuple[str, ...],
     *,
-    cwd: Path | None,
+    cwd: Union[Path, None],
     environment: Mapping[str, str],
-    timeout_seconds: float | None,
+    timeout_seconds: Union[float, None],
     terminate_grace_seconds: float = 5.0,
-    on_started: Callable[[int], None] | None = None,
-    parent_death_signal: int | None = None,
+    on_started: Union[Callable[[int], None], None] = None,
+    parent_death_signal: Union[int, None] = None,
 ) -> ProcessResult:
     """Run one command and terminate its process group on timeout or interruption.
 
@@ -272,9 +276,9 @@ def launch_process(
 def run_captured_process(
     command: tuple[str, ...],
     *,
-    cwd: Path | None,
+    cwd: Union[Path, None],
     environment: Mapping[str, str],
-    timeout_seconds: float | None,
+    timeout_seconds: Union[float, None],
     terminate_grace_seconds: float = 5.0,
     descendant_grace_seconds: float = 1.0,
 ) -> CapturedProcessResult:
@@ -294,7 +298,7 @@ def run_captured_process(
         terminate_grace_seconds=terminate_grace_seconds,
         descendant_grace_seconds=descendant_grace_seconds,
     )
-    process: subprocess.Popen[str] | None = None
+    process: Union[subprocess.Popen[str], None] = None
     process_started = False
     try:
         with _defer_process_start_signals():
@@ -404,9 +408,9 @@ def _defer_process_start_signals() -> Iterator[None]:
     signals = (signal.SIGINT, signal.SIGTERM)
     previous: dict[signal.Signals, Any] = {}
     installed: list[signal.Signals] = []
-    deferred_signal: int | None = None
-    body_error: BaseException | None = None
-    restore_error: BaseException | None = None
+    deferred_signal: Union[int, None] = None
+    body_error: Union[BaseException, None] = None
+    restore_error: Union[BaseException, None] = None
 
     def defer(signal_number: int, _frame: object) -> None:
         nonlocal deferred_signal
@@ -496,7 +500,7 @@ def terminate_process_tree(
     new_session: bool,
     grace_seconds: float,
     descendant_grace_seconds: float = 1.0,
-) -> int | None:
+) -> Union[int, None]:
     """Stop and reap a launcher plus descendants, including nested sessions."""
     descendant_pids = set(descendant_process_ids(process.pid))
     if process.returncode is None:

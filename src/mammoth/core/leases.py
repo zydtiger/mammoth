@@ -18,7 +18,9 @@ import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Union
+
+from mammoth.compat import DATACLASS_SLOTS
 
 LEASE_NAMESPACE_SCHEMA_VERSION = 1
 
@@ -30,7 +32,7 @@ _RETIRED_PROOF_SUFFIX = ".mammoth-retired-proof"
 _CREATING_SUFFIX = ".mammoth-creating"
 _RENAME_NOREPLACE = 1
 
-type LeaseNamespaceRecoveryStatus = Literal["absent", "active", "reclaimed"]
+LeaseNamespaceRecoveryStatus = Literal["absent", "active", "reclaimed"]
 
 
 class LeaseNamespaceError(RuntimeError):
@@ -45,7 +47,7 @@ class LeaseNamespaceRecoveryError(LeaseNamespaceError):
     """Raised when crash recovery cannot authenticate state before cleanup."""
 
 
-@dataclass(slots=True)
+@dataclass(**DATACLASS_SLOTS)
 class RetireableLeaseNamespace:
     """Own one authenticated canonical lease-namespace generation."""
 
@@ -431,8 +433,8 @@ def _remove_authenticated_retired(
     retired_path: Path,
     *,
     canonical_path: Path,
-    expected_generation: str | None,
-    releasing_lease: RetireableLeaseNamespace | None = None,
+    expected_generation: Union[str, None],
+    releasing_lease: Union[RetireableLeaseNamespace, None] = None,
 ) -> None:
     """Delete terminal state, including authenticated partial-deletion remnants."""
     proof_path = _retired_proof_path(canonical_path)
@@ -440,7 +442,7 @@ def _remove_authenticated_retired(
     retired_lock_descriptor = -1
     proof_descriptor = -1
     parent_descriptor = -1
-    lock_identity: tuple[int, int] | None = None
+    lock_identity: Union[tuple[int, int], None] = None
     try:
         children = set(os.listdir(descriptor))
         unknown = children - _KNOWN_CHILDREN
@@ -862,7 +864,7 @@ def _remove_retirement_proof(
     proof_path: Path,
     *,
     canonical_path: Path,
-    expected_generation: str | None,
+    expected_generation: Union[str, None],
 ) -> None:
     """Remove an authenticated proof after its retired directory is gone."""
     parent_descriptor = _open_directory(proof_path.parent, require_owned=False)

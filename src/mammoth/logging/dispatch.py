@@ -12,7 +12,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import suppress
-from typing import Protocol
+from typing import Protocol, Union
 
 from mammoth.core.pipeline import (
     BackgroundPipelineError,
@@ -58,7 +58,7 @@ class AsyncObservationSink:
         self.coalesce_progress = coalesce_progress
         self._lock = threading.RLock()
         self._closed = False
-        self._failure: BaseException | None = None
+        self._failure: Union[BaseException, None] = None
         self._pending_progress: OrderedDict[tuple[str, str], Observation] = OrderedDict()
         self._pipeline: BoundedBackgroundPipeline[Callable[[], None], None] = (
             BoundedBackgroundPipeline(

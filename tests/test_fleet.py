@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -317,11 +317,11 @@ def test_fleet_monitor_detects_stale_running_member_without_a_terminal_group_eve
     group_writer.close()
 
     monitor = FleetMonitor(entry)
-    fresh = monitor.poll(now=datetime.now(UTC))
+    fresh = monitor.poll(now=datetime.now(timezone.utc))
     assert fresh.groups[0].members[0].status == "running"
     assert fresh.groups[0].terminal_status is None
 
-    much_later = datetime.now(UTC) + timedelta(seconds=1000)
+    much_later = datetime.now(timezone.utc) + timedelta(seconds=1000)
     stale = monitor.poll(now=much_later, stale_after_seconds=90.0)
     assert stale.groups[0].members[0].status == "stale"
     assert stale.groups[0].active_member == "alpha"

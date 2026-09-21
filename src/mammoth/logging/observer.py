@@ -12,7 +12,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
-from typing import Any, Protocol
+from typing import Any, Protocol, Union
 
 from mammoth.core.events import DEFAULT_HEARTBEAT_INTERVAL_SECONDS, EventName
 from mammoth.logging.dispatch import AsyncObservationSink
@@ -68,7 +68,7 @@ class RunObserver:
         self._dispatch_lock = threading.RLock()
         self._heartbeat_threads: dict[threading.Thread, threading.Event] = {}
         self._close_complete = threading.Event()
-        self._closing_thread_id: int | None = None
+        self._closing_thread_id: Union[int, None] = None
         self._last_activity = monotonic_clock()
 
     @property
@@ -80,10 +80,10 @@ class RunObserver:
         self,
         event: EventName,
         *,
-        metrics: Mapping[str, float] | None = None,
-        display_metrics: Mapping[str, float] | None = None,
-        media: Mapping[str, Media] | None = None,
-        logical_step: int | None = None,
+        metrics: Union[Mapping[str, float], None] = None,
+        display_metrics: Union[Mapping[str, float], None] = None,
+        media: Union[Mapping[str, Media], None] = None,
+        logical_step: Union[int, None] = None,
         **fields: Any,
     ) -> Observation:
         """Validate and dispatch one observation without propagating sink I/O errors."""
@@ -129,15 +129,15 @@ class RunObserver:
         phase: str,
         task_id: str,
         completed: int,
-        total: int | None = None,
-        metrics: Mapping[str, float] | None = None,
-        display_metrics: Mapping[str, float] | None = None,
-        coordinates: Mapping[str, int | float | str] | None = None,
-        throughput: float | None = None,
+        total: Union[int, None] = None,
+        metrics: Union[Mapping[str, float], None] = None,
+        display_metrics: Union[Mapping[str, float], None] = None,
+        coordinates: Union[Mapping[str, Union[int, float, str]], None] = None,
+        throughput: Union[float, None] = None,
         final: bool = False,
-        message: str | None = None,
-        media: Mapping[str, Media] | None = None,
-        logical_step: int | None = None,
+        message: Union[str, None] = None,
+        media: Union[Mapping[str, Media], None] = None,
+        logical_step: Union[int, None] = None,
     ) -> Observation:
         """Dispatch a progress observation to JSONL and dense-history sinks."""
         fields: dict[str, Any] = {
@@ -167,13 +167,13 @@ class RunObserver:
         self,
         *,
         phase: str,
-        task_id: str | None = None,
-        metrics: Mapping[str, float] | None = None,
-        display_metrics: Mapping[str, float] | None = None,
-        coordinates: Mapping[str, int | float | str] | None = None,
+        task_id: Union[str, None] = None,
+        metrics: Union[Mapping[str, float], None] = None,
+        display_metrics: Union[Mapping[str, float], None] = None,
+        coordinates: Union[Mapping[str, Union[int, float, str]], None] = None,
         force: bool = False,
-        message: str | None = None,
-        logical_step: int | None = None,
+        message: Union[str, None] = None,
+        logical_step: Union[int, None] = None,
     ) -> Observation:
         """Dispatch a producer heartbeat for backend-specific retention."""
         fields: dict[str, Any] = {"phase": phase, "force": force}
@@ -196,8 +196,8 @@ class RunObserver:
         self,
         *,
         phase: str,
-        task_id: str | None = None,
-        message: str | None = None,
+        task_id: Union[str, None] = None,
+        message: Union[str, None] = None,
     ) -> Iterator[None]:
         """Emit observer heartbeats while caller-owned work is otherwise idle."""
         stop = threading.Event()
@@ -264,7 +264,7 @@ class RunObserver:
         phase: str,
         task_id: str,
         *,
-        parent_task_id: str | None = None,
+        parent_task_id: Union[str, None] = None,
     ) -> Iterator[None]:
         """Emit balanced task lifecycle records around caller-owned work."""
         fields: dict[str, Any] = {"phase": phase, "task_id": task_id}
@@ -360,7 +360,7 @@ def _snapshot_async_observation(observation: Observation) -> Observation:
 
 def _snapshot_async_value(value: Any) -> Any:
     """Copy JSON-shaped values and reject caller-owned runtime objects."""
-    if value is None or isinstance(value, str | int | float | bool):
+    if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, Mapping):
         snapshot: dict[str, Any] = {}
@@ -383,7 +383,7 @@ def _validate_heartbeat_interval(value: float) -> float:
     """Return one positive finite observer heartbeat interval."""
     if (
         isinstance(value, bool)
-        or not isinstance(value, int | float)
+        or not isinstance(value, (int, float))
         or not math.isfinite(value)
         or value <= 0
     ):

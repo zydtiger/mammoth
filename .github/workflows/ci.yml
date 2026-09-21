@@ -38,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13", "3.14"]
+        python-version: ["3.9", "3.12", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,11 +58,11 @@ jobs:
       # The wheel does not vary by interpreter, so build and smoke-test it on
       # the lowest supported version only.
       - name: Build distributions
-        if: matrix.python-version == '3.12'
+        if: matrix.python-version == '3.9'
         run: uv build
 
       - name: Install smoke test
-        if: matrix.python-version == '3.12'
+        if: matrix.python-version == '3.9'
         run: |
           uv venv "$RUNNER_TEMP/smoke"
           uv pip install --python "$RUNNER_TEMP/smoke" dist/*.whl

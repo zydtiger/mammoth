@@ -16,10 +16,10 @@ import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, Union
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from mammoth.core.identity import validate_execution_id, validate_run_name
@@ -233,13 +233,13 @@ class ExecutionMetadata:
     execution_mode: ExecutionMode
     command: tuple[str, ...]
     config_reference: str
-    previous_execution_id: str | None = None
-    resume_checkpoint: str | None = None
-    resume_checkpoint_sha256: str | None = None
-    parent_execution_id: str | None = None
-    starting_epoch: int | None = None
-    starting_global_step: int | None = None
-    runtime: Mapping[str, Any] | None = None
+    previous_execution_id: Union[str, None] = None
+    resume_checkpoint: Union[str, None] = None
+    resume_checkpoint_sha256: Union[str, None] = None
+    parent_execution_id: Union[str, None] = None
+    starting_epoch: Union[int, None] = None
+    starting_global_step: Union[int, None] = None
+    runtime: Union[Mapping[str, Any], None] = None
 
     def __post_init__(self) -> None:
         if self.resume_checkpoint_sha256 is not None:
@@ -343,7 +343,7 @@ class ExecutionContext:
     metadata_path: Path
     metadata: ExecutionMetadata
 
-    def rank_log_path(self, rank: int, *, world_size: int | None = None) -> Path:
+    def rank_log_path(self, rank: int, *, world_size: Union[int, None] = None) -> Path:
         """Return the process-exclusive log path for one runtime rank.
 
         ``world_size`` is used only by workflow children whose launcher topology
@@ -365,13 +365,13 @@ class ExecutionContext:
 
 def generate_execution_id() -> str:
     """Generate a timestamped, filesystem-safe ID with UUID4 collision resistance."""
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return f"{timestamp}-{uuid.uuid4().hex}"
 
 
 def execution_id_from_environment(
-    environ: Mapping[str, str] | None = None,
-) -> str | None:
+    environ: Union[Mapping[str, str], None] = None,
+) -> Union[str, None]:
     """Resolve and validate the canonical execution ID when it is populated."""
     source = os.environ if environ is None else environ
     value = source.get(EXECUTION_ID_ENV)
@@ -380,7 +380,7 @@ def execution_id_from_environment(
     return validate_execution_id(value)
 
 
-def sanitize_reference(reference: str | os.PathLike[str]) -> str:
+def sanitize_reference(reference: Union[str, os.PathLike[str]]) -> str:
     """Remove URL credentials, queries, and fragments from a metadata reference."""
     value = _path_string(reference, name="reference")
     try:
@@ -411,7 +411,7 @@ def validate_resume_checkpoint_sha256(value: str) -> str:
     return value
 
 
-def sanitize_command(command: Sequence[str | os.PathLike[str]]) -> tuple[str, ...]:
+def sanitize_command(command: Sequence[Union[str, os.PathLike[str]]]) -> tuple[str, ...]:
     """Redact credential-like option values and sanitize URL-like arguments."""
     arguments = _validated_command_arguments(command)
     sanitized: list[str] = []
@@ -515,17 +515,17 @@ def create_execution_context(
     intended_phases: Sequence[str],
     world_size: int,
     execution_mode: ExecutionMode,
-    command: Sequence[str | os.PathLike[str]],
-    config_reference: str | os.PathLike[str] = "",
-    execution_id: str | None = None,
-    previous_execution_id: str | None = None,
-    resume_checkpoint: str | os.PathLike[str] | None = None,
-    resume_checkpoint_sha256: str | None = None,
-    parent_execution_id: str | None = None,
-    starting_epoch: int | None = None,
-    starting_global_step: int | None = None,
-    runtime: Mapping[str, Any] | None = None,
-    created_at: str | None = None,
+    command: Sequence[Union[str, os.PathLike[str]]],
+    config_reference: Union[str, os.PathLike[str]] = "",
+    execution_id: Union[str, None] = None,
+    previous_execution_id: Union[str, None] = None,
+    resume_checkpoint: Union[str, os.PathLike[str], None] = None,
+    resume_checkpoint_sha256: Union[str, None] = None,
+    parent_execution_id: Union[str, None] = None,
+    starting_epoch: Union[int, None] = None,
+    starting_global_step: Union[int, None] = None,
+    runtime: Union[Mapping[str, Any], None] = None,
+    created_at: Union[str, None] = None,
 ) -> ExecutionContext:
     """Create and atomically publish one immutable execution attempt.
 
@@ -587,7 +587,7 @@ def create_execution_context(
     executions_dir = executions_dir_for(run_dir)
     executions_dir.mkdir(parents=True, exist_ok=True)
 
-    collision: FileExistsError | None = None
+    collision: Union[FileExistsError, None] = None
     for candidate_id in candidate_ids:
         execution_dir = executions_dir / candidate_id
         try:
@@ -640,7 +640,7 @@ def join_execution_context(
     run_dir: Path,
     execution_id: str,
     *,
-    expected_run_name: str | None = None,
+    expected_run_name: Union[str, None] = None,
 ) -> ExecutionContext:
     """Join an explicitly pre-established execution without modifying it."""
     safe_id = validate_execution_id(execution_id)
@@ -664,7 +664,7 @@ def join_execution_context(
     )
 
 
-def latest_execution_id(run_dir: Path) -> str | None:
+def latest_execution_id(run_dir: Path) -> Union[str, None]:
     """Return the newest valid immutable execution under ``run_dir`` when known."""
     records = _valid_execution_records(run_dir)
     if not records:
@@ -677,7 +677,7 @@ def latest_execution_id(run_dir: Path) -> str | None:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _parse_created_at(value: str) -> datetime:
@@ -685,7 +685,7 @@ def _parse_created_at(value: str) -> datetime:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as error:
         raise ValueError(f"Invalid UTC execution timestamp: {value!r}.") from error
-    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
         raise ValueError(f"Execution timestamp must use UTC: {value!r}.")
     return parsed
 
@@ -722,12 +722,12 @@ def _sanitize_metadata_value(field_name: str, value: Any) -> Any:
         and isinstance(value, Sequence)
         and not isinstance(value, (str, bytes, os.PathLike))
         and bool(value)
-        and all(isinstance(item, str | os.PathLike) for item in value)
+        and all(isinstance(item, (str, os.PathLike)) for item in value)
     ):
         return list(sanitize_command(value))
     if is_command_container:
         return _REDACTED
-    if value is None or isinstance(value, bool | int):
+    if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
         if not math.isfinite(value):
@@ -739,7 +739,7 @@ def _sanitize_metadata_value(field_name: str, value: Any) -> Any:
         return sanitize_metadata_fields(value)
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, os.PathLike)):
         if _contains_sensitive_command_argument(value):
-            if all(isinstance(item, str | os.PathLike) for item in value):
+            if all(isinstance(item, (str, os.PathLike)) for item in value):
                 return list(sanitize_command(value))
             return _REDACTED
         return [_sanitize_metadata_value(field_name, item) for item in value]
@@ -869,7 +869,7 @@ def _freeze_metadata_mapping(fields: Mapping[str, Any]) -> Mapping[str, Any]:
 def _freeze_metadata_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return _freeze_metadata_mapping(value)
-    if isinstance(value, list | tuple):
+    if isinstance(value, (list, tuple)):
         return tuple(_freeze_metadata_value(item) for item in value)
     return value
 
@@ -891,7 +891,7 @@ def _contains_sensitive_command_argument(value: Sequence[Any]) -> bool:
     if not value:
         return False
     for item in value:
-        if not isinstance(item, str | os.PathLike):
+        if not isinstance(item, (str, os.PathLike)):
             continue
         argument = os.fspath(item)
         name, separator, _ = argument.partition("=")
@@ -900,7 +900,7 @@ def _contains_sensitive_command_argument(value: Sequence[Any]) -> bool:
     return False
 
 
-def _path_string(value: str | os.PathLike[str], *, name: str) -> str:
+def _path_string(value: Union[str, os.PathLike[str]], *, name: str) -> str:
     try:
         path_value = os.fspath(value)
     except TypeError as error:
@@ -911,7 +911,7 @@ def _path_string(value: str | os.PathLike[str], *, name: str) -> str:
 
 
 def _validated_command_arguments(
-    command: Sequence[str | os.PathLike[str]],
+    command: Sequence[Union[str, os.PathLike[str]]],
 ) -> tuple[str, ...]:
     if isinstance(command, (str, bytes, os.PathLike)):
         raise ValueError("command must be a sequence of arguments, not a scalar.")
@@ -931,14 +931,14 @@ def _required_string(payload: Mapping[str, Any], key: str, *, allow_empty: bool 
     return value
 
 
-def _optional_string(payload: Mapping[str, Any], key: str) -> str | None:
+def _optional_string(payload: Mapping[str, Any], key: str) -> Union[str, None]:
     value = payload.get(key)
     if value is not None and not isinstance(value, str):
         raise ValueError(f"Execution metadata field {key!r} must be a string or null.")
     return value
 
 
-def _optional_resume_checkpoint_sha256(payload: Mapping[str, Any], key: str) -> str | None:
+def _optional_resume_checkpoint_sha256(payload: Mapping[str, Any], key: str) -> Union[str, None]:
     value = _optional_string(payload, key)
     return validate_resume_checkpoint_sha256(value) if value is not None else None
 
@@ -964,7 +964,7 @@ def _required_nonnegative_int(payload: Mapping[str, Any], key: str, *, minimum: 
     return value
 
 
-def _optional_nonnegative_int(payload: Mapping[str, Any], key: str) -> int | None:
+def _optional_nonnegative_int(payload: Mapping[str, Any], key: str) -> Union[int, None]:
     value = payload.get(key)
     if value is None:
         return None
@@ -975,12 +975,12 @@ def _optional_nonnegative_int(payload: Mapping[str, Any], key: str) -> int | Non
     return value
 
 
-def _optional_execution_id(payload: Mapping[str, Any], key: str) -> str | None:
+def _optional_execution_id(payload: Mapping[str, Any], key: str) -> Union[str, None]:
     value = _optional_string(payload, key)
     return validate_execution_id(value) if value is not None else None
 
 
-def _validate_starting_coordinate(name: str, value: int | None) -> None:
+def _validate_starting_coordinate(name: str, value: Union[int, None]) -> None:
     if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
         raise ValueError(f"{name} must be a non-negative integer or None, got {value!r}.")
 

@@ -34,11 +34,12 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, BinaryIO, Literal, cast
+from typing import Any, BinaryIO, Literal, Union, cast
 
+from mammoth.compat import DATACLASS_SLOTS, add_exception_note
 from mammoth.core.execution import sanitize_metadata_fields
 from mammoth.core.leases import (
     LeaseNamespaceConflictError,
@@ -68,7 +69,7 @@ IDENTITY_KDF_P = 1
 IDENTITY_KDF_DKLEN = 32
 _IDENTITY_KDF_MAXMEM = 64 * 1024 * 1024
 
-type WorkStoreStatus = Literal[
+WorkStoreStatus = Literal[
     "absent",
     "resumable",
     "legacy",
@@ -127,7 +128,7 @@ class WorkStoreIncompatibleError(WorkStoreStatusError):
         self.status = status
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, init=False, **DATACLASS_SLOTS)
 class WorkStoreInspection:
     """Non-mutating classification of one work-store path for a given identity.
 
@@ -143,9 +144,25 @@ class WorkStoreInspection:
     status: WorkStoreStatus
     completed_chunk_ids: tuple[str, ...] = ()
     detail: str = ""
-    completed_chunks: Mapping[str, str] = field(
-        default_factory=lambda: MappingProxyType({}), kw_only=True
-    )
+    completed_chunks: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+
+    __match_args__ = ("store_path", "status", "completed_chunk_ids", "detail")
+
+    def __init__(
+        self,
+        store_path: Path,
+        status: WorkStoreStatus,
+        completed_chunk_ids: tuple[str, ...] = (),
+        detail: str = "",
+        *,
+        completed_chunks: Mapping[str, str] = MappingProxyType({}),
+    ) -> None:
+        """Preserve inspection callers' positional and keyword-only arguments on 3.9."""
+        object.__setattr__(self, "store_path", store_path)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "completed_chunk_ids", completed_chunk_ids)
+        object.__setattr__(self, "detail", detail)
+        object.__setattr__(self, "completed_chunks", completed_chunks)
 
     def __hash__(self) -> int:
         """Hash over the hashable fields, preserving hashability despite the marker mapping.
@@ -160,12 +177,12 @@ class WorkStoreInspection:
         return hash((self.store_path, self.status, self.completed_chunk_ids, self.detail))
 
 
-@dataclass(slots=True)
+@dataclass(**DATACLASS_SLOTS)
 class WorkStoreLease:
     """Hold the exclusive advisory lease for one work-store path."""
 
     path: Path
-    _descriptor: int | None = None
+    _descriptor: Union[int, None] = None
     _namespaces: tuple[RetireableLeaseNamespace, ...] = ()
     _closed: bool = False
 
@@ -199,7 +216,7 @@ class WorkStoreLease:
         if errors:
             first = errors[0]
             for later in errors[1:]:
-                first.add_note(f"Additional lease retirement failure: {later!r}")
+                add_exception_note(first, f"Additional lease retirement failure: {later!r}")
             raise first
 
     def __enter__(self) -> WorkStoreLease:
@@ -214,7 +231,7 @@ class WorkStoreLease:
 def claim_work_store_lease(
     store_path: Path,
     *,
-    lease_namespace: Path | None = None,
+    lease_namespace: Union[Path, None] = None,
 ) -> WorkStoreLease:
     """Claim the exclusive advisory lease for one work-store path without waiting.
 
@@ -285,7 +302,7 @@ def inspect_work_store(
     store_path: Path,
     identity_payload: Mapping[str, Any],
     *,
-    lease_namespace: Path | None = None,
+    lease_namespace: Union[Path, None] = None,
 ) -> WorkStoreInspection:
     """Classify existing store state under a short-held exclusive lease.
 
@@ -375,7 +392,7 @@ class WorkStoreSession:
         store_path: Path,
         identity_payload: Mapping[str, Any],
         *,
-        lease_namespace: Path | None = None,
+        lease_namespace: Union[Path, None] = None,
     ) -> WorkStoreSession:
         """Claim exclusive ownership, resume a matching store, or create a new one."""
         path = Path(store_path)
@@ -614,7 +631,7 @@ def cleanup_work_store(
     identity_payload: Mapping[str, Any],
     *,
     validate_publication: Callable[[], object],
-    lease_namespace: Path | None = None,
+    lease_namespace: Union[Path, None] = None,
 ) -> None:
     """Revalidate a store under a fresh exclusive lease, then delete it.
 
@@ -643,7 +660,7 @@ def cleanup_work_store(
             lease.close()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class _LoadedStore:
     """One authenticated matching store and its completion-journal state."""
 
@@ -655,7 +672,7 @@ class _LoadedStore:
     identity_digest: str
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class _StoredMetadata:
     """Trustworthy fields parsed from one store's metadata file."""
 
@@ -876,7 +893,7 @@ def _journal_chain_seed(*, identity_digest: str, store_path: str) -> str:
     return _sha256_payload(payload)
 
 
-def _is_hex_string(value: object, *, length: int | None = None) -> bool:
+def _is_hex_string(value: object, *, length: Union[int, None] = None) -> bool:
     """Return whether a value is a lowercase hex string, optionally of one length."""
     return (
         isinstance(value, str)
@@ -891,7 +908,7 @@ def _is_exact_int(value: object, expected: int) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value == expected
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class _IdentityKdfParams:
     """One store's scrypt salt and cost parameters for its identity digest."""
 
@@ -934,7 +951,7 @@ def _identity_digest(raw_payload_bytes: bytes, *, kdf: _IdentityKdfParams) -> st
 
 def _utc_now_iso() -> str:
     """Return the current UTC time in the metadata timestamp format."""
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _sanitize_identity(identity_payload: Mapping[str, Any]) -> tuple[dict[str, Any], bytes]:
@@ -997,7 +1014,7 @@ def _freeze(value: Any) -> Any:
     """Deeply freeze a JSON-compatible value for immutable public exposure."""
     if isinstance(value, Mapping):
         return MappingProxyType({key: _freeze(item) for key, item in value.items()})
-    if isinstance(value, list | tuple):
+    if isinstance(value, (list, tuple)):
         return tuple(_freeze(item) for item in value)
     return value
 
@@ -1324,7 +1341,9 @@ def _load_journal(store_path: Path, *, chain_seed: str) -> tuple[dict[str, str],
     return completed, expected_sequence, previous_sha256, valid_bytes
 
 
-def _load_existing_store(store_path: Path, *, raw_payload_bytes: bytes) -> _LoadedStore | None:
+def _load_existing_store(
+    store_path: Path, *, raw_payload_bytes: bytes
+) -> Union[_LoadedStore, None]:
     """Authenticate one matching store, or classify why it cannot be adopted.
 
     Returns ``None`` when nothing exists at ``store_path`` yet. Raises

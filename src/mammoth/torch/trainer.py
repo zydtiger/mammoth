@@ -17,13 +17,14 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, cast
 
 import torch
 import torch.distributed
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 
+from mammoth.compat import DATACLASS_SLOTS, add_exception_note, zip_strict
 from mammoth.logging import RunObserver
 from mammoth.torch.batch import CudaPrefetchingBatchIterator, move_batch_to_device
 from mammoth.torch.callbacks import Callback, EarlyStopping
@@ -63,6 +64,8 @@ from mammoth.torch.metrics import (
 from mammoth.torch.scheduling import AccumulationPolicy, UniformAccumulationPolicy
 from mammoth.torch.state import TrainerState
 
+T = TypeVar("T")
+
 if TYPE_CHECKING:
     from mammoth.torch.runtime import Runtime
 
@@ -72,15 +75,15 @@ SchedulerInterval = Literal["optimizer", "epoch", "validation"]
 OptimizerStepLogicalClock = Literal["completed", "zero_based"]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class TorchCompileConfig:
     """Project-selected ``torch.compile`` options for the execution model."""
 
-    mode: str | None = "default"
+    mode: Union[str, None] = "default"
     fullgraph: bool = False
-    dynamic: bool | None = None
-    backend: str | Callable[..., Any] | None = None
-    options: Mapping[str, Any] | None = None
+    dynamic: Union[bool, None] = None
+    backend: Union[str, Callable[..., Any], None] = None
+    options: Union[Mapping[str, Any], None] = None
 
     def __post_init__(self) -> None:
         if self.mode is not None and (not isinstance(self.mode, str) or not self.mode):
@@ -103,7 +106,7 @@ class TorchCompileConfig:
             raise ValueError("compile mode and options are mutually exclusive")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class StepContext:
     """Ordinary loop coordinates supplied to a project step function.
 
@@ -118,12 +121,12 @@ class StepContext:
     optimizer_step: int
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class StepOutput:
     """Loss, scalar metrics, and transient stateful-metric updates from one step."""
 
-    loss: torch.Tensor | None = None
-    metrics: Mapping[str, float | torch.Tensor] = field(default_factory=dict)
+    loss: Union[torch.Tensor, None] = None
+    metrics: Mapping[str, Union[float, torch.Tensor]] = field(default_factory=dict)
     metric_updates: Mapping[str, Any] = field(default_factory=dict)
     weight: float = 1.0
 
@@ -142,10 +145,10 @@ class StepOutput:
 
 StepFunction = Callable[[torch.nn.Module, Any, StepContext], StepOutput]
 BatchMover = Callable[[Any, torch.device], Any]
-OptimizerStepMetrics = Callable[[TrainerState], Mapping[str, float | torch.Tensor]]
+OptimizerStepMetrics = Callable[[TrainerState], Mapping[str, Union[float, torch.Tensor]]]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class TrainerConfig:
     """Model-independent ordinary training-loop policy."""
 
@@ -154,12 +157,12 @@ class TrainerConfig:
     strategy: Strategy = "single"
     precision: Precision = "fp32"
     gradient_accumulation_steps: int = 1
-    max_gradient_norm: float | None = None
+    max_gradient_norm: Union[float, None] = None
     validation_every_epochs: int = 1
     log_every_batches: int = 1
     scheduler_interval: SchedulerInterval = "epoch"
-    scheduler_monitor: str | None = None
-    checkpoint_every_epochs: int | None = 1
+    scheduler_monitor: Union[str, None] = None
+    checkpoint_every_epochs: Union[int, None] = 1
     checkpoint_filename: str = "checkpoint-{epoch:04d}.pt"
     max_pending_checkpoints: int = 1
     checkpoint_capture_mode: CheckpointCaptureMode = "auto"
@@ -172,7 +175,7 @@ class TrainerConfig:
     display_metric_names: tuple[str, ...] = ("loss",)
     emit_fit_phase_events: bool = True
     optimizer_step_logical_clock: OptimizerStepLogicalClock = "completed"
-    compile_config: TorchCompileConfig | None = None
+    compile_config: Union[TorchCompileConfig, None] = None
 
     def __post_init__(self) -> None:
         positive_integer("epochs", self.epochs)
@@ -225,7 +228,7 @@ class TrainerConfig:
             raise ValueError("checkpoint_filename must be a single filename template")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class TrainerResult:
     """Terminal trainer coordinates and epoch summaries."""
 
@@ -245,24 +248,24 @@ class Trainer:
         train_loader: DataLoader[Any],
         train_step: StepFunction,
         config: TrainerConfig,
-        validation_loader: DataLoader[Any] | None = None,
-        validation_step: StepFunction | None = None,
-        scheduler: Any | None = None,
-        observer: RunObserver | None = None,
+        validation_loader: Union[DataLoader[Any], None] = None,
+        validation_step: Union[StepFunction, None] = None,
+        scheduler: Union[Any, None] = None,
+        observer: Union[RunObserver, None] = None,
         callbacks: Sequence[Callback] = (),
-        optimizer_step_metrics: OptimizerStepMetrics | None = None,
-        metric_specs: Mapping[str, MetricSpec] | None = None,
-        train_metric_routes: Mapping[str, MetricRoute] | None = None,
-        validation_metric_routes: Mapping[str, MetricRoute] | None = None,
-        train_stateful_metrics: Mapping[str, StatefulMetric] | None = None,
-        validation_stateful_metrics: Mapping[str, StatefulMetric] | None = None,
-        accumulation_policy: AccumulationPolicy | None = None,
-        checkpoint_dir: Path | None = None,
-        checkpoint_policy: TrainerCheckpointPolicy | None = None,
-        checkpoint_save_policy: CheckpointSavePolicy | None = None,
-        extra_state: Mapping[str, Stateful] | None = None,
-        batch_mover: BatchMover | None = None,
-        runtime: Runtime | None = None,
+        optimizer_step_metrics: Union[OptimizerStepMetrics, None] = None,
+        metric_specs: Union[Mapping[str, MetricSpec], None] = None,
+        train_metric_routes: Union[Mapping[str, MetricRoute], None] = None,
+        validation_metric_routes: Union[Mapping[str, MetricRoute], None] = None,
+        train_stateful_metrics: Union[Mapping[str, StatefulMetric], None] = None,
+        validation_stateful_metrics: Union[Mapping[str, StatefulMetric], None] = None,
+        accumulation_policy: Union[AccumulationPolicy, None] = None,
+        checkpoint_dir: Union[Path, None] = None,
+        checkpoint_policy: Union[TrainerCheckpointPolicy, None] = None,
+        checkpoint_save_policy: Union[CheckpointSavePolicy, None] = None,
+        extra_state: Union[Mapping[str, Stateful], None] = None,
+        batch_mover: Union[BatchMover, None] = None,
+        runtime: Union[Runtime, None] = None,
         monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if (validation_loader is None) != (validation_step is None):
@@ -376,7 +379,7 @@ class Trainer:
         self._initial_callback_states = tuple(
             snapshot_to_cpu(callback.state_dict()) for callback in self.callbacks
         )
-        self._checkpoint_restore: TrainerCheckpointRestore | None = None
+        self._checkpoint_restore: Union[TrainerCheckpointRestore, None] = None
         self.publisher = AsyncCheckpointPublisher(
             max_pending=config.max_pending_checkpoints,
             capture_mode=config.checkpoint_capture_mode,
@@ -397,7 +400,7 @@ class Trainer:
             )
         if self.config.emit_fit_phase_events:
             self.observer.emit("phase_started", phase=self.config.train_phase)
-        fit_error: BaseException | None = None
+        fit_error: Union[BaseException, None] = None
         try:
             self.coordinate(
                 "train-start callbacks",
@@ -418,7 +421,7 @@ class Trainer:
                     partial(self.run_epoch_callbacks, training_metrics),
                 )
 
-                validation_metrics: Mapping[str, float] | None = None
+                validation_metrics: Union[Mapping[str, float], None] = None
                 if (
                     self.validation_loader is not None
                     and (epoch + 1) % self.config.validation_every_epochs == 0
@@ -473,8 +476,8 @@ class Trainer:
                 try:
                     self.publish_interrupted_checkpoint()
                 except BaseException as checkpoint_error:
-                    error.add_note(
-                        f"Interrupted checkpoint publication also failed: {checkpoint_error}"
+                    add_exception_note(
+                        error, f"Interrupted checkpoint publication also failed: {checkpoint_error}"
                     )
             if self.config.emit_fit_phase_events:
                 self.observer.emit(
@@ -493,7 +496,7 @@ class Trainer:
                     else:
                         self.flush_checkpoints()
                 except BaseException as flush_error:
-                    fit_error.add_note(f"Checkpoint shutdown also failed: {flush_error}")
+                    add_exception_note(fit_error, f"Checkpoint shutdown also failed: {flush_error}")
         return TrainerResult(
             state=self.state,
             training_history=tuple(training_history),
@@ -510,7 +513,7 @@ class Trainer:
         )
         plan = None
         window_sizes: tuple[int, ...] = ()
-        planning_error: BaseException | None = None
+        planning_error: Union[BaseException, None] = None
         try:
             plan = self.accumulation_policy.plan(
                 rank=self.rank,
@@ -532,7 +535,7 @@ class Trainer:
             epoch_total=self.config.epochs,
         )
         task_started_at = self._monotonic_clock()
-        batch_iterator: CudaPrefetchingBatchIterator | None = None
+        batch_iterator: Union[CudaPrefetchingBatchIterator, None] = None
         try:
             window_stateful_baseline = self.coordinate(
                 "training metric setup",
@@ -557,8 +560,8 @@ class Trainer:
                 for window_offset, window_size in enumerate(window_sizes):
                     window_index = window_offset + 1
                     window_global_step = self.state.global_step
-                    window_error: BaseException | None = None
-                    final_backward_loss: torch.Tensor | None = None
+                    window_error: Union[BaseException, None] = None
+                    final_backward_loss: Union[torch.Tensor, None] = None
                     last_batch_index = batch_index
                     for local_window_offset in range(window_size):
                         if window_error is not None:
@@ -746,7 +749,7 @@ class Trainer:
         self.observer.emit("phase_started", phase=self.config.validation_phase)
         self.observer.emit("task_started", phase=self.config.validation_phase, task_id=task_id)
         task_started_at = self._monotonic_clock()
-        batch_iterator: CudaPrefetchingBatchIterator | None = None
+        batch_iterator: Union[CudaPrefetchingBatchIterator, None] = None
         try:
             self.coordinate(
                 "validation metric setup",
@@ -760,7 +763,7 @@ class Trainer:
                 ),
                 torch.no_grad(),
             ):
-                validation_error: BaseException | None = None
+                validation_error: Union[BaseException, None] = None
                 validation_iterator = self.coordinate(
                     "validation loader setup",
                     lambda: iter(validation_loader),
@@ -893,7 +896,7 @@ class Trainer:
     def compute_optimizer_step_metrics(
         self,
         provider: OptimizerStepMetrics,
-    ) -> dict[str, float | torch.Tensor]:
+    ) -> dict[str, Union[float, torch.Tensor]]:
         """Validate consumer metrics after one optimizer/scheduler boundary."""
         return prepared_scalar_metrics(provider(self.state))
 
@@ -995,10 +998,10 @@ class Trainer:
     def checkpoint_selection(
         self,
         epoch: int,
-        validation_metrics: Mapping[str, float] | None,
+        validation_metrics: Union[Mapping[str, float], None],
     ) -> tuple[bool, bool]:
         """Return rank zero's resumable/best selection on every rank."""
-        local_selection: tuple[bool, bool] | None = None
+        local_selection: Union[tuple[bool, bool], None] = None
         if self.rank == 0:
             if self.checkpoint_save_policy is not None:
                 policy = self.checkpoint_save_policy
@@ -1033,7 +1036,7 @@ class Trainer:
         self,
         epoch: int,
         training_metrics: Mapping[str, float],
-        validation_metrics: Mapping[str, float] | None,
+        validation_metrics: Union[Mapping[str, float], None],
     ) -> None:
         """Publish on rank zero and propagate planning or submission failures."""
         save_resumable, save_best = self.checkpoint_selection(
@@ -1042,7 +1045,7 @@ class Trainer:
         )
         if not save_resumable and not save_best:
             return
-        local_error: BaseException | None = None
+        local_error: Union[BaseException, None] = None
         with self.observer.periodic_heartbeats(
             phase=self.config.train_phase,
             message="Checkpoint publication is still active.",
@@ -1064,7 +1067,7 @@ class Trainer:
         self,
         epoch: int,
         training_metrics: Mapping[str, float],
-        validation_metrics: Mapping[str, float] | None,
+        validation_metrics: Union[Mapping[str, float], None],
         *,
         reason: CheckpointReason = "scheduled",
         save_resumable: bool = True,
@@ -1124,8 +1127,8 @@ class Trainer:
         self,
         *,
         reason: Literal["manual", "interrupted"] = "manual",
-        training_metrics: Mapping[str, float] | None = None,
-        validation_metrics: Mapping[str, float] | None = None,
+        training_metrics: Union[Mapping[str, float], None] = None,
+        validation_metrics: Union[Mapping[str, float], None] = None,
     ) -> None:
         """Force one synchronous checkpoint publication on rank zero."""
         if reason not in {"manual", "interrupted"}:
@@ -1136,7 +1139,7 @@ class Trainer:
             raise RuntimeError("rank zero returned an invalid checkpoint availability decision")
         if not decisions[0]:
             return
-        local_error: BaseException | None = None
+        local_error: Union[BaseException, None] = None
         if self.rank == 0:
             try:
                 self.publish_checkpoint(
@@ -1176,7 +1179,7 @@ class Trainer:
         """Inspect one checkpoint on rank zero and share the typed result."""
         checkpoint_path = Path(path)
 
-        def inspect_primary() -> CheckpointInspection | None:
+        def inspect_primary() -> Union[CheckpointInspection, None]:
             if self.rank != 0:
                 return None
             if self.checkpoint_policy is not None:
@@ -1203,7 +1206,7 @@ class Trainer:
         self,
         path: Path,
         *,
-        options: RestoreOptions | None = None,
+        options: Union[RestoreOptions, None] = None,
         strict: bool = True,
     ) -> TrainerCheckpointRestore:
         """Restore selected generic state and return the synchronized typed report."""
@@ -1350,11 +1353,11 @@ class Trainer:
             global_step=restored_state.global_step,
             stopped_early=restored_state.stopped_early,
             optimizer_state_dict=cast(
-                Mapping[str, Any] | None,
+                Union[Mapping[str, Any], None],
                 state.get("optimizer"),
             ),
             scheduler_state_dict=cast(
-                Mapping[str, Any] | None,
+                Union[Mapping[str, Any], None],
                 state.get("scheduler"),
             ),
             callback_state_dicts=callback_states,
@@ -1417,10 +1420,8 @@ class Trainer:
             if restored.callback_state_dicts:
                 restored_components.add("callbacks")
         else:
-            for callback, initial_state in zip(
-                self.callbacks,
-                self._initial_callback_states,
-                strict=True,
+            for callback, initial_state in zip_strict(
+                self.callbacks, self._initial_callback_states
             ):
                 callback.load_state_dict(initial_state)
             reset_components.add("callbacks")
@@ -1496,10 +1497,8 @@ class Trainer:
         learning_rates = self.scheduler.get_last_lr()
         if len(learning_rates) != len(self.optimizer.param_groups):
             raise ValueError("scheduler learning-rate count does not match optimizer groups")
-        for parameter_group, learning_rate in zip(
-            self.optimizer.param_groups,
-            learning_rates,
-            strict=True,
+        for parameter_group, learning_rate in zip_strict(
+            self.optimizer.param_groups, learning_rates
         ):
             parameter_group["lr"] = learning_rate
 
@@ -1521,7 +1520,7 @@ class Trainer:
 
     def flush_checkpoints(self) -> None:
         """Flush rank-zero publication and propagate a coherent DDP failure."""
-        local_error: BaseException | None = None
+        local_error: Union[BaseException, None] = None
         with self.observer.periodic_heartbeats(
             phase=self.config.train_phase,
             message="Final checkpoint publication is still active.",
@@ -1544,7 +1543,7 @@ class Trainer:
 
     def flush_checkpoint_publications(self) -> None:
         """Flush the worker and deliver every successful retained receipt once."""
-        first_error: BaseException | None = None
+        first_error: Union[BaseException, None] = None
         try:
             self.publisher.flush()
         except BaseException as error:
@@ -1566,7 +1565,7 @@ class Trainer:
     def raise_distributed_failure(
         self,
         operation: str,
-        local_error: BaseException | None,
+        local_error: Union[BaseException, None],
     ) -> None:
         """Raise the first rank-reported infrastructure failure everywhere."""
         if self.config.strategy == "single":
@@ -1603,10 +1602,10 @@ class Trainer:
         if failure is not None:
             raise RuntimeError(f"{operation} failed: {failure[1]}") from local_error
 
-    def coordinate[T](self, operation: str, function: Callable[[], T]) -> T:
+    def coordinate(self, operation: str, function: Callable[[], T]) -> T:
         """Run project-controlled work behind rank-wide failure consensus."""
-        result: T | None = None
-        local_error: BaseException | None = None
+        result: Union[T, None] = None
+        local_error: Union[BaseException, None] = None
         try:
             result = function()
         except BaseException as error:
@@ -1668,7 +1667,7 @@ class Trainer:
         if self._closed:
             return
         self._closed = True
-        first_error: BaseException | None = None
+        first_error: Union[BaseException, None] = None
         try:
             self.flush_checkpoint_publications()
         except BaseException as error:
@@ -1713,7 +1712,7 @@ def _synchronize_progress_device(device: torch.device) -> None:
         torch.cuda.current_stream(device).synchronize()
 
 
-def output_metrics(output: StepOutput) -> dict[str, float | torch.Tensor]:
+def output_metrics(output: StepOutput) -> dict[str, Union[float, torch.Tensor]]:
     """Validate and detach scalar tensors without forcing host materialization."""
     metrics = prepared_scalar_metrics(output.metrics)
     if output.loss is not None:
@@ -1723,16 +1722,17 @@ def output_metrics(output: StepOutput) -> dict[str, float | torch.Tensor]:
 
 
 def combine_failures(
-    primary: BaseException | None,
+    primary: Union[BaseException, None],
     secondary: BaseException,
 ) -> BaseException:
     """Preserve the first failure while retaining later cleanup context."""
     if primary is None:
         return secondary
     if secondary is not primary:
-        primary.add_note(
+        add_exception_note(
+            primary,
             "A later checkpoint lifecycle failure also occurred: "
-            f"{type(secondary).__name__}: {secondary}"
+            f"{type(secondary).__name__}: {secondary}",
         )
     return primary
 
@@ -1791,7 +1791,7 @@ def wrap_model(
 
 def compile_execution_model(
     model: torch.nn.Module,
-    config: TorchCompileConfig | None,
+    config: Union[TorchCompileConfig, None],
 ) -> torch.nn.Module:
     """Apply caller-selected compilation after device placement and DDP wrapping."""
     if config is None:

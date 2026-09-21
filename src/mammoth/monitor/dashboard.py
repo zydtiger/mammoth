@@ -11,8 +11,9 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from statistics import median
+from typing import Union
 
 from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
 from rich.progress import BarColumn, Progress, ProgressColumn, TextColumn
@@ -21,6 +22,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
+from mammoth.compat import DATACLASS_SLOTS
 from mammoth.core.events import ExecutionEvent
 from mammoth.monitor.fleet import FleetSnapshot, GroupMemberSnapshot, GroupSnapshot, MemberProgress
 from mammoth.monitor.model import (
@@ -63,15 +65,15 @@ _HEAVY_LOAD_PERCENT = 80.0
 _UNFOCUSED_TABLE_CAP = 3
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class _ProgressView:
     """One task progress summary, optionally reconciled across process ranks."""
 
     task: TaskState
     completed: int
-    total: int | None
-    throughput: float | None
-    eta_seconds: float | None
+    total: Union[int, None]
+    throughput: Union[float, None]
+    eta_seconds: Union[float, None]
     aggregation_pending: bool = False
 
 
@@ -81,7 +83,7 @@ class _MonitorSpeedColumn(ProgressColumn):
     def render(self, task: RichTask) -> Text:
         """Return the immutable throughput stored in the passive Rich task."""
         throughput = task.fields.get("monitor_throughput")
-        if not isinstance(throughput, int | float):
+        if not isinstance(throughput, (int, float)):
             return Text("--")
         return Text(f"{float(throughput):.1f} b/s", style="progress.data.speed")
 
@@ -139,16 +141,16 @@ class _MetricTrend:
 def dashboard_layout(
     snapshot: RunSnapshot,
     *,
-    host: PsutilViewerTelemetry | None,
+    host: Union[PsutilViewerTelemetry, None],
     detail: bool,
     compact: bool,
     pinned: bool = False,
     stale_after_seconds: float = 90.0,
     refresh_seconds: float = 2.0,
-    now: datetime | None = None,
+    now: Union[datetime, None] = None,
 ) -> RenderableType:
     """Build the legacy-style wide or compact dashboard for one logical run."""
-    observed_at = now or datetime.now(UTC)
+    observed_at = now or datetime.now(timezone.utc)
     if compact:
         return _compact_layout(
             snapshot,
@@ -170,7 +172,7 @@ def dashboard_layout(
     )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class FleetRow:
     """One selectable fleet-screen row: either a group or one loose run."""
 
@@ -187,8 +189,8 @@ def fleet_rows(fleet: FleetSnapshot) -> list[FleetRow]:
 
 def _row_window(
     total: int,
-    selected_local_index: int | None,
-    max_visible: int | None,
+    selected_local_index: Union[int, None],
+    max_visible: Union[int, None],
 ) -> tuple[int, int, int, int]:
     """Return ``(start, end, hidden_above, hidden_below)`` bounding one table.
 
@@ -333,7 +335,7 @@ def _fleet_tables_within_viewport(
     *,
     header: RenderableType,
     groups_label: RenderableType,
-    loose_label: RenderableType | None,
+    loose_label: Union[RenderableType, None],
     loose_shown: bool,
     group_count: int,
     loose_count: int,
@@ -341,7 +343,10 @@ def _fleet_tables_within_viewport(
     viewport_rows: int,
     width: int,
 ) -> tuple[
-    RenderableType | None, RenderableType | None, RenderableType | None, RenderableType | None
+    Union[RenderableType, None],
+    Union[RenderableType, None],
+    Union[RenderableType, None],
+    Union[RenderableType, None],
 ]:
     """Size the fleet screen's two tables so the selected row always fits.
 
@@ -381,8 +386,8 @@ def _fleet_tables_within_viewport(
             show_header=show_groups_header,
         )
         groups_label_kept = groups_label if keep_groups_label else None
-        loose_table: RenderableType | None = None
-        loose_label_kept: RenderableType | None = None
+        loose_table: Union[RenderableType, None] = None
+        loose_label_kept: Union[RenderableType, None] = None
         if loose_shown:
             assert loose_label is not None
             # _row_window always claims at least one row once it is given a
@@ -433,7 +438,7 @@ def _fleet_tables_within_viewport(
     )
 
     def prefix_for(
-        groups_variant: RenderableType | None, keep_loose_label: bool
+        groups_variant: Union[RenderableType, None], keep_loose_label: bool
     ) -> list[RenderableType]:
         pieces: list[RenderableType] = [header]
         if groups_variant is not None:
@@ -442,13 +447,13 @@ def _fleet_tables_within_viewport(
             pieces.append(loose_label)
         return pieces
 
-    candidates: tuple[tuple[RenderableType | None, bool], ...] = (
+    candidates: tuple[tuple[Union[RenderableType, None], bool], ...] = (
         (full_groups_table, True),
         (capped_groups_table, True),
         (None, True),
         (None, False),
     )
-    kept_groups_variant: RenderableType | None = full_groups_table
+    kept_groups_variant: Union[RenderableType, None] = full_groups_table
     keep_loose_label = True
     loose_budget = 0
     prefix_height = 0
@@ -487,8 +492,8 @@ def fleet_dashboard_layout(
     compact: bool,
     stale_after_seconds: float = 90.0,
     refresh_seconds: float = 2.0,
-    now: datetime | None = None,
-    viewport_rows: int | None = None,
+    now: Union[datetime, None] = None,
+    viewport_rows: Union[int, None] = None,
     width: int = 120,
 ) -> RenderableType:
     """Build the entry-level fleet overview: every group, then every loose run.
@@ -512,7 +517,7 @@ def fleet_dashboard_layout(
     guarantee that the selected row itself is never dropped to make room for
     markers.
     """
-    observed_at = now or datetime.now(UTC)
+    observed_at = now or datetime.now(timezone.utc)
     rows = fleet_rows(fleet)
     header = Table.grid(expand=True, padding=(0, 1), pad_edge=False)
     header.add_column(justify="left", no_wrap=True)
@@ -544,10 +549,10 @@ def fleet_dashboard_layout(
         )
     trailing_chunks.append([Text(), _fleet_footer(bool(rows))])
 
-    groups_label_kept: RenderableType | None = groups_label
-    loose_label_kept: RenderableType | None = loose_label
-    groups_table: RenderableType | None
-    loose_table: RenderableType | None
+    groups_label_kept: Union[RenderableType, None] = groups_label
+    loose_label_kept: Union[RenderableType, None] = loose_label
+    groups_table: Union[RenderableType, None]
+    loose_table: Union[RenderableType, None]
     if viewport_rows is None:
         groups_table = _group_roll_up_table(
             fleet, selected_index, observed_at, stale_after_seconds, None
@@ -624,8 +629,8 @@ def group_dashboard_layout(
     compact: bool,
     stale_after_seconds: float = 90.0,
     refresh_seconds: float = 2.0,
-    now: datetime | None = None,
-    viewport_rows: int | None = None,
+    now: Union[datetime, None] = None,
+    viewport_rows: Union[int, None] = None,
     width: int = 120,
 ) -> RenderableType:
     """Build the group-level view: one row per member in schedule order.
@@ -642,7 +647,7 @@ def group_dashboard_layout(
     row — see :func:`_budget_with_fallback`. ``None`` (plain-mode and other
     non-windowed callers) renders every member unconditionally.
     """
-    observed_at = now or datetime.now(UTC)
+    observed_at = now or datetime.now(timezone.utc)
     header = Table.grid(expand=True, padding=(0, 1), pad_edge=False)
     header.add_column(justify="left", no_wrap=True)
     header.add_column(justify="center", ratio=1, no_wrap=True, overflow="ellipsis")
@@ -801,7 +806,7 @@ def _group_roll_up_table(
     selected_index: int,
     now: datetime,
     stale_after_seconds: float,
-    max_visible: int | None,
+    max_visible: Union[int, None],
     *,
     show_header: bool = True,
 ) -> RenderableType:
@@ -833,7 +838,7 @@ def _loose_run_table(
     selected_index: int,
     now: datetime,
     stale_after_seconds: float,
-    max_visible: int | None,
+    max_visible: Union[int, None],
     *,
     show_header: bool = True,
 ) -> RenderableType:
@@ -862,7 +867,7 @@ def _member_table(
     selected_index: int,
     now: datetime,
     stale_after_seconds: float,
-    max_visible: int | None,
+    max_visible: Union[int, None],
     *,
     show_header: bool = True,
 ) -> RenderableType:
@@ -892,7 +897,7 @@ def _member_steps_text(member: GroupMemberSnapshot) -> str:
     return " ".join(f"{step.name}:{step.status}" for step in member.steps)
 
 
-def _member_progress_text(progress: MemberProgress | None) -> str:
+def _member_progress_text(progress: Union[MemberProgress, None]) -> str:
     if progress is None:
         return "--"
     counts = (
@@ -906,7 +911,9 @@ def _member_progress_text(progress: MemberProgress | None) -> str:
     return f"{counts}{rate}{eta_text}"
 
 
-def _heartbeat_cell(value: datetime | None, now: datetime, stale_after_seconds: float) -> Text:
+def _heartbeat_cell(
+    value: Union[datetime, None], now: datetime, stale_after_seconds: float
+) -> Text:
     if value is None:
         return Text("--", style="dim")
     age_seconds = max(0.0, (now - value).total_seconds())
@@ -966,7 +973,7 @@ def braille_line_chart(
         ]
 
     pixels: set[tuple[int, int]] = set()
-    for start, end in zip(coordinates, coordinates[1:], strict=False):
+    for start, end in zip(coordinates, coordinates[1:]):
         start_x, start_y = start
         end_x, end_y = end
         steps = max(abs(end_x - start_x), abs(end_y - start_y), 1)
@@ -995,7 +1002,7 @@ def braille_line_chart(
 def _wide_layout(
     snapshot: RunSnapshot,
     *,
-    host: PsutilViewerTelemetry | None,
+    host: Union[PsutilViewerTelemetry, None],
     detail: bool,
     pinned: bool,
     stale_after_seconds: float,
@@ -1047,7 +1054,7 @@ def _wide_layout(
 def _compact_layout(
     snapshot: RunSnapshot,
     *,
-    host: PsutilViewerTelemetry | None,
+    host: Union[PsutilViewerTelemetry, None],
     detail: bool,
     pinned: bool,
     stale_after_seconds: float,
@@ -1288,8 +1295,8 @@ def _telemetry_panel(host: PsutilViewerTelemetry, *, compact: bool) -> Renderabl
 
 def _resource_block(
     identity: str,
-    left: str | Text,
-    right: str | Text,
+    left: Union[str, Text],
+    right: Union[str, Text],
     *,
     compact: bool,
 ) -> RenderableType:
@@ -1310,11 +1317,11 @@ def _cpu_label(host: PsutilViewerTelemetry) -> str:
     return "CPU" if host.cpu_model_name is None else f"CPU · {host.cpu_model_name}"
 
 
-def _frequency(value: float | None) -> str:
+def _frequency(value: Union[float, None]) -> str:
     return "--" if value is None else f"{value:,.0f} MHz"
 
 
-def _power_and_frequency(power_w: float | None, frequency_mhz: float | None) -> str:
+def _power_and_frequency(power_w: Union[float, None], frequency_mhz: Union[float, None]) -> str:
     power = "--" if power_w is None else f"{power_w:,.1f} W"
     return f"Power {power} · Core {_frequency(frequency_mhz)}"
 
@@ -1388,7 +1395,7 @@ def _execution_details(
     return table
 
 
-def _progress_view(selected: MonitorSnapshot) -> _ProgressView | None:
+def _progress_view(selected: MonitorSnapshot) -> Union[_ProgressView, None]:
     """Return compatible attempt-wide progress without summing replicated counters."""
     task = _overview_task(selected)
     if task is None:
@@ -1442,7 +1449,7 @@ def _progress_view(selected: MonitorSnapshot) -> _ProgressView | None:
     )
 
 
-def _overview_task(selected: MonitorSnapshot) -> TaskState | None:
+def _overview_task(selected: MonitorSnapshot) -> Union[TaskState, None]:
     """Prefer the highest active ancestor with progress for the run overview."""
     task = selected.current_task
     if task is None:
@@ -1619,7 +1626,7 @@ def _attempt_history(
 def _producer_current_task(
     selected: MonitorSnapshot,
     producer: ProducerKey,
-) -> TaskState | None:
+) -> Union[TaskState, None]:
     tasks = [task for task in selected.tasks.values() if task.producer == producer]
     tasks.sort(key=lambda task: task.updated_at or selected.created_at)
     running = [task for task in tasks if task.status == "running"]
@@ -1658,7 +1665,7 @@ def _phase_history(selected: MonitorSnapshot) -> tuple[str, ...]:
     )
 
 
-def _terminal_event(selected: MonitorSnapshot) -> ExecutionEvent | None:
+def _terminal_event(selected: MonitorSnapshot) -> Union[ExecutionEvent, None]:
     runner_terminal = next(
         (
             event
@@ -1764,7 +1771,7 @@ def _display_time(value: str) -> str:
     return parsed.astimezone().strftime("%b %d %H:%M")
 
 
-def _task_counts(task: TaskState | None) -> str:
+def _task_counts(task: Union[TaskState, None]) -> str:
     if task is None:
         return "--"
     return (
@@ -1772,13 +1779,13 @@ def _task_counts(task: TaskState | None) -> str:
     )
 
 
-def _task_rate(task: TaskState | None) -> str:
+def _task_rate(task: Union[TaskState, None]) -> str:
     if task is None or task.throughput is None:
         return "--"
     return f"{task.throughput:.1f} b/s"
 
 
-def _compact_task_rate(task: TaskState | None) -> str:
+def _compact_task_rate(task: Union[TaskState, None]) -> str:
     if task is None or task.throughput is None:
         return "--"
     return f"{task.throughput:.1f} b/s"
@@ -1798,8 +1805,8 @@ def _progress_text(progress: _ProgressView) -> str:
 
 def _logical_eta_text(
     snapshot: RunSnapshot,
-    progress: _ProgressView | None,
-) -> str | None:
+    progress: Union[_ProgressView, None],
+) -> Union[str, None]:
     """Estimate a resume-aware optimizer horizon, falling back to task ETA."""
     coordinates = snapshot.logical_coordinates
     optimizer = coordinates.get("optimizer_step")
@@ -1829,7 +1836,7 @@ def _optimizer_interval_samples(snapshot: RunSnapshot) -> tuple[float, ...]:
             if isinstance(point.coordinates.get("optimizer_step"), int)
         ]
         samples: list[float] = []
-        previous: tuple[datetime, object] | None = None
+        previous: Union[tuple[datetime, object], None] = None
         for observed_at, step in observations:
             if previous is None:
                 previous = (observed_at, step)
@@ -1867,25 +1874,25 @@ def _downsample(
 
 
 def _ordered_coordinates(
-    coordinates: dict[str, int | float | str],
-) -> list[tuple[str, int | float | str]]:
+    coordinates: dict[str, Union[int, float, str]],
+) -> list[tuple[str, Union[int, float, str]]]:
     priority = {name: index for index, name in enumerate(_COORDINATE_ORDER)}
     return sorted(coordinates.items(), key=lambda item: (priority.get(item[0], 99), item[0]))
 
 
-def _coordinate(value: object | None, total: object | None) -> str:
+def _coordinate(value: Union[object, None], total: Union[object, None]) -> str:
     return f"{_optional(value)}/{_optional(total)}"
 
 
-def _short_execution_id(execution_id: str | None) -> str:
+def _short_execution_id(execution_id: Union[str, None]) -> str:
     return execution_id[-_SHORT_EXECUTION_ID_LENGTH:] if execution_id is not None else "--"
 
 
-def _optional(value: object | None) -> str:
+def _optional(value: Union[object, None]) -> str:
     return "--" if value is None else str(value)
 
 
-def _age(value: datetime | None, now: datetime) -> str:
+def _age(value: Union[datetime, None], now: datetime) -> str:
     if value is None:
         return "--"
     seconds = max(0.0, (now - value).total_seconds())
@@ -1896,7 +1903,7 @@ def _age(value: datetime | None, now: datetime) -> str:
     return f"{seconds / 3600:.1f}h"
 
 
-def _percentage(value: float | None) -> str:
+def _percentage(value: Union[float, None]) -> str:
     return f"{value:.1f}%" if value is not None else "--"
 
 
@@ -1908,7 +1915,7 @@ def _memory_usage(host: PsutilViewerTelemetry) -> str:
     return f"{used}/{total} GiB ({_percentage(host.memory_percent)})"
 
 
-def _load_metric(value: str, utilization_percent: float | None) -> Text:
+def _load_metric(value: str, utilization_percent: Union[float, None]) -> Text:
     if utilization_percent is None:
         style = ""
     elif utilization_percent < _LIGHT_LOAD_PERCENT:

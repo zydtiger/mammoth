@@ -9,18 +9,20 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, Union
 
 import torch
 import torch.distributed
 
+from mammoth.compat import DATACLASS_SLOTS, zip_strict
+
 Reduction = Literal["mean", "sum", "last"]
 MetricCadence = Literal["batch", "epoch"]
-MetricScalar = float | torch.Tensor
-MetricValidity = bool | torch.Tensor
+MetricScalar = Union[float, torch.Tensor]
+MetricValidity = Union[bool, torch.Tensor]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class MetricSpec:
     """Aggregation policy for one opaque project metric name."""
 
@@ -32,12 +34,12 @@ class MetricSpec:
             raise ValueError(f"Unsupported metric reduction: {self.reduction!r}")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class MetricRoute:
     """Map one opaque metric to optional batch and epoch sink names."""
 
-    batch_name: str | None
-    epoch_name: str | None
+    batch_name: Union[str, None]
+    epoch_name: Union[str, None]
 
     def __post_init__(self) -> None:
         for field_name, value in (
@@ -68,12 +70,12 @@ class StatefulMetric(Protocol):
     def compute(
         self,
         state: Mapping[str, torch.Tensor],
-    ) -> Mapping[str, float | torch.Tensor]:
+    ) -> Mapping[str, Union[float, torch.Tensor]]:
         """Compute project-named scalars from local or globally summed state."""
         ...
 
 
-@dataclass(slots=True)
+@dataclass(**DATACLASS_SLOTS)
 class MetricValue:
     """Mutable accumulator state for one metric."""
 
@@ -89,9 +91,9 @@ class MetricAccumulator:
 
     def __init__(
         self,
-        specs: Mapping[str, MetricSpec] | None = None,
+        specs: Union[Mapping[str, MetricSpec], None] = None,
         *,
-        default: MetricSpec | None = None,
+        default: Union[MetricSpec, None] = None,
     ) -> None:
         self.specs = dict(specs or {})
         self.default = default or MetricSpec()
@@ -99,10 +101,10 @@ class MetricAccumulator:
 
     def update(
         self,
-        metrics: Mapping[str, float | torch.Tensor],
+        metrics: Mapping[str, Union[float, torch.Tensor]],
         *,
         weight: float = 1.0,
-        required_finite: Mapping[str, float | torch.Tensor] | None = None,
+        required_finite: Union[Mapping[str, Union[float, torch.Tensor]], None] = None,
     ) -> None:
         """Accumulate detached scalar metrics without forcing host materialization."""
         if not math.isfinite(weight) or weight <= 0:
@@ -128,7 +130,7 @@ class MetricAccumulator:
     def compute(
         self,
         *,
-        device: torch.device | None = None,
+        device: Union[torch.device, None] = None,
         distributed: bool = False,
     ) -> dict[str, float]:
         """Return reduced metrics, optionally combining initialized DDP ranks."""
@@ -233,13 +235,13 @@ def compute_stateful_metrics(
     *,
     device: torch.device,
     distributed: bool,
-    baseline: Mapping[str, Mapping[str, torch.Tensor]] | None = None,
+    baseline: Union[Mapping[str, Mapping[str, torch.Tensor]], None] = None,
 ) -> dict[str, float]:
     """Sum complete or since-baseline additive state and compute finite scalars."""
     use_distributed = distributed and torch.distributed.is_initialized()
     metric_names = sorted(metrics)
-    snapshot: dict[str, dict[str, torch.Tensor]] | None = None
-    preparation_error: BaseException | None = None
+    snapshot: Union[dict[str, dict[str, torch.Tensor]], None] = None
+    preparation_error: Union[BaseException, None] = None
     try:
         snapshot = snapshot_stateful_metrics(metrics)
         if baseline is not None and sorted(baseline) != metric_names:
@@ -280,7 +282,7 @@ def compute_stateful_metrics(
             raise ValueError("stateful metric tensors must use strided layout")
 
     prepared: dict[str, dict[str, torch.Tensor]] = {}
-    tensor_error: BaseException | None = None
+    tensor_error: Union[BaseException, None] = None
     try:
         for metric_name in metric_names:
             state = snapshot[metric_name]
@@ -310,7 +312,7 @@ def compute_stateful_metrics(
                 torch.distributed.all_reduce(prepared[metric_name][state_name])
 
     results: dict[str, float] = {}
-    compute_error: BaseException | None = None
+    compute_error: Union[BaseException, None] = None
     try:
         for metric_name in metric_names:
             computed = scalar_metrics(metrics[metric_name].compute(prepared[metric_name]))
@@ -330,7 +332,7 @@ def compute_stateful_metrics(
 
 def raise_stateful_distributed_failure(
     operation: str,
-    local_error: BaseException | None,
+    local_error: Union[BaseException, None],
     *,
     use_distributed: bool,
 ) -> None:
@@ -340,7 +342,9 @@ def raise_stateful_distributed_failure(
             raise local_error
         return
     local_status = None if local_error is None else f"{type(local_error).__name__}: {local_error}"
-    gathered_statuses: list[str | None] = [None for _ in range(torch.distributed.get_world_size())]
+    gathered_statuses: list[Union[str, None]] = [
+        None for _ in range(torch.distributed.get_world_size())
+    ]
     torch.distributed.all_gather_object(gathered_statuses, local_status)
     failure = next((status for status in gathered_statuses if status is not None), None)
     if failure is not None:
@@ -409,7 +413,7 @@ def route_metrics(
 
 
 def prepared_scalar_metrics(
-    metrics: Mapping[str, float | torch.Tensor],
+    metrics: Mapping[str, Union[float, torch.Tensor]],
 ) -> dict[str, MetricScalar]:
     """Validate scalar shapes and detach tensors without materializing them on the host."""
     if not isinstance(metrics, Mapping):
@@ -424,7 +428,7 @@ def prepared_scalar_metrics(
             if raw_value.is_complex():
                 raise ValueError(f"metric {name!r} tensor must be real")
             value = raw_value.detach()
-        elif isinstance(raw_value, bool) or not isinstance(raw_value, int | float):
+        elif isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
             raise TypeError(f"metric {name!r} must be a number or scalar tensor")
         else:
             value = float(raw_value)
@@ -435,9 +439,9 @@ def prepared_scalar_metrics(
 
 
 def scalar_metrics(
-    metrics: Mapping[str, float | torch.Tensor],
+    metrics: Mapping[str, Union[float, torch.Tensor]],
     *,
-    required_finite: Mapping[str, float | torch.Tensor] | None = None,
+    required_finite: Union[Mapping[str, Union[float, torch.Tensor]], None] = None,
 ) -> dict[str, float]:
     """Materialize metrics and required validity checks in shared transfer groups."""
     required = prepared_scalar_metrics(required_finite or {})
@@ -448,7 +452,7 @@ def scalar_metrics(
 
 
 def _materialize_scalar_metrics(
-    metrics: Mapping[str, float | torch.Tensor],
+    metrics: Mapping[str, Union[float, torch.Tensor]],
     *,
     validities: Mapping[str, MetricValidity],
 ) -> dict[str, float]:
@@ -484,11 +488,7 @@ def _materialize_scalar_metrics(
     for grouped_values in tensors.values():
         tensor_values = [value for _name, _validity, value in grouped_values]
         transferred = torch.stack(tensor_values).cpu().tolist()
-        for (name, validity, _tensor), value in zip(
-            grouped_values,
-            transferred,
-            strict=True,
-        ):
+        for (name, validity, _tensor), value in zip_strict(grouped_values, transferred):
             if validity:
                 materialized_validities[name] = bool(value)
             else:

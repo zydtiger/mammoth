@@ -8,10 +8,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Union
+
+from mammoth.compat import DATACLASS_SLOTS
 
 
-@dataclass(slots=True)
+@dataclass(**DATACLASS_SLOTS)
 class TrainerState:
     """Mutable ordinary-loop coordinates restored from Mammoth checkpoints.
 
@@ -24,7 +26,7 @@ class TrainerState:
     optimizer_step: int = 0
     stopped_early: bool = False
 
-    def state_dict(self) -> dict[str, int | bool]:
+    def state_dict(self) -> dict[str, Union[int, bool]]:
         """Return JSON-like checkpoint state."""
         return {
             "epoch": self.epoch,

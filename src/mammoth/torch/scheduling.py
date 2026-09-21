@@ -11,11 +11,13 @@ import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, Union
 
 import torch
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import Sampler
+
+from mammoth.compat import DATACLASS_SLOTS, zip_strict
 
 IncompleteWindow = Literal["step", "error"]
 PartialWindow = Literal["error", "fixed"]
@@ -26,12 +28,12 @@ _TORCH_MAX_SEED = 2**64 - 1
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class WeightedTaskAssignment:
     """Assign one opaque caller task and its cost to a rank."""
 
     task_id: str
-    cost: int | float
+    cost: Union[int, float]
     rank: int
 
 
@@ -55,7 +57,7 @@ class WarmupLinearLR(LRScheduler):
             raise ValueError("total_steps must be a positive integer")
         if (
             isinstance(warmup_ratio, bool)
-            or not isinstance(warmup_ratio, int | float)
+            or not isinstance(warmup_ratio, (int, float))
             or not math.isfinite(warmup_ratio)
             or not 0 <= warmup_ratio < 1
         ):
@@ -64,7 +66,7 @@ class WarmupLinearLR(LRScheduler):
         self.total_steps = total_steps
         super().__init__(optimizer, last_epoch)
 
-    def get_lr(self) -> list[float | torch.Tensor]:
+    def get_lr(self) -> list[Union[float, torch.Tensor]]:
         """Return BERT-style warmup-linear rates at the current step."""
         step = self.last_epoch
         warmup_steps = int(self.warmup_ratio * self.total_steps)
@@ -95,11 +97,7 @@ class WarmupLinearLR(LRScheduler):
 
         self.total_steps = configured_total_steps
         resumed_lrs = self.get_lr()
-        for parameter_group, learning_rate in zip(
-            self.optimizer.param_groups,
-            resumed_lrs,
-            strict=True,
-        ):
+        for parameter_group, learning_rate in zip_strict(self.optimizer.param_groups, resumed_lrs):
             parameter_group["lr"] = learning_rate
         self._last_lr = resumed_lrs
         logger.warning(
@@ -112,14 +110,14 @@ class WarmupLinearLR(LRScheduler):
 
 
 def _validated_rank_weights(
-    rank_weights: Sequence[int | float],
-) -> tuple[int | float, ...]:
+    rank_weights: Sequence[Union[int, float]],
+) -> tuple[Union[int, float], ...]:
     """Return finite positive caller-supplied rank weights."""
     if not rank_weights:
         raise ValueError("rank_weights must contain at least one weight")
     if any(
         isinstance(weight, bool)
-        or not isinstance(weight, int | float)
+        or not isinstance(weight, (int, float))
         or (isinstance(weight, float) and not math.isfinite(weight))
         or weight <= 0
         for weight in rank_weights
@@ -129,8 +127,8 @@ def _validated_rank_weights(
 
 
 def allocate_weighted_tasks(
-    tasks: Sequence[tuple[str, int | float]],
-    rank_weights: Sequence[int | float],
+    tasks: Sequence[tuple[str, Union[int, float]]],
+    rank_weights: Sequence[Union[int, float]],
 ) -> tuple[WeightedTaskAssignment, ...]:
     """Allocate opaque costed tasks by lowest projected normalized rank load.
 
@@ -141,7 +139,7 @@ def allocate_weighted_tasks(
     """
     weights = _validated_rank_weights(rank_weights)
     exact_weights = tuple(Fraction(weight) for weight in weights)
-    validated_tasks: list[tuple[str, int | float, Fraction]] = []
+    validated_tasks: list[tuple[str, Union[int, float], Fraction]] = []
     seen_task_ids: set[str] = set()
     for task_id, cost in tasks:
         if not isinstance(task_id, str) or not task_id:
@@ -150,7 +148,7 @@ def allocate_weighted_tasks(
             raise ValueError(f"task IDs must be unique; received {task_id!r} more than once")
         if (
             isinstance(cost, bool)
-            or not isinstance(cost, int | float)
+            or not isinstance(cost, (int, float))
             or (isinstance(cost, float) and not math.isfinite(cost))
             or cost < 0
         ):
@@ -178,7 +176,7 @@ def allocate_weighted_tasks(
 
 def weighted_partition_counts(
     total_count: int,
-    rank_weights: Sequence[int | float],
+    rank_weights: Sequence[Union[int, float]],
     *,
     require_nonempty: bool = False,
 ) -> tuple[int, ...]:
@@ -219,7 +217,7 @@ def weighted_partition_counts(
 def weighted_partition_indices(
     total_count: int,
     rank: int,
-    rank_weights: Sequence[int | float],
+    rank_weights: Sequence[Union[int, float]],
     *,
     require_nonempty: bool = False,
 ) -> range:
@@ -245,7 +243,7 @@ class WeightedDistributedBatchSampler(Sampler[list[int]]):
         batch_size: int,
         global_microbatches_per_step: int,
         rank: int,
-        rank_weights: Sequence[int | float],
+        rank_weights: Sequence[Union[int, float]],
         seed: int = 0,
         shuffle: bool = True,
     ) -> None:
@@ -316,14 +314,14 @@ class WeightedDistributedBatchSampler(Sampler[list[int]]):
         self.epoch = epoch
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class AccumulationPlan:
     """Describe one rank's repeated local microbatch window."""
 
     local_microbatches_per_step: int
     loss_scale: float
     incomplete_window: IncompleteWindow = "step"
-    window_loss_scales: tuple[float, ...] | None = None
+    window_loss_scales: Union[tuple[float, ...], None] = None
 
     def __post_init__(self) -> None:
         if (
@@ -334,7 +332,7 @@ class AccumulationPlan:
             raise ValueError("local_microbatches_per_step must be a positive integer")
         if (
             isinstance(self.loss_scale, bool)
-            or not isinstance(self.loss_scale, int | float)
+            or not isinstance(self.loss_scale, (int, float))
             or not math.isfinite(self.loss_scale)
             or self.loss_scale <= 0
         ):
@@ -345,7 +343,7 @@ class AccumulationPlan:
             for scale in self.window_loss_scales:
                 if (
                     isinstance(scale, bool)
-                    or not isinstance(scale, int | float)
+                    or not isinstance(scale, (int, float))
                     or not math.isfinite(scale)
                     or scale <= 0
                 ):
@@ -407,7 +405,7 @@ class AccumulationPolicy(Protocol):
         ...
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class UniformAccumulationPolicy:
     """Use the same accumulation window on every rank."""
 
@@ -448,12 +446,12 @@ class UniformAccumulationPolicy:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class WeightedAccumulationPolicy:
     """Scale caller-weighted rank-local work into one global mean-loss window."""
 
     global_microbatches_per_step: int
-    rank_weights: Sequence[int | float]
+    rank_weights: Sequence[Union[int, float]]
     partial_window: PartialWindow = "error"
 
     def __post_init__(self) -> None:

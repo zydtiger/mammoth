@@ -4,8 +4,6 @@ This module keeps optional monitor UI imports out of base package startup. The
 console script and ``python -m mammoth`` both enter through :func:`main`.
 """
 
-from __future__ import annotations
-
 import importlib
 import json
 import math
@@ -15,7 +13,7 @@ from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
 from types import ModuleType
-from typing import Annotated, Any, NoReturn
+from typing import Annotated, Any, NoReturn, Union
 
 import typer
 
@@ -74,7 +72,7 @@ def version_callback(value: bool) -> None:
 @app.callback()
 def root(
     version: Annotated[
-        bool | None,
+        Union[bool, None],
         typer.Option(
             "--version",
             callback=version_callback,
@@ -106,7 +104,7 @@ def load_textual_ui() -> ModuleType:
 @app.command("monitor")
 def run_monitor(
     run_name: Annotated[
-        str | None,
+        Union[str, None],
         typer.Argument(help="Logical run name to inspect; omit for the entry-level fleet view."),
     ] = None,
     entry: Annotated[
@@ -114,14 +112,11 @@ def run_monitor(
         typer.Option("--entry", help="Run-directory entry path."),
     ] = Path("./runs"),
     group: Annotated[
-        str | None,
-        typer.Option(
-            "--group",
-            help="Exact group ID to open directly, without RUN_NAME.",
-        ),
+        Union[str, None],
+        typer.Option("--group", help="Exact group ID to open directly, without RUN_NAME."),
     ] = None,
     match: Annotated[
-        str | None,
+        Union[str, None],
         typer.Option(
             "--match",
             help=(
@@ -131,25 +126,20 @@ def run_monitor(
         ),
     ] = None,
     execution: Annotated[
-        str | None,
-        typer.Option("--execution", help="Exact immutable execution to inspect."),
+        Union[str, None], typer.Option("--execution", help="Exact immutable execution to inspect.")
     ] = None,
     watch: Annotated[
-        bool | None,
+        Union[bool, None],
         typer.Option("--watch/--no-watch", help="Enable or disable continuous polling."),
     ] = None,
     rich: Annotated[
-        bool | None,
-        typer.Option(
-            "--rich/--plain",
-            help="Use the Textual dashboard or stable plain output.",
-        ),
+        Union[bool, None],
+        typer.Option("--rich/--plain", help="Use the Textual dashboard or stable plain output."),
     ] = None,
     telemetry: Annotated[
-        bool | None,
+        Union[bool, None],
         typer.Option(
-            "--telemetry/--no-telemetry",
-            help="Enable or disable explicitly viewer-host telemetry.",
+            "--telemetry/--no-telemetry", help="Enable or disable explicitly viewer-host telemetry."
         ),
     ] = None,
     interval: Annotated[
@@ -258,11 +248,10 @@ def queue_submit(
     ],
     entry: Annotated[Path, typer.Option("--entry", help="Queue entry root.")] = Path("./runs"),
     cwd: Annotated[
-        Path | None,
-        typer.Option("--cwd", help="Working directory for the launched job."),
+        Union[Path, None], typer.Option("--cwd", help="Working directory for the launched job.")
     ] = None,
     metadata: Annotated[
-        str | None,
+        Union[str, None],
         typer.Option("--metadata", help="Opaque JSON object recorded with the job."),
     ] = None,
 ) -> None:
@@ -363,7 +352,7 @@ def queue_serve(
         raise typer.BadParameter(str(error)) from None
 
 
-def _parse_metadata_option(metadata: str | None) -> dict[str, Any] | None:
+def _parse_metadata_option(metadata: Union[str, None]) -> Union[dict[str, Any], None]:
     """Parse the ``--metadata`` CLI option into an opaque JSON object."""
     if metadata is None:
         return None
@@ -411,8 +400,8 @@ def _render_queue_snapshot(snapshot: QueueSnapshot) -> str:
 def _run_fleet_monitor(
     entry: Path,
     *,
-    group: str | None,
-    match: str | None,
+    group: Union[str, None],
+    match: Union[str, None],
     interactive: bool,
     should_watch: bool,
     include_telemetry: bool,
@@ -422,7 +411,7 @@ def _run_fleet_monitor(
     """Open the fleet view, or one directly requested group within it."""
     fleet_monitor = FleetMonitor(entry, match=match)
     fleet_snapshot = fleet_monitor.poll(stale_after_seconds=stale_after)
-    selected_group: GroupSnapshot | None = None
+    selected_group: Union[GroupSnapshot, None] = None
     if group is not None:
         selected_group = _find_group(fleet_snapshot, group)
         if selected_group is None:
@@ -468,12 +457,12 @@ def _run_fleet_monitor(
             selected_group = _find_group(fleet_snapshot, group) or selected_group
 
 
-def _find_group(fleet_snapshot: FleetSnapshot, group_id: str) -> GroupSnapshot | None:
+def _find_group(fleet_snapshot: FleetSnapshot, group_id: str) -> Union[GroupSnapshot, None]:
     """Return one group snapshot by ID, or ``None`` when it is not present."""
     return next((item for item in fleet_snapshot.groups if item.group_id == group_id), None)
 
 
-def run(argv: Sequence[str] | None = None) -> int:
+def run(argv: Union[Sequence[str], None] = None) -> int:
     """Execute one Typer command and return its process exit code."""
     try:
         app(args=list(argv) if argv is not None else None, prog_name="mammoth")

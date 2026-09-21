@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler, TensorDataset
 import mammoth.torch.checkpoint as checkpoint_module
 import mammoth.torch.runtime as torch_runtime_module
 import mammoth.torch.trainer as trainer_module
+from mammoth.compat import zip_strict
 from mammoth.core import (
     BoundedBackgroundPipeline,
     PreparedArtifact,
@@ -3818,10 +3819,9 @@ def test_cuda_prefetch_preserves_training_and_validation_results() -> None:
 
     assert baseline_result.training_history == pytest.approx(prefetched_result.training_history)
     assert baseline_result.validation_history == pytest.approx(prefetched_result.validation_history)
-    for baseline, prefetched in zip(
+    for baseline, prefetched in zip_strict(
         baseline_model.parameters(),
         prefetched_model.parameters(),
-        strict=True,
     ):
         assert torch.allclose(baseline, prefetched)
 
@@ -4468,7 +4468,7 @@ def test_restored_early_stop_makes_fit_a_no_op() -> None:
     assert result.validation_history == ()
     assert sink.observations == []
     assert optimizer.state_dict() == optimizer_state
-    for initial, current in zip(initial_parameters, model.parameters(), strict=True):
+    for initial, current in zip_strict(initial_parameters, model.parameters()):
         assert torch.equal(initial, current)
 
 
@@ -4508,7 +4508,7 @@ def test_registered_checkpoint_round_trip_resumes_next_epoch(tmp_path: Path) -> 
         restored.load_checkpoint(checkpoint)
         assert restored.state.epoch == 0
         assert restored_counter.value == 9
-        for original, loaded in zip(model.parameters(), restored_model.parameters(), strict=True):
+        for original, loaded in zip_strict(model.parameters(), restored_model.parameters()):
             assert torch.equal(original, loaded)
         result = restored.fit()
 
@@ -6571,7 +6571,10 @@ def test_async_checkpoint_flush_retains_failures_if_aggregation_is_interrupted(
             if self._interrupt_note_once:
                 self._interrupt_note_once = False
                 raise KeyboardInterrupt("failure aggregation interrupted")
-            super().add_note(note)
+            if hasattr(super(), "add_note"):
+                super().add_note(note)
+            else:
+                self.__notes__ = [*getattr(self, "__notes__", []), note]
 
     checkpoint_root = tmp_path / "checkpoints"
     checkpoint_root.mkdir()

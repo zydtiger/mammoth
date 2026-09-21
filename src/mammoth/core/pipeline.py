@@ -14,12 +14,17 @@ from contextlib import suppress
 from dataclasses import dataclass
 from threading import Condition, Event, RLock, Thread, current_thread
 from types import TracebackType
-from typing import Literal
+from typing import Generic, Literal, TypeVar, Union
 
-type _SubmissionState = Literal["queued", "running", "completed", "failed"]
+from mammoth.compat import DATACLASS_SLOTS, add_exception_note
+
+InputT = TypeVar("InputT")
+ResultT = TypeVar("ResultT")
+
+_SubmissionState = Literal["queued", "running", "completed", "failed"]
 
 
-class BackgroundPipelineSubmission[InputT, ResultT]:
+class BackgroundPipelineSubmission(Generic[InputT, ResultT]):
     """Provide read-only access to one accepted input and its worker outcome."""
 
     __slots__ = (
@@ -53,7 +58,7 @@ class BackgroundPipelineSubmission[InputT, ResultT]:
         self._state: _SubmissionState = "queued"
         self._state_finalized = Event()
         self._pipeline_token = pipeline_token
-        self._error: BackgroundPipelineError[InputT, ResultT] | None = None
+        self._error: Union[BackgroundPipelineError[InputT, ResultT], None] = None
         self._callback_dispatch = callback_dispatch
         self._callback_lock = RLock()
         self._callbacks: list[
@@ -73,7 +78,7 @@ class BackgroundPipelineSubmission[InputT, ResultT]:
         """Return the immutable input association for this submission."""
         return self._input
 
-    def result(self, timeout: float | None = None) -> ResultT:
+    def result(self, timeout: Union[float, None] = None) -> ResultT:
         """Wait for and return the worker result, or raise its original failure."""
         try:
             result = self._future.result(timeout=timeout)
@@ -120,8 +125,8 @@ class BackgroundPipelineSubmission[InputT, ResultT]:
         return f"BackgroundPipelineSubmission(input={self.input!r})"
 
 
-@dataclass(frozen=True, slots=True)
-class BackgroundPipelineResult[InputT, ResultT]:
+@dataclass(frozen=True, **DATACLASS_SLOTS)
+class BackgroundPipelineResult(Generic[InputT, ResultT]):
     """Associate one successfully completed result with its submission."""
 
     submission: BackgroundPipelineSubmission[InputT, ResultT]
@@ -133,7 +138,7 @@ class BackgroundPipelineResult[InputT, ResultT]:
         return self.submission.input
 
 
-class BackgroundPipelineError[InputT, ResultT](RuntimeError):
+class BackgroundPipelineError(RuntimeError, Generic[InputT, ResultT]):
     """Attribute one background worker failure to its accepted submission."""
 
     def __init__(
@@ -161,7 +166,7 @@ class BackgroundPipelineError[InputT, ResultT](RuntimeError):
         return self.submission.input
 
 
-class BoundedBackgroundPipeline[InputT, ResultT]:
+class BoundedBackgroundPipeline(Generic[InputT, ResultT]):
     """Execute accepted inputs in order on one worker with bounded backpressure.
 
     Callers retain ownership until :meth:`submit` accepts an input. The pipeline
@@ -203,7 +208,7 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
                 Callable[[BackgroundPipelineSubmission[InputT, ResultT]], object],
             ]
         ] = deque()
-        self._deferred_interrupt: KeyboardInterrupt | SystemExit | None = None
+        self._deferred_interrupt: Union[KeyboardInterrupt, SystemExit, None] = None
         self._lock = RLock()
         self._condition = Condition(self._lock)
         self._worker_thread = Thread(
@@ -236,7 +241,9 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
         self,
         input_value: InputT,
         *,
-        on_done: Callable[[BackgroundPipelineSubmission[InputT, ResultT]], object] | None = None,
+        on_done: Union[
+            Callable[[BackgroundPipelineSubmission[InputT, ResultT]], object], None
+        ] = None,
     ) -> BackgroundPipelineSubmission[InputT, ResultT]:
         """Transfer one input to the ordered worker after bounded backpressure."""
         if on_done is not None and not callable(on_done):
@@ -273,7 +280,7 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
         with self._condition:
             return any(item.input is input_value for item in self._submissions)
 
-    def take_deferred_interrupt(self) -> KeyboardInterrupt | SystemExit | None:
+    def take_deferred_interrupt(self) -> Union[KeyboardInterrupt, SystemExit, None]:
         """Return and clear an interruption delivered after work acceptance."""
         with self._condition:
             interrupt = self._deferred_interrupt
@@ -340,9 +347,9 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
 
     def __exit__(
         self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
+        exc_type: Union[type[BaseException], None],
+        exc_value: Union[BaseException, None],
+        traceback: Union[TracebackType, None],
     ) -> None:
         """Close without replacing an active caller exception."""
         del exc_type, traceback
@@ -365,15 +372,17 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
         if exc_value is None:
             first_error = cleanup_errors[0]
             for later_error in cleanup_errors[1:]:
-                first_error.add_note(
+                add_exception_note(
+                    first_error,
                     "Later background pipeline cleanup failure: "
-                    f"{type(later_error).__name__}: {later_error}"
+                    f"{type(later_error).__name__}: {later_error}",
                 )
             raise first_error
         for recorded_error in cleanup_errors:
-            exc_value.add_note(
+            add_exception_note(
+                exc_value,
                 "Background pipeline cleanup failed: "
-                f"{type(recorded_error).__name__}: {recorded_error}"
+                f"{type(recorded_error).__name__}: {recorded_error}",
             )
 
     def _worker_loop(self) -> None:
@@ -457,7 +466,7 @@ class BoundedBackgroundPipeline[InputT, ResultT]:
 
     def _next_queued_submission(
         self,
-    ) -> BackgroundPipelineSubmission[InputT, ResultT] | None:
+    ) -> Union[BackgroundPipelineSubmission[InputT, ResultT], None]:
         return next(
             (submission for submission in self._submissions if submission._state == "queued"),
             None,

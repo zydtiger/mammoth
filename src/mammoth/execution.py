@@ -19,8 +19,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
 from types import MappingProxyType, TracebackType
-from typing import Any, Literal, Self
+from typing import Any, Literal, TypeVar, Union
 
+from typing_extensions import Self
+
+from mammoth.compat import DATACLASS_SLOTS, add_exception_note
 from mammoth.core import (
     BackgroundPipelineError,
     BoundedBackgroundPipeline,
@@ -51,6 +54,9 @@ from mammoth.logging import (
     create_execution_logging,
 )
 
+InputT = TypeVar("InputT")
+ResultT = TypeVar("ResultT")
+
 __all__ = [
     "ExecutionObserver",
     "ExecutionSession",
@@ -60,7 +66,7 @@ __all__ = [
 ]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class ExecutionSpec:
     """Immutable expected facts for strict direct execution creation or attachment.
 
@@ -74,13 +80,13 @@ class ExecutionSpec:
     run_name: str
     invocation_kind: str
     intended_phases: tuple[str, ...]
-    config_reference: str | Path = ""
-    execution_id: str | None = None
-    resume_checkpoint: str | Path | None = None
-    resume_checkpoint_sha256: str | None = None
-    parent_execution_id: str | None = None
-    starting_epoch: int | None = None
-    starting_global_step: int | None = None
+    config_reference: Union[str, Path] = ""
+    execution_id: Union[str, None] = None
+    resume_checkpoint: Union[str, Path, None] = None
+    resume_checkpoint_sha256: Union[str, None] = None
+    parent_execution_id: Union[str, None] = None
+    starting_epoch: Union[int, None] = None
+    starting_global_step: Union[int, None] = None
     runtime: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -111,7 +117,7 @@ class ExecutionSpec:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class _JoinEnvironment:
     """Canonical workflow-child values required by strict direct attachment."""
 
@@ -136,7 +142,7 @@ class ExecutionSession:
         execution_logging: ExecutionLogging,
         *,
         close_callbacks: Sequence[tuple[str, Callable[[], None]]] = (),
-        logical_run_lease: LogicalRunLease | None = None,
+        logical_run_lease: Union[LogicalRunLease, None] = None,
     ) -> None:
         """Create a lifecycle owner for already-established execution resources."""
         if execution_logging.context != context:
@@ -147,11 +153,13 @@ class ExecutionSession:
         self.event_writer = execution_logging.event_writer
         self._close_callbacks = tuple(close_callbacks)
         self._logical_run_lease = logical_run_lease
-        self._phase: str | None = None
+        self._phase: Union[str, None] = None
         self._phase_terminal = False
-        self._phase_outcome: Literal["completed", "failed", "interrupted", "skipped"] | None = None
-        self._process_started_at: float | None = None
-        self._phase_started_at: float | None = None
+        self._phase_outcome: Union[
+            Literal["completed", "failed", "interrupted", "skipped"], None
+        ] = None
+        self._process_started_at: Union[float, None] = None
+        self._phase_started_at: Union[float, None] = None
         self._owned_resources = ExitStack()
         self._owned_observers = ExitStack()
         self._owned_pipelines = ExitStack()
@@ -175,8 +183,8 @@ class ExecutionSession:
         inherited_id = execution_id_from_environment()
         if inherited_id is not None:
             raise ValueError(f"{EXECUTION_ID_ENV} must not be set when creating an execution")
-        lease: LogicalRunLease | None = None
-        logging_bundle: ExecutionLogging | None = None
+        lease: Union[LogicalRunLease, None] = None
+        logging_bundle: Union[ExecutionLogging, None] = None
         try:
             lease = claim_logical_run_lease(spec.run_dir)
             context = create_execution_context(
@@ -265,7 +273,7 @@ class ExecutionSession:
         execution_logging: ExecutionLogging,
         *,
         close_callbacks: Sequence[tuple[str, Callable[[], None]]] = (),
-        logical_run_lease: LogicalRunLease | None = None,
+        logical_run_lease: Union[LogicalRunLease, None] = None,
     ) -> Self:
         """Wrap framework-established context and logging without importing it."""
         return cls(
@@ -276,7 +284,7 @@ class ExecutionSession:
         )
 
     @property
-    def phase(self) -> str | None:
+    def phase(self) -> Union[str, None]:
         """Return the active or most recently completed phase name."""
         return self._phase
 
@@ -293,7 +301,7 @@ class ExecutionSession:
             self._register_owned_resource(self._owned_observers, "observer", observer.close)
             return observer
 
-    def create_background_pipeline[InputT, ResultT](
+    def create_background_pipeline(
         self,
         worker: Callable[[InputT], ResultT],
         *,
@@ -335,9 +343,10 @@ class ExecutionSession:
             if cleanup_errors:
                 first_error = cleanup_errors[0]
                 for later_error in cleanup_errors[1:]:
-                    first_error.add_note(
+                    add_exception_note(
+                        first_error,
                         "Later background pipeline cleanup failure: "
-                        f"{type(later_error).__name__}: {later_error}"
+                        f"{type(later_error).__name__}: {later_error}",
                     )
                 raise first_error
 
@@ -353,13 +362,15 @@ class ExecutionSession:
             try:
                 close_pipeline()
             except BaseException as cleanup_error:
-                registration_error.add_note(
+                add_exception_note(
+                    registration_error,
                     "Unregistered background pipeline cleanup failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    f"{type(cleanup_error).__name__}: {cleanup_error}",
                 )
                 for note in getattr(cleanup_error, "__notes__", ()):
-                    registration_error.add_note(
-                        f"Unregistered background pipeline cleanup detail: {note}"
+                    add_exception_note(
+                        registration_error,
+                        f"Unregistered background pipeline cleanup detail: {note}",
                     )
             raise
         return pipeline
@@ -394,7 +405,7 @@ class ExecutionSession:
         else:
             self.complete_phase()
 
-    def complete_phase(self, *, message: str | None = None) -> None:
+    def complete_phase(self, *, message: Union[str, None] = None) -> None:
         """Mark the active phase successful."""
         with self._resource_lock:
             self._require_open()
@@ -432,11 +443,11 @@ class ExecutionSession:
     def close(
         self,
         *,
-        error: BaseException | None = None,
-        exit_code: int | None = None,
-        signal: int | str | None = None,
-        message: str | None = None,
-        before_close: Callable[[], None] | None = None,
+        error: Union[BaseException, None] = None,
+        exit_code: Union[int, None] = None,
+        signal: Union[int, str, None] = None,
+        message: Union[str, None] = None,
+        before_close: Union[Callable[[], None], None] = None,
         prior_cleanup_errors: Sequence[tuple[str, BaseException]] = (),
     ) -> None:
         """Close owned resources, lifecycle logging, and registered finalizers once."""
@@ -514,7 +525,7 @@ class ExecutionSession:
         elif cleanup_errors and exit_code in {None, 0}:
             first_label, first_error = cleanup_errors[0]
             _attach_cleanup_errors(first_error, cleanup_errors[1:])
-            first_error.add_note(f"Cleanup stage: {first_label}")
+            add_exception_note(first_error, f"Cleanup stage: {first_label}")
             raise first_error
 
     def __enter__(self) -> Self:
@@ -524,9 +535,9 @@ class ExecutionSession:
 
     def __exit__(
         self,
-        exc_type: type[BaseException] | None,
-        exc_value: BaseException | None,
-        traceback: TracebackType | None,
+        exc_type: Union[type[BaseException], None],
+        exc_value: Union[BaseException, None],
+        traceback: Union[TracebackType, None],
     ) -> None:
         """Close the session without replacing a workload exception."""
         del exc_type, traceback
@@ -603,7 +614,7 @@ class ExecutionObserver:
     def start_phase(self, name: str) -> None:
         """Mark the beginning of one sequential phase."""
 
-    def complete_phase(self, *, message: str | None = None) -> None:
+    def complete_phase(self, *, message: Union[str, None] = None) -> None:
         """Mark the active phase successful."""
 
     def skip_phase(self, message: str) -> None:
@@ -619,9 +630,9 @@ class ExecutionObserver:
         task_id: str,
         *,
         completed: int,
-        total: int | None = None,
+        total: Union[int, None] = None,
         final: bool = False,
-        message: str | None = None,
+        message: Union[str, None] = None,
     ) -> None:
         """Report unit-consistent completed/total counters for one task."""
 
@@ -630,13 +641,13 @@ class ExecutionObserver:
         task_id: str,
         *,
         completed: int,
-        total: int | None = None,
-        message: str | None = None,
+        total: Union[int, None] = None,
+        message: Union[str, None] = None,
     ) -> None:
         """Record one final counted result as a complete task lifecycle."""
 
     @contextmanager
-    def heartbeats(self, *, message: str | None = None) -> Iterator[None]:
+    def heartbeats(self, *, message: Union[str, None] = None) -> Iterator[None]:
         """Emit periodic liveness heartbeats around long uncounted work."""
         yield
 
@@ -661,7 +672,7 @@ class SessionExecutionObserver(ExecutionObserver):
         """Start one sequential phase (and the process on first use)."""
         self.session.start_phase(name)
 
-    def complete_phase(self, *, message: str | None = None) -> None:
+    def complete_phase(self, *, message: Union[str, None] = None) -> None:
         """Mark the active phase successful."""
         self.session.complete_phase(message=message)
 
@@ -680,9 +691,9 @@ class SessionExecutionObserver(ExecutionObserver):
         task_id: str,
         *,
         completed: int,
-        total: int | None = None,
+        total: Union[int, None] = None,
         final: bool = False,
-        message: str | None = None,
+        message: Union[str, None] = None,
     ) -> None:
         """Emit one unit-consistent progress record for the active phase."""
         self.session.observer.progress(
@@ -699,8 +710,8 @@ class SessionExecutionObserver(ExecutionObserver):
         task_id: str,
         *,
         completed: int,
-        total: int | None = None,
-        message: str | None = None,
+        total: Union[int, None] = None,
+        message: Union[str, None] = None,
     ) -> None:
         """Emit one complete task holding a single final counted result."""
         with self.task(task_id):
@@ -713,7 +724,7 @@ class SessionExecutionObserver(ExecutionObserver):
             )
 
     @contextmanager
-    def heartbeats(self, *, message: str | None = None) -> Iterator[None]:
+    def heartbeats(self, *, message: Union[str, None] = None) -> Iterator[None]:
         """Emit periodic heartbeats for the active phase while work runs."""
         with self.session.observer.periodic_heartbeats(
             phase=self._active_phase(),
@@ -838,7 +849,7 @@ def _validate_resume_metadata(metadata: Any, expected: ExecutionSpec) -> None:
             )
 
 
-def _validate_resume_coordinate(name: str, value: int | None) -> None:
+def _validate_resume_coordinate(name: str, value: Union[int, None]) -> None:
     """Reject non-integral resume coordinates before exact metadata comparison."""
     if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
         raise ValueError(f"{name} must be a non-negative integer or None, got {value!r}.")
@@ -846,11 +857,11 @@ def _validate_resume_coordinate(name: str, value: int | None) -> None:
 
 def _validate_resume_facts(
     *,
-    resume_checkpoint: str | Path | None,
-    resume_checkpoint_sha256: str | None,
-    parent_execution_id: str | None,
-    starting_epoch: int | None,
-    starting_global_step: int | None,
+    resume_checkpoint: Union[str, Path, None],
+    resume_checkpoint_sha256: Union[str, None],
+    parent_execution_id: Union[str, None],
+    starting_epoch: Union[int, None],
+    starting_global_step: Union[int, None],
 ) -> None:
     """Require resume provenance to be wholly absent or fully attestable."""
     if resume_checkpoint is None:
@@ -888,7 +899,7 @@ def _freeze_runtime_value(value: Any) -> Any:
     """Freeze nested mappings and sequences retained by :class:`ExecutionSpec`."""
     if isinstance(value, Mapping):
         return _freeze_runtime_mapping(value)
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes | os.PathLike):
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, os.PathLike)):
         return tuple(_freeze_runtime_value(item) for item in value)
     return value
 
@@ -901,7 +912,7 @@ def _error_text(error: BaseException) -> str:
 
 def _first_cleanup_error(
     errors: Sequence[tuple[str, BaseException]],
-) -> BaseException | None:
+) -> Union[BaseException, None]:
     """Return the first captured cleanup failure, if any."""
     return errors[0][1] if errors else None
 
@@ -912,16 +923,16 @@ def _attach_cleanup_errors(
 ) -> None:
     """Retain cleanup failures as notes without replacing the primary error."""
     for label, error in errors:
-        primary_error.add_note(f"{label} cleanup also failed: {_error_text(error)}")
+        add_exception_note(primary_error, f"{label} cleanup also failed: {_error_text(error)}")
         for note in getattr(error, "__notes__", ()):
-            primary_error.add_note(f"{label} cleanup detail: {note}")
+            add_exception_note(primary_error, f"{label} cleanup detail: {note}")
 
 
 def _process_exit_code(
-    error: BaseException | None,
+    error: Union[BaseException, None],
     *,
-    requested: int | None,
-    phase_outcome: str | None,
+    requested: Union[int, None],
+    phase_outcome: Union[str, None],
     cleanup_failed: bool,
 ) -> int:
     """Derive a non-success process code without erasing caller precedence."""

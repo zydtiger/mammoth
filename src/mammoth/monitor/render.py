@@ -5,7 +5,8 @@ The CLI, tests, logs, and optional Rich UI share this canonical textual view.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
+from typing import Union
 
 from mammoth.monitor.fleet import FleetSnapshot, GroupMemberSnapshot, GroupSnapshot, MemberProgress
 from mammoth.monitor.model import MonitorSnapshot
@@ -14,11 +15,11 @@ from mammoth.monitor.model import MonitorSnapshot
 def render_snapshot(
     snapshot: MonitorSnapshot,
     *,
-    now: datetime | None = None,
+    now: Union[datetime, None] = None,
     stale_after_seconds: float = 90.0,
 ) -> str:
     """Render one deterministic plain-text snapshot without terminal escapes."""
-    current_time = now or datetime.now(UTC)
+    current_time = now or datetime.now(timezone.utc)
     metadata = snapshot.context.metadata
     lines = [
         f"Run: {metadata.run_name}",
@@ -78,7 +79,7 @@ def render_snapshot(
 def render_fleet_snapshot(
     fleet: FleetSnapshot,
     *,
-    now: datetime | None = None,
+    now: Union[datetime, None] = None,
     stale_after_seconds: float = 90.0,
 ) -> str:
     """Render one deterministic plain-text entry overview without terminal escapes.
@@ -88,7 +89,7 @@ def render_fleet_snapshot(
     status where recorded) followed by every loose run, or by one ad-hoc
     ``--match`` cohort when ``fleet.match_pattern`` is set.
     """
-    current_time = now or datetime.now(UTC)
+    current_time = now or datetime.now(timezone.utc)
     lines = [f"Entry: {fleet.entry}"]
     if fleet.match_pattern is not None:
         lines.append(f"Match: {fleet.match_pattern}")
@@ -125,7 +126,7 @@ def render_fleet_snapshot(
 def render_group_snapshot(
     group: GroupSnapshot,
     *,
-    now: datetime | None = None,
+    now: Union[datetime, None] = None,
     stale_after_seconds: float = 90.0,
 ) -> str:
     """Render one deterministic plain-text group view without terminal escapes.
@@ -135,7 +136,7 @@ def render_group_snapshot(
     aggregate ETA only when every pending member's own progress makes one
     honestly derivable.
     """
-    current_time = now or datetime.now(UTC)
+    current_time = now or datetime.now(timezone.utc)
     lines = [f"Group: {group.group_id}"]
     lines.append(f"Order: {group.order or '--'}")
     lines.append(f"Terminal: {group.terminal_status or 'unknown'}")
@@ -170,7 +171,7 @@ def _render_member_lines(
     return lines
 
 
-def _progress_text(progress: MemberProgress | None) -> str:
+def _progress_text(progress: Union[MemberProgress, None]) -> str:
     if progress is None:
         return "--"
     counts = (
@@ -184,7 +185,7 @@ def _progress_text(progress: MemberProgress | None) -> str:
     return f"{counts}{rate}{eta_text}"
 
 
-def _heartbeat_text(value: datetime | None, now: datetime, stale_after_seconds: float) -> str:
+def _heartbeat_text(value: Union[datetime, None], now: datetime, stale_after_seconds: float) -> str:
     if value is None:
         return "--"
     age_seconds = max(0.0, (now - value).total_seconds())
@@ -192,7 +193,7 @@ def _heartbeat_text(value: datetime | None, now: datetime, stale_after_seconds: 
     return f"{age} ago (stale)" if age_seconds > stale_after_seconds else f"{age} ago"
 
 
-def format_duration(seconds: float | None) -> str | None:
+def format_duration(seconds: Union[float, None]) -> Union[str, None]:
     """Return a compact duration for generic ETA display."""
     if seconds is None:
         return None

@@ -20,11 +20,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypeVar, Union
 
+from mammoth.compat import DATACLASS_SLOTS
 from mammoth.core.groups import (
     GROUP_MANIFEST_FILENAME,
     GroupEvent,
@@ -46,6 +47,8 @@ from mammoth.monitor.model import (
     parse_time,
     select_execution,
 )
+
+Row = TypeVar("Row")
 
 MemberStatus = Literal[
     "pending",
@@ -79,17 +82,17 @@ _ACTIVE_MEMBER_STATUSES = frozenset({"running", "stale"})
 _PENDING_MEMBER_STATUSES = frozenset({"pending", "running", "stale"})
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class MemberProgress:
     """One member run's current-task progress, folded from its execution tail."""
 
     completed: int
-    total: int | None
-    throughput: float | None
-    eta_seconds: float | None
+    total: Union[int, None]
+    throughput: Union[float, None]
+    eta_seconds: Union[float, None]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class StepSnapshot:
     """One member's declared step name and its folded lifecycle status."""
 
@@ -97,20 +100,20 @@ class StepSnapshot:
     status: ScopeStatus
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class GroupMemberSnapshot:
     """One group member row: schedule position, step statuses, and run tail."""
 
     run_name: str
     steps: tuple[StepSnapshot, ...]
     status: MemberStatus
-    active_step: str | None
-    progress: MemberProgress | None
-    updated_at: datetime | None
+    active_step: Union[str, None]
+    progress: Union[MemberProgress, None]
+    updated_at: Union[datetime, None]
     warnings: tuple[str, ...] = ()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class GroupSnapshot:
     """Folded state for one manifest-backed group or one ``--match`` cohort.
 
@@ -126,14 +129,14 @@ class GroupSnapshot:
     """
 
     group_id: str
-    manifest: GroupManifest | None
-    pattern: str | None
-    order: GroupOrder | None
+    manifest: Union[GroupManifest, None]
+    pattern: Union[str, None]
+    order: Union[GroupOrder, None]
     members: tuple[GroupMemberSnapshot, ...]
-    terminal_status: str | None
-    created_at: datetime | None
-    updated_at: datetime | None
-    finished_at: datetime | None = None
+    terminal_status: Union[str, None]
+    created_at: Union[datetime, None]
+    updated_at: Union[datetime, None]
+    finished_at: Union[datetime, None] = None
     warnings: tuple[str, ...] = ()
 
     @property
@@ -158,18 +161,18 @@ class GroupSnapshot:
         return sum(1 for member in self.members if member.status in _FAILED_MEMBER_STATUSES)
 
     @property
-    def active_member(self) -> str | None:
+    def active_member(self) -> Union[str, None]:
         """Return the most recently active running or stale member, if any."""
         active = [member for member in self.members if member.status in _ACTIVE_MEMBER_STATUSES]
         if not active:
             return None
         return max(
             active,
-            key=lambda member: member.updated_at or datetime.min.replace(tzinfo=UTC),
+            key=lambda member: member.updated_at or datetime.min.replace(tzinfo=timezone.utc),
         ).run_name
 
     @property
-    def aggregate_eta_seconds(self) -> float | None:
+    def aggregate_eta_seconds(self) -> Union[float, None]:
         """Return one honest combined ETA, or ``None`` when it cannot be trusted.
 
         Only derived when every not-yet-terminal member currently reports
@@ -198,7 +201,7 @@ class GroupSnapshot:
         return remaining / rate
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class LooseRunSnapshot:
     """Folded state for one run not claimed by any group.
 
@@ -211,13 +214,13 @@ class LooseRunSnapshot:
 
     run_name: str
     status: MemberStatus
-    progress: MemberProgress | None
-    updated_at: datetime | None
-    finished_at: datetime | None = None
+    progress: Union[MemberProgress, None]
+    updated_at: Union[datetime, None]
+    finished_at: Union[datetime, None] = None
     warnings: tuple[str, ...] = ()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class FleetSnapshot:
     """Complete entry-level roll-up: every group plus every loose run.
 
@@ -230,14 +233,14 @@ class FleetSnapshot:
     entry: Path
     groups: tuple[GroupSnapshot, ...]
     loose_runs: tuple[LooseRunSnapshot, ...]
-    match_pattern: str | None
+    match_pattern: Union[str, None]
     warnings: tuple[str, ...] = ()
 
 
-def _sorted_by_recency[Row](
+def _sorted_by_recency(
     rows: Sequence[Row],
     *,
-    key: Callable[[Row], tuple[datetime | None, datetime | None, str]],
+    key: Callable[[Row], tuple[Union[datetime, None], Union[datetime, None], str]],
 ) -> list[Row]:
     """Sort rows most-recent-first by ``(finished_at, updated_at, name)``.
 
@@ -257,11 +260,15 @@ def _sorted_by_recency[Row](
     return sorted(rows, key=sort_key)
 
 
-def _group_recency_key(group: GroupSnapshot) -> tuple[datetime | None, datetime | None, str]:
+def _group_recency_key(
+    group: GroupSnapshot,
+) -> tuple[Union[datetime, None], Union[datetime, None], str]:
     return (group.finished_at, group.updated_at, group.group_id)
 
 
-def _loose_run_recency_key(run: LooseRunSnapshot) -> tuple[datetime | None, datetime | None, str]:
+def _loose_run_recency_key(
+    run: LooseRunSnapshot,
+) -> tuple[Union[datetime, None], Union[datetime, None], str]:
     return (run.finished_at, run.updated_at, run.run_name)
 
 
@@ -284,8 +291,8 @@ class _MemberTail:
     poll.
     """
 
-    monitor: ExecutionMonitor | None = None
-    executions_signature: tuple[int, int] | None = None
+    monitor: Union[ExecutionMonitor, None] = None
+    executions_signature: Union[tuple[int, int], None] = None
 
 
 def discover_group_ids(entry: Path) -> list[str]:
@@ -335,7 +342,7 @@ class FleetMonitor:
     once rather than on every subsequent poll.
     """
 
-    def __init__(self, entry: Path, *, match: str | None = None) -> None:
+    def __init__(self, entry: Path, *, match: Union[str, None] = None) -> None:
         self.entry = Path(entry)
         self.match = match
         self._manifests: dict[str, GroupManifest] = {}
@@ -349,11 +356,11 @@ class FleetMonitor:
     def poll(
         self,
         *,
-        now: datetime | None = None,
+        now: Union[datetime, None] = None,
         stale_after_seconds: float = 90.0,
     ) -> FleetSnapshot:
         """Discover groups and loose runs, tail each incrementally, and fold state."""
-        observed_at = now or datetime.now(UTC)
+        observed_at = now or datetime.now(timezone.utc)
         groups: list[GroupSnapshot] = []
         claimed: set[str] = set()
         for group_id in discover_group_ids(self.entry):
@@ -409,7 +416,7 @@ class FleetMonitor:
             warnings=tuple(self._warnings),
         )
 
-    def _load_manifest(self, group_id: str) -> GroupManifest | None:
+    def _load_manifest(self, group_id: str) -> Union[GroupManifest, None]:
         if group_id in self._invalid_manifests:
             return None
         manifest = self._manifests.get(group_id)
@@ -452,8 +459,8 @@ def _fold_group(
     stale_after_seconds: float,
 ) -> GroupSnapshot:
     """Fold one manifest plus its group event stream into a full group row set."""
-    terminal_status: str | None = None
-    terminal_at: datetime | None = None
+    terminal_status: Union[str, None] = None
+    terminal_at: Union[datetime, None] = None
     started_runs: set[str] = set()
     latest_run_event: dict[str, GroupEvent] = {}
     latest_step_event: dict[tuple[str, str], GroupEvent] = {}
@@ -470,7 +477,7 @@ def _fold_group(
 
     members: list[GroupMemberSnapshot] = []
     warnings: list[str] = []
-    newest_heartbeat: datetime | None = None
+    newest_heartbeat: Union[datetime, None] = None
     for member in manifest.members:
         steps = tuple(
             StepSnapshot(
@@ -533,7 +540,7 @@ def _fold_adhoc_group(
     """Fold ``--match``-selected loose runs into one synthetic, manifest-free group."""
     members: list[GroupMemberSnapshot] = []
     warnings: list[str] = []
-    newest_heartbeat: datetime | None = None
+    newest_heartbeat: Union[datetime, None] = None
     for run_name in run_names:
         tail = _poll_member_tail(entry, run_name, tails)
         status: MemberStatus = (
@@ -601,7 +608,7 @@ def _poll_member_tail(
     entry: Path,
     run_name: str,
     tails: dict[str, _MemberTail],
-) -> MonitorSnapshot | None:
+) -> Union[MonitorSnapshot, None]:
     """Return a cheap incremental tail of one run's newest execution, if any.
 
     Reuses the cached :class:`~mammoth.monitor.model.ExecutionMonitor` for
@@ -638,7 +645,7 @@ def _poll_member_tail(
     return tail.monitor.poll()
 
 
-def _executions_dir_signature(layout: RunLayout) -> tuple[int, int] | None:
+def _executions_dir_signature(layout: RunLayout) -> Union[tuple[int, int], None]:
     """Return ``(link count, mtime in nanoseconds)`` for the executions directory.
 
     ``None`` when the directory cannot be stat-ed (for example, it does not
@@ -651,7 +658,7 @@ def _executions_dir_signature(layout: RunLayout) -> tuple[int, int] | None:
     return (status.st_nlink, status.st_mtime_ns)
 
 
-def _member_progress(tail: MonitorSnapshot | None) -> MemberProgress | None:
+def _member_progress(tail: Union[MonitorSnapshot, None]) -> Union[MemberProgress, None]:
     """Project one member's current task into unitless progress fields.
 
     ``eta_seconds`` is withheld (``None``) whenever the task carries no

@@ -27,11 +27,12 @@ import os
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, cast
+from typing import Any, Literal, Union, cast
 
+from mammoth.compat import DATACLASS_SLOTS
 from mammoth.core.artifacts import artifact_open_flags, atomic_write_json
 from mammoth.core.identity import validate_device_spec, validate_run_name
 from mammoth.core.layout import QueueLayout
@@ -39,16 +40,16 @@ from mammoth.core.layout import QueueLayout
 QUEUE_SCHEMA_VERSION = 1
 QUEUE_JOURNAL_SCHEMA_VERSION = 1
 
-JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
-ImmutableJsonValue = (
-    None
-    | bool
-    | int
-    | float
-    | str
-    | tuple["ImmutableJsonValue", ...]
-    | Mapping[str, "ImmutableJsonValue"]
-)
+JsonValue = Union[None, bool, int, float, str, list["JsonValue"], dict[str, "JsonValue"]]
+ImmutableJsonValue = Union[
+    None,
+    bool,
+    int,
+    float,
+    str,
+    tuple["ImmutableJsonValue", ...],
+    Mapping[str, "ImmutableJsonValue"],
+]
 JobStatus = Literal["completed", "failed", "interrupted"]
 
 _JOB_ID_MAX_LENGTH = 128
@@ -67,7 +68,7 @@ class JobAlreadyClaimedError(QueueError):
     """Raised when ``cancel_job`` targets a job that a lane already claimed."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class Job:
     """One immutable spooled job: opaque argv, device requirement, and metadata."""
 
@@ -78,7 +79,7 @@ class Job:
     expected_run_names: tuple[str, ...]
     device: str
     submitted_at: str
-    cwd: str | None
+    cwd: Union[str, None]
     metadata: Mapping[str, ImmutableJsonValue]
 
     def __post_init__(self) -> None:
@@ -145,7 +146,7 @@ class Job:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class JobOutcome:
     """One immutable terminal record appended to the completion journal."""
 
@@ -156,10 +157,10 @@ class JobOutcome:
     status: JobStatus
     time: str
     expected_run_names: tuple[str, ...]
-    return_code: int | None = None
-    signal: int | None = None
-    duration_seconds: float | None = None
-    message: str | None = None
+    return_code: Union[int, None] = None
+    signal: Union[int, None] = None
+    duration_seconds: Union[float, None] = None
+    message: Union[str, None] = None
 
     def __post_init__(self) -> None:
         if self.schema_version != QUEUE_JOURNAL_SCHEMA_VERSION:
@@ -184,7 +185,7 @@ class JobOutcome:
         ):
             raise ValueError("Job outcome signal must be an integer or None.")
         if self.duration_seconds is not None and (
-            not isinstance(self.duration_seconds, int | float)
+            not isinstance(self.duration_seconds, (int, float))
             or isinstance(self.duration_seconds, bool)
             or self.duration_seconds < 0
         ):
@@ -248,7 +249,7 @@ class JobOutcome:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class QueueSnapshot:
     """Passively readable pending, claimed, and terminal queue state.
 
@@ -270,7 +271,7 @@ class QueueSnapshot:
     failed: tuple[JobOutcome, ...]
     interrupted: tuple[JobOutcome, ...]
     malformed_job_files: tuple[str, ...] = ()
-    journal_error: str | None = None
+    journal_error: Union[str, None] = None
 
 
 def submit_job(
@@ -279,8 +280,8 @@ def submit_job(
     argv: Sequence[str],
     expected_run_names: Sequence[str],
     device: str,
-    cwd: str | os.PathLike[str] | None = None,
-    metadata: Mapping[str, Any] | None = None,
+    cwd: Union[str, os.PathLike[str], None] = None,
+    metadata: Union[Mapping[str, Any], None] = None,
 ) -> Job:
     """Durably enqueue one opaque job under ``entry``'s pending spool.
 
@@ -339,7 +340,7 @@ def list_jobs(entry: Path) -> QueueSnapshot:
             claimed.extend(_load_all(_glob_json(lane_dir)))
     claimed_sorted = tuple(sorted(claimed, key=lambda job: job.sequence))
 
-    journal_error: str | None = None
+    journal_error: Union[str, None] = None
     outcomes: tuple[JobOutcome, ...] = ()
     try:
         outcomes = read_job_journal(layout.journal_path)
@@ -486,14 +487,14 @@ def _load_job(path: Path) -> Job:
         raise QueueError(f"Malformed queue job file {path}: {error}") from error
 
 
-def _find_job_file(directory: Path, job_id: str) -> Path | None:
+def _find_job_file(directory: Path, job_id: str) -> Union[Path, None]:
     if not directory.is_dir():
         return None
     matches = sorted(directory.glob(f"*-{job_id}.json"))
     return matches[0] if matches else None
 
 
-def _find_claimed_job_file(claimed_dir: Path, job_id: str) -> Path | None:
+def _find_claimed_job_file(claimed_dir: Path, job_id: str) -> Union[Path, None]:
     if not claimed_dir.is_dir():
         return None
     matches = sorted(claimed_dir.glob(f"*/*-{job_id}.json"))
@@ -537,7 +538,7 @@ def _allocate_sequence(layout: QueueLayout) -> int:
 
 
 def _generate_job_id() -> str:
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return f"{timestamp}-{uuid.uuid4().hex}"
 
 
@@ -580,7 +581,7 @@ def _validate_run_names(names: Sequence[str]) -> tuple[str, ...]:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _parse_utc_time(value: str) -> datetime:
@@ -590,7 +591,7 @@ def _parse_utc_time(value: str) -> datetime:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError as error:
         raise ValueError(f"Invalid UTC timestamp: {value!r}.") from error
-    if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
         raise ValueError(f"Timestamp must use UTC: {value!r}.")
     return parsed
 
@@ -615,7 +616,7 @@ def _validate_json_compatible(value: Any, *, depth: int = 0) -> JsonValue:
                 raise ValueError("Job metadata keys must be strings.")
             detached[key] = _validate_json_compatible(item, depth=depth + 1)
         return detached
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_validate_json_compatible(item, depth=depth + 1) for item in value]
     raise ValueError(
         f"Job metadata must contain JSON-compatible values, got {type(value).__name__}."
@@ -625,9 +626,9 @@ def _validate_json_compatible(value: Any, *, depth: int = 0) -> JsonValue:
 def _freeze_json(value: Any) -> ImmutableJsonValue:
     if isinstance(value, Mapping):
         return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
-    if isinstance(value, list | tuple):
+    if isinstance(value, (list, tuple)):
         return tuple(_freeze_json(item) for item in value)
-    return cast(None | bool | int | float | str, value)
+    return cast(Union[None, bool, int, float, str], value)
 
 
 def _thaw_json(value: ImmutableJsonValue) -> JsonValue:
@@ -645,7 +646,7 @@ def _required_string(payload: Mapping[str, Any], key: str) -> str:
     return value
 
 
-def _optional_string(payload: Mapping[str, Any], key: str) -> str | None:
+def _optional_string(payload: Mapping[str, Any], key: str) -> Union[str, None]:
     value = payload.get(key)
     if value is None:
         return None
@@ -661,7 +662,7 @@ def _required_int(payload: Mapping[str, Any], key: str) -> int:
     return value
 
 
-def _optional_int(payload: Mapping[str, Any], key: str) -> int | None:
+def _optional_int(payload: Mapping[str, Any], key: str) -> Union[int, None]:
     value = payload.get(key)
     if value is None:
         return None
@@ -670,10 +671,10 @@ def _optional_int(payload: Mapping[str, Any], key: str) -> int | None:
     return value
 
 
-def _optional_number(payload: Mapping[str, Any], key: str) -> float | None:
+def _optional_number(payload: Mapping[str, Any], key: str) -> Union[float, None]:
     value = payload.get(key)
     if value is None:
         return None
-    if not isinstance(value, int | float) or isinstance(value, bool):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ValueError(f"queue field {key!r} must be a number or null.")
     return float(value)

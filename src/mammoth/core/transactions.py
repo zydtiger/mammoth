@@ -20,8 +20,9 @@ from contextlib import suppress
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, overload
+from typing import Any, Literal, Union, overload
 
+from mammoth.compat import DATACLASS_SLOTS, add_exception_note
 from mammoth.core.artifacts import ArtifactReceipt, inspect_artifact
 from mammoth.core.leases import (
     LeaseNamespaceConflictError,
@@ -30,10 +31,10 @@ from mammoth.core.leases import (
     claim_lease_namespace,
 )
 
-type ArtifactKind = Literal["file", "directory"]
-type PublicationMode = Literal["create_only", "replace"]
-type RecoveryPolicy = Literal["roll_forward", "rollback_before_commit"]
-type ArtifactValidator = Callable[[Path], object]
+ArtifactKind = Literal["file", "directory"]
+PublicationMode = Literal["create_only", "replace"]
+RecoveryPolicy = Literal["roll_forward", "rollback_before_commit"]
+ArtifactValidator = Callable[[Path], object]
 
 _JOURNAL_VERSION = 2
 _TRANSACTION_DIRECTORY_NAME = ".mammoth-transactions"
@@ -51,7 +52,7 @@ _ARTIFACT_STATES = frozenset(
 )
 _RENAME_NOREPLACE = 1
 _RENAME_EXCHANGE = 2
-_ACTIVE_TRANSACTION_ROOTS: ContextVar[tuple[tuple[Path, int], ...] | None] = ContextVar(
+_ACTIVE_TRANSACTION_ROOTS: ContextVar[Union[tuple[tuple[Path, int], ...], None]] = ContextVar(
     "mammoth_active_transaction_roots", default=None
 )
 
@@ -76,7 +77,7 @@ class ArtifactTransactionRecoveryError(ArtifactTransactionError):
     """Raised when recovery cannot authenticate an object before changing it."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class TransactionArtifact:
     """One caller-prepared staged object and its stable publication target.
 
@@ -89,10 +90,10 @@ class TransactionArtifact:
     stage: Path
     target: Path
     kind: ArtifactKind
-    validator: ArtifactValidator | None = None
+    validator: Union[ArtifactValidator, None] = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class TransactionArtifactSpec:
     """Describe one consumer artifact before Mammoth derives its transaction paths.
 
@@ -104,10 +105,10 @@ class TransactionArtifactSpec:
     key: str
     target: Path
     kind: ArtifactKind
-    validator: ArtifactValidator | None = None
+    validator: Union[ArtifactValidator, None] = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class ArtifactTransactionPlan:
     """Immutable caller contract for one local publication transaction.
 
@@ -126,7 +127,7 @@ class ArtifactTransactionPlan:
     artifact_roots: tuple[Path, ...] = ()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class TransactionObjectIdentity:
     """Transaction-local identity used to authenticate one file or tree."""
 
@@ -137,7 +138,7 @@ class TransactionObjectIdentity:
     sha256: str
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class ArtifactTransactionResult:
     """Outcome of publication or recovery without hiding retained evidence."""
 
@@ -148,7 +149,7 @@ class ArtifactTransactionResult:
     preserved_evidence: tuple[Path, ...] = ()
 
 
-@dataclass(slots=True)
+@dataclass(**DATACLASS_SLOTS)
 class _TransactionLease:
     """One held advisory target lease managed by a transaction operation."""
 
@@ -164,7 +165,7 @@ class _TransactionLease:
         self.namespace.retire()
 
 
-@dataclass(slots=True)
+@dataclass(**DATACLASS_SLOTS)
 class _JournalHandle:
     """Current exact-byte receipt that authorizes one journal replacement."""
 
@@ -384,10 +385,10 @@ def recover_artifact_transaction(
 @overload
 def recover_artifact_transaction(
     plan: ArtifactTransactionPlan, *, missing_ok: Literal[True]
-) -> ArtifactTransactionResult | None: ...
+) -> Union[ArtifactTransactionResult, None]: ...
 def recover_artifact_transaction(
     plan: ArtifactTransactionPlan, *, missing_ok: bool = False
-) -> ArtifactTransactionResult | None:
+) -> Union[ArtifactTransactionResult, None]:
     """Idempotently recover one recorded transaction against its expected plan.
 
     Set ``missing_ok=True`` to return ``None`` when no active or retired
@@ -594,8 +595,8 @@ def stage_transaction_file(plan: ArtifactTransactionPlan, key: str, payload: byt
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     if not hasattr(os, "O_NOFOLLOW"):
         raise NotImplementedError("artifact transactions require os.O_NOFOLLOW")
-    descriptor: int | None = None
-    created_identity: tuple[int, int] | None = None
+    descriptor: Union[int, None] = None
+    created_identity: Union[tuple[int, int], None] = None
     complete = False
     try:
         parent_descriptor, name = open_confined_parent(stage, lease_root=root)
@@ -669,7 +670,7 @@ def move_directory_into_transaction_stage(
         validate_existing_object(stage, "directory", "stage")
         raise FileExistsError(f"transaction stage already exists: {stage}")
 
-    reservation: tuple[int, int] | None = None
+    reservation: Union[tuple[int, int], None] = None
     exchanged = False
     try:
         reservation = _reserve_transaction_directory(stage, root)
@@ -1199,13 +1200,13 @@ def claim_artifact_transaction_leases(plan: ArtifactTransactionPlan) -> _Transac
     return _TransactionLeases(leases, root_descriptors)
 
 
-@dataclass(slots=True)
+@dataclass(**DATACLASS_SLOTS)
 class _TransactionLeases:
     """Context manager that owns all leases acquired for one operation."""
 
     leases: list[_TransactionLease]
     root_descriptors: list[tuple[Path, int]]
-    context_token: Token[tuple[tuple[Path, int], ...] | None] | None = None
+    context_token: Union[Token[Union[tuple[tuple[Path, int], ...], None]], None] = None
 
     def __enter__(self) -> _TransactionLeases:
         """Keep all target locks until publication or recovery has finished."""
@@ -1249,7 +1250,9 @@ class _TransactionLeases:
         if errors:
             first = errors[0]
             for later in errors[1:]:
-                first.add_note(f"Additional transaction lease cleanup failure: {later!r}")
+                add_exception_note(
+                    first, f"Additional transaction lease cleanup failure: {later!r}"
+                )
             raise first
 
 
@@ -1542,7 +1545,7 @@ def sync_file_strict(path: Path) -> None:
         os.close(descriptor)
 
 
-def sync_directory_strict(path: Path, *, lease_root: Path | None = None) -> None:
+def sync_directory_strict(path: Path, *, lease_root: Union[Path, None] = None) -> None:
     """Synchronize a parent directory after every recovery-relevant name mutation."""
     descriptor = open_confined_directory(path, lease_root=lease_root)
     try:
@@ -1553,7 +1556,7 @@ def sync_directory_strict(path: Path, *, lease_root: Path | None = None) -> None
         os.close(descriptor)
 
 
-def open_confined_directory(path: Path, *, lease_root: Path | None = None) -> int:
+def open_confined_directory(path: Path, *, lease_root: Union[Path, None] = None) -> int:
     """Open a directory without allowing a later ancestor symlink to redirect it."""
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     if not hasattr(os, "O_NOFOLLOW"):
@@ -1624,7 +1627,7 @@ def open_absolute_directory_without_symlinks(path: Path) -> int:
         raise
 
 
-def open_confined_parent(path: Path, *, lease_root: Path | None = None) -> tuple[int, str]:
+def open_confined_parent(path: Path, *, lease_root: Union[Path, None] = None) -> tuple[int, str]:
     """Open one final path's parent through an anchored no-follow directory walk."""
     return open_confined_directory(path.parent, lease_root=lease_root), path.name
 
@@ -2143,7 +2146,7 @@ def move_original_to_backup(
     journal: dict[str, Any],
     artifact: TransactionArtifact,
     record: dict[str, Any],
-    original_identity: TransactionObjectIdentity | None,
+    original_identity: Union[TransactionObjectIdentity, None],
     backup: Path,
     target_exists: bool,
 ) -> None:
@@ -2339,7 +2342,7 @@ def require_matching_object(path: Path, identity: TransactionObjectIdentity, lab
 
 
 def rename_without_overwrite(
-    source: Path, destination: Path, *, lease_root: Path | None = None
+    source: Path, destination: Path, *, lease_root: Union[Path, None] = None
 ) -> None:
     """Atomically rename without overwriting a destination that races into view."""
     if object_exists(destination):
@@ -2385,7 +2388,7 @@ def rename_without_overwrite(
     )
 
 
-def rename_exchange(first: Path, second: Path, *, lease_root: Path | None = None) -> None:
+def rename_exchange(first: Path, second: Path, *, lease_root: Union[Path, None] = None) -> None:
     """Atomically exchange two same-filesystem names for safe cleanup quarantine."""
     renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
     if renameat2 is None:
@@ -2480,7 +2483,9 @@ def remove_retired_directory_tree(
     remove_authenticated_directory_tree(path, lease_root=lease_root)
 
 
-def remove_authenticated_directory_tree(path: Path, *, lease_root: Path | None = None) -> None:
+def remove_authenticated_directory_tree(
+    path: Path, *, lease_root: Union[Path, None] = None
+) -> None:
     """Recursively remove an ordinary tree through no-follow directory descriptors."""
     descriptor = open_confined_directory(path, lease_root=lease_root)
     try:

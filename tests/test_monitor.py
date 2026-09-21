@@ -6,7 +6,7 @@ import random
 import subprocess
 import threading
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from itertools import count
 from pathlib import Path
 from unittest import mock
@@ -288,7 +288,7 @@ def test_monitor_folds_generic_tasks_metrics_throughput_and_eta(tmp_path: Path) 
 
     rendered = render_snapshot(
         snapshot,
-        now=datetime(2026, 1, 1, tzinfo=UTC),
+        now=datetime(2026, 1, 1, tzinfo=timezone.utc),
         stale_after_seconds=10**9,
     )
     assert "rank-0/opaque/unit-1: running 4/10 rate=2.0 b/s eta=3s" in rendered
@@ -633,7 +633,7 @@ def test_dashboard_renders_identity_progress_metrics_and_viewer_telemetry(
             host=host,
             detail=True,
             compact=False,
-            now=datetime.now(UTC),
+            now=datetime.now(timezone.utc),
         )
     )
     rendered = console.export_text()
@@ -827,7 +827,7 @@ def test_dashboard_restores_legacy_wide_and_compact_information_hierarchy(
             GpuTelemetry(1, "GPU One", 75.0, 2800.0, 275.25),
         ),
     )
-    now = datetime(2026, 1, 2, 0, 10, tzinfo=UTC)
+    now = datetime(2026, 1, 2, 0, 10, tzinfo=timezone.utc)
 
     wide_console = Console(width=140, record=True, color_system=None)
     wide_console.print(
@@ -944,7 +944,7 @@ def test_dashboard_keeps_parent_overview_and_active_leaf_rank_progress(
             host=None,
             detail=False,
             compact=False,
-            now=datetime(2026, 1, 1, 0, 1, tzinfo=UTC),
+            now=datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc),
         )
     )
     rendered = console.export_text()
@@ -1204,7 +1204,9 @@ def test_fleet_dashboard_layout_renders_group_roll_up_and_selection_marker(
     snapshot = FleetMonitor(entry).poll()
     console = Console(width=120, record=True, color_system=None)
     console.print(
-        fleet_dashboard_layout(snapshot, selected_index=0, compact=False, now=datetime.now(UTC))
+        fleet_dashboard_layout(
+            snapshot, selected_index=0, compact=False, now=datetime.now(timezone.utc)
+        )
     )
     rendered = console.export_text()
 
@@ -1241,7 +1243,7 @@ def test_group_dashboard_layout_renders_member_steps_and_progress(tmp_path: Path
     console = Console(width=120, record=True, color_system=None)
     console.print(
         group_dashboard_layout(
-            snapshot.groups[0], selected_index=0, compact=False, now=datetime.now(UTC)
+            snapshot.groups[0], selected_index=0, compact=False, now=datetime.now(timezone.utc)
         )
     )
     rendered = console.export_text()
@@ -1844,7 +1846,7 @@ def test_fleet_dashboard_layout_windows_loose_runs_around_the_selection(tmp_path
             snapshot,
             selected_index=10,
             compact=False,
-            now=datetime.now(UTC),
+            now=datetime.now(timezone.utc),
             viewport_rows=20,
         )
     )
@@ -1872,7 +1874,7 @@ def test_fleet_dashboard_layout_reaches_first_and_last_rows_without_a_dangling_m
                 snapshot,
                 selected_index=selected_index,
                 compact=False,
-                now=datetime.now(UTC),
+                now=datetime.now(timezone.utc),
                 viewport_rows=20,
             )
         )
@@ -1906,7 +1908,7 @@ def test_group_dashboard_layout_windows_members_around_the_selection(tmp_path: P
             group,
             selected_index=10,
             compact=False,
-            now=datetime.now(UTC),
+            now=datetime.now(timezone.utc),
             viewport_rows=20,
         )
     )

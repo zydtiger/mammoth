@@ -11,13 +11,15 @@ import random
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Literal, Union, cast
 
 import torch
 
-type MatmulPrecision = Literal["highest", "high", "medium"]
-type TorchAutocastDtype = Literal["bf16", "fp16"]
-type TorchSDPABackend = Literal["default", "flash", "mem-efficient", "math", "cudnn"]
+from mammoth.compat import DATACLASS_SLOTS
+
+MatmulPrecision = Literal["highest", "high", "medium"]
+TorchAutocastDtype = Literal["bf16", "fp16"]
+TorchSDPABackend = Literal["default", "flash", "mem-efficient", "math", "cudnn"]
 
 _TORCH_MIN_SEED = -(2**63)
 _TORCH_MAX_SEED = 2**64 - 1
@@ -82,16 +84,16 @@ TORCH_LOG_ARTIFACTS: frozenset[str] = frozenset(
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class TorchBackendConfig:
     """Optional process-global PyTorch numerical backend settings."""
 
-    matmul_precision: MatmulPrecision | None = None
-    cuda_matmul_allow_tf32: bool | None = None
-    cudnn_allow_tf32: bool | None = None
-    cudnn_benchmark: bool | None = None
-    cudnn_deterministic: bool | None = None
-    deterministic_algorithms: bool | None = None
+    matmul_precision: Union[MatmulPrecision, None] = None
+    cuda_matmul_allow_tf32: Union[bool, None] = None
+    cudnn_allow_tf32: Union[bool, None] = None
+    cudnn_benchmark: Union[bool, None] = None
+    cudnn_deterministic: Union[bool, None] = None
+    deterministic_algorithms: Union[bool, None] = None
     deterministic_warn_only: bool = False
 
     def __post_init__(self) -> None:
@@ -113,7 +115,7 @@ class TorchBackendConfig:
             raise ValueError("deterministic_warn_only requires deterministic_algorithms to be set")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class TorchBackendState:
     """Capture the effective process-global PyTorch numerical backend state."""
 
@@ -126,7 +128,7 @@ class TorchBackendState:
     deterministic_warn_only: bool
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class TorchSeedPolicy:
     """Select which generic random-number generators receive one integer seed."""
 
@@ -196,7 +198,7 @@ def parse_torch_logs(requested: str) -> tuple[dict[str, Any], list[str]]:
 
 def autocast_dtype_for_device(
     device: str,
-    requested: TorchAutocastDtype | None,
+    requested: Union[TorchAutocastDtype, None],
 ) -> torch.dtype:
     """Resolve an autocast dtype for a device, defaulting by device type."""
     if requested == "bf16":
@@ -211,7 +213,7 @@ def autocast_context(
     device: str,
     *,
     enabled: bool,
-    dtype: TorchAutocastDtype | None,
+    dtype: Union[TorchAutocastDtype, None],
 ) -> Iterator[None]:
     """Yield an autocast context for one device with an explicit dtype override."""
     device_type = torch.device(device).type
@@ -307,7 +309,7 @@ def _current_matmul_precision(cuda_matmul_allow_tf32: bool) -> MatmulPrecision:
 def _normalized_matmul_precision(
     config: TorchBackendConfig,
     previous: TorchBackendState,
-) -> MatmulPrecision | None:
+) -> Union[MatmulPrecision, None]:
     """Express the legacy CUDA TF32 choice through the readable precision API."""
     precision = config.matmul_precision
     allow_tf32 = config.cuda_matmul_allow_tf32

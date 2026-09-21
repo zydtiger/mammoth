@@ -10,10 +10,11 @@ import bisect
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Union
 
+from mammoth.compat import DATACLASS_SLOTS
 from mammoth.core.events import (
     ExecutionEvent,
     ExecutionEventReadError,
@@ -62,12 +63,12 @@ _TERMINAL_SCOPE_STATUS: dict[str, ScopeStatus] = {
 }
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class ProducerKey:
     """Stable stream identity for a runner or process rank."""
 
     source: str
-    rank: int | None = None
+    rank: Union[int, None] = None
 
     @property
     def label(self) -> str:
@@ -75,43 +76,43 @@ class ProducerKey:
         return "runner" if self.rank is None else f"rank-{self.rank}"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class MetricPoint:
     """One time-indexed metric value with opaque project coordinates."""
 
     time: datetime
     value: float
     producer: ProducerKey
-    coordinates: Mapping[str, int | float | str]
+    coordinates: Mapping[str, Union[int, float, str]]
 
 
-@dataclass(slots=True)
+@dataclass(**DATACLASS_SLOTS)
 class TaskState:
     """Folded state for one producer-owned task."""
 
     producer: ProducerKey
     phase: str
     task_id: str
-    parent_task_id: str | None = None
+    parent_task_id: Union[str, None] = None
     status: ScopeStatus = "pending"
     completed: int = 0
-    total: int | None = None
-    throughput: float | None = None
-    message: str | None = None
-    started_at: datetime | None = None
-    updated_at: datetime | None = None
-    coordinates: dict[str, int | float | str] = field(default_factory=dict)
+    total: Union[int, None] = None
+    throughput: Union[float, None] = None
+    message: Union[str, None] = None
+    started_at: Union[datetime, None] = None
+    updated_at: Union[datetime, None] = None
+    coordinates: dict[str, Union[int, float, str]] = field(default_factory=dict)
     display_metrics: dict[str, float] = field(default_factory=dict)
 
     @property
-    def fraction(self) -> float | None:
+    def fraction(self) -> Union[float, None]:
         """Return bounded completion fraction when a nonzero total exists."""
         if self.total is None or self.total <= 0:
             return None
         return min(1.0, max(0.0, self.completed / self.total))
 
     @property
-    def eta_seconds(self) -> float | None:
+    def eta_seconds(self) -> Union[float, None]:
         """Estimate remaining seconds from observed task work only."""
         if (
             self.status != "running"
@@ -130,18 +131,18 @@ class TaskState:
         return elapsed * (self.total - self.completed) / self.completed
 
 
-@dataclass(slots=True)
+@dataclass(**DATACLASS_SLOTS)
 class ProducerState:
     """Folded process or runner state and its last observation time."""
 
     key: ProducerKey
     status: ScopeStatus = "pending"
-    phase: str | None = None
+    phase: Union[str, None] = None
     sequence: int = 0
-    updated_at: datetime | None = None
-    last_event: str | None = None
-    exit_code: int | None = None
-    signal: int | str | None = None
+    updated_at: Union[datetime, None] = None
+    last_event: Union[str, None] = None
+    exit_code: Union[int, None] = None
+    signal: Union[int, str, None] = None
 
     def effective_status(self, now: datetime, stale_after_seconds: float) -> ScopeStatus:
         """Return ``stale`` for a nonterminal producer with an old heartbeat."""
@@ -151,7 +152,7 @@ class ProducerState:
         return "stale" if age > stale_after_seconds else self.status
 
 
-@dataclass(slots=True)
+@dataclass(**DATACLASS_SLOTS)
 class MonitorSnapshot:
     """Complete project-neutral state reconstructed from one execution."""
 
@@ -200,7 +201,7 @@ class MonitorSnapshot:
         return max(0.0, (self.updated_at - self.created_at).total_seconds())
 
     @property
-    def terminal_event_time(self) -> datetime | None:
+    def terminal_event_time(self) -> Union[datetime, None]:
         """Return when this execution reached a terminal outcome, if it has.
 
         Returns ``None`` unless ``status`` itself is terminal (``completed``,
@@ -231,7 +232,7 @@ class MonitorSnapshot:
         return parse_time(preferred[-1].time) if preferred else None
 
     @property
-    def current_task(self) -> TaskState | None:
+    def current_task(self) -> Union[TaskState, None]:
         """Return the newest running task, or the newest observed task."""
         tasks = sorted(
             self.tasks.values(),
@@ -241,13 +242,13 @@ class MonitorSnapshot:
         return (running or tasks)[-1] if tasks else None
 
     @property
-    def current_coordinates(self) -> dict[str, int | float | str]:
+    def current_coordinates(self) -> dict[str, Union[int, float, str]]:
         """Return coordinates from the current task without assigning semantics."""
         task = self.current_task
         return dict(task.coordinates) if task is not None else {}
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class RunSnapshot:
     """All valid execution snapshots for one logical run."""
 
@@ -270,7 +271,7 @@ class RunSnapshot:
         selected = self.selected
         by_id = {snapshot.execution_id: snapshot for snapshot in self.executions}
         reversed_lineage: list[MonitorSnapshot] = []
-        current: MonitorSnapshot | None = selected
+        current: Union[MonitorSnapshot, None] = selected
         seen: set[str] = set()
         while current is not None and current.execution_id not in seen:
             reversed_lineage.append(current)
@@ -280,9 +281,9 @@ class RunSnapshot:
         return tuple(reversed(reversed_lineage))
 
     @property
-    def logical_coordinates(self) -> dict[str, int | float | str]:
+    def logical_coordinates(self) -> dict[str, Union[int, float, str]]:
         """Return latest coordinates across the selected explicit resume lineage."""
-        coordinates: dict[str, int | float | str] = {}
+        coordinates: dict[str, Union[int, float, str]] = {}
         for snapshot in self.resume_lineage:
             tasks = sorted(
                 snapshot.tasks.values(),
@@ -293,10 +294,10 @@ class RunSnapshot:
         return coordinates
 
     @property
-    def logical_source_execution_id(self) -> str | None:
+    def logical_source_execution_id(self) -> Union[str, None]:
         """Return the execution that supplied the newest logical coordinates."""
-        source: str | None = None
-        latest: datetime | None = None
+        source: Union[str, None] = None
+        latest: Union[datetime, None] = None
         for snapshot in self.resume_lineage:
             for task in snapshot.tasks.values():
                 if not task.coordinates or task.updated_at is None:
@@ -356,7 +357,7 @@ def discover_executions(layout: RunLayout) -> tuple[list[ExecutionContext], list
     return contexts, warnings
 
 
-def select_execution(layout: RunLayout, execution_id: str | None = None) -> ExecutionContext:
+def select_execution(layout: RunLayout, execution_id: Union[str, None] = None) -> ExecutionContext:
     """Select an exact attempt or the newest valid attempt without guessing names."""
     if execution_id is not None:
         return join_execution_context(
@@ -572,7 +573,7 @@ def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
             )
 
 
-def combined_coordinates(event: ExecutionEvent) -> dict[str, int | float | str]:
+def combined_coordinates(event: ExecutionEvent) -> dict[str, Union[int, float, str]]:
     """Return new coordinates plus compatible scalar legacy extension fields."""
     coordinates = dict(event.coordinates)
     for name in (
@@ -586,7 +587,7 @@ def combined_coordinates(event: ExecutionEvent) -> dict[str, int | float | str]:
         "slide_id",
     ):
         value = event.extensions.get(name)
-        if isinstance(value, int | float | str) and not isinstance(value, bool):
+        if isinstance(value, (int, float, str)) and not isinstance(value, bool):
             coordinates.setdefault(name, value)
     return coordinates
 
@@ -594,8 +595,8 @@ def combined_coordinates(event: ExecutionEvent) -> dict[str, int | float | str]:
 def _metric_precedes_resume(
     point: MetricPoint,
     *,
-    starting_global_step: int | None,
-    starting_epoch: int | None,
+    starting_global_step: Union[int, None],
+    starting_epoch: Union[int, None],
 ) -> bool:
     """Return whether a parent metric remains before a resumed child horizon."""
     global_step = point.coordinates.get("global_step")
@@ -673,9 +674,9 @@ class ExecutionMonitor:
     def __init__(
         self,
         layout: RunLayout,
-        execution_id: str | None = None,
+        execution_id: Union[str, None] = None,
         *,
-        tail_window_bytes: int | None = None,
+        tail_window_bytes: Union[int, None] = None,
     ) -> None:
         self.layout = layout
         self.context = select_execution(layout, execution_id)
@@ -710,7 +711,15 @@ class ExecutionMonitor:
         for event in new_events:
             apply_event(self._snapshot, event)
             if event.is_terminal:
-                bisect.insort(self._retained_events, event, key=_event_sort_key)
+                key = _event_sort_key(event)
+                left, right = 0, len(self._retained_events)
+                while left < right:
+                    middle = (left + right) // 2
+                    if key < _event_sort_key(self._retained_events[middle]):
+                        right = middle
+                    else:
+                        left = middle + 1
+                self._retained_events.insert(left, event)
             if event.event in _TERMINAL_RUN_STATUS:
                 self._has_runner_terminal = True
         _finalize_run_status(self._snapshot, has_runner_terminal=self._has_runner_terminal)
@@ -737,7 +746,7 @@ class RunMonitor:
     def __init__(
         self,
         layout: RunLayout,
-        execution_id: str | None = None,
+        execution_id: Union[str, None] = None,
         *,
         lazy_first_poll: bool = False,
     ) -> None:
@@ -748,7 +757,7 @@ class RunMonitor:
         self._monitors: dict[str, ExecutionMonitor] = {}
         self._lazy_next_poll = lazy_first_poll
 
-    def poll(self, selected_execution_id: str | None = None) -> RunSnapshot:
+    def poll(self, selected_execution_id: Union[str, None] = None) -> RunSnapshot:
         """Discover attempts, tail each stream, and select one execution."""
         contexts, warnings = discover_executions(self.layout)
         if not contexts:
@@ -801,5 +810,5 @@ def parse_time(value: str) -> datetime:
     """Parse a validated schema-v1 UTC timestamp."""
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)

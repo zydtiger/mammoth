@@ -12,8 +12,9 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO, cast
+from typing import TYPE_CHECKING, TextIO, Union, cast
 
+from mammoth.compat import add_exception_note
 from mammoth.core.execution import ExecutionContext
 
 DEFAULT_TEXT_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -78,7 +79,13 @@ def claim_process_text_log(path: Path) -> ProcessTextLogLease:
     )
 
 
-class ProcessTextLogHandler(logging.StreamHandler[TextIO]):
+if TYPE_CHECKING:
+    _TextStreamHandler = logging.StreamHandler[TextIO]
+else:
+    _TextStreamHandler = logging.StreamHandler
+
+
+class ProcessTextLogHandler(_TextStreamHandler):
     """A plain UTF-8 handler that owns and closes one rank log descriptor."""
 
     def __init__(self, path: Path, *, level: int = logging.INFO) -> None:
@@ -88,8 +95,8 @@ class ProcessTextLogHandler(logging.StreamHandler[TextIO]):
         flags = os.O_WRONLY | os.O_APPEND
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
-        descriptor: int | None = None
-        stream: TextIO | None = None
+        descriptor: Union[int, None] = None
+        stream: Union[TextIO, None] = None
         try:
             descriptor = os.open(self.path, flags)
             descriptor_stat = os.fstat(descriptor)
@@ -112,16 +119,18 @@ class ProcessTextLogHandler(logging.StreamHandler[TextIO]):
                 elif descriptor is not None:
                     os.close(descriptor)
             except BaseException as cleanup_error:
-                error.add_note(
+                add_exception_note(
+                    error,
                     "Text log descriptor cleanup failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    f"{type(cleanup_error).__name__}: {cleanup_error}",
                 )
             try:
                 self._lease.close()
             except BaseException as cleanup_error:
-                error.add_note(
+                add_exception_note(
+                    error,
                     "Text log lease cleanup failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    f"{type(cleanup_error).__name__}: {cleanup_error}",
                 )
             raise
 
@@ -145,7 +154,7 @@ def create_process_text_handler(
     context: ExecutionContext,
     *,
     rank: int,
-    world_size: int | None = None,
+    world_size: Union[int, None] = None,
     level: int = logging.INFO,
 ) -> ProcessTextLogHandler:
     """Create the exclusive plain-text handler for one execution process."""

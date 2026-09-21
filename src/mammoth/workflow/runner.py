@@ -20,8 +20,9 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, Union
 
+from mammoth.compat import DATACLASS_SLOTS, add_exception_note
 from mammoth.core import (
     ExecutionContext,
     GroupLayout,
@@ -64,14 +65,14 @@ _MAMMOTH_ENVIRONMENT_PREFIX = "MAMMOTH_"
 _FINALIZATION_STAGE_ATTEMPTS = 2
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class Step:
     """One named execution phase whose command is already the final argv."""
 
     name: str
     command: Sequence[str]
-    cwd: Path | None = None
-    timeout_seconds: float | None = None
+    cwd: Union[Path, None] = None
+    timeout_seconds: Union[float, None] = None
     environment: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -91,7 +92,7 @@ class Step:
         timeout = self.timeout_seconds
         if timeout is not None and (
             isinstance(timeout, bool)
-            or not isinstance(timeout, int | float)
+            or not isinstance(timeout, (int, float))
             or not math.isfinite(timeout)
             or timeout <= 0
         ):
@@ -105,19 +106,19 @@ class Step:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class Execution:
     """Caller-owned execution facts not derived from a :class:`Run` or workflow."""
 
     invocation_kind: str = "workflow"
-    config_reference: str | Path = ""
+    config_reference: Union[str, Path] = ""
     world_size: int = 1
     execution_mode: Literal["single", "distributed"] = "single"
-    resume_checkpoint: str | Path | None = None
-    resume_checkpoint_sha256: str | None = None
-    parent_execution_id: str | None = None
-    starting_epoch: int | None = None
-    starting_global_step: int | None = None
+    resume_checkpoint: Union[str, Path, None] = None
+    resume_checkpoint_sha256: Union[str, None] = None
+    parent_execution_id: Union[str, None] = None
+    starting_epoch: Union[int, None] = None
+    starting_global_step: Union[int, None] = None
     runtime: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -148,21 +149,21 @@ class Execution:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class Run:
     """One independently leased logical run and its declaration-ordered steps."""
 
     name: str
     steps: Sequence[Step]
     execution: Execution = field(default_factory=Execution)
-    root: Path | None = None
+    root: Union[Path, None] = None
     environment: Mapping[str, str] = field(default_factory=dict)
-    resolve_execution: Callable[[ExecutionResolutionContext], Execution] | None = field(
+    resolve_execution: Union[Callable[[ExecutionResolutionContext], Execution], None] = field(
         default=None,
         compare=False,
         repr=False,
     )
-    before_first_step: Callable[[BeforeFirstStepContext], None] | None = field(
+    before_first_step: Union[Callable[[BeforeFirstStepContext], None], None] = field(
         default=None,
         compare=False,
         repr=False,
@@ -207,16 +208,16 @@ class Run:
         raise KeyError(f"Run {self.name!r} has no step {name!r}")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class ExecutionResolutionContext:
     """Run-local facts available after layout preparation and lease acquisition."""
 
     run: Run
     layout: RunLayout
-    previous_execution_id: str | None
+    previous_execution_id: Union[str, None]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class BeforeFirstStepContext:
     """Immutable attempt facts available immediately before the first phase."""
 
@@ -226,18 +227,18 @@ class BeforeFirstStepContext:
     execution: ExecutionContext
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class StepResult:
     """One dispatched step's terminal process or launch outcome."""
 
     name: str
     outcome: StepOutcome
-    process: ProcessResult | None = None
-    reason: str | None = None
-    signal: int | None = None
+    process: Union[ProcessResult, None] = None
+    reason: Union[str, None] = None
+    signal: Union[int, None] = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class DispatchResult:
     """One step result retained in workflow dispatch order."""
 
@@ -245,18 +246,18 @@ class DispatchResult:
     step: StepResult
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class RunResult:
     """One logical run attempt or one artifact-free blocked declaration."""
 
     run_name: str
     outcome: RunOutcome
-    execution_id: str | None
+    execution_id: Union[str, None]
     steps: tuple[StepResult, ...]
-    reason: str | None = None
+    reason: Union[str, None] = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class WorkflowResult:
     """Structured terminal outcome for one :meth:`Workflow.run` invocation.
 
@@ -269,7 +270,7 @@ class WorkflowResult:
     runs: tuple[RunResult, ...]
     dispatch: tuple[DispatchResult, ...]
     exit_code: int
-    group_id: str | None = None
+    group_id: Union[str, None] = None
 
     @property
     def successful(self) -> bool:
@@ -291,7 +292,7 @@ class WorkflowResult:
         raise KeyError(f"Workflow result has no dispatched step {run_name!r}/{step_name!r}")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class Workflow:
     """One validated programmatic workflow with two explicit serial orders.
 
@@ -306,8 +307,8 @@ class Workflow:
     runs: Sequence[Run]
     root: Path = Path("runs")
     order: WorkflowOrder = "run-major"
-    step_order: Sequence[str] | None = None
-    launcher: Launcher | None = field(default=None, compare=False, repr=False)
+    step_order: Union[Sequence[str], None] = None
+    launcher: Union[Launcher, None] = field(default=None, compare=False, repr=False)
     group_metadata: Mapping[str, Any] = field(default_factory=dict)
     _dispatch: tuple[tuple[Run, Step], ...] = field(init=False, repr=False, compare=False)
 
@@ -357,7 +358,7 @@ class Workflow:
     def run(
         self,
         *,
-        base_environment: Mapping[str, str] | None = None,
+        base_environment: Union[Mapping[str, str], None] = None,
     ) -> WorkflowResult:
         """Execute the validated plan with owned attempts, children, and cleanup."""
         if threading.current_thread() is not threading.main_thread():
@@ -367,7 +368,7 @@ class Workflow:
         return _run_workflow(self, base_environment=base_environment)
 
 
-@dataclass(slots=True)
+@dataclass(**DATACLASS_SLOTS)
 class _ActiveRun:
     """Executor-owned resources for one started logical run."""
 
@@ -378,11 +379,11 @@ class _ActiveRun:
     context: ExecutionContext
     observer: RunObserver
     event_writer: ExecutionEventWriter
-    group_writer: GroupEventWriter | None = None
+    group_writer: Union[GroupEventWriter, None] = None
     group_run_event_emitted: bool = False
     before_first_step_done: bool = False
-    failure_reason: str | None = None
-    terminal_result: RunResult | None = None
+    failure_reason: Union[str, None] = None
+    terminal_result: Union[RunResult, None] = None
     terminal_event_attempts: int = 0
     terminal_event_failed: bool = False
     observer_closed: bool = False
@@ -393,7 +394,7 @@ class _ActiveRun:
     lease_close_failed: bool = False
 
 
-@dataclass(slots=True)
+@dataclass(**DATACLASS_SLOTS)
 class _PendingStep:
     """Lifecycle state for a step interrupted between paired records."""
 
@@ -402,11 +403,11 @@ class _PendingStep:
     phase_started: bool = False
     task_started: bool = False
     group_step_emitted: bool = False
-    result: StepResult | None = None
+    result: Union[StepResult, None] = None
     registered: bool = False
 
 
-@dataclass(slots=True)
+@dataclass(**DATACLASS_SLOTS)
 class _GroupState:
     """Executor-owned entry-level group resources, published lazily.
 
@@ -418,17 +419,17 @@ class _GroupState:
     """
 
     published: bool = False
-    manifest: GroupManifest | None = None
-    writer: GroupEventWriter | None = None
+    manifest: Union[GroupManifest, None] = None
+    writer: Union[GroupEventWriter, None] = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class _Failure:
     """The first ordinary or interruption failure that stops dispatch."""
 
     reason: str
     exit_code: int
-    signal: int | None = None
+    signal: Union[int, None] = None
     precedence: int = 3
     workflow_interruption: bool = False
 
@@ -440,16 +441,16 @@ class _WorkflowInterrupted(BaseException):
         self.signal_number = signal_number
 
 
-@dataclass(slots=True)
+@dataclass(**DATACLASS_SLOTS)
 class _InterruptionState:
     """Track signals deferred across owned resource transitions."""
 
     critical_depth: int = 0
-    deferred_signal: int | None = None
+    deferred_signal: Union[int, None] = None
     initial_guard_active: bool = False
 
 
-_INTERRUPTION_STATE: ContextVar[_InterruptionState | None] = ContextVar(
+_INTERRUPTION_STATE: ContextVar[Union[_InterruptionState, None]] = ContextVar(
     "mammoth_workflow_interruption_state",
     default=None,
 )
@@ -547,9 +548,9 @@ def _emit_group_run_terminal(active: _ActiveRun) -> None:
 def _finalize_group(
     group: _GroupState,
     *,
-    first_failure: _Failure | None,
-    original_error: BaseException | None,
-    cleanup_error: BaseException | None,
+    first_failure: Union[_Failure, None],
+    original_error: Union[BaseException, None],
+    cleanup_error: Union[BaseException, None],
 ) -> None:
     """Record one terminal group status and close the writer on every exit path.
 
@@ -580,17 +581,17 @@ def _finalize_group(
 def _run_workflow(
     workflow: Workflow,
     *,
-    base_environment: Mapping[str, str] | None,
+    base_environment: Union[Mapping[str, str], None],
 ) -> WorkflowResult:
     """Own serial dispatch and preserve the first failure through cleanup."""
     active: dict[str, _ActiveRun] = {}
     results_by_run: dict[str, list[StepResult]] = {run.name: [] for run in workflow.runs}
     dispatch_results: list[DispatchResult] = []
-    first_failure: _Failure | None = None
-    pending: _PendingStep | None = None
-    transition_result: StepResult | None = None
-    original_error: BaseException | None = None
-    cleanup_error: BaseException | None = None
+    first_failure: Union[_Failure, None] = None
+    pending: Union[_PendingStep, None] = None
+    transition_result: Union[StepResult, None] = None
+    original_error: Union[BaseException, None] = None
+    cleanup_error: Union[BaseException, None] = None
     finalization_errors: list[tuple[str, BaseException]] = []
     run_results: tuple[RunResult, ...] = ()
     group = _GroupState()
@@ -659,9 +660,10 @@ def _run_workflow(
                     )
                 except _WorkflowInterrupted as error:
                     if original_error is not None:
-                        original_error.add_note(
+                        add_exception_note(
+                            original_error,
                             "Workflow interrupted during resolver cleanup by signal "
-                            f"{error.signal_number}"
+                            f"{error.signal_number}",
                         )
                     else:
                         first_failure = _prefer_failure(
@@ -671,8 +673,9 @@ def _run_workflow(
                     continue
                 except KeyboardInterrupt:
                     if original_error is not None:
-                        original_error.add_note(
-                            "Workflow interrupted during resolver cleanup by signal 2"
+                        add_exception_note(
+                            original_error,
+                            "Workflow interrupted during resolver cleanup by signal 2",
                         )
                     else:
                         first_failure = _prefer_failure(
@@ -693,8 +696,9 @@ def _run_workflow(
 
     if original_error is not None:
         if cleanup_error is not None:
-            original_error.add_note(
-                f"Workflow cleanup failure: {type(cleanup_error).__name__}: {cleanup_error}"
+            add_exception_note(
+                original_error,
+                f"Workflow cleanup failure: {type(cleanup_error).__name__}: {cleanup_error}",
             )
         raise original_error
     if cleanup_error is not None:
@@ -716,8 +720,8 @@ def _start_run(
     group: _GroupState,
 ) -> _ActiveRun:
     """Prepare layout/lease, resolve execution, and publish immutable metadata."""
-    current: _ActiveRun | None = None
-    lease: LogicalRunLease | None = None
+    current: Union[_ActiveRun, None] = None
+    lease: Union[LogicalRunLease, None] = None
     try:
         with _blocked_interruption_signals():
             _ensure_group_published(group, workflow)
@@ -781,14 +785,15 @@ def _start_run(
                 with _blocked_interruption_signals(deliver_deferred=False):
                     lease.close()
             except BaseException as cleanup_error:
-                original_error.add_note(
+                add_exception_note(
+                    original_error,
                     "Workflow untransferred lease cleanup failure: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    f"{type(cleanup_error).__name__}: {cleanup_error}",
                 )
         raise
 
 
-def _run_before_first_step(active: _ActiveRun) -> _Failure | None:
+def _run_before_first_step(active: _ActiveRun) -> Union[_Failure, None]:
     """Call the run-local hook exactly once before any phase starts."""
     if active.before_first_step_done:
         return None
@@ -822,7 +827,7 @@ def _execute_step(
     base_environment: Mapping[str, str],
     pending: _PendingStep,
     *,
-    launcher: Launcher | None,
+    launcher: Union[Launcher, None],
 ) -> StepResult:
     """Launch one final argv while emitting paired phase/task lifecycle records."""
     command = sanitize_command(step.command)
@@ -883,8 +888,8 @@ def _record_pending_result(
 def _failure_for_workflow_interruption(
     signal_number: int,
     *,
-    pending: _PendingStep | None,
-    transition_result: StepResult | None,
+    pending: Union[_PendingStep, None],
+    transition_result: Union[StepResult, None],
     results_by_run: Mapping[str, list[StepResult]],
     dispatch_results: list[DispatchResult],
 ) -> _Failure:
@@ -914,7 +919,7 @@ def _signal_failure(signal_number: int) -> _Failure:
     )
 
 
-def _prefer_failure(*failures: _Failure | None) -> _Failure:
+def _prefer_failure(*failures: Union[_Failure, None]) -> _Failure:
     """Choose timeout, signal, child-code, then generic failure stably."""
     present = tuple(failure for failure in failures if failure is not None)
     if not present:
@@ -1046,7 +1051,7 @@ def _finalize_runs(
     active: Mapping[str, _ActiveRun],
     results_by_run: Mapping[str, list[StepResult]],
     *,
-    failure: _Failure | None,
+    failure: Union[_Failure, None],
     executor_failed: bool,
     cleanup_errors: list[tuple[str, BaseException]],
 ) -> tuple[RunResult, ...]:
@@ -1111,7 +1116,7 @@ def _finalize_runs(
                 current.group_run_event_emitted = True
                 _emit_group_run_terminal(current)
             if not current.observer_closed and not current.observer_close_failed:
-                stage_error: BaseException | None = None
+                stage_error: Union[BaseException, None] = None
                 try:
                     with _blocked_interruption_signals():
                         try:
@@ -1176,11 +1181,12 @@ def _finalize_runs(
             break
     if cleanup_errors:
         first_label, first_error = cleanup_errors[0]
-        first_error.add_note(f"Workflow cleanup stage: {first_label}")
+        add_exception_note(first_error, f"Workflow cleanup stage: {first_label}")
         for label, cleanup_failure in cleanup_errors[1:]:
-            first_error.add_note(
+            add_exception_note(
+                first_error,
                 f"Later workflow cleanup failure ({label}): "
-                f"{type(cleanup_failure).__name__}: {cleanup_failure}"
+                f"{type(cleanup_failure).__name__}: {cleanup_failure}",
             )
         raise first_error
     return tuple(
@@ -1202,8 +1208,8 @@ def _emit_execution_terminal(
     current: _ActiveRun,
     *,
     outcome: RunOutcome,
-    reason: str | None,
-    failure: _Failure | None,
+    reason: Union[str, None],
+    failure: Union[_Failure, None],
 ) -> None:
     """Emit one run terminal; the caller reconciles durable writes on interruption."""
     if outcome == "completed":
@@ -1239,9 +1245,9 @@ def _run_outcome(
     active: _ActiveRun,
     results: tuple[StepResult, ...],
     *,
-    failure: _Failure | None,
+    failure: Union[_Failure, None],
     executor_failed: bool,
-) -> tuple[RunOutcome, str | None]:
+) -> tuple[RunOutcome, Union[str, None]]:
     """Classify completed, direct failure, cross-run blocking, and interruption."""
     if failure is not None and failure.workflow_interruption:
         return "interrupted", failure.reason
@@ -1289,7 +1295,7 @@ def _child_environment(
     return environment
 
 
-def _base_environment(environment: Mapping[str, str] | None) -> Mapping[str, str]:
+def _base_environment(environment: Union[Mapping[str, str], None]) -> Mapping[str, str]:
     """Copy the inherited environment without retaining caller-owned state."""
     values = os.environ if environment is None else environment
     return MappingProxyType(
@@ -1324,7 +1330,7 @@ def _validate_phase_name(name: str) -> None:
         raise ValueError("Step names must be non-empty phase strings")
 
 
-def _validate_resume_coordinate(name: str, value: int | None) -> None:
+def _validate_resume_coordinate(name: str, value: Union[int, None]) -> None:
     """Reject negative, boolean, and non-integral resume coordinates."""
     if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
         raise ValueError(f"Execution {name} must be a non-negative integer or None")
@@ -1364,7 +1370,7 @@ def _freeze_runtime_value(value: Any) -> Any:
     """Freeze one nested mapping or sequence value."""
     if isinstance(value, Mapping):
         return _freeze_runtime_mapping(value)
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes | os.PathLike):
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, os.PathLike)):
         return tuple(_freeze_runtime_value(item) for item in value)
     return value
 
@@ -1384,7 +1390,7 @@ def _thaw_runtime_value(value: Any) -> Any:
 
 
 @contextmanager
-def _interruption_signals() -> Iterator[_InterruptionState | None]:
+def _interruption_signals() -> Iterator[Union[_InterruptionState, None]]:
     """Translate process termination signals into executor-managed cleanup."""
     if not hasattr(signal, "SIGTERM"):
         yield None
@@ -1428,7 +1434,7 @@ def _masked_process_signals(signals: tuple[signal.Signals, ...]) -> Iterator[Non
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
-def _release_initial_interrupt_guard(state: _InterruptionState | None) -> None:
+def _release_initial_interrupt_guard(state: Union[_InterruptionState, None]) -> None:
     """Deliver an install-window signal after entering the managed executor."""
     if state is None or not state.initial_guard_active:
         return

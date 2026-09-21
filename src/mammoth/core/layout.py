@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from mammoth.compat import DATACLASS_SLOTS
 from mammoth.core.identity import (
     validate_device_spec,
     validate_execution_id,
@@ -17,7 +18,7 @@ from mammoth.core.identity import (
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class RunLayout:
     """Resolve the stable ``<entry>/<run-name>`` artifact contract."""
 
@@ -77,7 +78,7 @@ class RunLayout:
         return self
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class GroupLayout:
     """Resolve the stable ``<entry>/.mammoth/groups/<group-id>`` artifact contract.
 
@@ -123,7 +124,7 @@ class GroupLayout:
         return self
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class QueueLayout:
     """Resolve the stable ``<entry>/.mammoth/queue`` device-aware job queue contract.
 

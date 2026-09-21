@@ -7,11 +7,11 @@ own function for custom batch containers.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
-from typing import Any, Final
+from typing import Any, Final, Union
 
 import torch
 
-type BatchMover = Callable[[Any, torch.device], Any]
+BatchMover = Callable[[Any, torch.device], Any]
 _EXHAUSTED: Final = object()
 
 
@@ -58,7 +58,7 @@ class CudaPrefetchingBatchIterator(Iterator[Any]):
         mover: BatchMover,
         *,
         enabled: bool,
-        prefetch_mover: BatchMover | None = None,
+        prefetch_mover: Union[BatchMover, None] = None,
     ) -> None:
         self._batches = batches
         self._device = device

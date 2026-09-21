@@ -52,6 +52,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `.github/workflows/ci.yml` | GitHub Actions validation: a `lint` job running the commit-stage hooks once, and a matrixed `test` job running the `pre-push` stage across the supported Python versions, then `uv build` and an install smoke test on the lowest one. Invokes the hook runner rather than restating hook commands. | CI triggers, jobs, the tested Python versions, or validation coverage change. |
 | `src/mammoth/__init__.py` | Lightweight root package metadata and intentionally small stable exports. | Package version or a truly root-level stable export changes. |
 | `src/mammoth/__main__.py` | `python -m mammoth` forwarding entry point. | Module execution behavior changes. |
+| `src/mammoth/compat.py` | Shared interpreter compatibility for dataclass storage, exception notes, and strict iterable pairing. | Supported Python versions or these runtime adaptations change. |
 | `src/mammoth/cli.py` | Public Typer application, typed commands, and console exit routing. | A public command, option, or exit behavior changes. |
 | `src/mammoth/py.typed` | PEP 561 marker declaring inline type information. | Keep present and empty while Mammoth ships typed source. |
 | `src/mammoth/execution.py` | Framework-neutral direct execution sessions: immutable specs, create/strict-attach lifecycle, phase and terminal events, logging and heartbeat-capable observer ownership, generic pipelines, leases, deterministic cleanup, and a detached no-op/session-backed observer call surface. | Neutral direct-session lifecycle, spec fields, attach strictness, cleanup ordering, or the no-op/session-backed observer call surface changes. |
@@ -139,7 +140,7 @@ commit and issue state before removing only clean task branches and worktrees.
 
 ## Python And API Standards
 
-- Use Python 3.12 syntax unless the project baseline is deliberately changed.
+- Use syntax and runtime APIs compatible with Python 3.9.
 - Add a module docstring to every Python module.
 - Keep all imports at module top level after the docstring and
   `from __future__ import annotations`.

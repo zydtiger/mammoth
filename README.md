@@ -18,7 +18,7 @@ No familiarity with Mammoth is assumed below.
 
 ## Requirements
 
-- Python 3.12 or newer
+- Python 3.9 or newer
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
 
 From the repository root, install the base dependencies and confirm the CLI is

@@ -16,12 +16,13 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, TypeVar, Union
 
 import torch
 from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils.hooks import RemovableHandle
 
+from mammoth.compat import DATACLASS_SLOTS
 from mammoth.core import atomic_write_json
 from mammoth.torch.backend import (
     TorchBackendConfig,
@@ -31,14 +32,16 @@ from mammoth.torch.backend import (
 )
 from mammoth.torch.device import resolve_device
 
+T = TypeVar("T")
+
 PROFILE_SCHEMA_VERSION = 1
 
-type JsonScalar = str | int | float | bool | None
-type FrozenJson = JsonScalar | tuple["FrozenJson", ...] | Mapping[str, "FrozenJson"]
-type OutputSummarizer = Callable[[Any], Mapping[str, Any]]
+JsonScalar = Union[str, int, float, bool, None]
+FrozenJson = Union[JsonScalar, tuple["FrozenJson", ...], Mapping[str, "FrozenJson"]]
+OutputSummarizer = Callable[[Any], Mapping[str, Any]]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class ProfileConfig:
     """Project-neutral policy for profiling one callable workload."""
 
@@ -53,8 +56,8 @@ class ProfileConfig:
     profile_memory: bool = True
     with_flops: bool = True
     row_limit: int = 20
-    sort_by: str | None = None
-    chrome_trace: Path | None = None
+    sort_by: Union[str, None] = None
+    chrome_trace: Union[Path, None] = None
 
     def __post_init__(self) -> None:
         _nonnegative_integer("warmup_iterations", self.warmup_iterations)
@@ -63,7 +66,7 @@ class ProfileConfig:
         _positive_integer("row_limit", self.row_limit)
         if (
             isinstance(self.work_units_per_iteration, bool)
-            or not isinstance(self.work_units_per_iteration, int | float)
+            or not isinstance(self.work_units_per_iteration, (int, float))
             or not math.isfinite(self.work_units_per_iteration)
             or self.work_units_per_iteration <= 0
         ):
@@ -82,15 +85,15 @@ TorchRuntimeOptions = TorchBackendConfig
 TorchRuntimeState = TorchBackendState
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class ProfileTiming:
     """Synchronized wall and optional CUDA-device time for one invocation."""
 
     wall_ms: float
-    device_ms: float | None
+    device_ms: Union[float, None]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class LatencySummary:
     """Distribution summary for repeated latency samples in milliseconds."""
 
@@ -101,7 +104,7 @@ class LatencySummary:
     max_ms: float
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class ThroughputSummary:
     """Caller-labelled throughput derived from synchronized wall time."""
 
@@ -110,7 +113,7 @@ class ThroughputSummary:
     work_units_per_second: float
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class CudaMemoryStats:
     """CUDA allocator state and peaks captured after steady-state measurement."""
 
@@ -121,15 +124,15 @@ class CudaMemoryStats:
     max_reserved_bytes: int
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class PhaseLatencySummary:
     """Immutable wall and optional device latency summaries for one named phase."""
 
     wall_latency: LatencySummary
-    device_latency: LatencySummary | None
+    device_latency: Union[LatencySummary, None]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class OperationProfile:
     """Normalized aggregate for one operation emitted by ``torch.profiler``."""
 
@@ -144,10 +147,10 @@ class OperationProfile:
     device_memory_usage_bytes: int
     self_device_memory_usage_bytes: int
     flops: int
-    input_shapes: tuple[tuple[int | str, ...], ...] = ()
+    input_shapes: tuple[tuple[Union[int, str], ...], ...] = ()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class ProfileReport:
     """Immutable versioned evidence returned by :func:`profile_callable`."""
 
@@ -155,9 +158,9 @@ class ProfileReport:
     device: str
     cold_start: ProfileTiming
     wall_latency: LatencySummary
-    device_latency: LatencySummary | None
+    device_latency: Union[LatencySummary, None]
     throughput: ThroughputSummary
-    memory: CudaMemoryStats | None
+    memory: Union[CudaMemoryStats, None]
     output_summary: FrozenJson
     operations_profiled: bool
     top_operations: tuple[OperationProfile, ...]
@@ -165,7 +168,7 @@ class ProfileReport:
     warmup_iterations: int
     measured_iterations: int
     profiler_iterations: int
-    trace_path: str | None
+    trace_path: Union[str, None]
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached JSON-compatible representation of this report."""
@@ -199,7 +202,7 @@ class NamedPhaseProfiler:
     ``torch.profiler`` lifecycle.
     """
 
-    def __init__(self, device: str | torch.device = "auto") -> None:
+    def __init__(self, device: Union[str, torch.device] = "auto") -> None:
         self._device = _resolve_profile_device(device)
         self._wall_samples: dict[str, list[float]] = {}
         self._device_samples: dict[str, list[float]] = {}
@@ -209,7 +212,7 @@ class NamedPhaseProfiler:
         """Return the resolved device used for measurements."""
         return self._device
 
-    def measure[T](
+    def measure(
         self,
         phase: str,
         workload: Callable[[], T],
@@ -251,10 +254,10 @@ class NamedPhaseProfiler:
 def profile_callable(
     workload: Callable[[], Any],
     *,
-    config: ProfileConfig | None = None,
-    components: Mapping[str, torch.nn.Module] | None = None,
-    summarize_output: OutputSummarizer | None = None,
-    runtime_options: TorchRuntimeOptions | None = None,
+    config: Union[ProfileConfig, None] = None,
+    components: Union[Mapping[str, torch.nn.Module], None] = None,
+    summarize_output: Union[OutputSummarizer, None] = None,
+    runtime_options: Union[TorchRuntimeOptions, None] = None,
 ) -> ProfileReport:
     """Profile an arbitrary caller-owned PyTorch workload.
 
@@ -294,7 +297,7 @@ def profile_callable(
         memory = collect_cuda_memory_stats(device)
 
         top_operations: tuple[OperationProfile, ...] = ()
-        trace_path: str | None = None
+        trace_path: Union[str, None] = None
         if selected_config.profile_operations:
             profiler = _profile_operations(
                 workload,
@@ -418,13 +421,13 @@ def current_torch_runtime_state() -> TorchRuntimeState:
     return current_torch_backend_state()
 
 
-def _measure_invocation[T](
+def _measure_invocation(
     device: torch.device,
     workload: Callable[[], T],
 ) -> tuple[T, ProfileTiming]:
     use_cuda = device.type == "cuda"
-    start_event: torch.cuda.Event | None = None
-    end_event: torch.cuda.Event | None = None
+    start_event: Union[torch.cuda.Event, None] = None
+    end_event: Union[torch.cuda.Event, None] = None
     if use_cuda:
         _synchronize(device)
         start_event = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]
@@ -432,7 +435,7 @@ def _measure_invocation[T](
         start_event.record(torch.cuda.current_stream(device))
     started = time.perf_counter()
     result = workload()
-    device_ms: float | None = None
+    device_ms: Union[float, None] = None
     if start_event is not None and end_event is not None:
         end_event.record(torch.cuda.current_stream(device))
         _synchronize(device)
@@ -522,9 +525,9 @@ def resolve_profiler_sort_key(requested: str, use_cuda: bool) -> str:
 def normalize_operation_profiles(
     profiler: Any,
     *,
-    device: str | torch.device = "auto",
-    row_limit: int | None = None,
-    sort_by: str | None = None,
+    device: Union[str, torch.device] = "auto",
+    row_limit: Union[int, None] = None,
+    sort_by: Union[str, None] = None,
     record_shapes: bool = False,
 ) -> tuple[OperationProfile, ...]:
     """Normalize and sort rows from a caller-owned ``torch.profiler`` result.
@@ -574,13 +577,13 @@ def normalize_operation_profiles(
     return normalized if row_limit is None else normalized[:row_limit]
 
 
-def _input_shapes(row: Any) -> tuple[tuple[int | str, ...], ...]:
+def _input_shapes(row: Any) -> tuple[tuple[Union[int, str], ...], ...]:
     raw_shapes = getattr(row, "input_shapes", ())
-    if not isinstance(raw_shapes, tuple | list):
+    if not isinstance(raw_shapes, (tuple, list)):
         return ()
-    shapes: list[tuple[int | str, ...]] = []
+    shapes: list[tuple[Union[int, str], ...]] = []
     for raw_shape in raw_shapes:
-        if not isinstance(raw_shape, tuple | list):
+        if not isinstance(raw_shape, (tuple, list)):
             continue
         shapes.append(
             tuple(
@@ -593,7 +596,7 @@ def _input_shapes(row: Any) -> tuple[tuple[int | str, ...], ...]:
     return tuple(shapes)
 
 
-def _row_number(row: Any, name: str, fallback: str | None = None) -> float:
+def _row_number(row: Any, name: str, fallback: Union[str, None] = None) -> float:
     value = getattr(row, name, None)
     if value is None and fallback is not None:
         value = getattr(row, fallback, 0.0)
@@ -614,12 +617,12 @@ def _row_sort_value(row: Any, name: str) -> float:
     return _row_number(row, name, fallbacks.get(name))
 
 
-def synchronize_device(device: str | torch.device = "auto") -> None:
+def synchronize_device(device: Union[str, torch.device] = "auto") -> None:
     """Synchronize one caller-selected CUDA device without initializing CUDA on CPU."""
     _synchronize(_resolve_profile_device(device))
 
 
-def reset_cuda_peak_memory_stats(device: str | torch.device = "auto") -> None:
+def reset_cuda_peak_memory_stats(device: Union[str, torch.device] = "auto") -> None:
     """Reset peak allocator accounting for one caller-selected CUDA device."""
     selected_device = _resolve_profile_device(device)
     if selected_device.type == "cuda":
@@ -627,13 +630,13 @@ def reset_cuda_peak_memory_stats(device: str | torch.device = "auto") -> None:
 
 
 def collect_cuda_memory_stats(
-    device: str | torch.device = "auto",
-) -> CudaMemoryStats | None:
+    device: Union[str, torch.device] = "auto",
+) -> Union[CudaMemoryStats, None]:
     """Return current CUDA allocator state and peaks, or ``None`` for CPU."""
     return _collect_memory_stats(_resolve_profile_device(device))
 
 
-def _collect_memory_stats(device: torch.device) -> CudaMemoryStats | None:
+def _collect_memory_stats(device: torch.device) -> Union[CudaMemoryStats, None]:
     if device.type != "cuda":
         return None
     index = device.index if device.index is not None else torch.cuda.current_device()
@@ -651,14 +654,14 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def _resolve_profile_device(device: str | torch.device) -> torch.device:
-    if not isinstance(device, str | torch.device):
+def _resolve_profile_device(device: Union[str, torch.device]) -> torch.device:
+    if not isinstance(device, (str, torch.device)):
         raise TypeError("device must be a string or torch.device")
     return resolve_device(str(device))
 
 
-def _resolve_operation_device(device: str | torch.device) -> torch.device:
-    if not isinstance(device, str | torch.device):
+def _resolve_operation_device(device: Union[str, torch.device]) -> torch.device:
+    if not isinstance(device, (str, torch.device)):
         raise TypeError("device must be a string or torch.device")
     if device == "auto":
         return resolve_device("auto")
@@ -717,12 +720,12 @@ def _summarize_value(value: Any) -> dict[str, Any]:
                 raise ValueError(f"output mapping keys collide after string conversion: {key!r}")
             values[normalized] = _summarize_value(item)
         return {"kind": "mapping", "values": values}
-    if isinstance(value, tuple | list):
+    if isinstance(value, (tuple, list)):
         return {
             "kind": "tuple" if isinstance(value, tuple) else "list",
             "values": [_summarize_value(item) for item in value],
         }
-    if isinstance(value, str | int | bool) or value is None:
+    if isinstance(value, (str, int, bool)) or value is None:
         return {"kind": type(value).__name__, "value": value}
     if isinstance(value, float):
         return {
@@ -734,7 +737,7 @@ def _summarize_value(value: Any) -> dict[str, Any]:
 
 
 def _freeze_json(value: Any, *, context: str) -> FrozenJson:
-    if value is None or isinstance(value, str | bool):
+    if value is None or isinstance(value, (str, bool)):
         return value
     if isinstance(value, int):
         return value
@@ -749,7 +752,7 @@ def _freeze_json(value: Any, *, context: str) -> FrozenJson:
                 raise TypeError(f"{context} mapping keys must be strings")
             frozen[key] = _freeze_json(item, context=context)
         return MappingProxyType(frozen)
-    if isinstance(value, tuple | list):
+    if isinstance(value, (tuple, list)):
         return tuple(_freeze_json(item, context=context) for item in value)
     raise TypeError(f"{context} contains unsupported value {type(value).__name__}")
 

@@ -20,7 +20,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
 from types import TracebackType
-from typing import Any, BinaryIO, Self
+from typing import Any, BinaryIO, Union
+
+from typing_extensions import Self
+
+from mammoth.compat import DATACLASS_SLOTS
 
 _DEFAULT_ARTIFACT_CHUNK_SIZE = 1024 * 1024
 
@@ -33,7 +37,7 @@ class ArtifactVerificationError(RuntimeError):
     """Raised when a visible artifact does not match a recorded receipt."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, **DATACLASS_SLOTS)
 class ArtifactReceipt:
     """Immutable exact-byte identity for one regular local file observation."""
 
@@ -83,10 +87,10 @@ class ArtifactReadSession:
         self._path = Path(path)
         validate_artifact_chunk_size(chunk_size)
         self._chunk_size = chunk_size
-        self._anchor_descriptor: int | None = None
-        self._anchor_stat: os.stat_result | None = None
-        self._receipt: ArtifactReceipt | None = None
-        self._active_reader: BinaryIO | None = None
+        self._anchor_descriptor: Union[int, None] = None
+        self._anchor_stat: Union[os.stat_result, None] = None
+        self._receipt: Union[ArtifactReceipt, None] = None
+        self._active_reader: Union[BinaryIO, None] = None
         self._entered = False
         self._closed = False
         self._state_lock = Lock()
@@ -133,9 +137,9 @@ class ArtifactReadSession:
 
     def __exit__(
         self,
-        exception_type: type[BaseException] | None,
-        exception: BaseException | None,
-        traceback: TracebackType | None,
+        exception_type: Union[type[BaseException], None],
+        exception: Union[BaseException, None],
+        traceback: Union[TracebackType, None],
     ) -> None:
         """Verify successful sessions and release all session-owned descriptors."""
         del exception, traceback
@@ -433,8 +437,8 @@ def artifact_stats_match(first: os.stat_result, second: os.stat_result) -> bool:
 class _DirectoryHandle:
     """Mutable ownership cell for one prepared artifact's staging resources."""
 
-    parent_descriptor: int | None
-    staging_descriptor: int | None
+    parent_descriptor: Union[int, None]
+    staging_descriptor: Union[int, None]
     staging_name: str
 
 
@@ -507,7 +511,7 @@ def atomic_publish(
     path: Path,
     writer: Callable[[Path], object],
     *,
-    inspect_serialized: Callable[[int], object] | None = None,
+    inspect_serialized: Union[Callable[[int], object], None] = None,
 ) -> Path:
     """Publish a validated caller-written file by same-directory atomic replace."""
     destination = Path(path)
@@ -544,7 +548,7 @@ def prepare_artifact(
     path: Path,
     writer: Callable[[Path], object],
     *,
-    mode: int | None = 0o600,
+    mode: Union[int, None] = 0o600,
     preserve_permissions: bool = True,
 ) -> PreparedArtifact:
     """Serialize and sync one opaque artifact without publishing its destination."""
@@ -566,9 +570,9 @@ def prepare_artifact_in_directory(
     writer: Callable[[Path], object],
     *,
     directory_descriptor: int,
-    mode: int | None = 0o600,
+    mode: Union[int, None] = 0o600,
     preserve_permissions: bool = True,
-    inspect_serialized: Callable[[int], object] | None = None,
+    inspect_serialized: Union[Callable[[int], object], None] = None,
 ) -> PreparedArtifact:
     """Prepare and optionally inspect a validated artifact before final permissions."""
     try:
@@ -585,7 +589,7 @@ def prepare_artifact_in_directory(
 
     staging_name = f".{destination.name}.{uuid.uuid4().hex}.tmp"
     artifact_name = destination.name
-    staging_descriptor: int | None = None
+    staging_descriptor: Union[int, None] = None
     try:
         os.mkdir(staging_name, mode=0o700, dir_fd=directory_descriptor)
         staging_descriptor = os.open(
@@ -680,7 +684,7 @@ def descriptor_filesystem_path(descriptor: int) -> Path:
     )
 
 
-def validate_artifact_writer(writer: Callable[[Path], object], mode: int | None) -> None:
+def validate_artifact_writer(writer: Callable[[Path], object], mode: Union[int, None]) -> None:
     """Validate shared prepared-artifact writer arguments."""
     if mode is not None and (
         isinstance(mode, bool) or not isinstance(mode, int) or not 0 <= mode <= 0o777
