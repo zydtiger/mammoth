@@ -25,7 +25,7 @@ from typing_extensions import Self
 
 from mammoth.compat import DATACLASS_SLOTS
 from mammoth.core._filesystem.io import artifact_open_flags as artifact_open_flags
-from mammoth.core._filesystem.io import open_artifact, open_serialized, replace_file
+from mammoth.core._filesystem.io import open_artifact, open_serialized, replace_file, stat_artifact
 from mammoth.core._filesystem.io import (
     validate_regular_artifact_stat as validate_regular_artifact_stat,
 )
@@ -324,7 +324,12 @@ def inspect_artifact(
             chunk_size=chunk_size,
             verify_stable_reads=True,
         )
-        final_path_stat = os.lstat(artifact_path)
+        try:
+            final_path_stat = stat_artifact(artifact_path)
+        except ValueError as error:
+            raise ArtifactChangedError(
+                f"artifact changed while being inspected: {artifact_path}"
+            ) from error
         if not artifact_stats_match(descriptor_stat, final_path_stat):
             raise ArtifactChangedError(f"artifact changed while being inspected: {artifact_path}")
         return receipt
@@ -334,7 +339,7 @@ def inspect_artifact(
 
 def _open_artifact_descriptor(path: Path) -> tuple[int, os.stat_result]:
     """Open one regular artifact and bind its descriptor to its visible path."""
-    initial_path_stat = os.lstat(path)
+    initial_path_stat = stat_artifact(path)
     validate_regular_artifact_stat(initial_path_stat, path)
     try:
         descriptor = open_artifact(path)
@@ -342,8 +347,8 @@ def _open_artifact_descriptor(path: Path) -> tuple[int, os.stat_result]:
         if isinstance(error, OSError) and error.errno == errno.ELOOP:
             raise ArtifactChangedError(f"artifact changed before inspection: {path}") from error
         try:
-            after_open_failure = os.lstat(path)
-        except OSError:
+            after_open_failure = stat_artifact(path)
+        except (OSError, ValueError):
             raise ArtifactChangedError(f"artifact changed before inspection: {path}") from error
         if not artifact_stats_match(initial_path_stat, after_open_failure):
             raise ArtifactChangedError(f"artifact changed before inspection: {path}") from error
@@ -368,8 +373,8 @@ def _validate_artifact_session_binding(
     """Require a session descriptor and visible path to remain the entry artifact."""
     try:
         descriptor_stat = os.fstat(descriptor)
-        path_stat = os.lstat(path)
-    except OSError as error:
+        path_stat = stat_artifact(path)
+    except (OSError, ValueError) as error:
         raise ArtifactChangedError(f"artifact changed while being read: {path}") from error
     if (
         not stat.S_ISREG(descriptor_stat.st_mode)

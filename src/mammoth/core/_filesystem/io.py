@@ -63,3 +63,17 @@ def read_at(descriptor: int, length: int, offset: int) -> bytes:
         return cast(bytes, pread(descriptor, length, offset))
     os.lseek(descriptor, offset, os.SEEK_SET)
     return os.read(descriptor, length)
+
+
+def stat_artifact(path: Path) -> os.stat_result:
+    """Compare path and descriptor identity using the same Windows stat operation."""
+    if os.name != "nt":
+        return os.lstat(path)
+    path_stat = os.lstat(path)
+    if not stat.S_ISREG(path_stat.st_mode) or getattr(path_stat, "st_file_attributes", 0) & 0x400:
+        return path_stat
+    descriptor = open_artifact(path)
+    try:
+        return os.fstat(descriptor)
+    finally:
+        os.close(descriptor)

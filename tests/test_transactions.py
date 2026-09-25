@@ -495,7 +495,10 @@ def test_directory_staging_rejects_nested_transaction_metadata_source(
     monkeypatch.setattr(transactions, "create_transaction_journal", original_create)
 
     stage = transaction_stage_path(plan, "payload")
-    with pytest.raises(ArtifactTransactionValidationError, match="contains Mammoth metadata"):
+    with pytest.raises(
+        ArtifactTransactionValidationError,
+        match="contains (Mammoth metadata|a reserved Mammoth object)",
+    ):
         move_directory_into_transaction_stage(plan, "payload", source)
 
     assert transaction_journal_path(other_plan).is_file()

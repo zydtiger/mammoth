@@ -172,8 +172,9 @@ def test_publication_replaces_read_only_target_and_preserves_mode(tmp_path: Path
     publish_prepared_artifact(first)
     try:
         second = prepare_artifact(target, lambda p: p.write_bytes(b"second"))
+        assert second.temporary.read_bytes() == b"second"
         publish_prepared_artifact(second)
-        assert target.read_bytes() == b"second"
+        assert target.read_bytes() == b"second", list(tmp_path.rglob("*"))
         assert target.stat().st_file_attributes & 1
     finally:
         target.chmod(0o600)

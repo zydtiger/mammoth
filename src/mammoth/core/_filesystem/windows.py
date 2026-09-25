@@ -77,11 +77,11 @@ def _open_handle(path: Path, *, access: int, share: int, creation: int) -> int:
         None,  # OPEN_REPARSE_POINT | BACKUP_SEMANTICS
     )
     if handle == ctypes.c_void_p(-1).value:
-        raise _winapi.WinError()
+        raise _winapi.WinError(_winapi.get_last_error())
     try:
         info = _FileInformation()
         if not _kernel.GetFileInformationByHandle(handle, ctypes.byref(info)):
-            raise _winapi.WinError()
+            raise _winapi.WinError(_winapi.get_last_error())
         if info.attributes & 0x400:  # FILE_ATTRIBUTE_REPARSE_POINT
             raise ValueError(f"Windows reparse points are not supported: {path}")
     except BaseException:
@@ -199,16 +199,16 @@ def replace_file(source: Path, destination: Path) -> None:
         if not stat.S_ISREG(info.st_mode) or not getattr(info, "st_file_attributes", 0) & 1:
             raise
     name = str(Path(os.path.abspath(destination))).encode("utf-16-le")
-    size = max(ctypes.sizeof(_RenameInformation), _RenameInformation.name.offset + len(name))
+    size = max(ctypes.sizeof(_RenameInformation), _RenameInformation.name.offset + len(name) + 2)
     buffer = ctypes.create_string_buffer(size)
     rename = _RenameInformation.from_buffer(buffer)
-    rename.flags = 0x1 | 0x40  # REPLACE_IF_EXISTS | IGNORE_READONLY_ATTRIBUTE
+    rename.flags = 0x1 | 0x2 | 0x40  # REPLACE_IF_EXISTS | POSIX_SEMANTICS | IGNORE_READONLY
     rename.root = None
     rename.length = len(name)
     ctypes.memmove(ctypes.addressof(buffer) + _RenameInformation.name.offset, name, len(name))
     handle = _open_handle(source, access=0x10000 | 0x80, share=7, creation=3)
     try:
         if not _kernel.SetFileInformationByHandle(handle, 22, buffer, size):
-            raise _winapi.WinError()
+            raise _winapi.WinError(_winapi.get_last_error())
     finally:
         _kernel.CloseHandle(handle)
