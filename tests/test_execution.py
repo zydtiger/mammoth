@@ -311,15 +311,14 @@ def test_logical_run_lease_closes_descriptor_after_lock_interruption(
 ) -> None:
     """A ``BaseException`` after flock succeeds cannot retain producer ownership."""
     layout = RunLayout(tmp_path, "interrupted-lock").prepare()
-    original_flock = lease_module.fcntl.flock
+    original_lock = lease_module.lock_exclusive
 
-    def interrupt_after_lock(descriptor: int, operation: int) -> None:
-        original_flock(descriptor, operation)
-        if operation == lease_module.fcntl.LOCK_EX | lease_module.fcntl.LOCK_NB:
-            raise KeyboardInterrupt("lease acquisition interrupted")
+    def interrupt_after_lock(descriptor: int) -> None:
+        original_lock(descriptor)
+        raise KeyboardInterrupt("lease acquisition interrupted")
 
     with monkeypatch.context() as patch:
-        patch.setattr(lease_module.fcntl, "flock", interrupt_after_lock)
+        patch.setattr(lease_module, "lock_exclusive", interrupt_after_lock)
         with pytest.raises(KeyboardInterrupt, match="lease acquisition interrupted"):
             claim_logical_run_lease(layout.run_dir)
 

@@ -24,15 +24,13 @@ from typing import Any, Generic, Literal, Protocol, TypeVar, Union, cast
 import torch
 
 from mammoth.compat import DATACLASS_SLOTS, add_exception_note
+from mammoth.core._filesystem.confined import anchor_root, publication_root, resolve_confined_path
 from mammoth.core.artifacts import (
     PreparedArtifact,
     atomic_publish,
-    directory_open_flags,
     discard_prepared_artifact,
     inspect_artifact_descriptor,
-    prepare_artifact_in_directory,
     publish_prepared_artifact,
-    sync_directory_descriptor,
 )
 from mammoth.core.pipeline import (
     BackgroundPipelineError,
@@ -1152,14 +1150,6 @@ def discover_resumable_checkpoints(
     )
 
 
-def resolve_confined_path(root: Path, path: Path, *, role: str) -> Path:
-    """Resolve one target without following its final path component."""
-    resolved = path.parent.resolve() / path.name
-    if resolved == root or not resolved.is_relative_to(root):
-        raise ValueError(f"checkpoint {role} target is outside checkpoint_root: {path}")
-    return resolved
-
-
 def publish_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPublication:
     """Prepare all artifacts, commit them in order, then retire exact old paths."""
     validated = validate_checkpoint_plan(plan)
@@ -1168,8 +1158,7 @@ def publish_checkpoint_plan(plan: CheckpointPlan) -> CheckpointPublication:
 
 def anchor_checkpoint_plan(plan: CheckpointPlan) -> _AnchoredCheckpointPlan:
     """Bind one normalized plan to a durably created checkpoint root."""
-    require_descriptor_relative_filesystem()
-    root_identity = ensure_checkpoint_root(plan.checkpoint_root)
+    root_identity = anchor_root(plan.checkpoint_root)
     return _AnchoredCheckpointPlan(
         checkpoint_root=plan.checkpoint_root,
         root_identity=root_identity,
@@ -1183,45 +1172,27 @@ def publish_anchored_checkpoint_plan(plan: _AnchoredCheckpointPlan) -> Checkpoin
     prepared: list[PreparedArtifact] = []
     receipts: list[PublishedCheckpoint] = []
     committed_count = 0
-    try:
-        for artifact in plan.artifacts:
-            directory_descriptor = open_confined_parent(
-                plan.checkpoint_root,
-                artifact.destination,
-                create=True,
-                root_identity=plan.root_identity,
-            )
-            prepared.append(
-                prepare_artifact_in_directory(
-                    artifact.destination,
-                    artifact.writer,
-                    directory_descriptor=directory_descriptor,
-                    mode=artifact.mode,
-                    preserve_permissions=artifact.preserve_permissions,
-                    inspect_serialized=receipt_inspector(artifact, receipts),
+    with publication_root(plan.checkpoint_root, plan.root_identity) as root:
+        try:
+            for artifact in plan.artifacts:
+                prepared.append(
+                    root.prepare(
+                        artifact.destination,
+                        artifact.writer,
+                        mode=artifact.mode,
+                        preserve_permissions=artifact.preserve_permissions,
+                        inspect_serialized=receipt_inspector(artifact, receipts),
+                    )
                 )
-            )
-        for prepared_artifact in prepared:
-            ensure_confined_path_unchanged(
-                plan.checkpoint_root,
-                prepared_artifact.destination,
-                role="publication",
-            )
-            publish_prepared_artifact(prepared_artifact)
-            committed_count += 1
-
-        retired: list[Path] = []
-        for path in plan.retire_after_commit:
-            if retire_confined_path(
-                plan.checkpoint_root,
-                path,
-                root_identity=plan.root_identity,
-            ):
-                retired.append(path)
-        return CheckpointPublication(published=tuple(receipts), retired=tuple(retired))
-    finally:
-        for prepared_artifact in prepared[committed_count:]:
-            discard_prepared_artifact(prepared_artifact)
+            for prepared_artifact in prepared:
+                root.validate_target(prepared_artifact.destination)
+                publish_prepared_artifact(prepared_artifact)
+                committed_count += 1
+            retired = tuple(path for path in plan.retire_after_commit if root.retire(path))
+            return CheckpointPublication(published=tuple(receipts), retired=retired)
+        finally:
+            for prepared_artifact in prepared[committed_count:]:
+                discard_prepared_artifact(prepared_artifact)
 
 
 def receipt_inspector(
@@ -1259,159 +1230,6 @@ def checkpoint_receipt_for_descriptor(
         size_bytes=receipt.size_bytes,
         sha256=receipt.sha256,
     )
-
-
-def retire_confined_path(
-    root: Path,
-    path: Path,
-    *,
-    root_identity: tuple[int, int],
-) -> bool:
-    """Unlink one exact retirement path through a no-follow root-relative traversal."""
-    ensure_confined_path_unchanged(root, path, role="retirement")
-    try:
-        directory_descriptor = open_confined_parent(
-            root,
-            path,
-            create=False,
-            root_identity=root_identity,
-        )
-    except FileNotFoundError:
-        return False
-    try:
-        try:
-            os.unlink(path.name, dir_fd=directory_descriptor)
-        except FileNotFoundError:
-            return False
-        sync_directory_descriptor(directory_descriptor)
-        return True
-    finally:
-        with suppress(OSError):
-            os.close(directory_descriptor)
-
-
-def ensure_confined_path_unchanged(root: Path, path: Path, *, role: str) -> None:
-    """Reject a normalized plan path whose parent now resolves elsewhere."""
-    normalized = resolve_confined_path(root, path, role=role)
-    if normalized != path:
-        raise RuntimeError(
-            f"checkpoint {role} parent changed before filesystem effect: {path.parent}"
-        )
-
-
-def open_confined_parent(
-    root: Path,
-    path: Path,
-    *,
-    create: bool,
-    root_identity: tuple[int, int],
-) -> int:
-    """Open a target parent by walking from its checkpoint root without symlinks."""
-    ensure_confined_path_unchanged(root, path, role="target")
-    relative_parent = path.parent.relative_to(root)
-    directory_descriptor = os.open(root, directory_open_flags())
-    try:
-        opened_root_stat = os.fstat(directory_descriptor)
-        opened_root_identity = (opened_root_stat.st_dev, opened_root_stat.st_ino)
-        if opened_root_identity != root_identity:
-            raise RuntimeError(f"checkpoint root changed before filesystem effect: {root}")
-        for component in relative_parent.parts:
-            created = False
-            if create:
-                try:
-                    os.mkdir(component, dir_fd=directory_descriptor)
-                except FileExistsError:
-                    pass
-                else:
-                    created = True
-            child_descriptor = os.open(
-                component,
-                directory_open_flags(),
-                dir_fd=directory_descriptor,
-            )
-            if created:
-                try:
-                    sync_directory_descriptor(directory_descriptor)
-                except BaseException:
-                    with suppress(OSError):
-                        os.close(child_descriptor)
-                    raise
-            parent_descriptor = directory_descriptor
-            directory_descriptor = child_descriptor
-            try:
-                os.close(parent_descriptor)
-            except BaseException:
-                with suppress(OSError):
-                    os.close(parent_descriptor)
-                raise
-        return directory_descriptor
-    except BaseException:
-        with suppress(OSError):
-            os.close(directory_descriptor)
-        raise
-
-
-def ensure_checkpoint_root(root: Path) -> tuple[int, int]:
-    """Create a resolved checkpoint root and durably link each new directory."""
-    missing_components: list[str] = []
-    existing_parent = root
-    while True:
-        try:
-            directory_descriptor = os.open(existing_parent, directory_open_flags())
-        except FileNotFoundError:
-            missing_components.append(existing_parent.name)
-            existing_parent = existing_parent.parent
-        else:
-            break
-
-    try:
-        for component in reversed(missing_components):
-            created = False
-            try:
-                os.mkdir(component, dir_fd=directory_descriptor)
-            except FileExistsError:
-                pass
-            else:
-                created = True
-            child_descriptor = os.open(
-                component,
-                directory_open_flags(),
-                dir_fd=directory_descriptor,
-            )
-            if created:
-                try:
-                    sync_directory_descriptor(directory_descriptor)
-                except BaseException:
-                    with suppress(OSError):
-                        os.close(child_descriptor)
-                    raise
-            parent_descriptor = directory_descriptor
-            directory_descriptor = child_descriptor
-            try:
-                os.close(parent_descriptor)
-            except BaseException:
-                with suppress(OSError):
-                    os.close(parent_descriptor)
-                raise
-        root_stat = os.fstat(directory_descriptor)
-        return root_stat.st_dev, root_stat.st_ino
-    finally:
-        with suppress(OSError):
-            os.close(directory_descriptor)
-
-
-def require_descriptor_relative_filesystem() -> None:
-    """Reject platforms without the operations required for confined durability."""
-    required = (os.mkdir, os.open, os.rename, os.stat, os.unlink)
-    unsupported = [
-        operation.__name__ for operation in required if operation not in os.supports_dir_fd
-    ]
-    if unsupported:
-        names = ", ".join(sorted(unsupported))
-        raise NotImplementedError(
-            "ordered checkpoint publication requires POSIX descriptor-relative "
-            f"filesystem operations; unavailable: {names}"
-        )
 
 
 def checkpoint_payload(registry: StateRegistry) -> dict[str, Any]:

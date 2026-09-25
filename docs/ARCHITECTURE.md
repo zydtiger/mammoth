@@ -42,8 +42,10 @@ publication) and reuses `mammoth.workflow.launch.launch_process` as its child
 launcher; nothing imports `mammoth.queue`, so a project that never queues a
 job carries no additional runtime dependency.
 
-`mammoth.core` uses the Python standard library and `typing-extensions` for
-portable type annotations. TensorBoard, Rich,
+`mammoth.core` uses the Python standard library, `typing-extensions` for
+portable type annotations, and `portalocker` for descriptor locking. The
+`portalocker` 3.x range preserves Python 3.9 support and installs `pywin32` on
+Windows. Optional-framework dependencies remain separate. TensorBoard, Rich,
 Textual, psutil, and PyTorch belong in optional dependency groups and must not
 be imported by the core package.
 
@@ -85,7 +87,7 @@ After a reader context closes, its binary handle is closed; after the one-use
 session closes, its immutable receipt remains available but opening another
 reader raises `RuntimeError`.
 
-`mammoth.core.leases` owns the standard-library-only lease namespace protocol
+`mammoth.core.leases` owns the lease namespace protocol
 used by publication-scoped lifecycles. `claim_lease_namespace()` creates or
 acquires one owner-only canonical directory generation containing fixed
 metadata, terminal, and lock files. It holds both the directory descriptor and
@@ -1173,6 +1175,82 @@ names and order, profiler lifecycles, workload semantics, report schemas, and
 any distributed aggregation policy.
 
 ## Compatibility policy
+
+### Operating systems
+
+Direct single-process `Trainer`, neutral and Torch `ExecutionSession`, artifact
+inspection/read sessions, prepared checkpoint publication, and JSONL/text/
+TensorBoard logging support Linux and Windows. Windows support is scoped to
+local filesystems (CI uses NTFS); remote shares, hostile same-user writers,
+and cross-host coordination are excluded. DDP, workflow subprocess supervision,
+device queues, generic retireable publication namespaces, multi-artifact
+transactions, and work stores retain their existing POSIX/Linux contracts.
+Their modules remain importable on Windows so importing shared core or Torch
+APIs does not require `fcntl`; this does not implement their POSIX operations.
+
+The private `core._filesystem` package owns platform selection, binary file
+access, descriptor locks, text-writer ownership, prepared-file resources, and
+root-confined publication operations. Public artifacts retain byte verification;
+execution retains lifecycle policy; logging retains formatting; checkpoints
+retain serialization, receipt roles, ordered commit, and retention decisions.
+These callers do not select an OS backend. Existing POSIX lease, work-store,
+and queue clients also use the shared descriptor-lock adapter; directory locks
+remain POSIX operations, and queue sequence allocation retains blocking locking.
+Mammoth has no direct `fcntl` dependency; `portalocker` owns that platform choice.
+Both platforms use one checkpoint publication loop. The adapter preserves the existing POSIX lease protocol and
+Windows lease format rather than migrating live ownership state.
+
+The private `core._filesystem.windows` backend opens files with `CreateFileW` and
+`FILE_FLAG_OPEN_REPARSE_POINT`, rejects reparse points, and converts handles to
+non-inheritable binary CRT descriptors. Artifact parsing retains file identity,
+size, timestamps, and exact-byte verification at the existing boundaries.
+Checkpoint serializers receive ordinary paths while non-delete-sharing handles
+pin every ancestor directory; junctions and other reparse points are rejected
+in that traversal. Queued plans still bind their submitted root identity.
+Publication prepares all files, computes receipts, closes serializer handles,
+replaces targets in order, and only then retires prior checkpoints. Failed
+serialization leaves previous targets untouched. Open files that do not permit
+delete sharing can block replacement; the error propagates instead of removing
+the old checkpoint first. Read-only target replacement uses `FileRenameInfoEx`
+with `FILE_RENAME_IGNORE_READONLY_ATTRIBUTE`; it requires native filesystem
+support and write-attributes permission, preserves the replacement read-only
+bit, and never temporarily makes the old checkpoint writable.
+
+File contents are flushed before replacement. Windows directory publication
+and retirement are atomic namespace operations where provided by the local
+filesystem, but this backend does **not** promise POSIX directory-fsync or
+power-loss recovery guarantees. Windows file modes preserve the read-only bit;
+access control follows inherited ACLs, not Unix owner-only mode bits. The
+existing POSIX implementation and its durability/permission checks are unchanged.
+
+Windows direct sessions use `core._filesystem.leases` instead of the generic POSIX
+lease namespace. The empty `logs/.mammoth-windows.lock` coordinator is opened
+with read/write sharing but no delete sharing, then locked nonblockingly by
+`portalocker`. The handle is non-inheritable and process exit releases the lock. It remains after successful runs and is classified as immutable by
+`is_immutable_log_entry`; never remove it while producers may be running. This
+stable identity serializes namespace creation, recovery, and retirement without
+an old-inode/new-inode race. The logical-run namespace holds Windows-specific
+generation metadata and a terminal marker. Successful shutdown retires and
+reclaims it while still holding the coordinator; failed or interrupted runs
+release ownership and retain the generation for the next attempt. Recovery
+accepts authenticated retired state and empty interrupted creation/cleanup
+stages, and preserves unknown files, mismatched generations, and ambiguous
+active-plus-retired state. Moving a live lease layout between operating systems
+is unsupported; backend-specific metadata is never silently adopted.
+
+Windows text logs deny competing write handles and duplicate their owned
+handle for the Python logging stream. JSONL uses binary descriptors and tail
+readers use a private seek/read fallback when `pread` is unavailable.
+
+CI runs the full existing suite on Linux and the supported direct-execution
+suites selected in `tests/conftest.py` on Windows, on Python 3.9, 3.12, and 3.14.
+Shared acceptance tests cover training/resume, checkpoint receipts and
+retention, binary artifacts, logs, contention, failure, interruption, and process
+exit. Additional Windows tests exercise native handle sharing, reparse-point
+rejection, pinned-directory publication, and lease recovery. POSIX fault
+injection and out-of-scope runtime suites remain Linux checks.
+
+### Python and artifact schemas
 
 The package supports Python 3.9 and newer. `mammoth.compat` contains the shared
 runtime adaptations used by core, workflow, logging, monitor, and Torch modules.

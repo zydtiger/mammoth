@@ -23,7 +23,6 @@ a writer that deliberately bypasses this module's lease is not.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import hmac
 import json
@@ -40,6 +39,7 @@ from types import MappingProxyType
 from typing import Any, BinaryIO, Literal, Union, cast
 
 from mammoth.compat import DATACLASS_SLOTS, add_exception_note
+from mammoth.core._filesystem.locking import lock_exclusive, unlock
 from mammoth.core.execution import sanitize_metadata_fields
 from mammoth.core.leases import (
     LeaseNamespaceConflictError,
@@ -192,7 +192,7 @@ class WorkStoreLease:
             return
         if self._descriptor is not None:
             try:
-                fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+                unlock(self._descriptor)
             finally:
                 os.close(self._descriptor)
         for namespace in reversed(self._namespaces):
@@ -275,7 +275,7 @@ def claim_work_store_lease(
         # cannot slip an unsafe lease file past ownership validation.
         _require_owned(lease_stat, path=lease_path, store_path=path)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_exclusive(descriptor)
         except BlockingIOError as error:
             raise WorkStoreConflictError(
                 f"Work store {path} is owned by another process.",

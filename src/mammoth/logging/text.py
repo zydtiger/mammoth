@@ -6,77 +6,19 @@ monitoring never parses these files as machine state.
 
 from __future__ import annotations
 
-import fcntl
 import logging
 import os
 import stat
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO, Union, cast
 
 from mammoth.compat import add_exception_note
+from mammoth.core._filesystem.text import ProcessTextLogLease as ProcessTextLogLease
+from mammoth.core._filesystem.text import claim_process_text_log as claim_process_text_log
+from mammoth.core._filesystem.text import open_text_stream
 from mammoth.core.execution import ExecutionContext
 
 DEFAULT_TEXT_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
-
-
-@dataclass
-class ProcessTextLogLease:
-    """Hold exclusive process ownership of one append-only rank log."""
-
-    path: Path
-    _descriptor: int
-    _device: int
-    _inode: int
-    _closed: bool = False
-
-    def close(self) -> None:
-        """Release ownership while retaining the append-only log inode."""
-        if self._closed:
-            return
-        try:
-            fcntl.flock(self._descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(self._descriptor)
-            self._closed = True
-
-    def __enter__(self) -> ProcessTextLogLease:
-        return self
-
-    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
-        self.close()
-
-
-def claim_process_text_log(path: Path) -> ProcessTextLogLease:
-    """Claim one regular append-only log without truncating earlier diagnostics."""
-    log_path = Path(path)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_APPEND | os.O_NONBLOCK
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        descriptor = os.open(log_path, flags | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        descriptor = os.open(log_path, flags)
-    try:
-        descriptor_stat = os.fstat(descriptor)
-        if not stat.S_ISREG(descriptor_stat.st_mode):
-            raise RuntimeError(f"Text log must be a regular file: {log_path}")
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise RuntimeError(
-                f"Text log is already owned by another process: {log_path}"
-            ) from error
-    except BaseException:
-        os.close(descriptor)
-        raise
-    return ProcessTextLogLease(
-        path=log_path,
-        _descriptor=descriptor,
-        _device=descriptor_stat.st_dev,
-        _inode=descriptor_stat.st_ino,
-    )
 
 
 if TYPE_CHECKING:
@@ -92,13 +34,10 @@ class ProcessTextLogHandler(_TextStreamHandler):
         self._mammoth_closed = False
         self.path = Path(path)
         self._lease = claim_process_text_log(self.path)
-        flags = os.O_WRONLY | os.O_APPEND
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
         descriptor: Union[int, None] = None
         stream: Union[TextIO, None] = None
         try:
-            descriptor = os.open(self.path, flags)
+            descriptor = open_text_stream(self._lease)
             descriptor_stat = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(descriptor_stat.st_mode)

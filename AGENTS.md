@@ -49,7 +49,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `.python-version` | uv/Python development baseline. | The supported development interpreter changes deliberately. |
 | `.gitignore` | Generated-file and local-environment exclusions. | A new reproducible build, cache, environment, or local artifact needs an exclusion. |
 | `.pre-commit-config.yaml` | Sole definition of mechanical commands, scopes, and local Git-hook stages. Run by `prek` locally and by CI over every file. | A mechanically checkable rule is added, removed, or rescoped. |
-| `.github/workflows/ci.yml` | GitHub Actions validation: a `lint` job running the commit-stage hooks once, and a matrixed `test` job running the `pre-push` stage across the supported Python versions, then `uv build` and an install smoke test on the lowest one. Invokes the hook runner rather than restating hook commands. | CI triggers, jobs, the tested Python versions, or validation coverage change. |
+| `.github/workflows/ci.yml` | GitHub Actions validation: a `lint` job running the commit-stage hooks once, and a matrixed Linux/Windows `test` job running the `pre-push` stage across the supported Python versions, then `uv build` and an install smoke test on the lowest one. Invokes the hook runner rather than restating hook commands. | CI triggers, jobs, the tested Python versions, or validation coverage change. |
 | `src/mammoth/__init__.py` | Lightweight root package metadata and intentionally small stable exports. | Package version or a truly root-level stable export changes. |
 | `src/mammoth/__main__.py` | `python -m mammoth` forwarding entry point. | Module execution behavior changes. |
 | `src/mammoth/compat.py` | Shared interpreter compatibility for dataclass storage, exception notes, and strict iterable pairing. | Supported Python versions or these runtime adaptations change. |
@@ -57,6 +57,14 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/py.typed` | PEP 561 marker declaring inline type information. | Keep present and empty while Mammoth ships typed source. |
 | `src/mammoth/execution.py` | Framework-neutral direct execution sessions: immutable specs, create/strict-attach lifecycle, phase and terminal events, logging and heartbeat-capable observer ownership, generic pipelines, leases, deterministic cleanup, and a detached no-op/session-backed observer call surface. | Neutral direct-session lifecycle, spec fields, attach strictness, cleanup ordering, or the no-op/session-backed observer call surface changes. |
 | `src/mammoth/core/__init__.py` | Public framework-neutral core exports. | A stable core symbol is added, removed, or renamed. |
+| `src/mammoth/core/_filesystem/__init__.py` | Private filesystem adapter boundary. | These filesystem adapter contracts change. |
+| `src/mammoth/core/_filesystem/confined.py` | Root identity, confined preparation, and retirement. | These filesystem adapter contracts change. |
+| `src/mammoth/core/_filesystem/io.py` | Portable binary descriptor operations and replacement. | These filesystem adapter contracts change. |
+| `src/mammoth/core/_filesystem/leases.py` | Platform logical-run lease selection and Windows recovery. | These filesystem adapter contracts change. |
+| `src/mammoth/core/_filesystem/locking.py` | Portalocker descriptor locking and error translation. | These filesystem adapter contracts change. |
+| `src/mammoth/core/_filesystem/publication.py` | Prepared-file ownership, staging, and directory durability. | These filesystem adapter contracts change. |
+| `src/mammoth/core/_filesystem/text.py` | Platform text-log descriptor ownership. | These filesystem adapter contracts change. |
+| `src/mammoth/core/_filesystem/windows.py` | Native Windows handles and pinned directory traversal. | These filesystem adapter contracts change. |
 | `src/mammoth/core/artifacts.py` | Atomic local bytes, text, JSON, and opaque artifact publication. | Local publication durability or writer behavior changes. |
 | `src/mammoth/core/events.py` | Schema-v1 event values, append-only producer writers, replay, and active tailing. | Event validation, retention, compatibility, or stream behavior changes. |
 | `src/mammoth/core/execution.py` | Immutable execution metadata, lineage, sanitization, discovery, joins, logical-run leases, and immutable-log-entry classification for consumer log resets. | Attempt identity, provenance, compatibility, lease, or immutable-log-entry classification behavior changes. |
@@ -101,6 +109,10 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/torch/scheduling.py` | Generic warmup-linear learning-rate scheduling, weighted rank partitioning, distributed batch sampling, accumulation plans, policies, and logical-window loss scales. | Learning-rate schedules, workload partitioning, sampler, accumulation-policy, or scaling behavior changes. |
 | `src/mammoth/torch/state.py` | Serializable ordinary trainer loop coordinates. | Trainer resume coordinates change. |
 | `src/mammoth/torch/trainer.py` | Constructed-object single/DDP loops, project policy integration, validation, observability, and checkpoint lifecycle. | Generic trainer behavior or policy integration changes. |
+| `tests/test_filesystem.py` | Portable descriptor-lock contention and process-exit coverage. | Filesystem adapter ownership contracts change. |
+| `tests/test_portable_training.py` | Shared Linux/Windows direct-training, artifact, logging, and process-exit acceptance coverage. | Supported direct-training behavior changes. |
+| `tests/test_windows.py` | Native Windows handle, reparse-point, and lease recovery coverage. | Windows platform behavior changes. |
+| `tests/conftest.py` | Shared test environment and Windows supported-suite selection. | Test collection or environment policy changes. |
 | `tests/test_artifacts.py` | Atomic artifact publication unit coverage. | Artifact publication behavior changes. |
 | `tests/test_events.py` | Event validation, writer, replay, tailing, and legacy-field unit coverage. | Event behavior changes. |
 | `tests/test_execution.py` | Execution metadata, lineage, sanitization, compatibility, lease, and immutable-log-entry classification unit coverage. | Execution behavior changes. |

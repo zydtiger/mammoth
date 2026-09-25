@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ import pytest
 
 import mammoth.logging.text as text_module
 from mammoth.core import RunLayout, create_execution_context, read_execution_events
+from mammoth.core._filesystem import text as filesystem_text
 from mammoth.core.events import ExecutionEventWriter
 from mammoth.logging import (
     JsonlEventSink,
@@ -613,21 +615,21 @@ def test_process_text_log_lease_rejects_concurrent_owner(tmp_path: Path) -> None
     assert path.is_file()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX syscall fault injection")
 def test_process_text_log_closes_descriptor_after_lock_interruption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A ``BaseException`` after flock succeeds cannot retain text-log ownership."""
     path = tmp_path / "interrupted-rank.log"
-    original_flock = text_module.fcntl.flock
+    original_lock = filesystem_text.lock_exclusive
 
-    def interrupt_after_lock(descriptor: int, operation: int) -> None:
-        original_flock(descriptor, operation)
-        if operation == text_module.fcntl.LOCK_EX | text_module.fcntl.LOCK_NB:
-            raise KeyboardInterrupt("text-log acquisition interrupted")
+    def interrupt_after_lock(descriptor: int) -> None:
+        original_lock(descriptor)
+        raise KeyboardInterrupt("text-log acquisition interrupted")
 
     with monkeypatch.context() as patch:
-        patch.setattr(text_module.fcntl, "flock", interrupt_after_lock)
+        patch.setattr(filesystem_text, "lock_exclusive", interrupt_after_lock)
         with pytest.raises(KeyboardInterrupt, match="text-log acquisition interrupted"):
             claim_process_text_log(path)
 
@@ -635,6 +637,7 @@ def test_process_text_log_closes_descriptor_after_lock_interruption(
         pass
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX syscall fault injection")
 def test_process_text_handler_closes_descriptors_after_base_exception(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

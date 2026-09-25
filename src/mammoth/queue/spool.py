@@ -21,7 +21,6 @@ cross-process coordination is required to append one.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import uuid
@@ -33,6 +32,7 @@ from types import MappingProxyType
 from typing import Any, Literal, Union, cast
 
 from mammoth.compat import DATACLASS_SLOTS
+from mammoth.core._filesystem.locking import lock_exclusive, unlock
 from mammoth.core.artifacts import artifact_open_flags, atomic_write_json
 from mammoth.core.identity import validate_device_spec, validate_run_name
 from mammoth.core.layout import QueueLayout
@@ -516,7 +516,7 @@ def _allocate_sequence(layout: QueueLayout) -> int:
         flags |= os.O_NOFOLLOW
     descriptor = os.open(lock_path, flags, 0o600)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        lock_exclusive(descriptor, blocking=True)
         try:
             os.lseek(descriptor, 0, os.SEEK_SET)
             raw = os.read(descriptor, 32).strip()
@@ -532,7 +532,7 @@ def _allocate_sequence(layout: QueueLayout) -> int:
             os.fsync(descriptor)
             return current
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            unlock(descriptor)
     finally:
         os.close(descriptor)
 

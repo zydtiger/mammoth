@@ -58,7 +58,7 @@ def test_derive_run_name_sanitizes_unsafe_stem_characters(tmp_path: Path) -> Non
 
 
 def test_derive_run_name_falls_back_when_the_stem_is_empty(tmp_path: Path) -> None:
-    target = tmp_path / "..."
+    target = tmp_path / "___"
 
     name = derive_run_name("preprocess", target)
 

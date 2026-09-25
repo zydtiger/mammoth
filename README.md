@@ -21,6 +21,13 @@ No familiarity with Mammoth is assumed below.
 - Python 3.9 or newer
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
 
+Direct single-process training, artifact receipts, JSONL/TensorBoard logging,
+and `ExecutionSession` support Linux and Windows on local filesystems. Workflow
+subprocess supervision, device queues, multi-artifact transactions, and work
+stores retain their POSIX/Linux requirements. See the
+[platform contract](docs/ARCHITECTURE.md#compatibility-policy) for Windows
+filesystem guarantees and limitations.
+
 From the repository root, install the base dependencies and confirm the CLI is
 available:
 
@@ -642,10 +649,10 @@ lease = claim_lease_namespace(output_root / ".staging" / output_identity / "leas
 try:
     publish_and_validate_complete_bundle()
 except BaseException:
-    lease.close()          # preserve crash-resumable state
+    lease.close()  # preserve crash-resumable state
     raise
 else:
-    lease.terminalize()    # atomically retire, then reclaim the namespace
+    lease.terminalize()  # atomically retire, then reclaim the namespace
 ```
 
 The namespace must be on the publication filesystem. Mammoth owns only its

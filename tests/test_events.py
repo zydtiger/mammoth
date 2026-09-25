@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -41,6 +42,7 @@ def test_event_contract_symbols_are_public_from_core() -> None:
     assert EventName is events_module.EventName
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX syscall fault injection")
 def test_event_stream_closes_descriptor_after_base_exception(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
