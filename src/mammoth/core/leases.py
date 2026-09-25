@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import ctypes
 import errno
-import fcntl
 import json
 import os
 import stat
@@ -21,6 +20,7 @@ from pathlib import Path
 from typing import Any, Literal, Union
 
 from mammoth.compat import DATACLASS_SLOTS
+from mammoth.core._filesystem.locking import lock_exclusive, unlock
 
 LEASE_NAMESPACE_SCHEMA_VERSION = 1
 
@@ -63,7 +63,7 @@ class RetireableLeaseNamespace:
         if self._closed:
             return
         try:
-            fcntl.flock(self._lease_descriptor, fcntl.LOCK_UN)
+            unlock(self._lease_descriptor)
         finally:
             os.close(self._lease_descriptor)
             os.close(self._directory_descriptor)
@@ -148,7 +148,7 @@ def claim_lease_namespace(
 ) -> RetireableLeaseNamespace:
     """Create or acquire one stable same-filesystem lease namespace.
 
-    Acquisition is nonblocking.  After ``flock`` succeeds, the canonical path
+    Acquisition is nonblocking.  After the lock is acquired, the canonical path
     is revalidated against the already-open directory and lock descriptors.
     A contender paused across retirement therefore rejects the old inode rather
     than proceeding concurrently with a newly created canonical generation.
@@ -222,7 +222,7 @@ def _claim_existing_namespace(
         generation = _metadata_generation(metadata, canonical)
         lease_descriptor = _open_lock(directory_descriptor, canonical)
         try:
-            fcntl.flock(lease_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_exclusive(lease_descriptor)
         except BlockingIOError as error:
             raise LeaseNamespaceConflictError(
                 f"Another process owns lease namespace {canonical}."
@@ -243,7 +243,7 @@ def _claim_existing_namespace(
     except BaseException:
         if lease_descriptor >= 0:
             try:
-                fcntl.flock(lease_descriptor, fcntl.LOCK_UN)
+                unlock(lease_descriptor)
             finally:
                 os.close(lease_descriptor)
         os.close(directory_descriptor)
@@ -275,11 +275,12 @@ def _create_namespace_if_absent(path: Path) -> None:
     try:
         _require_owned_mode(os.fstat(directory_descriptor), path=creating_path, directory=True)
         try:
-            fcntl.flock(directory_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_exclusive(directory_descriptor)
         except BlockingIOError as error:
             raise LeaseNamespaceConflictError(
                 f"Another process is creating lease namespace {path}."
             ) from error
+        _require_current_creation_directory(parent_descriptor, creating_path, directory_descriptor)
         children = set(os.listdir(directory_descriptor))
         unknown = children - {_METADATA_NAME, _LOCK_NAME}
         if unknown:
@@ -319,6 +320,16 @@ def _create_namespace_if_absent(path: Path) -> None:
         os.close(parent_descriptor)
 
 
+def _require_current_creation_directory(
+    parent_descriptor: int, path: Path, descriptor: int
+) -> None:
+    """Retry after a scratch directory was promoted while waiting for its lock."""
+    current = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+    opened = os.fstat(descriptor)
+    if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+        raise FileNotFoundError(f"Lease creation directory changed before acquisition: {path}")
+
+
 def _discard_creating_namespace(path: Path, parent_descriptor: int) -> None:
     """Reclaim an abandoned authenticated creation scratch beside canonical state."""
     creating_path = _creating_path(path)
@@ -332,9 +343,10 @@ def _discard_creating_namespace(path: Path, parent_descriptor: int) -> None:
     try:
         _require_owned_mode(os.fstat(descriptor), path=creating_path, directory=True)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_exclusive(descriptor)
         except BlockingIOError:
             return
+        _require_current_creation_directory(parent_descriptor, creating_path, descriptor)
         children = set(os.listdir(descriptor))
         unknown = children - {_METADATA_NAME, _LOCK_NAME}
         if unknown:
@@ -479,7 +491,7 @@ def _remove_authenticated_retired(
                     directory=False,
                 )
                 try:
-                    fcntl.flock(retired_lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    lock_exclusive(retired_lock_descriptor)
                 except BlockingIOError as error:
                     raise LeaseNamespaceConflictError(
                         f"Retired lease namespace is still owned: {retired_path}"
@@ -541,7 +553,7 @@ def _remove_authenticated_retired(
                 f"Lease retirement proof generation mismatch: {proof_path}"
             )
         try:
-            fcntl.flock(proof_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_exclusive(proof_descriptor)
         except BlockingIOError as error:
             raise LeaseNamespaceConflictError(
                 f"Lease retirement proof is still owned: {proof_path}"
@@ -603,12 +615,12 @@ def _remove_authenticated_retired(
     finally:
         if proof_descriptor >= 0:
             try:
-                fcntl.flock(proof_descriptor, fcntl.LOCK_UN)
+                unlock(proof_descriptor)
             finally:
                 os.close(proof_descriptor)
         if retired_lock_descriptor >= 0:
             try:
-                fcntl.flock(retired_lock_descriptor, fcntl.LOCK_UN)
+                unlock(retired_lock_descriptor)
             finally:
                 os.close(retired_lock_descriptor)
         if parent_descriptor >= 0:
@@ -874,7 +886,7 @@ def _remove_retirement_proof(
         proof_stat = os.fstat(descriptor)
         _require_owned_mode(proof_stat, path=proof_path, directory=False)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_exclusive(descriptor)
         except BlockingIOError as error:
             raise LeaseNamespaceConflictError(
                 f"Lease retirement proof is still owned: {proof_path}"

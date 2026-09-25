@@ -22,12 +22,11 @@ from types import MappingProxyType
 from typing import Any, Literal, Union
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
+from mammoth.core._filesystem.leases import WINDOWS_RUN_LOCK, RunLease, claim_run_lease
 from mammoth.core.identity import validate_execution_id, validate_run_name
 from mammoth.core.leases import (
     LeaseNamespaceConflictError,
     LeaseNamespaceError,
-    RetireableLeaseNamespace,
-    claim_lease_namespace,
 )
 
 EXECUTION_SCHEMA_VERSION = 1
@@ -165,7 +164,7 @@ class LogicalRunLease:
     """Hold exclusive producer ownership of one logical run until terminal state."""
 
     path: Path
-    _namespace: RetireableLeaseNamespace
+    _namespace: RunLease
     _closed: bool = False
 
     def close(self) -> None:
@@ -201,9 +200,8 @@ def claim_logical_run_lease(run_dir: Path) -> LogicalRunLease:
             f"that none is active: {legacy_path}"
         )
     namespace_path = run_dir / LOGICAL_RUN_LEASE_RELATIVE_DIR
-    lease_parent = namespace_path.parent
     try:
-        namespace = claim_lease_namespace(namespace_path, owned_parents=(lease_parent,))
+        lock_path, namespace = claim_run_lease(namespace_path)
     except LeaseNamespaceConflictError as error:
         raise RuntimeError(
             f"Another execution is already active for logical run {run_dir.name!r}: "
@@ -214,7 +212,7 @@ def claim_logical_run_lease(run_dir: Path) -> LogicalRunLease:
             f"Logical-run lease is not safely acquirable: {namespace_path}"
         ) from error
     return LogicalRunLease(
-        path=namespace.path / ".mammoth-lease.lock",
+        path=lock_path,
         _namespace=namespace,
     )
 
@@ -472,7 +470,8 @@ def is_immutable_log_entry(log_dir: Path, child: Path) -> bool:
     Returns ``True`` for the execution-attempt container (``EXECUTIONS_RELATIVE_DIR``'s
     final component, plus everything nested beneath it), the entire
     ``.mammoth-leases/`` namespace tree, and the logical-run lease file
-    (``LOGICAL_RUN_LEASE_FILENAME``); ``False`` for every other entry, which is
+    (``LOGICAL_RUN_LEASE_FILENAME``), and the Windows coordinator
+    (``WINDOWS_RUN_LOCK``); ``False`` for every other entry, which is
     consumer-owned mutable content a log reset may delete.
 
     Classification is purely by ``child``'s path identity relative to ``log_dir``
@@ -501,7 +500,13 @@ def is_immutable_log_entry(log_dir: Path, child: Path) -> bool:
     lease_namespace = normalized_log_dir / LOGICAL_RUN_LEASE_RELATIVE_DIR.relative_to("logs")
     lease_container = lease_namespace.parent
     return (
-        normalized_child in (executions_dir, legacy_lease_path, lease_container)
+        normalized_child
+        in (
+            executions_dir,
+            legacy_lease_path,
+            lease_container,
+            normalized_log_dir / WINDOWS_RUN_LOCK,
+        )
         or normalized_child.is_relative_to(executions_dir)
         or normalized_child.is_relative_to(lease_container)
     )

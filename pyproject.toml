@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.9"
 dependencies = [
+    "portalocker>=3.2,<4",
     "typer-slim>=0.21.2,<0.22",
     "typing-extensions>=4.12",
 ]
@@ -70,6 +71,7 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers"
 testpaths = ["tests"]
+markers = ["windows: requires native Windows handle semantics"]
 
 [tool.coverage.run]
 branch = true

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import stat
 import threading
 from pathlib import Path
 from typing import Any
@@ -559,3 +560,42 @@ def test_generation_substitution_is_detected(tmp_path: Path) -> None:
     with pytest.raises(LeaseNamespaceRecoveryError, match="generation metadata changed"):
         lease.terminalize()
     lease.close()
+
+
+@pytest.mark.parametrize("cleanup", [False, True])
+def test_open_creation_descriptor_cannot_rewrite_promoted_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup: bool
+) -> None:
+    namespace = tmp_path / "leases"
+    creating = lease_module._creating_path(namespace)
+    creating.mkdir(mode=0o700)
+    original_lock = lease_module.lock_exclusive
+    owner = None
+
+    def promote_before_lock(descriptor: int) -> None:
+        nonlocal owner
+        if owner is None and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            # Another contender completes promotion after our open, before our lock.
+            with monkeypatch.context() as patch:
+                patch.setattr(lease_module, "lock_exclusive", original_lock)
+                owner = claim_lease_namespace(namespace)
+        original_lock(descriptor)
+
+    monkeypatch.setattr(lease_module, "lock_exclusive", promote_before_lock)
+    try:
+        if cleanup:
+            parent_descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with pytest.raises(FileNotFoundError):
+                    lease_module._discard_creating_namespace(namespace, parent_descriptor)
+            finally:
+                os.close(parent_descriptor)
+        else:
+            with pytest.raises(LeaseNamespaceConflictError):
+                claim_lease_namespace(namespace)
+        assert owner is not None
+        lease_module._require_current_generation(owner)
+        assert not creating.exists()
+    finally:
+        if owner is not None:
+            owner.close()

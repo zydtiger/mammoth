@@ -10,6 +10,15 @@ src/mammoth/
 ├── compat.py
 ├── execution.py
 ├── core/
+│   ├── _filesystem/
+│   │   ├── __init__.py
+│   │   ├── confined.py
+│   │   ├── io.py
+│   │   ├── leases.py
+│   │   ├── locking.py
+│   │   ├── publication.py
+│   │   ├── text.py
+│   │   └── windows.py
 │   ├── __init__.py
 │   ├── artifacts.py
 │   ├── events.py
@@ -148,5 +157,27 @@ mammoth
 │   ├── mammoth.core
 │   └── tensorboardX (optional module only)
 └── mammoth.core
-    └── Python standard library
+    ├── Python standard library / typing-extensions
+    └── portalocker (pywin32 on Windows)
 ```
+
+
+## Platform backends
+
+`core._filesystem` is the private platform boundary:
+
+- `io` owns binary opens, offset reads, file validation, and replacement.
+- `publication` owns prepared artifacts, staging cleanup, and directory sync.
+- `confined` binds publication to root identities and confines target operations.
+- `locking` adapts `portalocker` descriptor locks and contention errors.
+- `text` owns exclusive append-only text descriptors.
+- `leases` selects logical-run lease formats and owns Windows recovery.
+- `windows` contains native handles and pinned directory traversal.
+
+`core.artifacts` re-exports the established prepared-artifact API and owns byte
+verification. `torch.checkpoint` has one ordered publication loop using
+`publication_root`; it owns no platform selection or native filesystem calls.
+All descriptor locking, including POSIX-only lease/work-store/queue clients,
+uses `core._filesystem.locking`. Mammoth does not import `fcntl` directly;
+`portalocker` selects the operating-system lock primitive.
+Platform guarantees and scope live in `docs/ARCHITECTURE.md`.

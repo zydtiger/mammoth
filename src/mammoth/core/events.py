@@ -25,6 +25,8 @@ from typing import Any, BinaryIO, Literal, Union, cast
 
 from typing_extensions import Self
 
+from mammoth.core._filesystem.io import open_event_file
+from mammoth.core._filesystem.io import read_at as _read_at
 from mammoth.core.execution import (
     ExecutionContext,
     sanitize_metadata_fields,
@@ -900,10 +902,7 @@ class ExecutionEventTailReader:
         return events
 
     def _read_appended_bytes(self) -> bytes:
-        flags = os.O_RDONLY | os.O_NONBLOCK
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(self.path, flags)
+        descriptor = open_event_file(self.path)
         try:
             descriptor_stat = os.fstat(descriptor)
             if not stat.S_ISREG(descriptor_stat.st_mode):
@@ -926,7 +925,7 @@ class ExecutionEventTailReader:
             guard_offset = self._offset - len(self._append_guard)
             if (
                 self._append_guard
-                and os.pread(
+                and _read_at(
                     descriptor,
                     len(self._append_guard),
                     guard_offset,
@@ -941,7 +940,7 @@ class ExecutionEventTailReader:
             seek_ahead = read_offset > self._offset
             mid_stream_start = False
             if seek_ahead:
-                landed_on_line_start = os.pread(descriptor, 1, read_offset - 1) == b"\n"
+                landed_on_line_start = _read_at(descriptor, 1, read_offset - 1) == b"\n"
                 if landed_on_line_start:
                     # The seek point happened to land exactly on a line
                     # boundary (the byte immediately before it is the
@@ -1125,10 +1124,7 @@ def _monotonic_time(clock: Callable[[], float]) -> float:
 
 
 def _open_event_stream(path: Path) -> BinaryIO:
-    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NONBLOCK
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags, 0o600)
+    descriptor = open_event_file(path, append=True)
     try:
         descriptor_stat = os.fstat(descriptor)
         if not stat.S_ISREG(descriptor_stat.st_mode):

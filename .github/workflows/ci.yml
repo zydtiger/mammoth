@@ -33,11 +33,12 @@ jobs:
           prek-version: "0.4.x"
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.9", "3.12", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -46,7 +47,7 @@ jobs:
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
-          cache-suffix: py${{ matrix.python-version }}
+          cache-suffix: ${{ matrix.os }}-py${{ matrix.python-version }}
           python-version: ${{ matrix.python-version }}
       - name: Sync all extras
         run: uv sync --locked --all-extras
@@ -62,8 +63,14 @@ jobs:
         run: uv build
 
       - name: Install smoke test
+        shell: bash
         if: matrix.python-version == '3.9'
         run: |
           uv venv "$RUNNER_TEMP/smoke"
-          uv pip install --python "$RUNNER_TEMP/smoke" dist/*.whl
-          "$RUNNER_TEMP/smoke/bin/mammoth" --help
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            uv pip install --python "$RUNNER_TEMP/smoke/Scripts/python.exe" dist/*.whl
+            "$RUNNER_TEMP/smoke/Scripts/mammoth.exe" --help
+          else
+            uv pip install --python "$RUNNER_TEMP/smoke/bin/python" dist/*.whl
+            "$RUNNER_TEMP/smoke/bin/mammoth" --help
+          fi

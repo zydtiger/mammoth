@@ -1,7 +1,7 @@
 """Exclusive device-lane leasing and the foreground FIFO job runner.
 
 One ``serve`` invocation exclusively leases a single device spec (mirroring
-:func:`mammoth.core.execution.claim_logical_run_lease`'s advisory-flock
+:func:`mammoth.core.execution.claim_logical_run_lease`'s advisory-lock
 mechanics), then repeatedly claims the oldest pending job whose device
 requirement matches, launches its argv as a supervised child through
 :func:`mammoth.workflow.launch.launch_process`, and appends the outcome to
@@ -23,7 +23,6 @@ mid-flight as ``interrupted`` before resuming FIFO dispatch.
 
 from __future__ import annotations
 
-import fcntl
 import os
 import signal
 import stat
@@ -35,6 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
+from mammoth.core._filesystem.locking import lock_exclusive, unlock
 from mammoth.core.identity import validate_device_spec
 from mammoth.core.layout import QueueLayout
 from mammoth.queue.spool import (
@@ -97,7 +97,7 @@ class DeviceLease:
         if self._closed:
             return
         try:
-            fcntl.flock(self._descriptor, fcntl.LOCK_UN)
+            unlock(self._descriptor)
         finally:
             os.close(self._descriptor)
             self._closed = True
@@ -116,7 +116,7 @@ def claim_device_lease(entry: Path, device: str) -> DeviceLease:
 
     Mirrors :func:`mammoth.core.execution.claim_logical_run_lease` exactly:
     a second concurrent claim for the same device fails closed instead of
-    blocking, and an OS-released flock (process crash or exit) frees the
+    blocking, and an OS-released lock (process crash or exit) frees the
     lane for the next ``serve`` invocation.
     """
     validated_device = validate_device_spec(device)
@@ -131,7 +131,7 @@ def claim_device_lease(entry: Path, device: str) -> DeviceLease:
         if not stat.S_ISREG(descriptor_stat.st_mode):
             raise QueueError(f"Device lease path must be a regular file: {path}")
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_exclusive(descriptor)
         except BlockingIOError as error:
             raise DeviceLeaseConflictError(
                 f"Device {validated_device!r} is already served by another lane: {path}"
