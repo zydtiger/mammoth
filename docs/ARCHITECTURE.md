@@ -1250,6 +1250,25 @@ exit. Additional Windows tests exercise native handle sharing, reparse-point
 rejection, pinned-directory publication, and lease recovery. POSIX fault
 injection and out-of-scope runtime suites remain Linux checks.
 
+### TensorBoard dependencies
+
+The `tensorboard` extra accepts TensorBoardX 2.6 and newer. Its lower bound
+allows consumers with older protobuf requirements to use the existing
+`TensorBoardSink` API without adding TensorFlow or PyTorch to Mammoth's
+framework-neutral logging layer. The `torch` extra remains independent.
+
+TensorFlow 2.10 requires `protobuf>=3.9.2,<3.20`; TensorBoardX 2.6 accepts
+`protobuf>=3.8,<4`, whereas TensorBoardX 2.6.2.2 requires `protobuf>=3.20`.
+A consumer combining these frameworks should explicitly select
+`tensorboardX==2.6` and `protobuf==3.19.6` in its own dependency metadata and
+lockfile. These ranges come from the published
+[TensorFlow 2.10.1 metadata](https://pypi.org/pypi/tensorflow/2.10.1/json),
+[TensorBoardX 2.6 metadata](https://pypi.org/pypi/tensorboardX/2.6/json), and
+[TensorBoardX 2.6.2.2 metadata](https://pypi.org/pypi/tensorboardX/2.6.2.2/json).
+Mammoth's default lock retains the modern logging stack. Framework, NumPy,
+Python, and CUDA compatibility remain the consuming application's responsibility;
+this dependency intersection alone does not establish GPU compatibility.
+
 ### Python and artifact schemas
 
 The package supports Python 3.9 and newer. `mammoth.compat` contains the shared

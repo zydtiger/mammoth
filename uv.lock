@@ -690,7 +690,7 @@ requires-dist = [
     { name = "portalocker", specifier = ">=3.2,<4" },
     { name = "psutil", marker = "extra == 'monitor'", specifier = ">=6.1" },
     { name = "rich", marker = "extra == 'monitor'", specifier = ">=14.3.2" },
-    { name = "tensorboardx", marker = "extra == 'tensorboard'", specifier = ">=2.6.2.2" },
+    { name = "tensorboardx", marker = "extra == 'tensorboard'", specifier = ">=2.6" },
     { name = "textual", marker = "extra == 'monitor'", specifier = ">=8.2.8" },
     { name = "torch", marker = "extra == 'torch'", specifier = ">=2.2,<2.13" },
     { name = "typer-slim", specifier = ">=0.21.2,<0.22" },

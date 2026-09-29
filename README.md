@@ -308,6 +308,14 @@ Multiple extras may be installed together:
 uv sync --extra monitor --extra tensorboard --extra torch
 ```
 
+For a consuming project that also requires TensorFlow 2.10, keep
+`mammoth[tensorboard]` and explicitly pin `tensorboardX==2.6` and
+`protobuf==3.19.6` in that project's dependencies. These logging pins do not
+require downgrading PyTorch. The default Mammoth lock continues to use modern
+TensorBoardX; the legacy combination needs the consuming project's own lock.
+See [TensorBoard dependency compatibility](docs/ARCHITECTURE.md#tensorboard-dependencies)
+for the dependency boundary.
+
 ## Profile an arbitrary PyTorch workload
 
 The optional profiler measures a caller-owned zero-argument callable, so the
