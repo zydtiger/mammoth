@@ -360,6 +360,9 @@ def test_old_producer_can_appear_after_reader_starts(tmp_path: Path, kind):
         with GroupEventWriter(path.with_suffix(""), group_id="group") as writer:
             writer.emit("group_started")
             assert [event.event for event in reader.poll()] == ["group_started"]
+            writer.emit("group_completed")
+            assert [event.event for event in reader.poll()] == ["group_completed"]
+            assert reader.poll() == []
 
 
 def test_skipping_an_empty_old_footer_does_not_skip_sequence_validation(tmp_path: Path):
