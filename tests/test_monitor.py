@@ -299,6 +299,7 @@ def test_monitor_folds_generic_tasks_metrics_throughput_and_eta(tmp_path: Path) 
 def test_monitor_preserves_valid_prefix_and_isolates_malformed_stream(tmp_path: Path) -> None:
     layout = RunLayout(tmp_path, "run").prepare()
     context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    (context.execution_dir / "rank-0.jsonl").touch()
     with ExecutionEventWriter.for_process(context, rank=0) as writer:
         writer.emit("execution_started")
     stream = context.execution_dir / "rank-0.jsonl"
@@ -539,6 +540,7 @@ def test_incremental_fold_matches_full_fold_with_malformed_trailing_line(
 ) -> None:
     layout = RunLayout(tmp_path, "run").prepare()
     context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    (context.execution_dir / "rank-0.jsonl").touch()
     with ExecutionEventWriter.for_process(context, rank=0) as writer:
         writer.emit("execution_started")
         writer.emit("process_started", phase="train")
@@ -673,6 +675,7 @@ def test_dashboard_ignores_legacy_units_when_reconciling_progress(tmp_path: Path
     layout = RunLayout(tmp_path, "run").prepare()
     context = create_context(layout, "attempt", "2026-01-01T00:00:00Z", world_size=2)
     for rank, unit in enumerate(("patches", "unrelated-items")):
+        (context.execution_dir / f"rank-{rank}.jsonl").touch()
         with ExecutionEventWriter.for_process(context, rank=rank) as writer:
             writer.emit_progress(
                 phase="arbitrary-phase",

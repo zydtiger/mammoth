@@ -20,6 +20,7 @@ src/mammoth/
 │   │   ├── text.py
 │   │   └── windows.py
 │   ├── __init__.py
+│   ├── _event_stream.py
 │   ├── artifacts.py
 │   ├── events.py
 │   ├── execution.py
@@ -71,6 +72,11 @@ src/mammoth/
 │   └── trainer.py
 └── py.typed
 ```
+
+`core/_event_stream.py` owns level-1 Zstandard frames, the standard final seek
+table, the disposable live index, append-preserving reopen, and incremental
+compressed byte reads. `core/events.py` and `core/groups.py` retain event schema
+and sequence validation above that shared storage layer.
 
 ## Public Symbol Index
 
@@ -158,7 +164,8 @@ mammoth
 │   └── tensorboardX (optional module only)
 └── mammoth.core
     ├── Python standard library / typing-extensions
-    └── portalocker (pywin32 on Windows)
+    ├── portalocker (pywin32 on Windows)
+    └── zstandard (event compression)
 ```
 
 

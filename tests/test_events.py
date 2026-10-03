@@ -178,6 +178,7 @@ def test_legacy_progress_unit_is_readable_but_not_reserialized() -> None:
 def test_tail_reader_holds_partial_record_and_detects_prefix_mutation(tmp_path: Path) -> None:
     context = execution_context(tmp_path)
     stream = context.execution_dir / "rank-0.jsonl"
+    stream.touch()  # Exercise the retained plain-JSONL reader.
     writer = ExecutionEventWriter.for_process(context, rank=0)
     writer.emit("execution_started")
     writer.close()
@@ -196,6 +197,7 @@ def test_tail_reader_bounded_first_read_discards_partial_leading_line(tmp_path: 
     """A bounded first read seeks near the end and drops the straddling line."""
     context = execution_context(tmp_path)
     stream = context.execution_dir / "rank-0.jsonl"
+    stream.touch()  # Exercise the retained plain-JSONL reader.
     writer = ExecutionEventWriter.for_process(context, rank=0)
     writer.emit("execution_started")
     for _ in range(30):
@@ -232,6 +234,7 @@ def test_tail_reader_bounded_window_landing_exactly_on_a_line_boundary_keeps_the
     """
     context = execution_context(tmp_path)
     stream = context.execution_dir / "rank-0.jsonl"
+    stream.touch()  # Exercise the retained plain-JSONL reader.
     writer = ExecutionEventWriter.for_process(context, rank=0)
     writer.emit("execution_started")
     for _ in range(20):
@@ -263,6 +266,7 @@ def test_tail_reader_bounded_window_smaller_than_one_record_falls_back_to_full_r
     """
     context = execution_context(tmp_path)
     stream = context.execution_dir / "rank-0.jsonl"
+    stream.touch()  # Exercise the retained plain-JSONL reader.
     writer = ExecutionEventWriter.for_process(context, rank=0)
     writer.emit("execution_started")
     for _ in range(5):
@@ -300,7 +304,7 @@ def test_writer_sanitizes_extensions_and_disables_on_open_failure(tmp_path: Path
         endpoint="https://user:pass@example.test/path?token=x",
     )
     writer.close()
-    payload = json.loads((context.execution_dir / "rank-0.jsonl").read_text())
+    payload = read_execution_events(writer.path)[0].to_dict()
     assert payload["api_token"] == "<redacted>"
     assert "secret" not in json.dumps(payload)
     assert "pass" not in json.dumps(payload)

@@ -138,10 +138,7 @@ def test_direct_training_resume_logs_and_retention(tmp_path: Path) -> None:
         }
         assert records[0].event == "process_started"
         assert records[-1].event == "process_completed" and records[-1].exit_code == 0
-        raw = [
-            json.loads(line)
-            for line in (session.context.execution_dir / "rank-0.jsonl").read_text().splitlines()
-        ]
+        raw = [event.to_dict() for event in records]
         receipts = [item for record in raw for item in record.get("checkpoints", [])]
         checkpoint = checkpoints / f"latest_epoch_{attempt}.pt"
         assert receipts[-1]["sha256"] == hashlib.sha256(checkpoint.read_bytes()).hexdigest()

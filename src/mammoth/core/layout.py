@@ -116,7 +116,7 @@ class GroupLayout:
     @property
     def events_path(self) -> Path:
         """Return the append-only group event stream location."""
-        return self.group_dir / "events.jsonl"
+        return self.group_dir / "events.jsonl.zst"
 
     def prepare(self) -> GroupLayout:
         """Create the stable group directory without creating manifest or events."""

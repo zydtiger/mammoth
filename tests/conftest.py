@@ -21,6 +21,7 @@ os.environ.setdefault("_TYPER_FORCE_DISABLE_TERMINAL", "1")
 _WINDOWS_SUITES = {
     "test_backend.py",
     "test_events.py",
+    "test_zstd_events.py",
     "test_filesystem.py",
     "test_execution_session.py",
     "test_layout.py",

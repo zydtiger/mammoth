@@ -14,6 +14,10 @@ You can use Mammoth to:
 - inspect a completed run or watch one while it is active; and
 - add a reusable training loop to an existing PyTorch project.
 
+Execution and group event logs use seekable Zstandard (`.jsonl.zst`) with live
+monitoring. Historical plain `.jsonl` logs remain readable. See the
+[logging contract](docs/ARCHITECTURE.md#jsonl) for file layout and crash behavior.
+
 No familiarity with Mammoth is assumed below.
 
 ## Requirements

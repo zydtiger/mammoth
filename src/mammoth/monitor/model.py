@@ -38,7 +38,7 @@ ScopeStatus = Literal[
     "stale",
 ]
 
-_RANK_STREAM_PATTERN = re.compile(r"^rank-(?P<rank>[0-9]+)\.jsonl$")
+_RANK_STREAM_PATTERN = re.compile(r"^rank-(?P<rank>[0-9]+)\.jsonl(?:\.zst)?$")
 FLEET_TAIL_WINDOW_BYTES = 128 * 1024
 """Bytes from the end of each stream that fleet/group roll-up folding reads.
 
@@ -794,14 +794,20 @@ class RunMonitor:
 def event_stream_paths(context: ExecutionContext) -> list[Path]:
     """Discover only reserved runner and rank JSONL stream filenames."""
     paths: list[Path] = []
-    runner = context.execution_dir / "runner.jsonl"
+    runner = context.execution_dir / "runner.jsonl.zst"
+    if not runner.is_file():
+        runner = context.execution_dir / "runner.jsonl"
     if runner.is_file():
         paths.append(runner)
     rank_paths: list[tuple[int, Path]] = []
-    for path in context.execution_dir.glob("rank-*.jsonl"):
+    seen_ranks: set[int] = set()
+    for path in sorted(context.execution_dir.glob("rank-*.jsonl*"), reverse=True):
         matched = _RANK_STREAM_PATTERN.fullmatch(path.name)
         if matched is not None and path.is_file():
-            rank_paths.append((int(matched.group("rank")), path))
+            rank = int(matched.group("rank"))
+            if rank not in seen_ranks:
+                rank_paths.append((rank, path))
+                seen_ranks.add(rank)
     paths.extend(path for _rank, path in sorted(rank_paths))
     return paths
 
