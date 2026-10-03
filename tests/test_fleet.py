@@ -54,6 +54,7 @@ def _write_large_progress_stream(
     ``message`` keeps each line comfortably over a hundred bytes so a few
     thousand steps reliably exceeds the fleet tail window by several times.
     """
+    (context.execution_dir / "rank-0.jsonl").touch(exist_ok=True)
     writer = ExecutionEventWriter.for_process(context, rank=0, world_size=1)
     writer.emit("process_started", phase="train")
     writer.emit("task_started", phase="train", task_id="epoch")
@@ -380,11 +381,12 @@ def test_fleet_monitor_isolates_a_malformed_group_event_stream(tmp_path: Path) -
         entry,
         members=(GroupMember("alpha", ("prepare",)),),
     )
-    writer = GroupEventWriter(layout.events_path, group_id=manifest.group_id)
+    stream = layout.group_dir / "events.jsonl"
+    writer = GroupEventWriter(stream, group_id=manifest.group_id)
     writer.emit("group_started")
     writer.emit("run_started", run_name="alpha")
     writer.close()
-    with layout.events_path.open("a", encoding="utf-8") as handle:
+    with stream.open("a", encoding="utf-8") as handle:
         handle.write('{"schema_version":1,"sequence":9,"group_id":"' + manifest.group_id)
         handle.write('","event":"run_completed","run_name":"alpha"}\n')
 
@@ -409,10 +411,11 @@ def test_fleet_monitor_retains_a_partially_written_group_event_line_across_polls
         entry,
         members=(GroupMember("alpha", ("prepare",)),),
     )
-    writer = GroupEventWriter(layout.events_path, group_id=manifest.group_id)
+    stream = layout.group_dir / "events.jsonl"
+    writer = GroupEventWriter(stream, group_id=manifest.group_id)
     writer.emit("group_started")
     writer.close()
-    with layout.events_path.open("ab") as handle:
+    with stream.open("ab") as handle:
         handle.write(b'{"schema_version":1,"sequence":2,"group_id":"' + manifest.group_id.encode())
 
     monitor = FleetMonitor(entry)
@@ -753,6 +756,7 @@ def test_fleet_monitor_withholds_bounded_eta_without_reported_throughput(
     entry = tmp_path / "runs"
     layout = RunLayout(entry, "eta-no-throughput").prepare()
     context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    (context.execution_dir / "rank-0.jsonl").touch(exist_ok=True)
     writer = ExecutionEventWriter.for_process(context, rank=0, world_size=1)
     writer.emit("process_started", phase="train")
     writer.emit("task_started", phase="train", task_id="epoch")
@@ -867,6 +871,7 @@ def test_fleet_monitor_bounded_tail_resolves_multirank_all_terminal_from_large_s
         execution_id="attempt",
         created_at="2026-01-01T00:00:00Z",
     )
+    (context.execution_dir / "rank-0.jsonl").touch()
     rank0_writer = ExecutionEventWriter.for_process(context, rank=0, world_size=2)
     rank0_writer.emit("execution_started")
     for step in range(1, 2000):

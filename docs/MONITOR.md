@@ -196,7 +196,7 @@ directly at the run view with no fleet or group screen beneath it.
   single run folds from its own execution streams:
   - The group's immutable manifest (`manifest.json`), read once and cached
     for the monitor's lifetime.
-  - The group's append-only event stream (`events.jsonl`), tailed
+  - The group's append-only event stream (`events.jsonl.zst`, or historical `events.jsonl`), tailed
     incrementally with `mammoth.core.groups.GroupEventTailReader` — never
     re-read in full on a later poll. Group-scoped terminal events
     (`group_completed`/`group_failed`/`group_interrupted`) and run-scoped
@@ -251,6 +251,22 @@ oversized single record) falls back to a full read from the true start for
 that stream, so the bound never silently starves a roll-up of events; this
 is expected to be unreachable at the configured window size in practice.
 
+For compressed streams, the window counts **uncompressed** JSONL bytes.
+A closed stream uses its standard seek table; a live stream uses its optional
+file-identity-bound `.idx` cache. Invalid embedded seek metadata also falls back
+to that cache or sequential decoding, preserving independently readable frames. The reader starts at a frame boundary, decodes
+the remaining suffix (including an unsealed live frame), then discards records
+before the requested window. Indexed reads may decode an additional boundary
+frame and the current live frame. Index metadata itself grows with frame count.
+Absent, invalid, or stale cache metadata may require scanning a larger prefix;
+this never authorizes a monitor write. Steady-state polling retains decompressor
+state and reads only appended compressed bytes, with the same file identity,
+truncation, and consumed-prefix checks as plain streams. Each event reader
+serializes overlapping polls so shared fleet/group refreshes cannot advance
+its decoder or sequence state concurrently. An incomplete compressed
+append is retained for later polling; malformed compressed data reports a stream
+warning, preserving events decoded before the damaged frame.
+
 **The approximation this bound introduces**: a fleet or group row cannot see
 task or metric history older than the window, only the *current* value of
 each field once fully written. This costs nothing observable, because every
@@ -268,7 +284,7 @@ overall status only reports `completed` once every expected rank's own
 process has completed (`_finalize_run_status` in `model.py`), which could
 seem to need each rank's *entire* history to confirm none is still pending.
 It does not, because each rank (and the runner) writes to its own reserved
-stream file (`rank-N.jsonl`, `runner.jsonl`), and a bounded read always seeks
+stream file (`rank-N.jsonl.zst`, `runner.jsonl.zst`, or historical plain equivalents), and a bounded read always seeks
 from the *current end* of that specific file backward — so whatever that
 rank's most recently written record is (its own terminal `process_completed`
 if it has one, or its latest heartbeat/progress if it is still running) is

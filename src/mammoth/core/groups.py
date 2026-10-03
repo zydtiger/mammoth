@@ -29,6 +29,14 @@ from types import MappingProxyType
 from typing import Any, BinaryIO, Literal, Union, cast
 
 from mammoth.compat import DATACLASS_SLOTS
+from mammoth.core._event_stream import (
+    CompressedReadError,
+    ZstdEventReader,
+    ZstdEventWriter,
+    resolve_event_path,
+)
+from mammoth.core._filesystem.io import open_event_file as _open_event_file
+from mammoth.core._filesystem.io import read_at as _read_at
 from mammoth.core.artifacts import atomic_write_json
 from mammoth.core.events import ImmutableJsonValue, JsonValue, utc_event_time
 from mammoth.core.execution import sanitize_metadata_fields
@@ -38,7 +46,7 @@ GROUP_SCHEMA_VERSION = 1
 GROUP_EVENT_SCHEMA_VERSION = 1
 GROUPS_RELATIVE_DIR = Path(".mammoth") / "groups"
 GROUP_MANIFEST_FILENAME = "manifest.json"
-GROUP_EVENT_STREAM_FILENAME = "events.jsonl"
+GROUP_EVENT_STREAM_FILENAME = "events.jsonl.zst"
 _GENERATED_ID_ATTEMPTS = 32
 _GROUP_EVENT_APPEND_GUARD_BYTES = 4096
 
@@ -466,7 +474,7 @@ class GroupEventWriter:
     ) -> None:
         self.path = Path(path)
         self.group_id = validate_group_id(group_id)
-        if self.path.name != GROUP_EVENT_STREAM_FILENAME:
+        if self.path.name not in {GROUP_EVENT_STREAM_FILENAME, "events.jsonl"}:
             raise ValueError(
                 f"group event writer path must end with {GROUP_EVENT_STREAM_FILENAME!r}, "
                 f"got {self.path}."
@@ -477,15 +485,20 @@ class GroupEventWriter:
         self._closed = False
         self._failure_logged = False
         self._lock = threading.RLock()
-        self._stream: Union[BinaryIO, None] = None
+        self._stream: Union[BinaryIO, ZstdEventWriter, None] = None
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         opened_stream: Union[BinaryIO, None] = None
         try:
+            self.path = resolve_event_path(self.path)
             descriptor = os.open(self.path, flags, 0o600)
             opened_stream = cast(BinaryIO, os.fdopen(descriptor, "wb", buffering=0))
-            self._stream = opened_stream
+            self._stream = (
+                ZstdEventWriter(opened_stream, self.path)
+                if self.path.suffix == ".zst"
+                else opened_stream
+            )
         except Exception as error:
             if opened_stream is not None:
                 with suppress(Exception):
@@ -588,7 +601,10 @@ def read_group_events(path: Path) -> list[GroupEvent]:
     next_sequence = 1
     stream_group_id: Union[str, None] = None
     try:
-        raw = Path(path).read_bytes()
+        resolved = resolve_event_path(path)
+        raw = (
+            ZstdEventReader(resolved).poll() if resolved.suffix == ".zst" else resolved.read_bytes()
+        )
     except FileNotFoundError:
         return []
     # A trailing "\n" yields an empty final element; an incomplete torn append
@@ -652,6 +668,7 @@ class GroupEventTailReader:
     def __init__(self, path: Path, *, allow_missing: bool = True) -> None:
         self.path = Path(path)
         self.allow_missing = allow_missing
+        self._compressed: Union[ZstdEventReader, None] = None
         self._file_identity: Union[tuple[int, int], None] = None
         self._offset = 0
         self._append_guard = b""
@@ -660,6 +677,7 @@ class GroupEventTailReader:
         self._next_sequence = 1
         self._group_id: Union[str, None] = None
         self._error: Union[GroupEventReadError, None] = None
+        self._poll_lock = threading.Lock()
 
     @property
     def line_number(self) -> int:
@@ -672,16 +690,27 @@ class GroupEventTailReader:
         return self._offset
 
     def poll(self) -> list[GroupEvent]:
-        """Return records appended since the previous poll without blocking."""
+        """Return appended records, serializing overlapping monitor refreshes."""
+        with self._poll_lock:
+            return self._poll()
+
+    def _poll(self) -> list[GroupEvent]:
         if self._error is not None:
             raise self._error
+        compression_error: Union[CompressedReadError, None] = None
         try:
             appended = self._read_appended_bytes()
+        except CompressedReadError as error:
+            compression_error = error
+            appended = error.valid_bytes
         except FileNotFoundError:
             if self.allow_missing and self._file_identity is None:
+                self._compressed = None
                 return []
             raise
         if not appended:
+            if compression_error is not None:
+                self._fail(self._line_number + 1, str(compression_error))
             return []
 
         raw = self._buffer + appended
@@ -697,13 +726,22 @@ class GroupEventTailReader:
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
                 self._fail(self._line_number, str(error), valid_events=tuple(events))
             events.append(event)
+        if compression_error is not None:
+            self._fail(self._line_number + 1, str(compression_error), valid_events=tuple(events))
         return events
 
     def _read_appended_bytes(self) -> bytes:
-        flags = os.O_RDONLY | os.O_NONBLOCK
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(self.path, flags)
+        if self._file_identity is None and self._compressed is None:
+            self.path = resolve_event_path(self.path)
+            if self.path.suffix == ".zst":
+                self._compressed = ZstdEventReader(self.path)
+        if self._compressed is not None:
+            try:
+                return self._compressed.poll()
+            finally:
+                self._file_identity = self._compressed.identity
+                self._offset = self._compressed.offset
+        descriptor = _open_event_file(self.path)
         try:
             descriptor_stat = os.fstat(descriptor)
             if not stat.S_ISREG(descriptor_stat.st_mode):
@@ -719,7 +757,7 @@ class GroupEventTailReader:
             guard_offset = self._offset - len(self._append_guard)
             if (
                 self._append_guard
-                and os.pread(descriptor, len(self._append_guard), guard_offset)
+                and _read_at(descriptor, len(self._append_guard), guard_offset)
                 != self._append_guard
             ):
                 self._fail(self._line_number + 1, "consumed stream prefix changed")

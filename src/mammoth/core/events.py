@@ -8,6 +8,7 @@ PyTorch.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import math
@@ -25,6 +26,12 @@ from typing import Any, BinaryIO, Literal, Union, cast
 
 from typing_extensions import Self
 
+from mammoth.core._event_stream import (
+    CompressedReadError,
+    ZstdEventReader,
+    ZstdEventWriter,
+    resolve_event_path,
+)
 from mammoth.core._filesystem.io import open_event_file
 from mammoth.core._filesystem.io import read_at as _read_at
 from mammoth.core.execution import (
@@ -35,8 +42,8 @@ from mammoth.core.identity import validate_execution_id
 
 EXECUTION_EVENT_SCHEMA_VERSION = 1
 MAX_DISPLAY_METRICS = 16
-RUNNER_EVENT_STREAM_FILENAME = "runner.jsonl"
-PROCESS_EVENT_STREAM_TEMPLATE = "rank-{rank}.jsonl"
+RUNNER_EVENT_STREAM_FILENAME = "runner.jsonl.zst"
+PROCESS_EVENT_STREAM_TEMPLATE = "rank-{rank}.jsonl.zst"
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 1.0
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _APPEND_GUARD_BYTES = 4096
@@ -436,7 +443,7 @@ class ExecutionEventWriter:
         self._monotonic_clock = monotonic_clock
         self._utc_clock = utc_clock or utc_event_time
         self._failure_logger = failure_logger
-        self._stream: Union[BinaryIO, None] = None
+        self._stream: Union[BinaryIO, ZstdEventWriter, None] = None
         self._sequence = 0
         self._pending_progress: Union[ExecutionEvent, None] = None
         self._last_progress_emitted: Union[float, None] = None
@@ -447,9 +454,12 @@ class ExecutionEventWriter:
         self._validate_writer_identity()
         opened_stream: Union[BinaryIO, None] = None
         try:
+            self.path = resolve_event_path(self.path)
             opened_stream = _open_event_stream(self.path)
             self._sequence = _existing_stream_sequence(
-                opened_stream,
+                io.BytesIO(ZstdEventReader(self.path).poll())
+                if self.path.suffix == ".zst"
+                else opened_stream,
                 self.path,
                 execution_id=self.execution_id,
                 run_name=self.run_name,
@@ -457,7 +467,11 @@ class ExecutionEventWriter:
                 rank=self.rank,
                 world_size=self.world_size,
             )
-            self._stream = opened_stream
+            self._stream = (
+                ZstdEventWriter(opened_stream, self.path)
+                if self.path.suffix == ".zst"
+                else opened_stream
+            )
         except Exception as error:
             if opened_stream is not None:
                 with suppress(Exception):
@@ -473,10 +487,11 @@ class ExecutionEventWriter:
         world_size: Union[int, None] = None,
         **options: Any,
     ) -> Self:
-        """Open the reserved ``rank-N.jsonl`` stream for one execution rank."""
+        """Open the reserved ``rank-N.jsonl.zst`` stream for one execution rank."""
         effective_world_size = context.metadata.world_size if world_size is None else world_size
+        context.rank_log_path(rank, world_size=effective_world_size)
         return cls(
-            process_event_stream_path(context, rank, world_size=effective_world_size),
+            context.execution_dir / PROCESS_EVENT_STREAM_TEMPLATE.format(rank=rank),
             execution_id=context.metadata.execution_id,
             run_name=context.metadata.run_name,
             source="process",
@@ -491,9 +506,9 @@ class ExecutionEventWriter:
         context: ExecutionContext,
         **options: Any,
     ) -> Self:
-        """Open the reserved optional ``runner.jsonl`` orchestration stream."""
+        """Open the reserved optional ``runner.jsonl.zst`` orchestration stream."""
         return cls(
-            runner_event_stream_path(context),
+            context.execution_dir / RUNNER_EVENT_STREAM_FILENAME,
             execution_id=context.metadata.execution_id,
             run_name=context.metadata.run_name,
             source="runner",
@@ -726,7 +741,7 @@ class ExecutionEventWriter:
             expected_name = PROCESS_EVENT_STREAM_TEMPLATE.format(rank=self.rank)
         else:
             raise ValueError(f"source must be 'runner' or 'process', got {self.source!r}.")
-        if self.path.name != expected_name:
+        if self.path.name not in {expected_name, expected_name.removesuffix(".zst")}:
             raise ValueError(
                 f"{self.source} writer path must end with {expected_name!r}, got {self.path}."
             )
@@ -849,6 +864,7 @@ class ExecutionEventTailReader:
         self.path = Path(path)
         self.allow_missing = allow_missing
         self.tail_window_bytes = tail_window_bytes
+        self._compressed: Union[ZstdEventReader, None] = None
         self._file_identity: Union[tuple[int, int], None] = None
         self._offset = 0
         self._append_guard = b""
@@ -860,6 +876,7 @@ class ExecutionEventTailReader:
             tuple[str, str, EventSource, Union[int, None], Union[int, None]], None
         ] = None
         self._error: Union[ExecutionEventReadError, None] = None
+        self._poll_lock = threading.Lock()
 
     @property
     def line_number(self) -> int:
@@ -872,16 +889,27 @@ class ExecutionEventTailReader:
         return self._offset
 
     def poll(self) -> list[ExecutionEvent]:
-        """Return records appended since the previous poll without blocking."""
+        """Return appended records, serializing overlapping monitor refreshes."""
+        with self._poll_lock:
+            return self._poll()
+
+    def _poll(self) -> list[ExecutionEvent]:
         if self._error is not None:
             raise self._error
+        compression_error: Union[CompressedReadError, None] = None
         try:
             appended = self._read_appended_bytes()
+        except CompressedReadError as error:
+            compression_error = error
+            appended = error.valid_bytes
         except FileNotFoundError:
             if self.allow_missing and self._file_identity is None:
+                self._compressed = None
                 return []
             raise
         if not appended:
+            if compression_error is not None:
+                self._fail(self._line_number + 1, str(compression_error))
             return []
 
         complete_lines, self._buffer = _split_complete_lines(self._buffer + appended)
@@ -899,9 +927,26 @@ class ExecutionEventTailReader:
             ) as error:
                 self._fail(self._line_number, str(error), valid_events=tuple(events))
             events.append(event)
+        if compression_error is not None:
+            self._fail(self._line_number + 1, str(compression_error), valid_events=tuple(events))
         return events
 
     def _read_appended_bytes(self) -> bytes:
+        if self._file_identity is None and self._compressed is None:
+            self.path = resolve_event_path(self.path)
+            if self.path.suffix == ".zst":
+                self._compressed = ZstdEventReader(
+                    self.path, tail_window_bytes=self.tail_window_bytes
+                )
+        if self._compressed is not None:
+            try:
+                return self._compressed.poll()
+            finally:
+                # A damaged suffix can still carry a valid bounded prefix.
+                self._file_identity = self._compressed.identity
+                self._offset = self._compressed.offset
+                if self._line_number == 0:
+                    self._sequence_baseline_synced = not self._compressed.skipped
         descriptor = open_event_file(self.path)
         try:
             descriptor_stat = os.fstat(descriptor)
@@ -1065,12 +1110,14 @@ def process_event_stream_path(
 ) -> Path:
     """Return the reserved process-owned JSONL path for one validated rank."""
     context.rank_log_path(rank, world_size=world_size)
-    return context.execution_dir / PROCESS_EVENT_STREAM_TEMPLATE.format(rank=rank)
+    return resolve_event_path(
+        context.execution_dir / PROCESS_EVENT_STREAM_TEMPLATE.format(rank=rank)
+    )
 
 
 def runner_event_stream_path(context: ExecutionContext) -> Path:
     """Return the optional experiment-runner JSONL path for one execution."""
-    return context.execution_dir / RUNNER_EVENT_STREAM_FILENAME
+    return resolve_event_path(context.execution_dir / RUNNER_EVENT_STREAM_FILENAME)
 
 
 def _with_sequence(

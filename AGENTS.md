@@ -65,6 +65,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/core/_filesystem/publication.py` | Prepared-file ownership, staging, and directory durability. | These filesystem adapter contracts change. |
 | `src/mammoth/core/_filesystem/text.py` | Platform text-log descriptor ownership. | These filesystem adapter contracts change. |
 | `src/mammoth/core/_filesystem/windows.py` | Native Windows handles and pinned directory traversal. | These filesystem adapter contracts change. |
+| `src/mammoth/core/_event_stream.py` | Seekable Zstandard event storage, disposable live index, and incremental compressed reads. | Compression, framing, indexing, or compressed stream behavior changes. |
 | `src/mammoth/core/artifacts.py` | Atomic local bytes, text, JSON, and opaque artifact publication. | Local publication durability or writer behavior changes. |
 | `src/mammoth/core/events.py` | Schema-v1 event values, append-only producer writers, replay, and active tailing. | Event validation, retention, compatibility, or stream behavior changes. |
 | `src/mammoth/core/execution.py` | Immutable execution metadata, lineage, sanitization, discovery, joins, logical-run leases, and immutable-log-entry classification for consumer log resets. | Attempt identity, provenance, compatibility, lease, or immutable-log-entry classification behavior changes. |
@@ -114,6 +115,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `tests/test_windows.py` | Native Windows handle, reparse-point, and lease recovery coverage. | Windows platform behavior changes. |
 | `tests/conftest.py` | Shared test environment and Windows supported-suite selection. | Test collection or environment policy changes. |
 | `tests/test_artifacts.py` | Atomic artifact publication unit coverage. | Artifact publication behavior changes. |
+| `tests/test_zstd_events.py` | Live compressed event, seek table, append, cache, corruption, and monitor integration coverage. | Compressed event behavior changes. |
 | `tests/test_events.py` | Event validation, writer, replay, tailing, and legacy-field unit coverage. | Event behavior changes. |
 | `tests/test_execution.py` | Execution metadata, lineage, sanitization, compatibility, lease, and immutable-log-entry classification unit coverage. | Execution behavior changes. |
 | `tests/test_groups.py` | Group-ID validation, `GroupLayout` path resolution, group manifest atomicity/collision/metadata-round-trip, and group event writer/reader/incremental-tail-reader unit coverage. | Group manifest, layout, or event-stream/tailing behavior changes. |

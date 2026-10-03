@@ -43,7 +43,8 @@ launcher; nothing imports `mammoth.queue`, so a project that never queues a
 job carries no additional runtime dependency.
 
 `mammoth.core` uses the Python standard library, `typing-extensions` for
-portable type annotations, and `portalocker` for descriptor locking. The
+portable type annotations, `portalocker` for descriptor locking, and `zstandard`
+for compressed event storage. The
 `portalocker` 3.x range preserves Python 3.9 support and installs `pywin32` on
 Windows. Optional-framework dependencies remain separate. TensorBoard, Rich,
 Textual, psutil, and PyTorch belong in optional dependency groups and must not
@@ -516,8 +517,8 @@ operational paths. The default contract is:
 │   └── executions/
 │       └── <execution-id>/
 │           ├── execution.json   immutable attempt identity
-│           ├── runner.jsonl     optional workflow producer
-│           ├── rank-N.jsonl     process/rank producer
+│           ├── runner.jsonl.zst optional workflow producer
+│           ├── rank-N.jsonl.zst process/rank producer
 │           └── rank-N.log       human-readable diagnostics
 ├── results/                     project-owned contents
 └── vis/                         project-owned contents
@@ -540,14 +541,14 @@ contract published only by `Workflow.run()`. The default contract is:
 ```text
 <entry>/.mammoth/groups/<group-id>/
 ├── manifest.json                immutable group manifest
-└── events.jsonl                 append-only group event stream
+└── events.jsonl.zst             append-only group event stream
 ```
 
 `manifest.json` records the group ID, creation time, declared schedule order
 (`run-major`/`step-major`), the ordered member run names and their planned
 step names, and the caller-supplied opaque metadata block, published
 atomically with `mammoth.core.artifacts.atomic_write_json` before the first
-step dispatches. `events.jsonl` reuses the schema-v1 JSONL conventions from
+step dispatches. `events.jsonl.zst` reuses the schema-v1 JSONL conventions from
 `mammoth.core.events` at group scope: a monotonically sequenced, flush-per-
 record append-only stream that opens with a `group_started` record, then
 records member run and step lifecycle transitions (`run_started`/
@@ -792,6 +793,42 @@ that cannot provide that relationship omits throughput. Mammoth neither
 validates nor converts that domain meaning. Progress may be throttled and
 replaced; lifecycle and terminal records flush immediately. A writer failure
 disables only that writer and must not terminate the workload.
+
+New execution and group event streams use seekable Zstandard files named
+`rank-N.jsonl.zst`, `runner.jsonl.zst`, and `events.jsonl.zst`. Compression is
+level 1, with independent frames targeting 256 KiB of uncompressed JSONL;
+frame boundaries follow complete records, so one large record may exceed the
+target. Each emitted record receives a block flush and is visible before the
+frame closes. JSON schema, sequence numbers, redaction, and observation routing
+are unchanged. Compression and flush do not add an fsync durability guarantee.
+
+On close, the writer appends the standard Zstandard seek table. Reopening a
+sealed execution stream validates its complete event history, retains the old
+table as a zero-output skippable frame, and appends new frames and a new final
+table. Existing bytes are never rewritten. An unsealed stream left by a crash
+remains readable through its complete decoded records, but cannot be reopened
+for writing: use a new execution attempt. No automatic truncation, repair, or
+conversion of existing data is performed.
+
+A sibling `.jsonl.zst.idx` is a disposable live acceleration cache containing
+the file identity and sizes of closed frames. A checksum covers that metadata
+so corrupted cache entries can be rejected without replaying all indexed frames.
+It is published atomically only after those frames are flushed; failure to
+publish this cache does not disable logging. A missing, stale, or invalid cache
+falls back to sequential reading.
+The compressed event file remains the source of truth, including bytes after
+the indexed prefix. Closed streams normally use their embedded table without
+requiring the cache. If that table is invalid, readers fall back to the cache
+or sequential decoding; reopening for append still rejects an invalid table.
+Monitors never create or repair either file.
+
+Readers accept historical plain `.jsonl` streams, including ongoing appends.
+Execution factories continue an existing plain stream for that producer;
+otherwise new streams use `.jsonl.zst`. Both variants for the same producer are
+ambiguous and produce an error instead of double-counting events. This default
+filename change is a breaking on-disk layout change for consumers that hardcode
+names or read logs as plain text; use event path helpers and event readers.
+Queue completion and work-store journals retain their existing plain formats.
 
 `RunObserver` asynchronously dispatches CPU-owned scalar observations. It owns
 one bounded ordered worker per sink, so a slow TensorBoard writer cannot stall

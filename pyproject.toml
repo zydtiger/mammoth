@@ -11,6 +11,7 @@ dependencies = [
     "portalocker>=3.2,<4",
     "typer-slim>=0.21.2,<0.22",
     "typing-extensions>=4.12",
+    "zstandard>=0.25,<0.26",
 ]
 
 [project.scripts]

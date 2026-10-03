@@ -35,7 +35,7 @@ def test_group_layout_resolves_stable_paths(tmp_path: Path) -> None:
     assert layout.groups_root == tmp_path / "runs" / ".mammoth" / "groups"
     assert layout.group_dir == layout.groups_root / "group-1"
     assert layout.manifest_path == layout.group_dir / "manifest.json"
-    assert layout.events_path == layout.group_dir / "events.jsonl"
+    assert layout.events_path == layout.group_dir / "events.jsonl.zst"
     assert layout.group_dir.is_dir()
 
 
@@ -229,13 +229,14 @@ def test_group_event_writer_rejects_a_mismatched_stream_filename(tmp_path: Path)
 
 def test_read_group_events_ignores_an_incomplete_trailing_line(tmp_path: Path) -> None:
     layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
-    writer = GroupEventWriter(layout.events_path, group_id="group-1")
+    stream = layout.group_dir / "events.jsonl"
+    writer = GroupEventWriter(stream, group_id="group-1")
     writer.emit("group_started")
     writer.emit("group_completed")
-    with layout.events_path.open("ab") as handle:
+    with stream.open("ab") as handle:
         handle.write(b'{"schema_version":1,"sequence":3,"group_id":"group-1","event":"run_started"')
 
-    events = read_group_events(layout.events_path)
+    events = read_group_events(stream)
 
     assert [event.event for event in events] == ["group_started", "group_completed"]
 
@@ -264,18 +265,19 @@ def test_group_event_tail_reader_retains_an_incomplete_trailing_line_across_poll
     tmp_path: Path,
 ) -> None:
     layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
-    writer = GroupEventWriter(layout.events_path, group_id="group-1")
+    stream = layout.group_dir / "events.jsonl"
+    writer = GroupEventWriter(stream, group_id="group-1")
     writer.emit("group_started")
-    reader = GroupEventTailReader(layout.events_path)
+    reader = GroupEventTailReader(stream)
     assert [event.event for event in reader.poll()] == ["group_started"]
 
-    with layout.events_path.open("ab") as handle:
+    with stream.open("ab") as handle:
         handle.write(
             b'{"schema_version":1,"sequence":2,"time":"2026-01-01T00:00:00Z","group_id":"group-1"'
         )
     assert reader.poll() == []
 
-    with layout.events_path.open("ab") as handle:
+    with stream.open("ab") as handle:
         handle.write(b',"event":"run_started","run_name":"alpha"}\n')
     completed = reader.poll()
     assert [event.event for event in completed] == ["run_started"]
@@ -317,13 +319,14 @@ def test_group_event_tail_reader_fails_on_truncation_and_returns_valid_events(
 def test_group_event_tail_reader_fails_on_a_blank_complete_line(tmp_path: Path) -> None:
     """A blank line fails the stream, exactly like ExecutionEventTailReader."""
     layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
-    writer = GroupEventWriter(layout.events_path, group_id="group-1")
+    stream = layout.group_dir / "events.jsonl"
+    writer = GroupEventWriter(stream, group_id="group-1")
     writer.emit("group_started")
     writer.close()
-    reader = GroupEventTailReader(layout.events_path)
+    reader = GroupEventTailReader(stream)
     assert [event.event for event in reader.poll()] == ["group_started"]
 
-    with layout.events_path.open("ab") as handle:
+    with stream.open("ab") as handle:
         handle.write(b"\n")
 
     with pytest.raises(GroupEventReadError) as excinfo:
@@ -335,15 +338,16 @@ def test_group_event_tail_reader_reports_out_of_sequence_records_with_valid_pref
     tmp_path: Path,
 ) -> None:
     layout = GroupLayout(tmp_path / "runs", "group-1").prepare()
-    writer = GroupEventWriter(layout.events_path, group_id="group-1")
+    stream = layout.group_dir / "events.jsonl"
+    writer = GroupEventWriter(stream, group_id="group-1")
     writer.emit("group_started")
     writer.close()
-    with layout.events_path.open("ab") as handle:
+    with stream.open("ab") as handle:
         handle.write(
             b'{"schema_version":1,"sequence":9,"time":"2026-01-01T00:00:00Z",'
             b'"group_id":"group-1","event":"run_started","run_name":"alpha"}\n'
         )
-    reader = GroupEventTailReader(layout.events_path)
+    reader = GroupEventTailReader(stream)
 
     with pytest.raises(GroupEventReadError, match="sequence") as excinfo:
         reader.poll()
