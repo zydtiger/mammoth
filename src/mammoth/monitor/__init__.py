@@ -15,6 +15,7 @@ from mammoth.monitor.fleet import (
     discover_run_names,
 )
 from mammoth.monitor.model import (
+    DisplayItem,
     ExecutionMonitor,
     MetricPoint,
     MonitorSnapshot,
@@ -22,6 +23,7 @@ from mammoth.monitor.model import (
     ProducerState,
     RunMonitor,
     RunSnapshot,
+    StagePoint,
     TaskState,
     discover_executions,
     execution_lineage,
@@ -32,6 +34,7 @@ from mammoth.monitor.render import render_fleet_snapshot, render_group_snapshot,
 from mammoth.monitor.telemetry import ViewerTelemetry, sample_viewer_telemetry
 
 __all__ = [
+    "DisplayItem",
     "ExecutionMonitor",
     "FleetMonitor",
     "FleetSnapshot",
@@ -46,6 +49,7 @@ __all__ = [
     "ProducerState",
     "RunMonitor",
     "RunSnapshot",
+    "StagePoint",
     "StepSnapshot",
     "TaskState",
     "ViewerTelemetry",

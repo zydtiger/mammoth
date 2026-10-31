@@ -14,6 +14,7 @@ from mammoth.core import (
     create_execution_context,
 )
 from mammoth.core.events import (
+    MAX_DISPLAY_DATA_BYTES,
     ExecutionEvent,
     ExecutionEventReadError,
     ExecutionEventTailReader,
@@ -321,3 +322,49 @@ def test_writer_sanitizes_extensions_and_disables_on_open_failure(tmp_path: Path
     )
     assert not disabled.enabled
     assert disabled.emit("execution_started") is None
+
+
+def _presentation_writer(tmp_path: Path) -> ExecutionEventWriter:
+    return ExecutionEventWriter(
+        tmp_path / "rank-0.jsonl.zst",
+        execution_id="attempt",
+        run_name="run",
+        source="process",
+        rank=0,
+        world_size=1,
+    )
+
+
+def test_presentation_events_round_trip_without_a_phase(tmp_path: Path) -> None:
+    with _presentation_writer(tmp_path) as writer:
+        writer.emit("stage_changed", stage="train", lane="main")
+        writer.emit("display", kind="table", name="scores", data={"columns": ["a"], "rows": [[1]]})
+
+    stage, display = read_execution_events(tmp_path / "rank-0.jsonl.zst")
+    assert stage.phase is None
+    assert stage.extensions["stage"] == "train"
+    assert stage.extensions["lane"] == "main"
+    assert display.extensions["kind"] == "table"
+    assert display.extensions["name"] == "scores"
+
+
+@pytest.mark.parametrize(
+    ("event", "fields"),
+    [
+        ("stage_changed", {"lane": "main"}),
+        ("stage_changed", {"stage": "train"}),
+        ("stage_changed", {"stage": "", "lane": "main"}),
+        ("display", {"name": "n", "data": {}}),
+        ("display", {"kind": "table", "data": {}}),
+        ("display", {"kind": "table", "name": "n"}),
+        ("display", {"kind": "table", "name": "n", "data": [1]}),
+        ("stage_changed", {"stage": "s" * 257, "lane": "main"}),
+        ("display", {"kind": "k" * 257, "name": "n", "data": {}}),
+        ("display", {"kind": "table", "name": "n", "data": {"x": "y" * MAX_DISPLAY_DATA_BYTES}}),
+    ],
+)
+def test_presentation_events_reject_invalid_fields(
+    tmp_path: Path, event: EventName, fields: dict[str, object]
+) -> None:
+    with _presentation_writer(tmp_path) as writer, pytest.raises(ValueError):
+        writer.emit(event, **fields)

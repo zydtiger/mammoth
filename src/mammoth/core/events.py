@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import re
 import stat
 import threading
 import time
@@ -42,6 +43,9 @@ from mammoth.core.identity import validate_execution_id
 
 EXECUTION_EVENT_SCHEMA_VERSION = 1
 MAX_DISPLAY_METRICS = 16
+MAX_DISPLAY_DATA_BYTES = 16 * 1024
+MAX_PRESENTATION_NAME_CHARS = 256
+MAX_DISPLAY_DEPTH = 32
 RUNNER_EVENT_STREAM_FILENAME = "runner.jsonl.zst"
 PROCESS_EVENT_STREAM_TEMPLATE = "rank-{rank}.jsonl.zst"
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 1.0
@@ -67,6 +71,8 @@ EventName = Literal[
     "task_failed",
     "task_skipped",
     "heartbeat",
+    "stage_changed",
+    "display",
 ]
 EventSource = Literal["runner", "process"]
 JsonValue = Union[None, bool, int, float, str, list["JsonValue"], dict[str, "JsonValue"]]
@@ -98,6 +104,8 @@ EVENT_NAMES: frozenset[str] = frozenset(
         "task_failed",
         "task_skipped",
         "heartbeat",
+        "stage_changed",
+        "display",
     }
 )
 
@@ -111,6 +119,9 @@ _EXECUTION_EVENTS = frozenset(
 )
 _PHASE_EVENTS = frozenset({"phase_started", "phase_completed", "phase_failed", "phase_skipped"})
 _PROCESS_EVENTS = frozenset({"process_started", "process_completed"})
+_PRESENTATION_EVENTS = frozenset({"stage_changed", "display"})
+_PRESENTATION_NAME_FIELDS = ("stage", "lane", "kind", "name")
+_PLAIN_PRESENTATION_NAME = re.compile(r"\w[\w./-]*")
 _TASK_EVENTS = frozenset(
     {"task_started", "progress", "task_completed", "task_failed", "task_skipped"}
 )
@@ -210,9 +221,16 @@ class ExecutionEvent:
         metrics = _validated_display_metrics(self.display_metrics)
         coordinates = _validated_coordinates(self.coordinates)
         extensions = _validated_extensions(self.extensions)
+        if self.event in _PRESENTATION_EVENTS:
+            for name in _PRESENTATION_NAME_FIELDS:
+                if name in self.extensions:
+                    extensions[name] = _freeze_json(
+                        sanitize_presentation_name(self.extensions[name])
+                    )
         object.__setattr__(self, "display_metrics", MappingProxyType(metrics))
         object.__setattr__(self, "coordinates", MappingProxyType(coordinates))
         object.__setattr__(self, "extensions", MappingProxyType(extensions))
+        self._validate_presentation()
 
     def to_dict(self) -> dict[str, JsonValue]:
         """Return the flattened JSON object consumed by writers and readers."""
@@ -333,7 +351,7 @@ class ExecutionEvent:
         if self.event in _EXECUTION_EVENTS:
             if self.phase is not None:
                 raise ValueError(f"{self.event} must omit phase.")
-        else:
+        elif self.event not in _PRESENTATION_EVENTS:
             _validate_nonempty_string("phase", self.phase)
         if self.event in _TASK_EVENTS:
             _validate_nonempty_string("task_id", self.task_id)
@@ -401,6 +419,16 @@ class ExecutionEvent:
                 )
         if self.display_metrics and self.event not in {"progress", "heartbeat"}:
             raise ValueError("display_metrics are valid only for progress or heartbeat events.")
+
+    def _validate_presentation(self) -> None:
+        if self.event == "stage_changed":
+            validate_stage_fields(self.extensions.get("stage"), self.extensions.get("lane"))
+        elif self.event == "display":
+            validate_display_fields(
+                self.extensions.get("kind"),
+                self.extensions.get("name"),
+                self.extensions.get("data"),
+            )
 
 
 class ExecutionEventWriter:
@@ -864,6 +892,7 @@ class ExecutionEventTailReader:
         self.path = Path(path)
         self.allow_missing = allow_missing
         self.tail_window_bytes = tail_window_bytes
+        self._seeked_ahead = False
         self._compressed: Union[ZstdEventReader, None] = None
         self._file_identity: Union[tuple[int, int], None] = None
         self._offset = 0
@@ -931,6 +960,13 @@ class ExecutionEventTailReader:
             self._fail(self._line_number + 1, str(compression_error), valid_events=tuple(events))
         return events
 
+    @property
+    def truncated(self) -> bool:
+        """Return whether a bounded first read skipped earlier records."""
+        if self._compressed is not None:
+            return self._compressed.skipped
+        return self._seeked_ahead
+
     def _read_appended_bytes(self) -> bytes:
         if self._file_identity is None and self._compressed is None:
             self.path = resolve_event_path(self.path)
@@ -983,6 +1019,7 @@ class ExecutionEventTailReader:
                 )
             appended = self._read_from(descriptor, read_offset, descriptor_stat.st_size)
             seek_ahead = read_offset > self._offset
+            self._seeked_ahead = self._seeked_ahead or seek_ahead
             mid_stream_start = False
             if seek_ahead:
                 landed_on_line_start = _read_at(descriptor, 1, read_offset - 1) == b"\n"
@@ -1234,6 +1271,62 @@ def _existing_stream_sequence(
 def utc_event_time() -> str:
     """Return a schema-compatible UTC timestamp for event producers."""
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def sanitize_presentation_name(value: Any) -> Any:
+    """Keep a plain label such as ``tokens/s`` and sanitize anything richer.
+
+    A label that is one word cannot carry an assignment, option, or URL credential,
+    and the path-segment rules would otherwise rewrite ordinary stage names.
+    """
+    if isinstance(value, str) and _PLAIN_PRESENTATION_NAME.fullmatch(value):
+        return value
+    return sanitize_metadata_fields({"label": value})["label"]
+
+
+def _validate_presentation_name(name: str, value: Any) -> None:
+    _validate_nonempty_string(name, value)
+    if len(value) > MAX_PRESENTATION_NAME_CHARS:
+        raise ValueError(f"{name} must be at most {MAX_PRESENTATION_NAME_CHARS} characters.")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"{name} must be encodable as UTF-8.") from error
+
+
+def validate_stage_fields(stage: Any, lane: Any) -> None:
+    """Validate one ``stage_changed`` transition's opaque stage and lane names."""
+    _validate_presentation_name("stage", stage)
+    _validate_presentation_name("lane", lane)
+
+
+def validate_display_depth(data: Any) -> None:
+    """Reject deep nesting iteratively, before recursive freezing can overflow."""
+    level = [data]
+    for _ in range(MAX_DISPLAY_DEPTH):
+        level = [
+            child
+            for item in level
+            if isinstance(item, (Mapping, list, tuple))
+            for child in (item.values() if isinstance(item, Mapping) else item)
+        ]
+        if not level:
+            return
+    raise ValueError(f"display data must nest at most {MAX_DISPLAY_DEPTH} levels.")
+
+
+def validate_display_fields(kind: Any, name: Any, data: Any) -> None:
+    """Validate one ``display`` item, bounding its serialized data size."""
+    _validate_presentation_name("kind", kind)
+    _validate_presentation_name("name", name)
+    if not isinstance(data, Mapping):
+        raise ValueError("display data must be a mapping.")
+    validate_display_depth(data)
+    size = len(json.dumps(_thaw_json(data), allow_nan=False, ensure_ascii=False).encode("utf-8"))
+    if size > MAX_DISPLAY_DATA_BYTES:
+        raise ValueError(
+            f"display data is {size} bytes, above the {MAX_DISPLAY_DATA_BYTES} byte limit."
+        )
 
 
 def _validated_display_metrics(metrics: Mapping[str, float]) -> dict[str, float]:

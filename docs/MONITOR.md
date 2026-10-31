@@ -9,6 +9,15 @@ The monitor is project-neutral. Phase names, task identifiers, coordinates,
 metric names, and extension fields remain opaque producer data except for the
 small presentation conventions stated below.
 
+## Commands
+
+- `mammoth monitor tui` opens the interactive terminal dashboard.
+- `mammoth monitor web` serves the read-only web monitor.
+- `mammoth monitor show` prints a stable plain-text snapshot or, with `--json`,
+  one JSON document per snapshot. `--watch` repeats until a run reaches a terminal
+  status. Fleet and group snapshots repeat until interrupted.
+- `mammoth monitor` alone prints help.
+
 ## Passive State Reconstruction
 
 - Monitoring reads immutable execution metadata and append-only JSONL streams.
@@ -71,10 +80,10 @@ small presentation conventions stated below.
 
 ## View Hierarchy And Navigation
 
-The monitor presents three nested Textual views above the same passive
-reconstruction:
+The terminal and web monitors present three nested views above the same passive
+reconstruction. In the terminal they are Textual screens:
 
-1. **Fleet** (`mammoth monitor --entry <root>` with no run name). Lists every
+1. **Fleet** (`mammoth monitor tui --entry <root>` with no run name). Lists every
    published group under `<entry>/.mammoth/groups/` plus every run directory
    under `<entry>` not claimed by a group ("loose" runs). Each group row
    shows members completed/failed/total, the currently active member, the
@@ -123,11 +132,11 @@ every other attempt in the run's history gets a cheap unfolded placeholder
 (immutable metadata only, no event-stream read) for that one call, so a run
 with many historical attempts does not make the first paint wait on all of
 them. Every poll after that first one folds every attempt exactly as
-`mammoth monitor <run_name>` always has, so the attempt-history panel is
+`mammoth monitor tui <run_name>` always has, so the attempt-history panel is
 complete again from the very next scheduled refresh (or immediately once an
 operator navigates to a not-yet-folded attempt, at which point it becomes the
 selected execution for that poll). Standalone single-run monitoring
-(`mammoth monitor <run_name>`, with no fleet or group screen beneath it)
+(`mammoth monitor tui <run_name>`, with no fleet or group screen beneath it)
 never uses this lazy first poll, so its behavior and output are unaffected.
 
 Both the fleet screen (its groups table and its loose-runs table
@@ -186,7 +195,7 @@ sparsest:
    is suppressed (the table renders with no column headers) rather than the
    row.
 
-`mammoth monitor <run_name>` without `--group` or `--match` is unaffected by
+`mammoth monitor tui <run_name>` without `--group` or `--match` is unaffected by
 any of this: it keeps its original single-run behavior exactly, entering
 directly at the run view with no fleet or group screen beneath it.
 
@@ -240,7 +249,7 @@ fleet or group row folds from (see above) bounds its *first* read of every
 underlying stream to the last `FLEET_TAIL_WINDOW_BYTES` (128 KiB) bytes,
 discarding the partial line straddling the seek point, instead of reading
 from byte 0; every read after that first one is unaffected and reads only
-newly appended bytes exactly like the unbounded reader `mammoth monitor
+newly appended bytes exactly like the unbounded reader `mammoth monitor tui
 <run_name>` uses. 128 KiB comfortably covers ordinary tails: a schema-v1
 JSONL record is on the order of a few hundred bytes, so the window holds
 hundreds of records per stream — far more than one heartbeat interval (30s
@@ -304,6 +313,98 @@ streams even for a long-running group; bounding their first read was not
 worth the added complexity. If a future producer ever made a single group's
 event stream large, this choice should be revisited.
 
+## Stage And Display Events
+
+Both events live in `rank-N.jsonl.zst` or `runner.jsonl.zst`, need no phase, and
+stay opaque to Mammoth apart from the conventions below. A schema-v1 reader older
+than these events stops at the first one and reports a stream warning, so monitors
+must be at least as new as the producers they read.
+
+- `stage_changed` records that a named `lane` entered a named `stage`. Folding keeps
+  a chronological history for every lane, independent of poll batching, and joins
+  histories across the selected resume lineage. A stage lasts until the next
+  transition on the same producer and lane within its attempt. An attempt's last
+  stage ends at that attempt's last observation, so a resume gap is not stage time.
+  The last stage of a live attempt stays open.
+- `display` carries a `kind`, a `name`, and JSON `data` of at most
+  `MAX_DISPLAY_DATA_BYTES` (16 KiB) and `MAX_DISPLAY_DEPTH` (32) nested levels. The newest item of each `kind` and `name` wins,
+  across the resume lineage. Like every extension field, `data` passes the metadata
+  credential redactor, so a column or key named like a credential is stored as
+  `<redacted>`. A stage, lane, kind, or display name that is one plain word, such as
+  `tokens/s`, is stored as written; anything richer is sanitized.
+- `RunObserver.stage` and `RunObserver.display` drop anything that cannot be stored
+  instead of raising or disabling the sink, logging a warning through the Python
+  logger, and do nothing after close. `kind` and `name` are positional-only, so a
+  payload can use those field names.
+- `table` is the built-in display kind, with `columns` and `rows` in `data`. Web,
+  terminal, and plain output render it. For any other kind the web page shows the
+  raw JSON, and the terminal and plain output skip it. A new kind needs a renderer
+  and no schema change.
+- Stage names, lane names, display kinds, and display names are limited to
+  `MAX_PRESENTATION_NAME_CHARS` (256) and must be encodable as UTF-8.
+- Frequent stage events can push every task out of a fleet tail's first 128 KiB. When
+  a bounded first read skipped records and folded no task, that one run's newest
+  execution is read fully, once, so its row keeps its progress.
+
+## Execution Telemetry
+
+`ExecutionSession` samples at a default 1 Hz, on rank 0, into `telemetry.jsonl.zst`
+in the execution directory, starting with the first phase. Project code passes
+nothing; `ExecutionSpec(telemetry=False)` opts out. Each line is one JSON record:
+
+- `{"kind": "gpu", "time", "gpu", "utilization", "power_watts", "memory_mib"}` for
+  each GPU from one long-lived `nvidia-smi` loop, limited to `CUDA_VISIBLE_DEVICES`
+  or all reported GPUs when unset. An unavailable field is `null`.
+- `{"kind": "cpu", "time", "main_cores", "worker_cores"}` from `/proc`. Workers are
+  direct children of any thread in the process, excluding the sampler's own child.
+- `{"kind": "status", "time", "source", "status": "unavailable", "detail"}` when a
+  source cannot be sampled or stops. The other source continues.
+
+`event_stream_paths` does not return this file, so telemetry cannot refresh
+producer liveness, change event sequence numbers, or consume fleet tail windows.
+The child stays in the process group so supervised cleanup reaches it. After its
+parent dies it exits through `SIGPIPE` once every process holding the pipe has ended,
+which includes forked workers. Forked workers do not own the recorder. Stopping waits
+at most a few seconds, escalating to `SIGKILL`.
+
+## Web Monitor
+
+`mammoth monitor web [--root DIR]... [--host] [--port] [--interval] [--stale-after]`
+serves one long-lived, read-only process.
+
+- Discovery walks each root up to `MAX_ENTRY_DEPTH` directories every
+  `DISCOVERY_INTERVAL_SECONDS`, skipping hidden directories, symbolic links, and the
+  inside of run directories. A directory is an entry when a child has
+  `logs/executions` or it has `.mammoth/groups`. A new entry can take that long to
+  appear; a new run in a known entry appears on the next sweep.
+- One background sweep polls every entry's bounded `FleetMonitor`. The fleet page
+  lists only runs with recorded executions, active runs first, and shows the 100 most
+  recent matching rows.
+- A full `RunMonitor` and telemetry readers exist only for an opened run, are shared
+  by its viewers, and are released after `RUN_IDLE_SECONDS` without a request.
+- `GET /api/fleet`, `/api/group`, `/api/run`, `/api/series`, and `/api/stages` return
+  JSON. `/api/series` takes one `after` per `name`, so each series resumes from its
+  own newest point and a refresh costs only new points. Its downsampling keeps each
+  bucket's minimum and maximum. `/api/stages` returns stage spans overlapping the time
+  after `since`, including a span already in progress, and beyond `max_points` shows
+  one stage per time bucket in proportion to each stage's time. A run whose artifacts cannot be read right now
+  returns 503, and the page keeps retrying through that and a temporary 404. Every
+  other method returns 501, and only the packaged static files are served.
+- `/api/run` holds at most `MAX_DOCUMENT_ROWS` (100) stage rows, stage names, and
+  display items, newest display items first. The stage summary is recomputed at most
+  every `SUMMARY_SECONDS` (10). An opened run keeps its telemetry in memory until it
+  is released, and its first load decodes the whole stream.
+- The page shows progress, status, tasks, telemetry charts with stage shading,
+  per-stage summaries, one chart per metric, display items, producers, attempts, and
+  warnings. Metrics are grouped by leading namespace. The x-axis is the `epoch`
+  coordinate when every point has one and time otherwise. A run with stages and no
+  telemetry gets a stage timeline chart. Runs still reporting open on a five-minute window and other runs on their
+  whole history. Pages use `/?entry=<id>&run=<name>[&execution=<id>]` and
+  `/?entry=<id>&group=<id>`.
+- The server binds to `127.0.0.1` unless `--host` says otherwise and has no
+  authentication. While bound to loopback it refuses requests whose `Host` header
+  names anything else, which blocks DNS rebinding from a browser.
+
 ## Dashboard Information Hierarchy
 
 The wide dashboard uses this stable order:
@@ -311,11 +412,12 @@ The wide dashboard uses this stable order:
 1. Run header and refresh state.
 2. `RUN PROGRESS`.
 3. `TRAINING TRENDS`, when loss or learning-rate history exists.
-4. `HOST RESOURCES`, when viewer telemetry is enabled.
-5. Selected attempt and its overall progress.
-6. Per-rank state and active leaf progress.
-7. Attempt history and lineage.
-8. Stream warnings and interaction help.
+4. `TABLES`, when `table` display items exist.
+5. `HOST RESOURCES`, when viewer telemetry is enabled.
+6. Selected attempt and its overall progress.
+7. Per-rank state and active leaf progress.
+8. Attempt history and lineage.
+9. Stream warnings and interaction help.
 
 Compact mode preserves the same order but stacks charts and resource blocks,
 uses textual overall progress instead of a narrow progress bar, and keeps each
@@ -397,10 +499,18 @@ row followed by edge-aligned live metrics.
 - `src/mammoth/monitor/psutil_telemetry.py` owns optional hardware sampling.
 - `src/mammoth/monitor/render.py` owns the stable ANSI-free plain snapshot for
   the run, fleet, and group views.
+- `src/mammoth/monitor/documents.py` owns JSON documents for `show --json` and the
+  web monitor.
+- `src/mammoth/monitor/web.py` and `src/mammoth/monitor/web_static/` own entry
+  discovery, the read-only HTTP API, and the browser page.
+- `src/mammoth/core/telemetry.py` owns execution-host sampling and reading.
 - `tests/test_monitor.py` pins single-run reconstruction, layout, telemetry,
   responsive width, and interaction behavior, plus fleet/group presentation
   and navigation; also pins `ExecutionMonitor`'s incremental-fold/full-fold
   equivalence and the fleet drill-down's non-blocking loading state.
+- `tests/test_web_monitor.py` pins entry discovery, routes, cursors, downsampling,
+  lazy views, and read-only behavior. `tests/test_telemetry.py` pins execution-host
+  sampling, failure isolation, session ownership, and liveness separation.
 - `tests/test_fleet.py` pins fleet and group folding, ad-hoc `--match`
   grouping, and their plain-mode rendering; also pins bounded-tail-window
   status/heartbeat/terminal/progress extraction and bounded initial-poll

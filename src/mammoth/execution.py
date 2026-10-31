@@ -47,6 +47,7 @@ from mammoth.core.execution import (
     PHASE_ENV,
     RUN_NAME_ENV,
 )
+from mammoth.core.telemetry import TelemetryRecorder
 from mammoth.logging import (
     ExecutionLogging,
     ObservationSink,
@@ -88,6 +89,7 @@ class ExecutionSpec:
     starting_epoch: Union[int, None] = None
     starting_global_step: Union[int, None] = None
     runtime: Mapping[str, Any] = field(default_factory=dict)
+    telemetry: bool = True
 
     def __post_init__(self) -> None:
         """Detach mutable inputs and validate the complete resume-fact group."""
@@ -143,6 +145,7 @@ class ExecutionSession:
         *,
         close_callbacks: Sequence[tuple[str, Callable[[], None]]] = (),
         logical_run_lease: Union[LogicalRunLease, None] = None,
+        telemetry: bool = True,
     ) -> None:
         """Create a lifecycle owner for already-established execution resources."""
         if execution_logging.context != context:
@@ -153,6 +156,8 @@ class ExecutionSession:
         self.event_writer = execution_logging.event_writer
         self._close_callbacks = tuple(close_callbacks)
         self._logical_run_lease = logical_run_lease
+        self._telemetry_enabled = telemetry and execution_logging.rank == 0
+        self._telemetry: Union[TelemetryRecorder, None] = None
         self._phase: Union[str, None] = None
         self._phase_terminal = False
         self._phase_outcome: Union[
@@ -231,6 +236,7 @@ class ExecutionSession:
             context,
             logging_bundle,
             logical_run_lease=lease,
+            telemetry=spec.telemetry,
         )
 
     @classmethod
@@ -264,7 +270,7 @@ class ExecutionSession:
             additional_sinks=additional_sinks,
             text_level=text_level,
         )
-        return cls(context, logging_bundle)
+        return cls(context, logging_bundle, telemetry=expected.telemetry)
 
     @classmethod
     def from_established(
@@ -274,6 +280,7 @@ class ExecutionSession:
         *,
         close_callbacks: Sequence[tuple[str, Callable[[], None]]] = (),
         logical_run_lease: Union[LogicalRunLease, None] = None,
+        telemetry: bool = True,
     ) -> Self:
         """Wrap framework-established context and logging without importing it."""
         return cls(
@@ -281,6 +288,7 @@ class ExecutionSession:
             execution_logging,
             close_callbacks=close_callbacks,
             logical_run_lease=logical_run_lease,
+            telemetry=telemetry,
         )
 
     @property
@@ -387,6 +395,9 @@ class ExecutionSession:
             if self._process_started_at is None:
                 self._process_started_at = now
                 self.observer.emit("process_started", phase=phase)
+                if self._telemetry_enabled:
+                    self._telemetry = TelemetryRecorder(self.context.execution_dir)
+                    self._telemetry.start()
             self._phase = phase
             self._phase_terminal = False
             self._phase_outcome = None
@@ -457,6 +468,8 @@ class ExecutionSession:
             self._closed = True
         cleanup_errors = list(prior_cleanup_errors)
         self._owned_resource_errors = cleanup_errors
+        if self._telemetry is not None:
+            self._telemetry.stop()
         self._owned_resources.close()
         if before_close is not None:
             try:
@@ -651,6 +664,12 @@ class ExecutionObserver:
         """Emit periodic liveness heartbeats around long uncounted work."""
         yield
 
+    def stage(self, name: str, *, lane: str = "main") -> None:
+        """Record that one lane entered a named stage."""
+
+    def display(self, kind: str, name: str, /, **data: Any) -> None:
+        """Publish one display item such as a table."""
+
 
 NULL_EXECUTION_OBSERVER = ExecutionObserver()
 """Shared detached no-op observer for call sites without a live session."""
@@ -731,6 +750,14 @@ class SessionExecutionObserver(ExecutionObserver):
             message=message,
         ):
             yield
+
+    def stage(self, name: str, *, lane: str = "main") -> None:
+        """Record that one lane entered a named stage."""
+        self.session.observer.stage(name, lane=lane)
+
+    def display(self, kind: str, name: str, /, **data: Any) -> None:
+        """Publish one display item such as a table."""
+        self.session.observer.display(kind, name, **data)
 
     def _active_phase(self) -> str:
         """Return the active phase name or raise if none is active."""

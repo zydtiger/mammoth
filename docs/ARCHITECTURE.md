@@ -31,7 +31,7 @@ consuming project
     ├── mammoth.torch       optional generic nn.Module/DataLoader training
     ├── mammoth.queue       local device-aware job spool and FIFO runner
     ├── mammoth.workflow    programmatic serial steps and supervision
-    ├── mammoth.monitor     replay, terminal UI, and telemetry
+    ├── mammoth.monitor     replay, terminal and web UIs, and viewer telemetry
     ├── mammoth.execution   direct process lifecycle composition
     ├── mammoth.logging     JSONL, text, and TensorBoard sinks
     └── mammoth.core        identities, layout, events, artifacts, provenance
@@ -484,7 +484,8 @@ Mammoth uses seven nested concepts:
 4. **Execution**: one immutable attempt to produce or continue a run.
 5. **Producer**: a runner or process/rank that exclusively owns one stream.
 6. **Phase and task**: arbitrary project-named work scopes.
-7. **Observation**: lifecycle, progress, heartbeat, metric, or terminal state.
+7. **Observation**: lifecycle, progress, heartbeat, metric, stage, display item, or
+   terminal state.
 
 Core event consumers treat phase names, task names, coordinates, metric names,
 and artifact extensions as opaque validated data.
@@ -519,6 +520,7 @@ operational paths. The default contract is:
 │           ├── execution.json   immutable attempt identity
 │           ├── runner.jsonl.zst optional workflow producer
 │           ├── rank-N.jsonl.zst process/rank producer
+│           ├── telemetry.jsonl.zst execution-host CPU and GPU samples
 │           └── rank-N.log       human-readable diagnostics
 ├── results/                     project-owned contents
 └── vis/                         project-owned contents
@@ -882,14 +884,15 @@ the sanitized checkpoint reference, digest, parent ID, epoch, and optional
 global step with immutable metadata before project work begins. Mammoth does
 not inspect checkpoint contents or infer any of these facts.
 
-An interactive terminal launches the optional Textual dashboard by default.
-Textual owns refresh workers, keyboard navigation, scrolling, and responsive
-layout; Rich renderables provide progress bars, execution panels, task tables,
-and terminal-width-aware training charts. Redirected output remains one stable
-ANSI-free snapshot. Conventional loss and learning-rate names affect
-interactive presentation only and do not alter folding or assign scientific
-meaning. `docs/MONITOR.md` owns the detailed reconstruction and presentation
-contract.
+`mammoth monitor tui` opens the optional Textual dashboard. Textual owns refresh
+workers, keyboard navigation, scrolling, and responsive layout; Rich renderables
+provide progress bars, execution panels, task tables, and terminal-width-aware
+training charts. `mammoth monitor show` prints one stable ANSI-free or JSON
+snapshot. `mammoth monitor web` serves the same reconstructed state to a browser
+using only the standard library and packaged static files. Conventional loss and
+learning-rate names affect terminal presentation only and do not alter folding
+or assign scientific meaning. `docs/MONITOR.md` owns the detailed reconstruction
+and presentation contract.
 
 The optional PyTorch integration may provide a training view for Mammoth's own
 trainer. Project-specific pipeline projections are supplied as data or plugins,
@@ -905,8 +908,15 @@ Viewer-host telemetry and execution-host telemetry are distinct. Local resource
 sampling must never be presented as historical or remote execution provenance.
 The Textual dashboard samples optional viewer CPU, memory, and GPU state,
 labels it as viewer-host data, and isolates sampling failures. The monitor
-remains passive: neither rendering nor telemetry writes artifacts, contacts
-producers, or controls an execution.
+remains passive: neither rendering nor viewer telemetry writes artifacts,
+contacts producers, or controls an execution.
+
+Execution-host telemetry belongs to the producer. `ExecutionSession` starts
+`mammoth.core.telemetry.TelemetryRecorder` once per execution, on rank 0, when its
+first phase starts, and stops it on close. Samples go to `telemetry.jsonl.zst`, a
+Mammoth-owned stream outside the producer event streams, so a live sampler cannot
+keep a hung producer looking alive or displace events from bounded fleet tails.
+Telemetry failure never affects the workload.
 
 ## Direct execution sessions and PyTorch runtime
 
@@ -930,7 +940,7 @@ metadata, artifact paths, event schemas, leases, sanitization, and strict
 context join/publication primitives.
 
 `mammoth.execution` also owns `ExecutionObserver`, a detached no-op
-phase/task/progress/heartbeat call surface, and `SessionExecutionObserver`,
+phase/task/progress/heartbeat/stage/display call surface, and `SessionExecutionObserver`,
 which forwards the identical calls onto one live `ExecutionSession`. A
 consumer writes workflow code once against this shared shape and passes
 either the shared `NULL_EXECUTION_OBSERVER` instance or a session-bound

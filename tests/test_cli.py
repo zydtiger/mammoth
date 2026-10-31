@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -56,7 +57,7 @@ def test_monitor_rejects_non_positive_duration(
 ) -> None:
     result = runner.invoke(
         app,
-        ["monitor", "run", "--entry", str(tmp_path), option, interval],
+        ["monitor", "show", "run", "--entry", str(tmp_path), option, interval],
     )
 
     assert result.exit_code == 2
@@ -69,7 +70,7 @@ def test_monitor_rejects_non_positive_duration(
 def test_monitor_rejects_malformed_interval(tmp_path: Path) -> None:
     result = runner.invoke(
         app,
-        ["monitor", "run", "--entry", str(tmp_path), "--interval", "abc"],
+        ["monitor", "show", "run", "--entry", str(tmp_path), "--interval", "abc"],
     )
 
     assert result.exit_code == 2
@@ -79,7 +80,7 @@ def test_monitor_rejects_malformed_interval(tmp_path: Path) -> None:
 
 
 def test_monitor_reports_missing_run_without_traceback(tmp_path: Path) -> None:
-    result = runner.invoke(app, ["monitor", "missing", "--entry", str(tmp_path)])
+    result = runner.invoke(app, ["monitor", "show", "missing", "--entry", str(tmp_path)])
 
     assert result.exit_code == 2
     assert "No valid executions found" in result.output
@@ -113,25 +114,24 @@ def test_monitor_defaults_entry_to_runs(
     create_completed_monitor_run(tmp_path / "runs")
     monkeypatch.chdir(tmp_path)
 
-    result = runner.invoke(app, ["monitor", "run", "--plain"])
+    result = runner.invoke(app, ["monitor", "show", "run"])
 
     assert result.exit_code == 0
     assert "Execution: attempt" in result.output
 
 
-def test_monitor_defaults_to_textual_watch_and_telemetry_on_tty(
+def test_monitor_tui_defaults_to_watch_and_telemetry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     create_completed_monitor_run(tmp_path)
     run_textual = Mock()
-    monkeypatch.setattr("mammoth.cli.stdout_is_interactive", lambda: True)
     monkeypatch.setattr(
         "mammoth.cli.load_textual_ui",
         lambda: SimpleNamespace(run_textual=run_textual),
     )
 
-    result = runner.invoke(app, ["monitor", "run", "--entry", str(tmp_path)])
+    result = runner.invoke(app, ["monitor", "tui", "run", "--entry", str(tmp_path)])
 
     assert result.exit_code == 0
     assert run_textual.call_count == 1
@@ -143,16 +143,15 @@ def test_monitor_defaults_to_textual_watch_and_telemetry_on_tty(
     }
 
 
-def test_monitor_plain_opt_out_keeps_tty_output_noninteractive(
+def test_monitor_show_never_loads_the_terminal_dashboard(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     create_completed_monitor_run(tmp_path)
     load_textual = Mock()
-    monkeypatch.setattr("mammoth.cli.stdout_is_interactive", lambda: True)
     monkeypatch.setattr("mammoth.cli.load_textual_ui", load_textual)
 
-    result = runner.invoke(app, ["monitor", "run", "--entry", str(tmp_path), "--plain"])
+    result = runner.invoke(app, ["monitor", "show", "run", "--entry", str(tmp_path)])
 
     assert result.exit_code == 0
     assert "Execution: attempt" in result.output
@@ -165,7 +164,6 @@ def test_monitor_explicit_tui_opt_outs_reach_textual_app(
 ) -> None:
     create_completed_monitor_run(tmp_path)
     run_textual = Mock()
-    monkeypatch.setattr("mammoth.cli.stdout_is_interactive", lambda: False)
     monkeypatch.setattr(
         "mammoth.cli.load_textual_ui",
         lambda: SimpleNamespace(run_textual=run_textual),
@@ -175,10 +173,10 @@ def test_monitor_explicit_tui_opt_outs_reach_textual_app(
         app,
         [
             "monitor",
+            "tui",
             "run",
             "--entry",
             str(tmp_path),
-            "--rich",
             "--no-watch",
             "--no-telemetry",
         ],
@@ -198,21 +196,20 @@ def test_monitor_missing_interactive_dependencies_has_actionable_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     create_completed_monitor_run(tmp_path)
-    monkeypatch.setattr("mammoth.cli.stdout_is_interactive", lambda: True)
 
     def raise_missing() -> None:
         raise ModuleNotFoundError("textual")
 
     monkeypatch.setattr("mammoth.cli.load_textual_ui", raise_missing)
 
-    result = runner.invoke(app, ["monitor", "run", "--entry", str(tmp_path)])
+    result = runner.invoke(app, ["monitor", "tui", "run", "--entry", str(tmp_path)])
 
     assert result.exit_code == 2
     assert "uv sync --extra monitor" in result.output
-    assert "--plain" in result.output
+    assert "mammoth monitor show" in result.output
 
 
-def test_monitor_fleet_view_plain_lists_groups_and_loose_runs(tmp_path: Path) -> None:
+def test_monitor_show_fleet_view_lists_groups_and_loose_runs(tmp_path: Path) -> None:
     manifest = publish_group_manifest(
         tmp_path,
         order="run-major",
@@ -227,7 +224,7 @@ def test_monitor_fleet_view_plain_lists_groups_and_loose_runs(tmp_path: Path) ->
     writer.close()
     RunLayout(tmp_path, "loose").prepare()
 
-    result = runner.invoke(app, ["monitor", "--entry", str(tmp_path), "--plain"])
+    result = runner.invoke(app, ["monitor", "show", "--entry", str(tmp_path)])
 
     assert result.exit_code == 0
     assert f"Entry: {tmp_path}" in result.output
@@ -240,7 +237,7 @@ def test_monitor_fleet_view_plain_lists_groups_and_loose_runs(tmp_path: Path) ->
 def test_monitor_fleet_view_reports_useful_output_with_nothing_published(
     tmp_path: Path,
 ) -> None:
-    result = runner.invoke(app, ["monitor", "--entry", str(tmp_path), "--plain"])
+    result = runner.invoke(app, ["monitor", "show", "--entry", str(tmp_path)])
 
     assert result.exit_code == 0
     assert "(none observed)" in result.output
@@ -256,7 +253,7 @@ def test_monitor_group_view_plain_renders_selected_group(tmp_path: Path) -> None
 
     result = runner.invoke(
         app,
-        ["monitor", "--entry", str(tmp_path), "--group", manifest.group_id, "--plain"],
+        ["monitor", "show", "--entry", str(tmp_path), "--group", manifest.group_id],
     )
 
     assert result.exit_code == 0
@@ -267,7 +264,7 @@ def test_monitor_group_view_plain_renders_selected_group(tmp_path: Path) -> None
 def test_monitor_group_view_rejects_an_unknown_group_id(tmp_path: Path) -> None:
     result = runner.invoke(
         app,
-        ["monitor", "--entry", str(tmp_path), "--group", "does-not-exist", "--plain"],
+        ["monitor", "show", "--entry", str(tmp_path), "--group", "does-not-exist"],
     )
 
     assert result.exit_code == 2
@@ -282,7 +279,7 @@ def test_monitor_match_groups_loose_runs_ad_hoc_in_plain_mode(tmp_path: Path) ->
 
     result = runner.invoke(
         app,
-        ["monitor", "--entry", str(tmp_path), "--match", "sweep-*", "--plain"],
+        ["monitor", "show", "--entry", str(tmp_path), "--match", "sweep-*"],
     )
 
     assert result.exit_code == 0
@@ -294,11 +291,11 @@ def test_monitor_match_groups_loose_runs_ad_hoc_in_plain_mode(tmp_path: Path) ->
 def test_monitor_rejects_group_or_match_combined_with_a_run_name(tmp_path: Path) -> None:
     result = runner.invoke(
         app,
-        ["monitor", "run", "--entry", str(tmp_path), "--group", "some-group"],
+        ["monitor", "show", "run", "--entry", str(tmp_path), "--group", "some-group"],
     )
 
     assert result.exit_code == 2
-    assert "--group and --match apply only when RUN_NAME is" in result.output
+    assert "--group and --match apply only when RUN is" in result.output
     assert "omitted" in result.output
     assert "Traceback" not in result.output
 
@@ -306,19 +303,28 @@ def test_monitor_rejects_group_or_match_combined_with_a_run_name(tmp_path: Path)
 def test_monitor_rejects_execution_without_a_run_name(tmp_path: Path) -> None:
     result = runner.invoke(
         app,
-        ["monitor", "--entry", str(tmp_path), "--execution", "bogus"],
+        ["monitor", "show", "--entry", str(tmp_path), "--execution", "bogus"],
     )
 
     assert result.exit_code == 2
     assert "--execution applies only to a single-run" in result.output
-    assert "RUN_NAME given" in result.output
+    assert "RUN given" in result.output
     assert "Traceback" not in result.output
 
 
 def test_monitor_rejects_group_and_match_combined(tmp_path: Path) -> None:
     result = runner.invoke(
         app,
-        ["monitor", "--entry", str(tmp_path), "--group", "some-group", "--match", "sweep-*"],
+        [
+            "monitor",
+            "show",
+            "--entry",
+            str(tmp_path),
+            "--group",
+            "some-group",
+            "--match",
+            "sweep-*",
+        ],
     )
 
     assert result.exit_code == 2
@@ -326,19 +332,18 @@ def test_monitor_rejects_group_and_match_combined(tmp_path: Path) -> None:
     assert "Traceback" not in result.output
 
 
-def test_monitor_fleet_view_defaults_to_textual_watch_and_telemetry_on_tty(
+def test_monitor_tui_fleet_view_defaults_to_watch_and_telemetry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     RunLayout(tmp_path, "loose").prepare()
     run_fleet_textual = Mock()
-    monkeypatch.setattr("mammoth.cli.stdout_is_interactive", lambda: True)
     monkeypatch.setattr(
         "mammoth.cli.load_textual_ui",
         lambda: SimpleNamespace(run_fleet_textual=run_fleet_textual),
     )
 
-    result = runner.invoke(app, ["monitor", "--entry", str(tmp_path)])
+    result = runner.invoke(app, ["monitor", "tui", "--entry", str(tmp_path)])
 
     assert result.exit_code == 0
     assert run_fleet_textual.call_count == 1
@@ -353,7 +358,7 @@ def test_monitor_fleet_view_defaults_to_textual_watch_and_telemetry_on_tty(
 def test_monitor_single_run_invocation_is_unaffected_by_the_fleet_view(
     tmp_path: Path,
 ) -> None:
-    """Regression: `mammoth monitor <run_name>` keeps its exact original behavior."""
+    """Regression: `mammoth monitor show <run_name>` keeps the single-run snapshot."""
     layout = RunLayout(tmp_path, "run").prepare()
     context = create_execution_context(
         layout.run_dir,
@@ -370,9 +375,70 @@ def test_monitor_single_run_invocation_is_unaffected_by_the_fleet_view(
         writer.emit("execution_started")
         writer.emit("execution_completed")
 
-    result = runner.invoke(app, ["monitor", "run", "--entry", str(tmp_path), "--plain"])
+    result = runner.invoke(app, ["monitor", "show", "run", "--entry", str(tmp_path)])
 
     assert result.exit_code == 0
     assert "Run: run" in result.output
     assert "Execution: attempt" in result.output
     assert "Entry:" not in result.output
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["monitor", "run", "--entry", "runs"],
+        ["monitor", "--entry", "runs"],
+        ["monitor", "show", "run", "--plain"],
+        ["monitor", "tui", "run", "--rich"],
+    ],
+)
+def test_monitor_removed_invocation_forms_fail(arguments: list[str]) -> None:
+    result = runner.invoke(app, arguments)
+
+    assert result.exit_code == 2
+
+
+def test_monitor_without_subcommand_prints_help() -> None:
+    result = runner.invoke(app, ["monitor"])
+
+    assert "tui" in result.output
+    assert "web" in result.output
+    assert "show" in result.output
+
+
+def test_monitor_show_json_documents_run_and_fleet(tmp_path: Path) -> None:
+    create_completed_monitor_run(tmp_path)
+
+    run_result = runner.invoke(app, ["monitor", "show", "run", "--entry", str(tmp_path), "--json"])
+    fleet_result = runner.invoke(app, ["monitor", "show", "--entry", str(tmp_path), "--json"])
+
+    assert run_result.exit_code == 0
+    run_document = json.loads(run_result.output)
+    assert run_document["execution_id"] == "attempt"
+    assert run_document["status"] == "completed"
+    assert fleet_result.exit_code == 0
+    assert json.loads(fleet_result.output)["loose_runs"][0]["run_name"] == "run"
+
+
+def test_monitor_web_rejects_a_missing_root(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["monitor", "web", "--root", str(tmp_path / "missing")])
+
+    assert result.exit_code == 2
+    assert "Not a directory" in result.output
+
+
+def test_monitor_web_serves_the_requested_address(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = Mock(url="http://127.0.0.1:9/")
+    create = Mock(return_value=server)
+    monkeypatch.setattr("mammoth.cli.create_web_server", create)
+
+    result = runner.invoke(app, ["monitor", "web", "--root", str(tmp_path), "--port", "9"])
+
+    assert result.exit_code == 0
+    assert create.call_args.kwargs["host"] == "127.0.0.1"
+    assert create.call_args.kwargs["port"] == 9
+    server.serve_forever.assert_called_once()
+    server.shutdown_monitor.assert_called_once()
