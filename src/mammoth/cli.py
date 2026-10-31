@@ -10,7 +10,6 @@ import math
 import sys
 import time
 from collections.abc import Sequence
-from dataclasses import asdict
 from pathlib import Path
 from types import ModuleType
 from typing import Annotated, Any, NoReturn, Union
@@ -28,8 +27,9 @@ from mammoth.monitor import (
     render_fleet_snapshot,
     render_group_snapshot,
     render_snapshot,
-    sample_viewer_telemetry,
 )
+from mammoth.monitor.documents import fleet_document, group_document, run_document
+from mammoth.monitor.web import create_web_server
 from mammoth.queue import (
     DeviceLeaseConflictError,
     Job,
@@ -60,6 +60,14 @@ queue_app = typer.Typer(
     pretty_exceptions_enable=False,
 )
 app.add_typer(queue_app, name="queue")
+monitor_app = typer.Typer(
+    add_completion=False,
+    context_settings=CONTEXT_SETTINGS,
+    help="Passive monitors: terminal dashboard, web server, and stable snapshots.",
+    no_args_is_help=True,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(monitor_app, name="monitor")
 
 
 def version_callback(value: bool) -> None:
@@ -91,89 +99,60 @@ def positive_float(value: float) -> float:
     return value
 
 
-def stdout_is_interactive() -> bool:
-    """Return whether the monitor output supports an interactive dashboard."""
-    return sys.stdout.isatty()
-
-
 def load_textual_ui() -> ModuleType:
     """Load the optional Textual module only for an interactive invocation."""
     return importlib.import_module("mammoth.monitor.textual_ui")
 
 
-@app.command("monitor")
-def run_monitor(
-    run_name: Annotated[
-        Union[str, None],
-        typer.Argument(help="Logical run name to inspect; omit for the entry-level fleet view."),
-    ] = None,
-    entry: Annotated[
-        Path,
-        typer.Option("--entry", help="Run-directory entry path."),
-    ] = Path("./runs"),
-    group: Annotated[
-        Union[str, None],
-        typer.Option("--group", help="Exact group ID to open directly, without RUN_NAME."),
-    ] = None,
-    match: Annotated[
-        Union[str, None],
-        typer.Option(
-            "--match",
-            help=(
-                "Glob pattern grouping loose runs ad hoc in the fleet view, "
-                "for entries without group manifests."
-            ),
-        ),
-    ] = None,
-    execution: Annotated[
-        Union[str, None], typer.Option("--execution", help="Exact immutable execution to inspect.")
-    ] = None,
-    watch: Annotated[
-        Union[bool, None],
-        typer.Option("--watch/--no-watch", help="Enable or disable continuous polling."),
-    ] = None,
-    rich: Annotated[
-        Union[bool, None],
-        typer.Option("--rich/--plain", help="Use the Textual dashboard or stable plain output."),
-    ] = None,
-    telemetry: Annotated[
-        Union[bool, None],
-        typer.Option(
-            "--telemetry/--no-telemetry", help="Enable or disable explicitly viewer-host telemetry."
-        ),
-    ] = None,
-    interval: Annotated[
-        float,
-        typer.Option(
-            "--interval",
-            callback=positive_float,
-            help="Polling interval in seconds.",
-        ),
-    ] = 2.0,
-    stale_after: Annotated[
-        float,
-        typer.Option(
-            "--stale-after",
-            callback=positive_float,
-            help="Seconds without an observation before a running producer is stale.",
-        ),
-    ] = 90.0,
-) -> None:
-    """Open the live dashboard on a TTY or render a stable plain snapshot.
+EntryOption = Annotated[Path, typer.Option("--entry", help="Run-directory entry path.")]
+GroupOption = Annotated[
+    Union[str, None],
+    typer.Option("--group", help="Exact group ID to open directly, without RUN."),
+]
+MatchOption = Annotated[
+    Union[str, None],
+    typer.Option(
+        "--match",
+        help="Glob pattern grouping loose runs ad hoc, for entries without group manifests.",
+    ),
+]
+ExecutionOption = Annotated[
+    Union[str, None], typer.Option("--execution", help="Exact immutable execution to inspect.")
+]
+RunArgument = Annotated[
+    Union[str, None],
+    typer.Argument(metavar="[RUN]", help="Logical run to inspect; omit for the fleet view."),
+]
+IntervalOption = Annotated[
+    float,
+    typer.Option("--interval", callback=positive_float, help="Polling interval in seconds."),
+]
+StaleAfterOption = Annotated[
+    float,
+    typer.Option(
+        "--stale-after",
+        callback=positive_float,
+        help="Seconds without an observation before a running producer is stale.",
+    ),
+]
 
-    With ``RUN_NAME`` this is exactly the original single-run invocation.
-    Without it, ``--entry`` opens the fleet view listing every group and
-    loose run; ``--group`` opens one group directly; ``--match`` groups loose
-    runs by name pattern ad hoc for entries without group manifests.
-    """
+
+def _validate_monitor_target(
+    run_name: Union[str, None],
+    *,
+    group: Union[str, None],
+    match: Union[str, None],
+    execution: Union[str, None],
+) -> None:
+    """Reject option combinations that do not name one monitor view."""
     if run_name is not None and (group is not None or match is not None):
         raise typer.BadParameter(
-            "--group and --match apply only when RUN_NAME is omitted",
-            param_hint="RUN_NAME",
+            "--group and --match apply only when RUN is omitted",
+            param_hint="RUN",
         )
     if run_name is None and execution is not None:
         raise typer.BadParameter(
-            "--execution applies only to a single-run invocation (RUN_NAME given)",
+            "--execution applies only to a single-run invocation (RUN given)",
             param_hint="--execution",
         )
     if group is not None and match is not None:
@@ -181,58 +160,168 @@ def run_monitor(
             "--group and --match are mutually exclusive",
             param_hint="--group",
         )
-    interactive = stdout_is_interactive() if rich is None else rich
-    should_watch = interactive if watch is None else watch
-    include_telemetry = interactive if telemetry is None else telemetry
 
-    if run_name is None:
-        _run_fleet_monitor(
-            entry,
-            group=group,
-            match=match,
-            interactive=interactive,
-            should_watch=should_watch,
-            include_telemetry=include_telemetry,
-            interval=interval,
-            stale_after=stale_after,
-        )
-        return
 
-    try:
-        layout = RunLayout(entry, run_name)
-        monitor = ExecutionMonitor(layout, execution)
-    except (OSError, ValueError) as error:
-        raise typer.BadParameter(str(error), param_hint="RUN_NAME/--execution") from None
-    if interactive:
+def _open_fleet(
+    entry: Path,
+    *,
+    group: Union[str, None],
+    match: Union[str, None],
+    stale_after: float,
+) -> tuple[FleetMonitor, FleetSnapshot]:
+    """Take the first fleet snapshot and confirm a requested group exists."""
+    fleet_monitor = FleetMonitor(entry, match=match)
+    fleet_snapshot = fleet_monitor.poll(stale_after_seconds=stale_after)
+    if group is not None and _find_group(fleet_snapshot, group) is None:
+        raise typer.BadParameter(f"No group {group!r} found under {entry}", param_hint="--group")
+    return fleet_monitor, fleet_snapshot
+
+
+@monitor_app.command("tui")
+def monitor_tui(
+    run_name: RunArgument = None,
+    entry: EntryOption = Path("./runs"),
+    group: GroupOption = None,
+    match: MatchOption = None,
+    execution: ExecutionOption = None,
+    watch: Annotated[
+        bool,
+        typer.Option("--watch/--no-watch", help="Enable or disable continuous polling."),
+    ] = True,
+    telemetry: Annotated[
+        bool,
+        typer.Option("--telemetry/--no-telemetry", help="Show viewer-host telemetry."),
+    ] = True,
+    interval: IntervalOption = 2.0,
+    stale_after: StaleAfterOption = 90.0,
+) -> None:
+    """Open the interactive terminal dashboard."""
+    _validate_monitor_target(run_name, group=group, match=match, execution=execution)
+    run_monitor: Union[RunMonitor, None] = None
+    if run_name is not None:
         try:
-            textual_module = load_textual_ui()
-        except ModuleNotFoundError as error:
-            typer.echo(
-                "Interactive monitoring requires the monitor extra; "
-                "install it with `uv sync --extra monitor` or pass `--plain`.",
-                err=True,
-            )
-            raise typer.Exit(code=2) from error
-        run_monitor_state = RunMonitor(layout, execution)
-        initial_snapshot = run_monitor_state.poll()
+            run_monitor = RunMonitor(RunLayout(entry, run_name), execution)
+            initial_snapshot = run_monitor.poll()
+        except (OSError, ValueError) as error:
+            raise typer.BadParameter(str(error), param_hint="RUN/--execution") from None
+    else:
+        fleet_monitor, fleet_snapshot = _open_fleet(
+            entry, group=group, match=match, stale_after=stale_after
+        )
+    try:
+        textual_module = load_textual_ui()
+    except ModuleNotFoundError as error:
+        typer.echo(
+            "The terminal dashboard requires the monitor extra; "
+            "install it with `uv sync --extra monitor`, or use `mammoth monitor show`.",
+            err=True,
+        )
+        raise typer.Exit(code=2) from error
+    if run_monitor is not None:
         textual_module.run_textual(
-            run_monitor_state,
+            run_monitor,
             initial_snapshot,
-            watch=should_watch,
-            telemetry=include_telemetry,
+            watch=watch,
+            telemetry=telemetry,
             interval_seconds=interval,
             stale_after_seconds=stale_after,
         )
         return
+    textual_module.run_fleet_textual(
+        entry,
+        fleet_monitor,
+        fleet_snapshot,
+        watch=watch,
+        telemetry=telemetry,
+        interval_seconds=interval,
+        stale_after_seconds=stale_after,
+        open_group_id=group,
+    )
+
+
+@monitor_app.command("show")
+def monitor_show(
+    run_name: RunArgument = None,
+    entry: EntryOption = Path("./runs"),
+    group: GroupOption = None,
+    match: MatchOption = None,
+    execution: ExecutionOption = None,
+    watch: Annotated[
+        bool,
+        typer.Option("--watch", help="Keep printing snapshots until the run finishes."),
+    ] = False,
+    as_json: Annotated[bool, typer.Option("--json", help="Print one JSON object per snapshot.")] = (
+        False
+    ),
+    interval: IntervalOption = 2.0,
+    stale_after: StaleAfterOption = 90.0,
+) -> None:
+    """Print a stable plain-text or JSON snapshot."""
+    _validate_monitor_target(run_name, group=group, match=match, execution=execution)
+    if run_name is None:
+        _show_fleet(
+            entry,
+            group=group,
+            match=match,
+            watch=watch,
+            as_json=as_json,
+            interval=interval,
+            stale_after=stale_after,
+        )
+        return
+    try:
+        layout = RunLayout(entry, run_name)
+        monitor = ExecutionMonitor(layout, execution)
+        run_monitor = RunMonitor(layout, execution) if as_json else None
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error), param_hint="RUN/--execution") from None
     while True:
         snapshot = monitor.poll()
-        sys.stdout.write(render_snapshot(snapshot, stale_after_seconds=stale_after))
-        if include_telemetry:
-            sys.stdout.write(json.dumps(asdict(sample_viewer_telemetry()), sort_keys=True) + "\n")
+        if run_monitor is not None:
+            document = run_document(run_monitor.poll(), stale_after_seconds=stale_after)
+            sys.stdout.write(json.dumps(document, sort_keys=True) + "\n")
+        else:
+            sys.stdout.write(render_snapshot(snapshot, stale_after_seconds=stale_after))
         sys.stdout.flush()
-        if not should_watch or snapshot.status in {"completed", "failed", "interrupted"}:
+        if not watch or snapshot.status in {"completed", "failed", "interrupted"}:
             return
         time.sleep(interval)
+
+
+@monitor_app.command("web")
+def monitor_web(
+    root: Annotated[
+        Union[list[Path], None],
+        typer.Option("--root", help="Directory searched for entries; repeatable. [default: runs]"),
+    ] = None,
+    host: Annotated[str, typer.Option("--host", help="Interface to bind.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", min=0, max=65535, help="Port to bind.")] = 8765,
+    interval: IntervalOption = 2.0,
+    stale_after: StaleAfterOption = 90.0,
+) -> None:
+    """Serve the read-only web monitor for every entry below each root."""
+    roots = tuple(root) if root else (Path("./runs"),)
+    missing = [str(path) for path in roots if not path.is_dir()]
+    if missing:
+        raise typer.BadParameter(f"Not a directory: {', '.join(missing)}", param_hint="--root")
+    try:
+        server = create_web_server(
+            roots,
+            host=host,
+            port=port,
+            interval_seconds=interval,
+            stale_after_seconds=stale_after,
+        )
+    except OSError as error:
+        typer.echo(f"Could not bind {host}:{port}: {error}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(f"Serving {', '.join(map(str, roots))} at {server.url}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown_monitor()
 
 
 @queue_app.command("submit")
@@ -397,64 +486,38 @@ def _render_queue_snapshot(snapshot: QueueSnapshot) -> str:
     return "\n".join(lines)
 
 
-def _run_fleet_monitor(
+def _show_fleet(
     entry: Path,
     *,
     group: Union[str, None],
     match: Union[str, None],
-    interactive: bool,
-    should_watch: bool,
-    include_telemetry: bool,
+    watch: bool,
+    as_json: bool,
     interval: float,
     stale_after: float,
 ) -> None:
-    """Open the fleet view, or one directly requested group within it."""
-    fleet_monitor = FleetMonitor(entry, match=match)
-    fleet_snapshot = fleet_monitor.poll(stale_after_seconds=stale_after)
-    selected_group: Union[GroupSnapshot, None] = None
-    if group is not None:
-        selected_group = _find_group(fleet_snapshot, group)
-        if selected_group is None:
-            raise typer.BadParameter(
-                f"No group {group!r} found under {entry}", param_hint="--group"
-            )
-
-    if interactive:
-        try:
-            textual_module = load_textual_ui()
-        except ModuleNotFoundError as error:
-            typer.echo(
-                "Interactive monitoring requires the monitor extra; "
-                "install it with `uv sync --extra monitor` or pass `--plain`.",
-                err=True,
-            )
-            raise typer.Exit(code=2) from error
-        textual_module.run_fleet_textual(
-            entry,
-            fleet_monitor,
-            fleet_snapshot,
-            watch=should_watch,
-            telemetry=include_telemetry,
-            interval_seconds=interval,
-            stale_after_seconds=stale_after,
-            open_group_id=group,
-        )
-        return
-
+    """Print the fleet view, or one directly requested group within it."""
+    fleet_monitor, fleet_snapshot = _open_fleet(
+        entry, group=group, match=match, stale_after=stale_after
+    )
+    selected: Union[GroupSnapshot, None] = None
     while True:
-        if selected_group is not None:
-            sys.stdout.write(render_group_snapshot(selected_group, stale_after_seconds=stale_after))
+        if group is not None:
+            selected = _find_group(fleet_snapshot, group) or selected
+        if as_json:
+            document = (
+                group_document(selected) if selected is not None else fleet_document(fleet_snapshot)
+            )
+            sys.stdout.write(json.dumps(document, sort_keys=True) + "\n")
+        elif selected is not None:
+            sys.stdout.write(render_group_snapshot(selected, stale_after_seconds=stale_after))
         else:
             sys.stdout.write(render_fleet_snapshot(fleet_snapshot, stale_after_seconds=stale_after))
-        if include_telemetry:
-            sys.stdout.write(json.dumps(asdict(sample_viewer_telemetry()), sort_keys=True) + "\n")
         sys.stdout.flush()
-        if not should_watch:
+        if not watch:
             return
         time.sleep(interval)
         fleet_snapshot = fleet_monitor.poll(stale_after_seconds=stale_after)
-        if group is not None:
-            selected_group = _find_group(fleet_snapshot, group) or selected_group
 
 
 def _find_group(fleet_snapshot: FleetSnapshot, group_id: str) -> Union[GroupSnapshot, None]:

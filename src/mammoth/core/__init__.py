@@ -93,6 +93,11 @@ from mammoth.core.pipeline import (
     BackgroundPipelineSubmission,
     BoundedBackgroundPipeline,
 )
+from mammoth.core.telemetry import (
+    TelemetryRecorder,
+    TelemetryTailReader,
+    telemetry_stream_path,
+)
 from mammoth.core.transactions import (
     ArtifactKind,
     ArtifactTransactionConflictError,
@@ -138,6 +143,9 @@ from mammoth.core.workstore import (
 )
 
 __all__ = [
+    "TelemetryRecorder",
+    "TelemetryTailReader",
+    "telemetry_stream_path",
     "BackgroundPipelineError",
     "BackgroundPipelineResult",
     "BackgroundPipelineSubmission",

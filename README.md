@@ -100,15 +100,48 @@ one.
 
 ## Inspect or watch a run
 
-Install the monitor dependencies, then open the latest execution of `demo`:
+`mammoth monitor` has three passive views of the same artifacts. Each reads
+from `./runs` by default.
+
+| Command | Use it for | Requires |
+| --- | --- | --- |
+| `mammoth monitor web` | Browser charts, stage timelines, tables, and telemetry for every run | Base install |
+| `mammoth monitor tui` | Interactive terminal dashboard | `monitor` extra |
+| `mammoth monitor show` | Stable plain-text or JSON snapshot for logs and scripts | Base install |
+
+Serve every entry found below a directory, including nested ones:
+
+```bash
+uv run mammoth monitor web --root runs
+```
+
+The server binds to `127.0.0.1:8765` and serves read-only pages. New runs appear
+without a restart. Pass `--host` to bind another interface; the server has no
+authentication, so only use a trusted network.
+
+Open the terminal dashboard for the latest execution of `demo`, or omit the run
+for the fleet view:
 
 ```bash
 uv sync --extra monitor
-uv run mammoth monitor demo
+uv run mammoth monitor tui demo --entry runs
 ```
 
-The monitor reads from `./runs` by default. Use `--entry <path>` to inspect a
-different artifact root.
+It includes compact attempt IDs, resume-aware run progress, integrated progress
+bars, throughput, ETA, rank state, lineage-rich attempt history, and responsive
+multi-row Braille charts for conventional loss and learning-rate metrics. Exact
+detail retains complete immutable IDs and provenance. Use the arrow keys or
+`j`/`k` to select an execution, Enter to toggle overview and detail, `r` to
+refresh, and `q` to quit. Pass `--execution <execution-id>` to pin one immutable
+attempt exactly.
+
+Print one snapshot, or keep printing until the run finishes:
+
+```bash
+uv run mammoth monitor show demo
+uv run mammoth monitor show demo --json
+uv run mammoth monitor show demo --watch --interval 5
+```
 
 Progress counters are unitless producer-owned numbers. Within each task,
 `completed`, `total`, and any reported throughput must describe the same
@@ -116,36 +149,31 @@ logical work quantity; producers omit throughput when they cannot keep that
 relationship. The monitor renders every present throughput as `b/s` without
 defining or converting the underlying work batch.
 
-On an interactive terminal, this opens the Textual dashboard with continuous
-two-second polling and explicitly viewer-host telemetry enabled. The dashboard
-includes compact attempt IDs, resume-aware run progress, integrated progress
-bars, throughput, ETA, rank state, lineage-rich attempt history, and responsive
-multi-row Braille charts for conventional loss and learning-rate metrics. Exact
-detail retains complete immutable IDs and provenance.
+### What appears on the web page
 
-Use the arrow keys or `j`/`k` to select an execution, Enter to toggle overview
-and detail, `r` to refresh, and `q` to quit. Pass `--execution <execution-id>`
-to pin one immutable attempt exactly.
+A project needs no monitor configuration. `display_metrics` become one chart per
+metric, grouped into sections by leading namespace such as `train/` or `val/`.
+`ExecutionSession` records this process's CPU load and its visible NVIDIA GPUs
+into the execution directory automatically; set `ExecutionSpec(telemetry=False)`
+to turn that off.
 
-Redirected output remains a single stable ANSI-free snapshot:
+Two observer calls add stages and tables to the same event stream:
 
-```bash
-uv run mammoth monitor demo > monitor.txt
+```python
+observer.stage("train")                     # the "main" lane entered "train"
+observer.stage("write", lane="background")  # safe from background threads
+observer.display(
+    "table",
+    "Per-domain error",
+    columns=["domain", "MAE"],
+    rows=[["a", 0.12], ["b", 0.09]],
+)
 ```
 
-Interactive invocations can opt out of individual defaults:
-
-```bash
-uv run mammoth monitor demo --plain
-uv run mammoth monitor demo --no-watch
-uv run mammoth monitor demo --no-telemetry
-uv run mammoth monitor demo --interval 5 --stale-after 120
-```
-
-The existing `--rich`, `--watch`, and `--telemetry` flags remain accepted for
-explicit compatibility. Plain mode works without the monitor extra; requesting
-the dashboard without its optional dependencies reports the exact installation
-command.
+Stages shade the telemetry charts and fill a table of time share and resource
+use per stage. The newest item of each display kind and name replaces earlier
+ones. Monitors must be at least as new as the producers they read, because older
+readers do not recognize these events.
 
 ## Identify an existing artifact's exact bytes
 
@@ -301,7 +329,7 @@ the number of retained JSONL progress scopes.
 Install only the features your project uses:
 
 ```bash
-uv sync --extra monitor       # Textual dashboard, Rich renderables, and psutil telemetry
+uv sync --extra monitor       # Terminal dashboard, Rich renderables, and psutil telemetry
 uv sync --extra tensorboard   # TensorBoard logging sink
 uv sync --extra torch         # Generic PyTorch runtime, trainer, and profiler
 ```

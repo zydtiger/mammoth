@@ -17,6 +17,7 @@ from mammoth.core import (
     publish_group_manifest,
 )
 from mammoth.core.events import ExecutionEventTailReader, ExecutionEventWriter
+from mammoth.core.telemetry import TelemetryRecorder
 from mammoth.monitor import fleet as fleet_module
 from mammoth.monitor.fleet import (
     FleetMonitor,
@@ -948,3 +949,61 @@ def test_fleet_monitor_initial_poll_reads_are_bounded_at_scale(
     # full read of every stream would cost.
     assert bytes_read < run_count * FLEET_TAIL_WINDOW_BYTES * 2
     assert bytes_read < total_on_disk / 4
+
+
+def test_fleet_rollup_keeps_progress_beyond_the_tail_window(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    with ExecutionEventWriter.for_process(context, rank=0, world_size=1) as writer:
+        writer.emit("process_started", phase="train")
+        writer.emit("progress", phase="train", task_id="epochs", completed=3, total=9, final=True)
+        for index in range(3000):
+            writer.emit("stage_changed", stage=f"s{index % 3}", lane="main")
+    stream = context.execution_dir / "rank-0.jsonl.zst"
+    assert stream.stat().st_size > 0
+
+    monitor = FleetMonitor(tmp_path)
+    run = monitor.poll().loose_runs[0]
+
+    assert run.progress is not None
+    assert (run.progress.completed, run.progress.total) == (3, 9)
+    # Later polls stay incremental on the fully read stream.
+    assert monitor.poll().loose_runs[0].progress is not None
+
+
+def test_fleet_rollup_survives_heavy_stage_activity_and_telemetry(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_execution_context(
+        layout.run_dir,
+        run_name="run",
+        invocation_kind="test",
+        intended_phases=("train",),
+        world_size=1,
+        execution_mode="single",
+        command=("train",),
+        execution_id="attempt",
+    )
+    with ExecutionEventWriter.for_process(context, rank=0, world_size=1) as writer:
+        writer.emit("process_started", phase="train")
+        writer.emit("progress", phase="train", task_id="epochs", completed=3, total=9, final=True)
+        for index in range(100):
+            writer.emit("stage_changed", stage=f"s{index % 3}", lane="main")
+    recorder = TelemetryRecorder(context.execution_dir, environment={"CUDA_VISIBLE_DEVICES": ""})
+    recorder.interval_seconds = 3600.0
+    recorder.start()
+
+    def grow_telemetry() -> None:
+        for index in range(5000):
+            recorder._write({"kind": "cpu", "time": float(index), "main_cores": 1.0})
+
+    monitor = FleetMonitor(tmp_path)
+    grow_telemetry()
+    monitor.poll()
+    grow_telemetry()
+    run = monitor.poll().loose_runs[0]
+    recorder.stop()
+
+    assert run.status == "running"
+    assert run.progress is not None
+    assert (run.progress.completed, run.progress.total) == (3, 9)
+    assert run.warnings == ()

@@ -642,6 +642,13 @@ def _poll_member_tail(
             newest.metadata.execution_id,
             tail_window_bytes=FLEET_TAIL_WINDOW_BYTES,
         )
+        snapshot = tail.monitor.poll()
+        if not snapshot.tasks and tail.monitor.truncated:
+            # Frequent events pushed every task out of the window. Read this one
+            # stream fully, once, rather than show a run with no progress.
+            tail.monitor = ExecutionMonitor(layout, newest.metadata.execution_id)
+            snapshot = tail.monitor.poll()
+        return snapshot
     return tail.monitor.poll()
 
 

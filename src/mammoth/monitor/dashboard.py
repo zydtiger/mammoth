@@ -33,7 +33,7 @@ from mammoth.monitor.model import (
     TaskState,
 )
 from mammoth.monitor.psutil_telemetry import PsutilViewerTelemetry
-from mammoth.monitor.render import format_duration
+from mammoth.monitor.render import format_duration, table_cells
 
 _STATE_STYLE = {
     "pending": "dim",
@@ -1021,6 +1021,8 @@ def _wide_layout(
     ]
     if _featured_metric_names(list(snapshot.metric_history.items())):
         pieces.extend((_section("TRAINING TRENDS"), _metric_panel(snapshot, compact=False)))
+    if tables := _display_tables(snapshot):
+        pieces.extend((_section("TABLES"), *tables))
     if host is not None:
         pieces.extend(
             (
@@ -1076,6 +1078,8 @@ def _compact_layout(
                 _metric_panel(snapshot, compact=True),
             )
         )
+    if tables := _display_tables(snapshot):
+        pieces.extend((Text("\nTABLES", style="bold"), *tables))
     if host is not None:
         pieces.extend(
             (
@@ -1209,6 +1213,22 @@ def _metric_panel(snapshot: RunSnapshot, *, compact: bool) -> RenderableType:
             grid.add_row(*trends)
             pieces.append(grid)
     return Group(*pieces)
+
+
+def _display_tables(snapshot: RunSnapshot) -> list[RenderableType]:
+    """Render ``table`` display items; other kinds have no terminal presentation."""
+    tables: list[RenderableType] = []
+    items = snapshot.display_items
+    for key in sorted(key for key in items if key[0] == "table"):
+        columns, rows = table_cells(items[key].data)
+        # Producer text is literal, so it must not be parsed as Rich markup.
+        table = Table(title=Text(key[1]), title_justify="left", expand=True, box=None)
+        for column in columns:
+            table.add_column(Text(column), overflow="fold")
+        for row in rows:
+            table.add_row(*(Text(cell) for cell in row))
+        tables.append(table)
+    return tables
 
 
 def _featured_metric_names(

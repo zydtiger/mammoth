@@ -86,6 +86,27 @@ class MetricPoint:
     coordinates: Mapping[str, Union[int, float, str]]
 
 
+@dataclass(frozen=True, **DATACLASS_SLOTS)
+class StagePoint:
+    """One producer lane's transition into a named stage."""
+
+    time: datetime
+    stage: str
+    lane: str
+    producer: ProducerKey
+
+
+@dataclass(frozen=True, **DATACLASS_SLOTS)
+class DisplayItem:
+    """Newest producer-chosen presentation item for one kind and name."""
+
+    time: datetime
+    kind: str
+    name: str
+    data: Mapping[str, object]
+    producer: ProducerKey
+
+
 @dataclass(**DATACLASS_SLOTS)
 class TaskState:
     """Folded state for one producer-owned task."""
@@ -162,6 +183,8 @@ class MonitorSnapshot:
     producers: dict[ProducerKey, ProducerState] = field(default_factory=dict)
     tasks: dict[tuple[ProducerKey, str], TaskState] = field(default_factory=dict)
     metric_history: dict[str, list[MetricPoint]] = field(default_factory=dict)
+    stage_history: list[StagePoint] = field(default_factory=list)
+    display_items: dict[tuple[str, str], DisplayItem] = field(default_factory=dict)
     lineage: tuple[str, ...] = ()
     warnings: list[str] = field(default_factory=list)
     events: tuple[ExecutionEvent, ...] = ()
@@ -169,6 +192,12 @@ class MonitorSnapshot:
         default_factory=dict, compare=False, repr=False
     )
     _metric_keys: dict[str, list[tuple[datetime, str, int, int]]] = field(
+        default_factory=dict, compare=False, repr=False
+    )
+    _stage_keys: list[tuple[datetime, str, int, int]] = field(
+        default_factory=list, compare=False, repr=False
+    )
+    _display_keys: dict[tuple[str, str], tuple[datetime, str, int, int]] = field(
         default_factory=dict, compare=False, repr=False
     )
 
@@ -331,6 +360,24 @@ class RunSnapshot:
             for name, points in combined.items()
         }
 
+    @property
+    def stage_history(self) -> tuple[StagePoint, ...]:
+        """Return stage transitions across the selected resume lineage chronologically."""
+        return tuple(
+            sorted(
+                (point for snapshot in self.resume_lineage for point in snapshot.stage_history),
+                key=lambda point: point.time,
+            )
+        )
+
+    @property
+    def display_items(self) -> dict[tuple[str, str], DisplayItem]:
+        """Return the newest display items across the selected resume lineage."""
+        items: dict[tuple[str, str], DisplayItem] = {}
+        for snapshot in self.resume_lineage:
+            items.update(snapshot.display_items)
+        return items
+
 
 def discover_executions(layout: RunLayout) -> tuple[list[ExecutionContext], list[str]]:
     """Return valid attempts sorted by creation time plus isolated warnings."""
@@ -480,6 +527,38 @@ def _insert_metric_point(
     point_keys.insert(position, key)
 
 
+def _thaw_display_data(value: object) -> object:
+    """Return plain JSON containers for one frozen display payload value."""
+    if isinstance(value, Mapping):
+        return {key: _thaw_display_data(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_display_data(item) for item in value]
+    return value
+
+
+def _apply_presentation_event(
+    snapshot: MonitorSnapshot,
+    event: ExecutionEvent,
+    producer: ProducerKey,
+    observed_at: datetime,
+    sort_key: tuple[datetime, str, int, int],
+) -> None:
+    """Fold one stage transition or display item independently of poll batching."""
+    fields = event.extensions
+    if event.event == "stage_changed":
+        point = StagePoint(observed_at, str(fields["stage"]), str(fields["lane"]), producer)
+        position = bisect.bisect_right(snapshot._stage_keys, sort_key)
+        snapshot.stage_history.insert(position, point)
+        snapshot._stage_keys.insert(position, sort_key)
+        return
+    key = (str(fields["kind"]), str(fields["name"]))
+    if key not in snapshot._display_keys or sort_key > snapshot._display_keys[key]:
+        snapshot._display_keys[key] = sort_key
+        data = _thaw_display_data(fields["data"])
+        assert isinstance(data, dict)
+        snapshot.display_items[key] = DisplayItem(observed_at, key[0], key[1], data, producer)
+
+
 def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
     """Apply one validated observation to an existing snapshot."""
     observed_at = parse_time(event.time)
@@ -491,6 +570,9 @@ def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
     producer.last_event = event.event
     if event.phase is not None:
         producer.phase = event.phase
+
+    if event.event in {"stage_changed", "display"}:
+        _apply_presentation_event(snapshot, event, producer_key, observed_at, sort_key)
 
     if event.event == "execution_started":
         snapshot.status = "running"
@@ -515,6 +597,8 @@ def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
         "task_started",
         "progress",
         "heartbeat",
+        "stage_changed",
+        "display",
     }:
         snapshot.status = "running"
 
@@ -687,6 +771,11 @@ class ExecutionMonitor:
         self._snapshot = MonitorSnapshot(context=self.context)
         self._retained_events: list[ExecutionEvent] = []
         self._has_runner_terminal = False
+
+    @property
+    def truncated(self) -> bool:
+        """Return whether a bounded first read skipped records in any stream."""
+        return any(reader.truncated for reader in self._readers.values())
 
     def poll(self) -> MonitorSnapshot:
         """Read newly appended records and apply them to the folded state."""

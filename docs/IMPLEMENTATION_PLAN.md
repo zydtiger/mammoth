@@ -306,9 +306,8 @@ Defer these until another real project supplies requirements:
 - FSDP, pipeline parallelism, or remote distributed coordination;
 - Slurm, Kubernetes, and cloud launchers;
 - object-store event and artifact backends;
-- several optimizers or automatic GAN/RL control flow;
-- generic inference serving; and
-- a web monitoring service.
+- several optimizers or automatic GAN/RL control flow; and
+- generic inference serving.
 
 The extension protocols should permit these later without making the initial
 implementation speculative.

@@ -206,6 +206,7 @@ class Runtime:
         self.execution_logging: Union[ExecutionLogging, None] = None
         self.execution_context: Union[ExecutionContext, None] = None
         self._execution_session: Union[ExecutionSession, None] = None
+        self._execution_telemetry = True
         self._state_lock = RLock()
         self._closed = False
 
@@ -477,6 +478,7 @@ class Runtime:
                 raise RuntimeError("This torch runtime has already established an execution")
             context = self._create_execution(spec)
             self.execution_context = context
+            self._execution_telemetry = spec.telemetry
             return context
 
     def attach_execution(self, expected: ExecutionSpec) -> ExecutionContext:
@@ -489,6 +491,7 @@ class Runtime:
                 raise RuntimeError("This torch runtime has already established an execution")
             context = self._attach_execution(expected)
             self.execution_context = context
+            self._execution_telemetry = expected.telemetry
             return context
 
     def close_process_group(self) -> None:
@@ -1049,6 +1052,7 @@ class ExecutionSession:
                 ("torch runtime", self._mark_runtime_closed),
             ),
             logical_run_lease=logical_run_lease,
+            telemetry=runtime._execution_telemetry,
         )
         self.context = self._neutral.context
         self.execution_logging = self._neutral.execution_logging

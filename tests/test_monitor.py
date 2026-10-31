@@ -347,6 +347,8 @@ def _assert_snapshot_equivalent(incremental: object, oracle: object) -> None:
     assert incremental.producers == oracle.producers
     assert incremental.tasks == oracle.tasks
     assert incremental.metric_history == oracle.metric_history
+    assert incremental.stage_history == oracle.stage_history
+    assert incremental.display_items == oracle.display_items
     assert incremental.terminal_event_time == oracle.terminal_event_time
     assert incremental.duration_seconds == oracle.duration_seconds
     assert incremental.updated_at == oracle.updated_at
@@ -572,19 +574,18 @@ def test_monitor_cli_preserves_public_command_shape(tmp_path: Path) -> None:
         app,
         [
             "monitor",
+            "show",
             "run",
             "--entry",
             str(tmp_path),
             "--execution",
             "attempt",
-            "--telemetry",
         ],
     )
 
     assert result.exit_code == 0
     assert "Run: run" in result.output
     assert "Execution: attempt" in result.output
-    assert '"host_role": "viewer"' in result.output
 
 
 def test_local_telemetry_never_claims_execution_host_provenance() -> None:
@@ -2352,3 +2353,133 @@ def test_fleet_dashboard_layout_uses_full_room_at_a_large_viewport(tmp_path: Pat
         assert "more below" not in text
         for row in rows:
             assert row.key in text
+
+
+def _write_presentation_stream(writer: ExecutionEventWriter) -> None:
+    writer.emit("process_started", phase="train")
+    writer.emit("stage_changed", stage="train", lane="main")
+    writer.emit("display", kind="table", name="scores", data={"columns": ["a"], "rows": [[1]]})
+    writer.emit("stage_changed", stage="write", lane="background")
+    writer.emit("display", kind="table", name="scores", data={"columns": ["a"], "rows": [[2]]})
+    writer.emit("display", kind="custom", name="scores", data={"anything": True})
+
+
+def test_stage_and_display_fold_incrementally_like_a_full_fold(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    monitor = ExecutionMonitor(layout, "attempt")
+    with ExecutionEventWriter.for_process(context, rank=0, world_size=1) as writer:
+        _write_presentation_stream(writer)
+        _assert_snapshot_equivalent(monitor.poll(), _oracle_snapshot(layout, context))
+        writer.emit("stage_changed", stage="validate", lane="main")
+    snapshot = monitor.poll()
+    _assert_snapshot_equivalent(snapshot, _oracle_snapshot(layout, context))
+
+    assert [(point.lane, point.stage) for point in snapshot.stage_history] == [
+        ("main", "train"),
+        ("background", "write"),
+        ("main", "validate"),
+    ]
+    assert snapshot.display_items["table", "scores"].data == {"columns": ["a"], "rows": [[2]]}
+    assert snapshot.display_items["custom", "scores"].data == {"anything": True}
+
+
+def test_presentation_events_keep_arrival_order_independent(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z", world_size=2)
+    clock = ["2026-01-01T00:00:10Z"]
+    with (
+        ExecutionEventWriter.for_process(
+            context, rank=0, world_size=2, utc_clock=lambda: clock[0]
+        ) as first,
+        ExecutionEventWriter.for_process(
+            context, rank=1, world_size=2, utc_clock=lambda: clock[0]
+        ) as second,
+    ):
+        monitor = ExecutionMonitor(layout, "attempt")
+        first.emit("stage_changed", stage="late", lane="main")
+        first.emit("display", kind="table", name="t", data={"rows": ["late"]})
+        monitor.poll()
+        clock[0] = "2026-01-01T00:00:05Z"
+        second.emit("stage_changed", stage="early", lane="main")
+        second.emit("display", kind="table", name="t", data={"rows": ["early"]})
+        snapshot = monitor.poll()
+
+    assert [point.stage for point in snapshot.stage_history] == ["early", "late"]
+    assert snapshot.display_items["table", "t"].data == {"rows": ["late"]}
+
+
+def test_run_snapshot_joins_presentation_across_resume_lineage(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    parent = create_context(layout, "parent", "2026-01-01T00:00:00Z")
+    child = create_context(
+        layout,
+        "child",
+        "2026-01-02T00:00:00Z",
+        previous_execution_id="parent",
+        parent_execution_id="parent",
+    )
+    with ExecutionEventWriter.for_process(parent, rank=0, world_size=1) as writer:
+        writer.emit("stage_changed", stage="first", lane="main")
+        writer.emit("display", kind="table", name="t", data={"rows": ["parent"]})
+    with ExecutionEventWriter.for_process(child, rank=0, world_size=1) as writer:
+        writer.emit("stage_changed", stage="second", lane="main")
+        writer.emit("display", kind="table", name="t", data={"rows": ["child"]})
+
+    snapshot = RunMonitor(layout).poll()
+
+    assert [point.stage for point in snapshot.stage_history] == ["first", "second"]
+    assert snapshot.display_items["table", "t"].data == {"rows": ["child"]}
+
+
+def test_tables_render_in_plain_and_terminal_output_and_skip_unknown_kinds(
+    tmp_path: Path,
+) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    with ExecutionEventWriter.for_process(context, rank=0, world_size=1) as writer:
+        _write_presentation_stream(writer)
+    monitor = RunMonitor(layout)
+
+    plain = render_snapshot(monitor.poll().selected)
+    snapshot = monitor.poll()
+    terminal = ""
+    for compact in (False, True):
+        console = Console(width=100, record=True, color_system=None)
+        console.print(dashboard_layout(snapshot, host=None, detail=False, compact=compact))
+        terminal += console.export_text()
+
+    assert "Tables:\n  scores:\n    a\n    2\n" in plain
+    assert "anything" not in plain
+    assert terminal.count("scores") == 2
+    assert "anything" not in terminal
+
+
+def test_terminal_tables_show_producer_text_literally(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    with ExecutionEventWriter.for_process(context, rank=0, world_size=1) as writer:
+        writer.emit(
+            "display",
+            kind="table",
+            name="[bold]scores",
+            data={"columns": ["[a-z]+"], "rows": [["err[/path]"], ["[unknown]"]]},
+        )
+    console = Console(width=100, record=True, color_system=None)
+
+    console.print(
+        dashboard_layout(RunMonitor(layout).poll(), host=None, detail=False, compact=False)
+    )
+
+    terminal = console.export_text()
+    for text in ("[bold]scores", "[a-z]+", "err[/path]", "[unknown]"):
+        assert text in terminal
+
+
+def test_plain_snapshot_omits_tables_when_none_exist(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "run").prepare()
+    context = create_context(layout, "attempt", "2026-01-01T00:00:00Z")
+    with ExecutionEventWriter.for_runner(context) as writer:
+        writer.emit("execution_started")
+
+    assert "Tables:" not in render_snapshot(ExecutionMonitor(layout).poll())

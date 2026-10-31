@@ -11,7 +11,11 @@ import pytest
 import mammoth.logging.text as text_module
 from mammoth.core import RunLayout, create_execution_context, read_execution_events
 from mammoth.core._filesystem import text as filesystem_text
-from mammoth.core.events import ExecutionEventWriter
+from mammoth.core.events import (
+    MAX_DISPLAY_DATA_BYTES,
+    MAX_PRESENTATION_NAME_CHARS,
+    ExecutionEventWriter,
+)
 from mammoth.logging import (
     JsonlEventSink,
     Media,
@@ -724,3 +728,166 @@ def test_execution_observability_does_not_claim_text_log(tmp_path: Path) -> None
     events = read_execution_events(context.execution_dir / "rank-0.jsonl")
     assert [event.event for event in events] == ["process_started"]
     assert [observation.event for observation in recording.observations] == ["process_started"]
+
+
+def test_observer_stage_and_display_reach_the_event_stream(tmp_path: Path) -> None:
+    path = tmp_path / "rank-0.jsonl.zst"
+    writer = ExecutionEventWriter(
+        path,
+        execution_id="attempt",
+        run_name="run",
+        source="process",
+        rank=0,
+        world_size=1,
+    )
+    observer = RunObserver([JsonlEventSink(writer)])
+
+    worker = threading.Thread(target=observer.stage, args=("write",), kwargs={"lane": "background"})
+    worker.start()
+    worker.join()
+    observer.display("table", "scores", columns=("a",), rows=[(1,)])
+    observer.close()
+
+    events = {event.event: event for event in read_execution_events(path)}
+    assert events["stage_changed"].extensions["lane"] == "background"
+    assert events["display"].extensions["data"] == {"columns": ("a",), "rows": ((1,),)}
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"values": "x" * (MAX_DISPLAY_DATA_BYTES + 1)},
+        {"value": float("nan")},
+        {"value": object()},
+        {"oversized_name": True},
+    ],
+)
+def test_observer_drops_an_unstorable_display_item_and_keeps_logging(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, data: dict[str, object]
+) -> None:
+    path = tmp_path / "rank-0.jsonl.zst"
+    writer = ExecutionEventWriter(
+        path,
+        execution_id="attempt",
+        run_name="run",
+        source="process",
+        rank=0,
+        world_size=1,
+    )
+    observer = RunObserver([JsonlEventSink(writer)])
+
+    name = "n" * (MAX_PRESENTATION_NAME_CHARS + 1) if "oversized_name" in data else "scores"
+    with caplog.at_level(logging.WARNING):
+        assert observer.display("table", name, **data) is None
+    observer.stage("train")
+    observer.close()
+
+    assert "Dropped display item" in caplog.text
+    assert observer.disabled_sink_count == 0
+    assert [event.event for event in read_execution_events(path)] == ["stage_changed"]
+
+
+def test_observer_stage_and_display_after_close_are_no_ops() -> None:
+    observer = RunObserver()
+    observer.close()
+
+    assert observer.stage("late") is None
+    assert observer.display("table", "late", rows=[]) is None
+
+
+def _deeply_nested(levels: int = 100_000) -> list[Any]:
+    nested: list[Any] = []
+    for _ in range(levels):
+        nested = [nested]
+    return nested
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda observer: observer.stage(""),
+        lambda observer: observer.stage(object()),
+        lambda observer: observer.stage("a\udcffb"),
+        lambda observer: observer.stage("a", lane="l\udcff"),
+        lambda observer: observer.display("table", "n\udcff", rows=[]),
+        lambda observer: observer.display("k\udcff", "n", value=1),
+        lambda observer: observer.display("table", "n", rows=[["\udcff"]]),
+        lambda observer: observer.display("table", "n", rows=_deeply_nested()),
+    ],
+)
+def test_unstorable_presentation_never_disables_the_event_sink(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, call: Any
+) -> None:
+    path = tmp_path / "rank-0.jsonl.zst"
+    writer = ExecutionEventWriter(
+        path,
+        execution_id="attempt",
+        run_name="run",
+        source="process",
+        rank=0,
+        world_size=1,
+    )
+    observer = RunObserver([JsonlEventSink(writer)])
+
+    with caplog.at_level(logging.WARNING):
+        assert call(observer) is None
+    observer.heartbeat(phase="train", force=True)
+    observer.close()
+
+    assert "Dropped" in caplog.text
+    assert observer.disabled_sink_count == 0
+    assert [event.event for event in read_execution_events(path)] == ["heartbeat"]
+
+
+def test_presentation_names_stay_as_written_and_payloads_can_use_reserved_fields(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "rank-0.jsonl.zst"
+    writer = ExecutionEventWriter(
+        path,
+        execution_id="attempt",
+        run_name="run",
+        source="process",
+        rank=0,
+        world_size=1,
+    )
+    observer = RunObserver([JsonlEventSink(writer)])
+
+    observer.stage("token")
+    observer.stage("tokens", lane="sig")
+    observer.display("table", "tokens/s", kind="row", name="column", rows=[])
+    observer.stage("password=hunter2")
+    observer.close()
+
+    stage_one, stage_two, display, secret = read_execution_events(path)
+    assert stage_one.extensions["stage"] == "token"
+    assert stage_two.extensions["stage"] == "tokens"
+    assert stage_two.extensions["lane"] == "sig"
+    assert display.extensions["name"] == "tokens/s"
+    assert display.extensions["data"]["kind"] == "row"
+    assert "hunter2" not in secret.extensions["stage"]
+
+
+@pytest.mark.parametrize("levels", [30, 31, 40, 400, 488, 493, 500, 520, 1000])
+def test_observer_decides_display_depth_before_the_sink_can_fail(
+    tmp_path: Path, levels: int
+) -> None:
+    path = tmp_path / "rank-0.jsonl.zst"
+    writer = ExecutionEventWriter(
+        path,
+        execution_id="attempt",
+        run_name="run",
+        source="process",
+        rank=0,
+        world_size=1,
+    )
+    observer = RunObserver([JsonlEventSink(writer)])
+
+    accepted = observer.display("table", "n", rows=_deeply_nested(levels)) is not None
+    observer.stage("after")
+    observer.close()
+
+    assert accepted is (levels == 30)
+    assert observer.disabled_sink_count == 0
+    expected = ["display", "stage_changed"] if accepted else ["stage_changed"]
+    assert [event.event for event in read_execution_events(path)] == expected
