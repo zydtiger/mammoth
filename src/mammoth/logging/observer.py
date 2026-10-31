@@ -318,11 +318,21 @@ class RunObserver:
         task_id: str,
         *,
         parent_task_id: Union[str, None] = None,
+        order: Union[int, None] = None,
+        transient: Union[bool, None] = None,
     ) -> Iterator[None]:
-        """Emit balanced task lifecycle records around caller-owned work."""
+        """Emit balanced task lifecycle records around caller-owned work.
+
+        ``order`` ranks the task in monitor task lists before its ID, and a
+        ``transient`` task leaves those lists once completed or skipped.
+        """
         fields: dict[str, Any] = {"phase": phase, "task_id": task_id}
         if parent_task_id is not None:
             fields["parent_task_id"] = parent_task_id
+        if order is not None:
+            fields["task_order"] = order
+        if transient is not None:
+            fields["task_transient"] = transient
         self.emit("task_started", **fields)
         try:
             yield

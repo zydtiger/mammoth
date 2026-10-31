@@ -2483,3 +2483,26 @@ def test_plain_snapshot_omits_tables_when_none_exist(tmp_path: Path) -> None:
         writer.emit("execution_started")
 
     assert "Tables:" not in render_snapshot(ExecutionMonitor(layout).poll())
+
+
+def test_task_lists_follow_producer_order_and_transience(tmp_path: Path) -> None:
+    layout = RunLayout(tmp_path, "ordered-run").prepare()
+    context = create_context(
+        layout,
+        "20260101T000000000000Z-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "2026-01-01T00:00:00Z",
+    )
+    with ExecutionEventWriter.for_process(context, rank=0) as writer:
+        writer.emit("process_started", phase="train")
+        writer.emit("task_started", phase="train", task_id="epochs")
+        for epoch, event in ((1, "task_completed"), (2, "task_started")):
+            task = f"epoch-{epoch}"
+            writer.emit(
+                "task_started", phase="train", task_id=task, task_order=1, task_transient=True
+            )
+            if event == "task_completed":
+                writer.emit(event, phase="train", task_id=task)
+
+    snapshot = RunMonitor(layout).poll().selected
+    assert [task.task_id for task in snapshot.listed_tasks] == ["epochs", "epoch-2"]
+    assert {key[1] for key in snapshot.tasks} == {"epochs", "epoch-1", "epoch-2"}
