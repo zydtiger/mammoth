@@ -152,6 +152,8 @@ _KNOWN_FIELDS = frozenset(
         "phase",
         "task_id",
         "parent_task_id",
+        "task_order",
+        "task_transient",
         "event",
         "coordinates",
         "throughput",
@@ -198,6 +200,8 @@ class ExecutionEvent:
     phase: Union[str, None] = None
     task_id: Union[str, None] = None
     parent_task_id: Union[str, None] = None
+    task_order: Union[int, None] = None
+    task_transient: Union[bool, None] = None
     coordinates: Mapping[str, Union[int, float, str]] = field(default_factory=dict)
     throughput: Union[float, None] = None
     duration_seconds: Union[float, None] = None
@@ -249,6 +253,8 @@ class ExecutionEvent:
             "phase": self.phase,
             "task_id": self.task_id,
             "parent_task_id": self.parent_task_id,
+            "task_order": self.task_order,
+            "task_transient": self.task_transient,
             "throughput": self.throughput,
             "duration_seconds": self.duration_seconds,
             "exit_code": self.exit_code,
@@ -303,6 +309,8 @@ class ExecutionEvent:
             phase=_optional_string(payload, "phase"),
             task_id=_optional_string(payload, "task_id"),
             parent_task_id=_optional_string(payload, "parent_task_id"),
+            task_order=_optional_int(payload, "task_order"),
+            task_transient=_optional_bool(payload, "task_transient"),
             coordinates=_optional_mapping(payload, "coordinates"),
             throughput=_optional_number(payload, "throughput", minimum=0.0),
             duration_seconds=_optional_number(payload, "duration_seconds", minimum=0.0),
@@ -366,6 +374,15 @@ class ExecutionEvent:
             _validate_nonempty_string("parent_task_id", self.parent_task_id)
             if self.parent_task_id == self.task_id:
                 raise ValueError("parent_task_id must differ from task_id.")
+        if self.task_order is not None or self.task_transient is not None:
+            if self.task_id is None:
+                raise ValueError("task_order and task_transient require task_id.")
+            if isinstance(self.task_order, bool) or not isinstance(
+                self.task_order, (int, type(None))
+            ):
+                raise ValueError(f"task_order must be an integer, got {self.task_order!r}.")
+            if not isinstance(self.task_transient, (bool, type(None))):
+                raise ValueError(f"task_transient must be a boolean, got {self.task_transient!r}.")
         if self.event in _PROCESS_EVENTS and self.source != "process":
             raise ValueError(f"{self.event} requires source='process'.")
         progress_values = (self.completed, self.total, self.final)

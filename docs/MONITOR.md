@@ -63,6 +63,10 @@ small presentation conventions stated below.
 
 ## Hierarchical And Distributed Progress
 
+- A task event may set `task_order` and `task_transient`; the newest value of each
+  applies. Task lists sort by producer, `task_order` (default 0), then task ID, and
+  omit a transient task once it is completed or skipped. Its record stays in the
+  event log and still drives overview progress.
 - The selected-attempt overview prefers the highest active task ancestor that
   has progress. Rank rows show the deepest active leaf for each producer.
 - In the wide rank table, rank is a fixed six-character field and progress has
@@ -396,7 +400,8 @@ serves one long-lived, read-only process.
   is released, and its first load decodes the whole stream.
 - The page shows progress, status, tasks, telemetry charts with stage shading,
   per-stage summaries, one chart per metric, display items, producers, attempts, and
-  warnings. Metrics are grouped by leading namespace. The x-axis is the `epoch`
+  warnings. The task table's message column appears only when a listed task has a
+  message. Metrics are grouped by leading namespace. The x-axis is the `epoch`
   coordinate when every point has one and time otherwise. A run with stages and no
   telemetry gets a stage timeline chart. Runs still reporting open on a five-minute window and other runs on their
   whole history. Pages use `/?entry=<id>&run=<name>[&execution=<id>]` and

@@ -140,12 +140,7 @@ def run_document(
             }
             for key, producer in sorted(selected.producers.items(), key=lambda item: item[0].label)
         ],
-        "tasks": [
-            _task(task)
-            for task in sorted(
-                selected.tasks.values(), key=lambda item: (item.producer.label, item.task_id)
-            )
-        ],
+        "tasks": [_task(task) for task in selected.listed_tasks],
         "coordinates": run.logical_coordinates,
         "metrics": [
             {"name": name, "latest": points[-1].value, "count": len(points)}

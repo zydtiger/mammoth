@@ -115,6 +115,8 @@ class TaskState:
     phase: str
     task_id: str
     parent_task_id: Union[str, None] = None
+    order: int = 0
+    transient: bool = False
     status: ScopeStatus = "pending"
     completed: int = 0
     total: Union[int, None] = None
@@ -223,6 +225,18 @@ class MonitorSnapshot:
             task.updated_at for task in self.tasks.values() if task.updated_at is not None
         )
         return max(observed, default=self.created_at)
+
+    @property
+    def listed_tasks(self) -> list[TaskState]:
+        """Return tasks for display, in producer-declared order, without finished transients."""
+        return sorted(
+            (
+                task
+                for task in self.tasks.values()
+                if not (task.transient and task.status in {"completed", "skipped"})
+            ),
+            key=lambda task: (task.producer.label, task.order, task.task_id),
+        )
 
     @property
     def duration_seconds(self) -> float:
@@ -626,6 +640,10 @@ def apply_event(snapshot: MonitorSnapshot, event: ExecutionEvent) -> None:
             ),
         )
         task.updated_at = observed_at
+        if event.task_order is not None:
+            task.order = event.task_order
+        if event.task_transient is not None:
+            task.transient = event.task_transient
         if task.started_at is None:
             task.started_at = observed_at
         if event.event == "task_started":

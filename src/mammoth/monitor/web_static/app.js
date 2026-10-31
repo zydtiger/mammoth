@@ -431,14 +431,15 @@ class RunPage {
       setHtml(target, "");
       return;
     }
+    const messages = data.tasks.some((task) => task.message);
     setHtml(target, "<h2>TASKS</h2>" + table(
-      [th("Task"), th("Phase"), th("Producer"), th("Status"), th("Progress"), th("Rate", "num"), th("ETA", "num"), th("Message")],
+      [th("Task"), th("Phase"), th("Producer"), th("Status"), th("Progress"), th("Rate", "num"), th("ETA", "num"), ...(messages ? [th("Message")] : [])],
       data.tasks.map((task) => `<tr>
         ${td(esc(task.task_id))}${td(esc(task.phase))}${td(esc(task.producer))}${td(pill(task.status))}
         ${td(progressCell(task))}
         ${td(task.throughput ? `${number(task.throughput)} b/s` : "–", "num")}
         ${td(duration(task.eta_seconds), "num")}
-        ${td(esc(task.message ?? ""), "wrap")}
+        ${messages ? td(esc(task.message ?? ""), "wrap") : ""}
       </tr>`),
     ));
   }

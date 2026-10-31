@@ -47,10 +47,8 @@ def render_snapshot(
         lines.append("  (none observed)")
 
     lines.append("Tasks:")
-    if snapshot.tasks:
-        for (_producer, _task_id), task in sorted(
-            snapshot.tasks.items(), key=lambda item: (item[0][0].label, item[0][1])
-        ):
+    if snapshot.listed_tasks:
+        for task in snapshot.listed_tasks:
             progress = str(task.completed)
             if task.total is not None:
                 progress = f"{progress}/{task.total}"
