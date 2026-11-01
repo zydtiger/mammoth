@@ -50,7 +50,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `.python-version` | uv/Python development baseline. | The supported development interpreter changes deliberately. |
 | `.gitignore` | Generated-file and local-environment exclusions. | A new reproducible build, cache, environment, or local artifact needs an exclusion. |
 | `.pre-commit-config.yaml` | Sole definition of mechanical commands, scopes, and local Git-hook stages. Run by `prek` locally and by CI over every file. | A mechanically checkable rule is added, removed, or rescoped. |
-| `.github/workflows/ci.yml` | GitHub Actions validation: a `lint` job running the commit-stage hooks once, and a matrixed Linux/Windows `test` job running the `pre-push` stage across the supported Python versions, then `uv build` and an install smoke test on the lowest one. Invokes the hook runner rather than restating hook commands. | CI triggers, jobs, the tested Python versions, or validation coverage change. |
+| `.github/workflows/ci.yml` | GitHub Actions validation: a `lint` job running the commit-stage hooks once, and a matrixed Linux/Windows `test` job running the `manual` stage across the supported Python versions, then `uv build` and an install smoke test on the lowest one. Invokes the hook runner rather than restating hook commands. | CI triggers, jobs, the tested Python versions, or validation coverage change. |
 | `src/mammoth/__init__.py` | Lightweight root package metadata and intentionally small stable exports. | Package version or a truly root-level stable export changes. |
 | `src/mammoth/__main__.py` | `python -m mammoth` forwarding entry point. | Module execution behavior changes. |
 | `src/mammoth/compat.py` | Shared interpreter compatibility for dataclass storage, exception notes, and strict iterable pairing. | Supported Python versions or these runtime adaptations change. |
@@ -207,15 +207,16 @@ uv tool install prek
 prek install
 ```
 
-- Full: `prek run --all-files && prek run --all-files --hook-stage pre-push`
-- Targeted: `prek run --files <changed-path>... && prek run --files <changed-path>... --hook-stage pre-push`
+- Full: `prek run --all-files && prek run --all-files --hook-stage manual`
+- Targeted: `prek run --files <changed-path>... && prek run --files <changed-path>... --hook-stage manual`
 - Documentation-only: `prek run --files <changed-document-path>... && git diff --check -- <changed-document-path>...`
 - Package changes: run the full validation, then `uv build`.
 
 `.pre-commit-config.yaml` is the sole definition of mechanical commands and
 their scope. Its `commit-msg` hook validates commit subjects separately from
-source-file validation. CI invokes the same source-file stages rather than
-restating their commands.
+source-file validation. `git push` runs only the fast torch-free pytest subset;
+the full suite is the `manual` stage. CI invokes the commit and `manual` stages
+rather than restating their commands.
 
 Use `uv run pytest --cov=mammoth --cov-report=term-missing` for completion and
 release audits. Do not claim a check passed unless it was actually run.

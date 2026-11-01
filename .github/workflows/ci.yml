@@ -51,11 +51,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Sync all extras
         run: uv sync --locked --all-extras
-      - name: Run push-stage hooks
+      - name: Run manual-stage hooks
         uses: j178/prek-action@1382ad72dea72f9d53832f2bcb65b3e87a947204 # v3.0.1
         with:
           prek-version: "0.4.x"
-          extra-args: --all-files --hook-stage pre-push
+          extra-args: --all-files --hook-stage manual
       # The wheel does not vary by interpreter, so build and smoke-test it on
       # the lowest supported version only.
       - name: Build distributions
