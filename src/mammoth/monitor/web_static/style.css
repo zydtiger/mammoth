@@ -78,10 +78,24 @@ h2 {
 }
 .st-running { color: var(--running); }
 .st-stale { color: var(--stale); }
-.st-failed, .st-blocked { color: var(--failed); }
+.st-failed, .st-blocked, .st-dependency_failed { color: var(--failed); }
 .st-completed { color: var(--completed); }
-.st-interrupted { color: var(--interrupted); }
-.st-pending, .st-skipped { color: var(--muted); }
+.st-interrupted, .st-unknown { color: var(--interrupted); }
+.st-launching { color: var(--stale); }
+.st-pending, .st-skipped, .st-cancelled { color: var(--muted); }
+.nav { color: var(--sub); }
+.nav-gap { margin-right: auto; }
+button {
+  font: inherit;
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--grid);
+  border-radius: 6px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+button:disabled { color: var(--muted); cursor: default; }
 .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 12px 0; }
 input, select {
   background: var(--surface);
