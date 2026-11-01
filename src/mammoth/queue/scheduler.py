@@ -154,9 +154,13 @@ def schedule(
             ram_blocker = request.job_id
             continue
         if needed_ram > ram_left:
-            reasons[request.job_id] = (
-                f"waiting: RAM needs {format_size(needed_ram)}, has {format_size(max(0, ram_left))}"
-            )
+            if request.ram is None:
+                reasons[request.job_id] = "waiting: host RAM is below the reserved headroom"
+            else:
+                reasons[request.job_id] = (
+                    f"waiting: RAM needs {format_size(needed_ram)}, "
+                    f"has {format_size(max(0, ram_left))}"
+                )
             ram_blocker = request.job_id
             continue
         if request.gpus == 0:

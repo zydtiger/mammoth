@@ -166,7 +166,7 @@ function renderFleet(fleet, filter) {
     : all;
   if (!rows.length) {
     target.dataset.html = "";
-    target.innerHTML = `<p class="muted">${!fleet.ready ? "Scanning entries…" : needle ? "No runs match this filter." : "No runs found below the configured roots."}</p>`;
+    target.innerHTML = `<p class="muted">${!fleet.ready ? "Scanning entries…" : needle ? "No runs match this filter." : "No runs found yet."}</p>`;
     return;
   }
   const count = (status) => all.filter((row) => row.status === status).length;
@@ -776,7 +776,7 @@ function bytes(value) {
 
 const ACTIVE = new Set(["pending", "launching", "running"]);
 
-function queueRow(job) {
+function queueRow(job, writable) {
   const run = job.link
     ? `<a href="./?${query(job.link)}">${esc(job.link.run)}</a>`
     : esc(job.run_dir ? job.run_dir.split("/").pop() : "–");
@@ -785,11 +785,11 @@ function queueRow(job) {
   const partial = job.peak_partial ? " partial" : "";
   const notes = [job.wait_reason, job.message, ...job.warnings].filter(Boolean).map(esc).join("<br>");
   const buttons = [];
-  if (job.status === "pending") {
+  if (writable && job.status === "pending") {
     buttons.push(`<button data-action="priority" data-job="${esc(job.job_id)}" data-priority="${job.priority + 1}" title="Raise priority">↑</button>`);
     buttons.push(`<button data-action="priority" data-job="${esc(job.job_id)}" data-priority="${job.priority - 1}" title="Lower priority">↓</button>`);
   }
-  if (ACTIVE.has(job.status)) {
+  if (writable && ACTIVE.has(job.status)) {
     const label = job.cancel_requested ? "Cancelling" : "Cancel";
     buttons.push(`<button data-action="cancel" data-job="${esc(job.job_id)}"${job.cancel_requested ? " disabled" : ""}>${label}</button>`);
   }
@@ -818,8 +818,8 @@ function renderQueue(target, data) {
     + table([th("GPU"), th("Free"), th("Total"), th("External"), th("Jobs")], tiles)
     + ram
     + `<div class="table-title">Active (${active.length})</div>`
-    + (active.length ? table(heads, active.map(queueRow)) : `<p class="muted">Nothing is queued or running.</p>`)
-    + (ended.length ? `<details><summary>Ended (${ended.length})</summary>${table(heads, ended.map(queueRow))}</details>` : ""));
+    + (active.length ? table(heads, active.map((job) => queueRow(job, data.writable))) : `<p class="muted">Nothing is queued or running.</p>`)
+    + (ended.length ? `<details><summary>Ended (${ended.length})</summary>${table(heads, ended.map((job) => queueRow(job, data.writable)))}</details>` : ""));
 }
 
 async function queuePage() {
@@ -830,6 +830,7 @@ async function queuePage() {
       renderQueue(target, await getJson("api/queue"));
       setRefresh(true);
     } catch (error) {
+      if (error.status === 404) target.innerHTML = `<p class="muted">The Queue page needs <code>mammoth monitor serve</code>.</p>`;
       setRefresh(false, error.message);
     }
   };
@@ -853,6 +854,16 @@ async function queuePage() {
   await tick();
   setInterval(() => { if (!document.hidden) tick(); }, REFRESH_MS);
 }
+
+async function showQueueLink() {
+  try {
+    const mode = await getJson("api/mode");
+    document.getElementById("queue-link").hidden = !mode.queue;
+  } catch {
+    setTimeout(showQueueLink, REFRESH_MS);
+  }
+}
+showQueueLink();
 
 const entryParam = params.get("entry");
 if (params.get("view") === "queue") queuePage();

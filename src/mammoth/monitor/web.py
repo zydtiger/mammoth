@@ -1,4 +1,8 @@
-"""Web monitor serving every entry found below configured roots.
+"""Web monitor with one frontend and two sources of entries.
+
+``mammoth monitor web`` finds entries below configured roots and is read-only.
+``mammoth monitor serve`` finds them from every run directory the queue service
+ever recorded, and adds the Queue page.
 
 The server folds the same execution artifacts as the terminal dashboard and adds
 each execution's telemetry stream. It never writes artifacts or contacts
@@ -6,8 +10,8 @@ producers. One background sweep keeps bounded fleet roll-ups fresh; a full
 :class:`~mammoth.monitor.model.RunMonitor` exists only for an opened run and is
 released after it has been idle.
 
-Its only writes are queue cancel and priority changes, forwarded to the queue
-service from a loopback bind. It never exposes job submission.
+The only writes are queue cancel and priority changes, forwarded to the queue
+service. Job submission is never exposed.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import logging
 import math
 import os
 import re
+import socket
 import threading
 import time
 from collections.abc import Iterable, Sequence
@@ -54,6 +59,7 @@ DEFAULT_MAX_POINTS = 1000
 MAX_POINTS_LIMIT = 5000
 MAX_WRITE_BYTES = 4096
 _LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+_WILDCARD_ADDRESS = "0.0.0.0"
 _QUEUE_WRITE = re.compile(r"^/api/queue/([0-9a-f]{12})/(cancel|priority)$")
 _STATIC_DIR = Path(__file__).with_name("web_static")
 _STATIC_FILES = {
@@ -105,6 +111,37 @@ def discover_entries(roots: Sequence[Path], *, max_depth: int = MAX_ENTRY_DEPTH)
         used.add(name)
         walk(path, name, 0)
     return entries
+
+
+def _is_wildcard(host: str) -> bool:
+    try:
+        return socket.gethostbyname(host or _WILDCARD_ADDRESS) == _WILDCARD_ADDRESS
+    except OSError:
+        return False  # Binding reports an unresolvable host.
+
+
+def queue_entries(run_dirs: Iterable[str]) -> tuple[dict[str, Path], dict[str, set[str]]]:
+    """Return entries holding queued runs that have started, and each entry's run names.
+
+    Directories that do not exist, such as deleted runs, are skipped.
+    """
+    entries: dict[str, Path] = {}
+    names: dict[str, set[str]] = {}
+    for run_dir in run_dirs:
+        path = Path(run_dir)
+        if _is_run_dir(path):
+            entry_id = queue_entry_id(path.parent)
+            entries[entry_id] = path.parent
+            names.setdefault(entry_id, set()).add(path.name)
+    return entries, names
+
+
+def queue_entry_id(path: Path) -> str:
+    """Return a stable readable ID, unique because it derives from the full path."""
+    try:
+        return str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
 
 
 def downsample(
@@ -443,7 +480,8 @@ class MonitorService:
         queue_client: Union[QueueClient, None] = None,
     ) -> None:
         self.roots = tuple(roots)
-        self.queue_client = queue_client or QueueClient(default_socket_path())
+        self.queue_client = queue_client
+        self._queue_runs: dict[str, set[str]] = {}
         self.interval_seconds = interval_seconds
         self.stale_after_seconds = stale_after_seconds
         self._lock = threading.Lock()
@@ -462,20 +500,44 @@ class MonitorService:
         """Start the background fleet sweep."""
         self._thread.start()
 
-    def queue(self) -> dict[str, Any]:
+    def queue(self) -> Union[dict[str, Any], None]:
         """Return queue state with run links, or say why the service cannot answer."""
+        if self.queue_client is None:
+            return None
         try:
             jobs = self.queue_client.list_jobs()
             resources = self.queue_client.resources()
         except QueueError as error:
             return {"available": False, "error": str(error), "jobs": [], "resources": None}
         with self._lock:
-            entry_ids = {os.path.abspath(path): name for name, path in self._entries.items()}
+            queue_runs = dict(self._queue_runs)
         for job in jobs:
-            run_dir = str(job.get("run_dir") or "")
-            entry = entry_ids.get(os.path.dirname(run_dir))
-            job["link"] = {"entry": entry, "run": os.path.basename(run_dir)} if entry else None
+            job["link"] = None
+            if job.get("run_dir"):
+                path = Path(job["run_dir"])
+                entry = queue_entry_id(path.parent)
+                if path.name in queue_runs.get(entry, ()):
+                    job["link"] = {"entry": entry, "run": path.name}
         return {"available": True, "error": None, "jobs": jobs, "resources": resources}
+
+    def _discover(self) -> bool:
+        """Refresh entries and return whether the source answered."""
+        if self.queue_client is None:
+            entries = discover_entries(self.roots)
+            with self._lock:
+                self._entries = entries
+            return True
+        try:
+            run_dirs = self.queue_client.run_dirs()
+        except QueueError as error:
+            # Keep what is already shown; runs stay readable while the service is down.
+            logger.warning("Could not read run directories from the queue: %s", error)
+            return False
+        entries, names = queue_entries(run_dirs)
+        with self._lock:
+            self._entries = entries
+            self._queue_runs = names
+        return True
 
     def stop(self) -> None:
         """Stop the background fleet sweep."""
@@ -490,13 +552,13 @@ class MonitorService:
 
     def _sweep(self) -> None:
         now = time.monotonic()
-        if self._discovered_at is None or now - self._discovered_at >= DISCOVERY_INTERVAL_SECONDS:
-            entries = discover_entries(self.roots)
-            with self._lock:
-                self._entries = entries
+        due = self._discovered_at is None or now - self._discovered_at >= DISCOVERY_INTERVAL_SECONDS
+        # A failure, such as the queue still starting, retries on the next sweep.
+        if due and self._discover():
             self._discovered_at = now
         with self._lock:
             entries = dict(self._entries)
+            queue_runs = dict(self._queue_runs)
             for removed in set(self._snapshots) - set(entries):
                 del self._snapshots[removed]
         for removed in set(self._fleets) - set(entries):
@@ -505,6 +567,8 @@ class MonitorService:
             if self._stop.is_set():
                 return
             fleet = self._fleets.setdefault(entry_id, FleetMonitor(path))
+            if self.queue_client is not None:
+                fleet.run_names = queue_runs.get(entry_id, set())
             try:
                 snapshot = fleet.poll(stale_after_seconds=self.stale_after_seconds)
             except Exception as error:
@@ -565,8 +629,11 @@ class MonitorService:
         with self._lock:
             path = self._entries.get(entry_id)
             view = self._views.get((entry_id, run_name))
-            if view is not None or path is None:
+            if view is not None and path is not None and _is_run_dir(path / run_name):
                 return view
+            self._views.pop((entry_id, run_name), None)
+            if path is None:
+                return None
             try:
                 layout = RunLayout(path, validate_run_name(run_name))
             except ValueError:
@@ -735,6 +802,10 @@ class _Handler(BaseHTTPRequestHandler):
         if body is None:
             self._json({"error": "invalid or oversized Content-Length"}, status=400)
             return
+        client = self.server.service.queue_client
+        if client is None:
+            self._json({"error": "not found"}, status=404)
+            return
         refusal = self._write_refusal()
         if refusal is not None:
             self._json({"error": refusal}, status=403)
@@ -744,7 +815,6 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, status=404)
             return
         job_id, action = match.groups()
-        client = self.server.service.queue_client
         try:
             if action == "cancel":
                 self._json(client.cancel(job_id))
@@ -762,11 +832,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": str(error)}, status=500)
 
     def _write_refusal(self) -> Union[str, None]:
-        """Allow writes only from this page on a loopback bind."""
-        if not self.server.loopback_only:
-            return "queue writes are disabled on a non-loopback bind"
+        """Allow writes only from this page, on the address the server is bound to."""
+        if not self.server.writes_enabled:
+            return "queue writes are disabled on a non-loopback bind without --allow-queue-writes"
         host = self.headers.get("Host")
-        if host is None or not self._host_allowed():
+        names = _LOOPBACK_NAMES if self.server.loopback_only else {self.server_host_name}
+        # An exact address also stops DNS rebinding, where Origin and Host would agree.
+        if host is None or urlsplit(f"//{host}").hostname not in names:
             return "unexpected Host header"
         origin = self.headers.get("Origin")
         if origin is not None and urlsplit(origin).netloc != host:
@@ -775,6 +847,11 @@ class _Handler(BaseHTTPRequestHandler):
         if self.headers.get_content_type() != "application/json":
             return "unexpected Content-Type header"
         return None
+
+    @property
+    def server_host_name(self) -> str:
+        """Return the bound address, which writes must name exactly."""
+        return str(self.server.server_address[0])
 
     def _read_body(self) -> Union[bytes, None]:
         try:
@@ -844,8 +921,16 @@ class _Handler(BaseHTTPRequestHandler):
         max_points = int(min(max(2.0, number("max_points", DEFAULT_MAX_POINTS)), MAX_POINTS_LIMIT))
         if path == "/api/fleet":
             return service.fleet()
+        if path == "/api/mode":
+            return {
+                "queue": service.queue_client is not None,
+                "writable": self.server.writes_enabled,
+            }
         if path == "/api/queue":
-            return service.queue()
+            document = service.queue()
+            if document is not None:
+                document["writable"] = self.server.writes_enabled
+            return document
         if path == "/api/group":
             return service.group(required("entry"), required("group"))
         if path == "/api/run":
@@ -910,10 +995,19 @@ class MonitorWebServer(ThreadingHTTPServer):
 
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], service: MonitorService) -> None:
+    def __init__(
+        self,
+        address: tuple[str, int],
+        service: MonitorService,
+        *,
+        allow_queue_writes: bool = False,
+    ) -> None:
         super().__init__(address, _Handler)
         self.service = service
         self.loopback_only = address[0] in _LOOPBACK_NAMES
+        self.writes_enabled = service.queue_client is not None and (
+            self.loopback_only or allow_queue_writes
+        )
 
     @property
     def server_name_for_url(self) -> str:
@@ -938,15 +1032,36 @@ def create_web_server(
     port: int = 8765,
     interval_seconds: float = 2.0,
     stale_after_seconds: float = 90.0,
-    queue_client: Union[QueueClient, None] = None,
 ) -> MonitorWebServer:
-    """Bind the server and start its fleet sweep; the caller runs ``serve_forever``."""
+    """Bind the read-only server and start its sweep; the caller runs ``serve_forever``."""
     service = MonitorService(
         roots,
         interval_seconds=interval_seconds,
         stale_after_seconds=stale_after_seconds,
-        queue_client=queue_client,
     )
     server = MonitorWebServer((host, port), service)
+    service.start()
+    return server
+
+
+def create_queue_monitor_server(
+    queue_client: Union[QueueClient, None] = None,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    interval_seconds: float = 2.0,
+    stale_after_seconds: float = 90.0,
+    allow_queue_writes: bool = False,
+) -> MonitorWebServer:
+    """Bind the queue-backed server and start its sweep; the caller runs ``serve_forever``."""
+    if allow_queue_writes and _is_wildcard(host):
+        raise ValueError("--allow-queue-writes needs one specific --host address")
+    service = MonitorService(
+        (),
+        interval_seconds=interval_seconds,
+        stale_after_seconds=stale_after_seconds,
+        queue_client=queue_client or QueueClient(default_socket_path()),
+    )
+    server = MonitorWebServer((host, port), service, allow_queue_writes=allow_queue_writes)
     service.start()
     return server

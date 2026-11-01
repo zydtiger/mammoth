@@ -125,6 +125,8 @@ class _Handler(BaseHTTPRequestHandler):
             return 200, {"jobs": [self._document(job) for job in service.list_jobs()]}
         if url.path == "/v1/resources":
             return 200, service.resources()
+        if url.path == "/v1/run-dirs":
+            return 200, {"run_dirs": service.run_dirs()}
         if url.path == "/v1/wait":
             query = parse_qs(url.query)
             done, jobs = service.wait(
@@ -258,6 +260,11 @@ class QueueClient:
     def resources(self) -> dict[str, Any]:
         """Return the service's resource accounting."""
         return self._request("GET", "/v1/resources")
+
+    def run_dirs(self) -> list[str]:
+        """Return every run directory any job ever named."""
+        run_dirs: list[str] = self._request("GET", "/v1/run-dirs")["run_dirs"]
+        return run_dirs
 
     def wait_once(
         self,

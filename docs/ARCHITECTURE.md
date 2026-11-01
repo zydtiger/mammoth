@@ -674,6 +674,14 @@ ACTL `ok` maps to `completed`; `failed`, `timeout`, `skipped`, and `error` to `f
 `oom` from their logs or a sampled cgroup `oom_kill` count, and OOM never retries. A
 failed `ok` dependency moves its dependent to `dependency_failed` without running it.
 
+### Deployment
+
+`deploy/` holds the complete systemd user units: `mammoth.target` starts
+`mammoth-queue.service` and `mammoth-monitor.service`, and each stops and restarts
+with it. They stay separate processes because the monitor depends on the queue but
+not the reverse, so its scans and any crash cannot delay scheduling, and the scheduler
+keeps no TCP listener. Hosts change `PATH` or `MAMMOTH_MONITOR_ARGS` through drop-ins.
+
 ### Execution and recovery
 
 Only `mammoth.queue.executor` calls `actl`. Before starting a job the service records
@@ -807,7 +815,7 @@ not inspect checkpoint contents or infer any of these facts.
 workers, keyboard navigation, scrolling, and responsive layout; Rich renderables
 provide progress bars, execution panels, task tables, and terminal-width-aware
 training charts. `mammoth monitor show` prints one stable ANSI-free or JSON
-snapshot. `mammoth monitor web` serves the same reconstructed state to a browser
+snapshot. `mammoth monitor web` and `serve` serve the same reconstructed state to a browser
 using only the standard library and packaged static files. Conventional loss and
 learning-rate names affect terminal presentation only and do not alter folding
 or assign scientific meaning. `docs/MONITOR.md` owns the detailed reconstruction

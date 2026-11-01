@@ -40,7 +40,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `AGENTS.md` | Repository rules, dependency boundaries, validation policy, Git prefixes, and file ownership. | Agent workflow, repository conventions, validation, Git policy, or documentation ownership changes. |
 | `README.md` | Concise user-facing project introduction and setup entry point. | Public package purpose, installation, stable CLI/API, or user-visible behavior changes. |
 | `LICENSE` | MIT license terms and copyright notice. | The project license or copyright notice changes. |
-| `mammoth-queue.service` | Example systemd user unit for the queue service. | The service command or its runtime prerequisites change. |
+| `deploy/` | Complete systemd user units for the queue service and its web monitor. | A service command, its grouping, or its runtime prerequisites change. |
 | `docs/ARCHITECTURE.md` | Durable package boundary, dependency direction, runtime model, logging roles, trainer scope, and compatibility policy. | Responsibilities move between layers or a stable architectural contract changes. |
 | `docs/MONITOR.md` | Canonical passive-monitor reconstruction, dashboard hierarchy, telemetry, responsive presentation, and interaction behavior. | Monitor folding, layout, display naming or units, resource probes, refresh policy, or keyboard behavior changes. |
 | `docs/IMPLEMENTATION_PLAN.md` | Ordered delivery phases, acceptance conditions, migration sequence, and explicitly deferred capabilities. | A phase is started/completed, delivery order changes, or deferred scope is approved. |
@@ -97,7 +97,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/monitor/__init__.py` | Public passive-monitor exports. | A stable monitor symbol is added, removed, or renamed. |
 | `src/mammoth/monitor/model.py` | Single-run execution discovery, lineage, incremental stream reads, and project-neutral state folding. | Monitor selection or reconstructed single-run state changes. |
 | `src/mammoth/monitor/documents.py` | JSON documents of run, group, and fleet snapshots for `show --json` and the web monitor. | Document fields change. |
-| `src/mammoth/monitor/web.py` | Web monitor: entry discovery, fleet sweep, lazy run views, series and stage queries, HTTP routes, and forwarded queue cancel and priority writes. | Web discovery, API, retention, or server behavior changes. |
+| `src/mammoth/monitor/web.py` | Web monitor: root and queue entry discovery, fleet sweep, lazy run views, series and stage queries, HTTP routes, and forwarded queue cancel and priority writes. | Web discovery, API, retention, or server behavior changes. |
 | `src/mammoth/monitor/web_static/` | Browser page, styles, and vendored uPlot with its license. | Web presentation or the vendored chart library changes. |
 | `src/mammoth/monitor/fleet.py` | Passive fleet and group discovery and folding from group manifests, incrementally tailed group event streams, and cheap per-run execution tails; ad-hoc `--match` grouping. | Fleet or group roll-up fields, folding sources, or ad-hoc grouping behavior changes. |
 | `src/mammoth/monitor/dashboard.py` | Responsive Rich renderables for the optional Textual dashboard, at the run, fleet, and group levels. | Interactive panels, progress bars, metric charts, or wide/compact presentation changes at any level. |

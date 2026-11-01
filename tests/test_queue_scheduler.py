@@ -105,6 +105,11 @@ def test_ram_shortfall_blocks_the_head_and_everything_behind_it() -> None:
     assert decision.reasons["b"] == "waiting: behind a, which is blocked on RAM"
 
 
+def test_unknown_ram_reports_exhausted_headroom() -> None:
+    decision = run([request("a", gpus=0)], available=5 * G, headroom=9 * G)
+    assert decision.reasons["a"] == "waiting: host RAM is below the reserved headroom"
+
+
 def test_unknown_ram_jobs_launch_one_at_a_time_until_stable() -> None:
     decision = run([request("a"), request("b")])
     assert [item.job_id for item in decision.placements] == ["a"]

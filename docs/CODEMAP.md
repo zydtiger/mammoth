@@ -118,6 +118,9 @@ mammoth.cli.app (Typer)
 │   ├── web [--root]... [--host] [--port] → mammoth.cli.monitor_web
 │   │   └── mammoth.monitor.web.create_web_server
 │   │       └── MonitorService → FleetMonitor sweep, lazy RunMonitor, TelemetryTailReader
+│   ├── serve [--socket] [--host] [--port] [--allow-queue-writes] → mammoth.cli.monitor_serve
+│   │   └── mammoth.monitor.web.create_queue_monitor_server
+│   │       └── MonitorService → QueueClient.run_dirs → queue_entries, plus the Queue page
 │   └── presentation contract → docs/MONITOR.md
 └── mammoth queue (Typer sub-app)
     ├── submit, list, cancel, priority, wait → mammoth.queue.QueueClient

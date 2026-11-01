@@ -31,9 +31,11 @@ from mammoth.monitor.web import (
     _compact_spans,
     _Span,
     _stage_summary,
+    create_queue_monitor_server,
     create_web_server,
     discover_entries,
     downsample,
+    queue_entries,
 )
 
 
@@ -754,6 +756,9 @@ class _FakeQueue:
     def resources(self) -> dict[str, object]:
         return {"gpus": [], "ram": None}
 
+    def run_dirs(self) -> list[str]:
+        return [self.run_dir, f"{self.run_dir}-deleted"]
+
     def cancel(self, job_id: str) -> dict[str, object]:
         if self.failure:
             raise self.failure
@@ -769,12 +774,7 @@ class _FakeQueue:
 def queue_server(tmp_path: Path) -> Iterator[tuple[object, _FakeQueue]]:
     create_run(tmp_path, "run-a")
     fake = _FakeQueue(str(tmp_path / "run-a"))
-    instance = create_web_server(
-        [tmp_path],
-        port=0,
-        interval_seconds=0.05,
-        queue_client=fake,  # type: ignore[arg-type]
-    )
+    instance = create_queue_monitor_server(fake, port=0, interval_seconds=0.05)  # type: ignore[arg-type]
     instance.service.sweep()
     thread = threading.Thread(target=instance.serve_forever, daemon=True)
     thread.start()
@@ -807,7 +807,7 @@ def test_queue_route_links_jobs_to_discovered_runs(queue_server) -> None:
 def test_queue_route_reports_a_down_service(tmp_path: Path) -> None:
     from mammoth.queue import QueueClient
 
-    service = MonitorService([tmp_path], queue_client=QueueClient(tmp_path / "none.sock"))
+    service = MonitorService((), queue_client=QueueClient(tmp_path / "none.sock"))
     document = service.queue()
     assert document["available"] is False
     assert "not answering" in document["error"]
@@ -879,12 +879,11 @@ def test_queue_write_survives_a_bad_content_length(queue_server, length: str) ->
 
 
 def test_queue_writes_are_disabled_on_a_non_loopback_bind(tmp_path: Path) -> None:
-    instance = create_web_server(
-        [tmp_path],
+    instance = create_queue_monitor_server(
+        _FakeQueue(str(tmp_path / "run")),  # type: ignore[arg-type]
         host="0.0.0.0",
         port=0,
         interval_seconds=0.05,
-        queue_client=_FakeQueue(""),  # type: ignore[arg-type]
     )
     thread = threading.Thread(target=instance.serve_forever, daemon=True)
     thread.start()
@@ -893,6 +892,127 @@ def test_queue_writes_are_disabled_on_a_non_loopback_bind(tmp_path: Path) -> Non
         status, document = _post(f"http://127.0.0.1:{port}/api/queue/{'a' * 12}/cancel")
         assert status == 403
         assert "non-loopback" in document["error"]
+    finally:
+        instance.shutdown()
+        instance.shutdown_monitor()
+        thread.join(timeout=5.0)
+
+
+def test_web_command_has_no_queue(server: object) -> None:
+    assert json.loads(get(server, "api/mode")[1]) == {"queue": False, "writable": False}
+    assert get(server, "api/queue")[0] == 404
+    assert _post(f"{server.url}api/queue/{'a' * 12}/cancel")[0] == 404
+
+
+def test_queue_entries_keep_started_runs_and_skip_deleted_ones(tmp_path: Path) -> None:
+    create_run(tmp_path / "project", "started")
+    (tmp_path / "project" / "not-started").mkdir()
+    entries, names = queue_entries(
+        [
+            str(tmp_path / "project" / "started"),
+            str(tmp_path / "project" / "not-started"),
+            str(tmp_path / "gone" / "run"),
+        ]
+    )
+    assert list(entries.values()) == [tmp_path / "project"]
+    assert list(names.values()) == [{"started"}]
+
+
+def test_serve_lists_only_queued_runs_from_any_project(tmp_path: Path) -> None:
+    create_run(tmp_path / "one", "queued")
+    create_run(tmp_path / "one", "sibling")
+    create_run(tmp_path / "two", "other")
+
+    class Client(_FakeQueue):
+        def run_dirs(self) -> list[str]:
+            return [str(tmp_path / "one" / "queued"), str(tmp_path / "two" / "other")]
+
+    service = MonitorService((), queue_client=Client(""), interval_seconds=0.05)  # type: ignore[arg-type]
+    service.sweep()
+    runs = {run["run_name"] for entry in service.fleet()["entries"] for run in entry["loose_runs"]}
+    assert runs == {"queued", "other"}
+
+
+def test_serve_keeps_runs_readable_when_the_service_stops_answering(tmp_path: Path) -> None:
+    from mammoth.queue import ServiceUnavailableError
+
+    create_run(tmp_path, "queued")
+
+    class Client(_FakeQueue):
+        down = False
+
+        def run_dirs(self) -> list[str]:
+            if self.down:
+                raise ServiceUnavailableError("down")
+            return [str(tmp_path / "queued")]
+
+    client = Client("")
+    service = MonitorService((), queue_client=client, interval_seconds=0.05)  # type: ignore[arg-type]
+    service.sweep()
+    client.down = True
+    service._discovered_at = None
+    service.sweep()
+    assert service.fleet()["entries"][0]["loose_runs"][0]["run_name"] == "queued"
+
+
+def test_failed_discovery_retries_on_the_next_sweep(tmp_path: Path) -> None:
+    from mammoth.queue import ServiceUnavailableError
+
+    create_run(tmp_path, "queued")
+
+    class Client(_FakeQueue):
+        down = True
+
+        def run_dirs(self) -> list[str]:
+            if self.down:
+                raise ServiceUnavailableError("starting")
+            return [str(tmp_path / "queued")]
+
+    client = Client("")
+    service = MonitorService((), queue_client=client, interval_seconds=0.05)  # type: ignore[arg-type]
+    service.sweep()
+    assert service.fleet()["entries"] == []
+    client.down = False
+    service.sweep()
+    assert service.fleet()["entries"][0]["loose_runs"][0]["run_name"] == "queued"
+
+
+def test_deleted_run_stops_serving_its_cached_view(tmp_path: Path) -> None:
+    create_run(tmp_path, "run-a")
+    service = MonitorService([tmp_path], interval_seconds=0.05)
+    service.sweep()
+    entry_id = next(iter(service._entries))
+    assert service.run(entry_id, "run-a", None) is not None
+    shutil.rmtree(tmp_path / "run-a")
+    assert service.run(entry_id, "run-a", None) is None
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "0", ""])
+def test_allow_queue_writes_refuses_any_wildcard_spelling(host: str) -> None:
+    with pytest.raises(ValueError, match="specific"):
+        create_queue_monitor_server(_FakeQueue(""), host=host, port=0, allow_queue_writes=True)  # type: ignore[arg-type]
+
+
+def test_allow_queue_writes_checks_host() -> None:
+    with pytest.raises(ValueError, match="specific"):
+        create_queue_monitor_server(_FakeQueue(""), host="0.0.0.0", port=0, allow_queue_writes=True)  # type: ignore[arg-type]
+    fake = _FakeQueue("")
+    instance = create_queue_monitor_server(
+        fake,  # type: ignore[arg-type]
+        host="127.0.0.2",
+        port=0,
+        interval_seconds=0.05,
+        allow_queue_writes=True,
+    )
+    thread = threading.Thread(target=instance.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.2:{instance.server_address[1]}/api/queue/{'a' * 12}/cancel"
+        assert _post(url, Host="rebind.example")[0] == 403
+        assert _post(url, Host="rebind.example", Origin="http://rebind.example")[0] == 403
+        assert _post(url)[0] == 200
+        assert json.loads(get(instance, "api/mode")[1])["writable"] is True
+        assert fake.calls == [("cancel", "a" * 12)]
     finally:
         instance.shutdown()
         instance.shutdown_monitor()

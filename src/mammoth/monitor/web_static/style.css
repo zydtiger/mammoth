@@ -83,7 +83,8 @@ h2 {
 .st-interrupted, .st-unknown { color: var(--interrupted); }
 .st-launching { color: var(--stale); }
 .st-pending, .st-skipped, .st-cancelled { color: var(--muted); }
-.nav { margin-right: auto; color: var(--sub); }
+.nav { color: var(--sub); }
+.nav-gap { margin-right: auto; }
 button {
   font: inherit;
   font-size: 12px;

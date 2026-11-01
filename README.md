@@ -115,9 +115,8 @@ Serve every entry found below a directory, including nested ones:
 uv run mammoth monitor web --root runs
 ```
 
-The server binds to `127.0.0.1:8765`. New runs appear without a restart. Its only
-writes are queue cancel and priority changes on the Queue page, which work only on
-a loopback bind. Pass `--host` to bind another interface; the server has no
+The server binds to `127.0.0.1:8765` and serves read-only pages. New runs appear
+without a restart. Pass `--host` to bind another interface; the server has no
 authentication, so only use a trusted network.
 
 Open the terminal dashboard for the latest execution of `demo`, or omit the run
@@ -766,16 +765,24 @@ mammoth queue wait --group study
 ```
 
 A job with no `--vram` reserves a whole GPU, and the service measures every job's
-peak, so `--like <job-or-run>` can reuse it later. Run the service with the
-[systemd user unit](mammoth-queue.service), after editing its paths to match the
-host, and enable lingering if it must outlive logout:
+peak, so `--like <job-or-run>` can reuse it later.
+
+The [`deploy/`](deploy) directory holds the complete systemd user units. Install
+them and start the queue and its web monitor together, and enable lingering if they
+must outlive logout:
 
 ```sh
 mkdir -p ~/.config/systemd/user
-cp mammoth-queue.service ~/.config/systemd/user/
+cp deploy/* ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now mammoth-queue
+systemctl --user enable --now mammoth.target
 ```
+
+The monitor shows every run any job named with `--run-dir`, including finished jobs,
+plus a Queue page at <http://127.0.0.1:8765/?view=queue> for cancelling jobs and
+changing priority. It needs no project paths. For runs that never went through the
+queue, use `mammoth monitor web`. Restarting `mammoth.target` or either service never
+stops a running job.
 
 The [architecture](docs/ARCHITECTURE.md#host-wide-gpu-job-queue) defines scheduling
 and recovery.

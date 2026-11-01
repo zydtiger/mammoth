@@ -139,6 +139,11 @@ class QueueService:
         with self._condition:
             return self._store.recent(RECENT_JOB_LIMIT)
 
+    def run_dirs(self) -> list[str]:
+        """Return every run directory any job ever named."""
+        with self._condition:
+            return self._store.run_dirs()
+
     def wait_reason(self, job_id: str) -> Union[str, None]:
         """Return why a pending job has not started, as of the latest tick."""
         with self._condition:

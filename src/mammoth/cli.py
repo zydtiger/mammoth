@@ -31,7 +31,7 @@ from mammoth.monitor import (
     render_snapshot,
 )
 from mammoth.monitor.documents import fleet_document, group_document, run_document
-from mammoth.monitor.web import create_web_server
+from mammoth.monitor.web import create_queue_monitor_server, create_web_server
 from mammoth.queue import (
     Dependency,
     JobSpec,
@@ -331,6 +331,45 @@ def monitor_web(
 SocketOption = Annotated[
     Union[Path, None], typer.Option("--socket", help="Queue service API socket.")
 ]
+
+
+@monitor_app.command("serve")
+def monitor_serve(
+    socket_path: SocketOption = None,
+    host: Annotated[str, typer.Option("--host", help="Interface to bind.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", min=0, max=65535, help="Port to bind.")] = 8765,
+    allow_queue_writes: Annotated[
+        bool,
+        typer.Option(
+            "--allow-queue-writes",
+            help="Allow cancel and priority changes on this non-loopback --host address.",
+        ),
+    ] = False,
+    interval: IntervalOption = 2.0,
+    stale_after: StaleAfterOption = 90.0,
+) -> None:
+    """Serve the web monitor for every queued run; normally run by the mammoth-monitor service."""
+    try:
+        server = create_queue_monitor_server(
+            QueueClient(socket_path) if socket_path is not None else None,
+            host=host,
+            port=port,
+            interval_seconds=interval,
+            stale_after_seconds=stale_after,
+            allow_queue_writes=allow_queue_writes,
+        )
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from None
+    except OSError as error:
+        typer.echo(f"Could not bind {host}:{port}: {error}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(f"Serving queued runs at {server.url}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown_monitor()
 
 
 def _client(socket_path: Union[Path, None]) -> QueueClient:

@@ -80,6 +80,15 @@ def test_submit_list_get_cancel_over_the_socket(api, tmp_path: Path) -> None:
         client.cancel(job["job_id"])
 
 
+def test_run_dirs_outlive_the_jobs_that_named_them(api, tmp_path: Path) -> None:
+    client, _, _, _ = api
+    job = client.submit({"argv": ["x"], "cwd": str(tmp_path), "run_dir": "/runs/a"})
+    client.submit({"argv": ["x"], "cwd": str(tmp_path), "run_dir": "/runs/a"})
+    client.submit({"argv": ["x"], "cwd": str(tmp_path)})
+    client.cancel(job["job_id"])
+    assert client.run_dirs() == ["/runs/a"]
+
+
 def test_errors_map_to_their_types(api, tmp_path: Path) -> None:
     client, _, _, _ = api
     with pytest.raises(JobValidationError):

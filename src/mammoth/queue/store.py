@@ -167,6 +167,13 @@ class JobStore:
         )
         return [_job_from_row(row) for row in rows]
 
+    def run_dirs(self) -> list[str]:
+        """Return every run directory any job ever named, kept after the job ends."""
+        rows = self._connection.execute(
+            "SELECT DISTINCT run_dir FROM jobs WHERE run_dir IS NOT NULL ORDER BY run_dir"
+        )
+        return [row[0] for row in rows]
+
     def by_run_dir(self, run_dir: str) -> list[Job]:
         """Return every job for one run directory, newest first."""
         rows = self._connection.execute(
