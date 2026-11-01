@@ -1,0 +1,10 @@
+[Unit]
+Description=Mammoth GPU job queue scheduler
+PartOf=mammoth.target
+
+[Service]
+# Needs mammoth, actl, nvidia-smi, and systemctl. Override PATH in a drop-in if they live elsewhere.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env mammoth queue serve
+Restart=always
+RestartSec=5

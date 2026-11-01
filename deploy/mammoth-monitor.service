@@ -1,0 +1,13 @@
+[Unit]
+Description=Mammoth web monitor for queued runs
+PartOf=mammoth.target
+After=mammoth-queue.service
+
+[Service]
+# Set MAMMOTH_MONITOR_ARGS in a drop-in to add options such as
+# --host ADDRESS --allow-queue-writes for a trusted network.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=MAMMOTH_MONITOR_ARGS=
+ExecStart=/usr/bin/env mammoth monitor serve $MAMMOTH_MONITOR_ARGS
+Restart=always
+RestartSec=5

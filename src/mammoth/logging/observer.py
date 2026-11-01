@@ -14,7 +14,15 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from typing import Any, Protocol, Union
 
-from mammoth.core.events import DEFAULT_HEARTBEAT_INTERVAL_SECONDS, EventName
+from mammoth.core.events import (
+    DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    EventName,
+    sanitize_presentation_name,
+    validate_display_depth,
+    validate_display_fields,
+    validate_stage_fields,
+)
+from mammoth.core.execution import sanitize_metadata_fields
 from mammoth.logging.dispatch import AsyncObservationSink
 from mammoth.logging.jsonl import JsonlEventSink
 from mammoth.logging.model import Media, Observation
@@ -191,6 +199,51 @@ class RunObserver:
             **fields,
         )
 
+    def stage(self, name: str, *, lane: str = "main") -> Union[Observation, None]:
+        """Record that ``lane`` entered stage ``name``; safe from background threads.
+
+        An unusable name is logged and dropped, and a call after close is a no-op,
+        since a presentation problem must never terminate the caller's workload.
+        """
+        try:
+            stored = {
+                "stage": sanitize_presentation_name(name),
+                "lane": sanitize_presentation_name(lane),
+            }
+            validate_stage_fields(stored["stage"], stored["lane"])
+        except (ValueError, RecursionError) as error:
+            logger.warning("Dropped stage %r: %s", name, error)
+            return None
+        try:
+            return self.emit("stage_changed", **stored)
+        except RuntimeError:
+            return None
+
+    def display(self, kind: str, name: str, /, **data: Any) -> Union[Observation, None]:
+        """Publish one display item, replacing an earlier item of the same kind and name.
+
+        A payload that cannot be stored is logged and dropped rather than raised,
+        since a presentation problem must never terminate the caller's workload.
+        """
+        try:
+            # The limits apply to what is stored, which sanitization can change.
+            snapshot = _snapshot_async_value(data)
+            # Check depth first: every later step recurses over the payload.
+            validate_display_depth(snapshot)
+            stored = {
+                "kind": sanitize_presentation_name(kind),
+                "name": sanitize_presentation_name(name),
+                "data": sanitize_metadata_fields({"data": snapshot})["data"],
+            }
+            validate_display_fields(stored["kind"], stored["name"], stored["data"])
+        except (ValueError, RecursionError) as error:
+            logger.warning("Dropped display item %r: %s", name, error)
+            return None
+        try:
+            return self.emit("display", **stored)
+        except RuntimeError:
+            return None
+
     @contextmanager
     def periodic_heartbeats(
         self,
@@ -265,11 +318,21 @@ class RunObserver:
         task_id: str,
         *,
         parent_task_id: Union[str, None] = None,
+        order: Union[int, None] = None,
+        transient: Union[bool, None] = None,
     ) -> Iterator[None]:
-        """Emit balanced task lifecycle records around caller-owned work."""
+        """Emit balanced task lifecycle records around caller-owned work.
+
+        ``order`` ranks the task in monitor task lists before its ID, and a
+        ``transient`` task leaves those lists once completed or skipped.
+        """
         fields: dict[str, Any] = {"phase": phase, "task_id": task_id}
         if parent_task_id is not None:
             fields["parent_task_id"] = parent_task_id
+        if order is not None:
+            fields["task_order"] = order
+        if transient is not None:
+            fields["task_transient"] = transient
         self.emit("task_started", **fields)
         try:
             yield

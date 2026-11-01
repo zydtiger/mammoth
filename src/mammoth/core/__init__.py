@@ -71,12 +71,11 @@ from mammoth.core.groups import (
 )
 from mammoth.core.identity import (
     derive_run_name,
-    validate_device_spec,
     validate_execution_id,
     validate_group_id,
     validate_run_name,
 )
-from mammoth.core.layout import GroupLayout, QueueLayout, RunLayout
+from mammoth.core.layout import GroupLayout, RunLayout
 from mammoth.core.leases import (
     LEASE_NAMESPACE_SCHEMA_VERSION,
     LeaseNamespaceConflictError,
@@ -92,6 +91,11 @@ from mammoth.core.pipeline import (
     BackgroundPipelineResult,
     BackgroundPipelineSubmission,
     BoundedBackgroundPipeline,
+)
+from mammoth.core.telemetry import (
+    TelemetryRecorder,
+    TelemetryTailReader,
+    telemetry_stream_path,
 )
 from mammoth.core.transactions import (
     ArtifactKind,
@@ -138,6 +142,9 @@ from mammoth.core.workstore import (
 )
 
 __all__ = [
+    "TelemetryRecorder",
+    "TelemetryTailReader",
+    "telemetry_stream_path",
     "BackgroundPipelineError",
     "BackgroundPipelineResult",
     "BackgroundPipelineSubmission",
@@ -185,7 +192,6 @@ __all__ = [
     "PHASE_ENV",
     "PreparedArtifact",
     "PublicationMode",
-    "QueueLayout",
     "RUN_NAME_ENV",
     "RecoveryPolicy",
     "RunLayout",
@@ -246,7 +252,6 @@ __all__ = [
     "transaction_journal_exists",
     "transaction_journal_path",
     "transaction_stage_path",
-    "validate_device_spec",
     "validate_execution_id",
     "validate_group_id",
     "validate_resume_checkpoint_sha256",

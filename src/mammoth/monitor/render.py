@@ -5,6 +5,7 @@ The CLI, tests, logs, and optional Rich UI share this canonical textual view.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Union
 
@@ -46,10 +47,8 @@ def render_snapshot(
         lines.append("  (none observed)")
 
     lines.append("Tasks:")
-    if snapshot.tasks:
-        for (_producer, _task_id), task in sorted(
-            snapshot.tasks.items(), key=lambda item: (item[0][0].label, item[0][1])
-        ):
+    if snapshot.listed_tasks:
+        for task in snapshot.listed_tasks:
             progress = str(task.completed)
             if task.total is not None:
                 progress = f"{progress}/{task.total}"
@@ -70,10 +69,31 @@ def render_snapshot(
     else:
         lines.append("  (none observed)")
 
+    tables = [item for item in snapshot.display_items.values() if item.kind == "table"]
+    if tables:
+        lines.append("Tables:")
+        for item in sorted(tables, key=lambda table: table.name):
+            columns, rows = table_cells(item.data)
+            lines.append(f"  {item.name}:")
+            lines.append("    " + " | ".join(columns))
+            lines.extend("    " + " | ".join(row) for row in rows)
+
     if snapshot.warnings:
         lines.append("Warnings:")
         lines.extend(f"  {warning}" for warning in snapshot.warnings)
     return "\n".join(lines) + "\n"
+
+
+def table_cells(data: Mapping[str, object]) -> tuple[list[str], list[list[str]]]:
+    """Return one ``table`` display payload's columns and rows as text."""
+    columns, rows = data.get("columns"), data.get("rows")
+    return (
+        [str(column) for column in columns] if isinstance(columns, list) else [],
+        [
+            [str(cell) for cell in row] if isinstance(row, list) else [str(row)]
+            for row in (rows if isinstance(rows, list) else [])
+        ],
+    )
 
 
 def render_fleet_snapshot(

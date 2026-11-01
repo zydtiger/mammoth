@@ -1,0 +1,6 @@
+[Unit]
+Description=Mammoth GPU job queue and web monitor
+Wants=mammoth-queue.service mammoth-monitor.service
+
+[Install]
+WantedBy=default.target

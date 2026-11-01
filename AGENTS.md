@@ -40,6 +40,7 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `AGENTS.md` | Repository rules, dependency boundaries, validation policy, Git prefixes, and file ownership. | Agent workflow, repository conventions, validation, Git policy, or documentation ownership changes. |
 | `README.md` | Concise user-facing project introduction and setup entry point. | Public package purpose, installation, stable CLI/API, or user-visible behavior changes. |
 | `LICENSE` | MIT license terms and copyright notice. | The project license or copyright notice changes. |
+| `deploy/` | Complete systemd user units for the queue service and its web monitor. | A service command, its grouping, or its runtime prerequisites change. |
 | `docs/ARCHITECTURE.md` | Durable package boundary, dependency direction, runtime model, logging roles, trainer scope, and compatibility policy. | Responsibilities move between layers or a stable architectural contract changes. |
 | `docs/MONITOR.md` | Canonical passive-monitor reconstruction, dashboard hierarchy, telemetry, responsive presentation, and interaction behavior. | Monitor folding, layout, display naming or units, resource probes, refresh policy, or keyboard behavior changes. |
 | `docs/IMPLEMENTATION_PLAN.md` | Ordered delivery phases, acceptance conditions, migration sequence, and explicitly deferred capabilities. | A phase is started/completed, delivery order changes, or deferred scope is approved. |
@@ -70,15 +71,22 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/core/events.py` | Schema-v1 event values, append-only producer writers, replay, and active tailing. | Event validation, retention, compatibility, or stream behavior changes. |
 | `src/mammoth/core/execution.py` | Immutable execution metadata, lineage, sanitization, discovery, joins, logical-run leases, and immutable-log-entry classification for consumer log resets. | Attempt identity, provenance, compatibility, lease, or immutable-log-entry classification behavior changes. |
 | `src/mammoth/core/groups.py` | Optional entry-level group manifests (atomic publication, generated-ID collision retry, opaque caller-metadata round trip), schema-v1-style append-only group event streams, and incremental `GroupEventTailReader` group-event tailing. | Group manifest fields, group ID generation, or group event schema/durability/tailing behavior changes. |
-| `src/mammoth/core/identity.py` | Filesystem-safe run-name, execution-ID, group-ID, and device-spec validation, plus `derive_run_name` stable path-derived run-name construction. | Identity syntax, length limits, or derived-name construction changes. |
-| `src/mammoth/core/layout.py` | Stable caller-entry/run-name artifact path resolution, plus `GroupLayout` entry/group-ID group artifact path resolution and `QueueLayout` entry-level device-queue path resolution. | The run-directory, group-directory, or queue-directory contract changes. |
+| `src/mammoth/core/identity.py` | Filesystem-safe run-name, execution-ID, and group-ID validation, plus `derive_run_name` stable path-derived run-name construction. | Identity syntax, length limits, or derived-name construction changes. |
+| `src/mammoth/core/layout.py` | Stable caller-entry/run-name artifact path resolution, plus `GroupLayout` entry/group-ID group artifact path resolution. | The run-directory or group-directory contract changes. |
 | `src/mammoth/core/leases.py` | Framework-neutral retireable lease namespaces, generation fencing, terminal retirement, and crash reconciliation. | Publication-scoped lease acquisition, retirement, cleanup, recovery, or filesystem safety changes. |
 | `src/mammoth/core/pipeline.py` | Framework-neutral ordered background execution, bounded backpressure, ownership, result attribution, interruption recovery, and cleanup. | Generic background pipeline behavior or public values change. |
+| `src/mammoth/core/telemetry.py` | Execution-host CPU and GPU recorder, its `telemetry.jsonl.zst` stream, and incremental reading. | Telemetry sampling, stream schema, or failure isolation changes. |
 | `src/mammoth/core/transactions.py` | Multi-artifact transaction planning, exclusive staging, per-root leasing, journal schemas, coordinated publication, and semantic recovery preflight. | Transaction planning, staging, journal, publication, or recovery behavior changes. |
 | `src/mammoth/core/workstore.py` | Framework-neutral recoverable chunked work-store leasing, hash-chained completion journal, durable creation, fail-closed prior-state classification, and verified-journal committed-marker read-back. | Work-store leasing, journal format, durability, classification, or committed-marker read-back behavior changes. |
-| `src/mammoth/queue/__init__.py` | Public device-aware job queue exports. | A stable queue symbol is added, removed, or renamed. |
-| `src/mammoth/queue/spool.py` | Job and job-outcome value objects, atomic pending-spool submission/listing/cancellation, and the shared multi-writer-safe completion journal. | Job/journal schema, spool-file atomicity, cancellation refusal, or journal durability behavior changes. |
-| `src/mammoth/queue/serve.py` | Exclusive per-device lease claiming, fail-closed crash reconciliation, and the foreground FIFO device-lane runner over `mammoth.workflow.launch`. | Device-lease semantics, claim atomicity, interruption classification, or the serve-loop signal-handling contract changes. |
+| `src/mammoth/queue/__init__.py` | Public host-wide job queue exports. | A stable queue symbol is added, removed, or renamed. |
+| `src/mammoth/queue/model.py` | Job values, submission validation, size and duration parsing, default paths, and the queue error family. | The job contract or its validation changes. |
+| `src/mammoth/queue/store.py` | SQLite job persistence written only by the running service. | The state schema changes. |
+| `src/mammoth/queue/scheduler.py` | Pure admission: placement, reservations, RAM gating, ordering, backfill, and wait reasons. | Admission rules change. |
+| `src/mammoth/queue/sampling.py` | GPU, host memory, and per-job cgroup sampling without job cooperation. | Sampling sources or attribution change. |
+| `src/mammoth/queue/executor.py` | The only module that calls `actl`. | Durable-execution operations change. |
+| `src/mammoth/queue/service.py` | Queue state owner: submit, cancel, wait, the tick, measurement, and restart recovery. | Service behavior or the recovery contract changes. |
+| `src/mammoth/queue/api.py` | Versioned JSON over a Unix socket: server, client, and job documents. | The API changes. |
+| `src/mammoth/queue/daemon.py` | Service process composition, prerequisites, state lock, and signals. | Service startup or shutdown changes. |
 | `src/mammoth/logging/__init__.py` | Public lightweight logging exports that do not require TensorBoard. | A stable logging symbol is added, removed, or renamed. |
 | `src/mammoth/logging/execution.py` | Per-process execution logging bundle for JSONL observations and exclusive text diagnostics. | Execution logging composition or ownership changes. |
 | `src/mammoth/logging/jsonl.py` | Adapter from sink-neutral observations to append-only execution events. | JSONL routing or flush behavior changes. |
@@ -88,6 +96,9 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `src/mammoth/logging/text.py` | Process-exclusive plain-text Python logging handler. | Text-log ownership or formatting changes. |
 | `src/mammoth/monitor/__init__.py` | Public passive-monitor exports. | A stable monitor symbol is added, removed, or renamed. |
 | `src/mammoth/monitor/model.py` | Single-run execution discovery, lineage, incremental stream reads, and project-neutral state folding. | Monitor selection or reconstructed single-run state changes. |
+| `src/mammoth/monitor/documents.py` | JSON documents of run, group, and fleet snapshots for `show --json` and the web monitor. | Document fields change. |
+| `src/mammoth/monitor/web.py` | Web monitor: root and queue entry discovery, fleet sweep, lazy run views, series and stage queries, HTTP routes, and forwarded queue cancel and priority writes. | Web discovery, API, retention, or server behavior changes. |
+| `src/mammoth/monitor/web_static/` | Browser page, styles, and vendored uPlot with its license. | Web presentation or the vendored chart library changes. |
 | `src/mammoth/monitor/fleet.py` | Passive fleet and group discovery and folding from group manifests, incrementally tailed group event streams, and cheap per-run execution tails; ad-hoc `--match` grouping. | Fleet or group roll-up fields, folding sources, or ad-hoc grouping behavior changes. |
 | `src/mammoth/monitor/dashboard.py` | Responsive Rich renderables for the optional Textual dashboard, at the run, fleet, and group levels. | Interactive panels, progress bars, metric charts, or wide/compact presentation changes at any level. |
 | `src/mammoth/monitor/psutil_telemetry.py` | Optional psutil-backed viewer-host samples. | Optional CPU or memory sampling changes. |
@@ -124,9 +135,13 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `tests/test_pipeline.py` | Ordered background execution, backpressure, attribution, interruption, and cleanup coverage. | Generic background pipeline behavior changes. |
 | `tests/test_transactions.py` | Transaction planning, staging, leasing, journal, publication, recovery, and interruption unit coverage. | Transaction behavior changes. |
 | `tests/test_workstore.py` | Work-store lease exclusivity, interruption-and-resume, journal tamper detection, prior-state classification, durability, cleanup-ordering, and committed-marker read-back coverage. | Work-store behavior changes. |
-| `tests/test_queue.py` | Job/journal validation, device-lease exclusivity and lane concurrency, FIFO ordering, device matching, single-claim contention, before/during/after interruption classification, and `mammoth queue submit/list/cancel/serve` CLI coverage. | Queue behavior or its CLI commands change. |
+| `tests/test_queue_scheduler.py` | Pure admission coverage. | Admission rules change. |
+| `tests/test_queue_service.py` | Service behavior with fakes, including every recovery row. | Service behavior changes. |
+| `tests/test_queue_api.py` | Socket API, CLI client, host sampling, and `actl` executor coverage. | The API, CLI, sampling, or executor changes. |
 | `tests/test_logging.py` | Observer, sink isolation, JSONL routing, text, and TensorBoard unit coverage. | Logging behavior changes. |
-| `tests/test_cli.py` | Typer version, monitor help, usage-error, removed-workflow-route, and fleet/group CLI invocation coverage. | Root or monitor CLI behavior changes. |
+| `tests/test_cli.py` | Typer version, monitor subcommands, help, usage-error, removed-route, and fleet/group CLI invocation coverage. | Root or monitor CLI behavior changes. |
+| `tests/test_telemetry.py` | Execution telemetry sampling, device selection, failure isolation, session ownership, and liveness separation coverage. | Telemetry behavior changes. |
+| `tests/test_web_monitor.py` | Web monitor discovery, service queries, routes, downsampling, lazy views, read-only coverage, and queue write guards. | Web monitor behavior changes. |
 | `tests/test_fleet.py` | Fleet and group folding from group manifests, group event streams, and run tails (including partial writes and crashed producers), ad-hoc `--match` grouping, and their plain-mode rendering. | Fleet or group folding, discovery, or plain-mode rendering behavior changes. |
 | `tests/test_monitor.py` | Single-run discovery, lineage, folding, rendering, telemetry, malformed streams, CLI unit coverage, and fleet/group Rich presentation and Textual screen-stack navigation. | Monitor or monitor CLI behavior changes. |
 | `tests/test_workflow.py` | Programmatic models, both serial orders, lifecycle boundaries, failure results, canonical environments, subprocess supervision, and group manifest/event publication (including terminal status on success, failure, and signal-driven interruption) coverage. | Workflow or group persistence behavior changes. |

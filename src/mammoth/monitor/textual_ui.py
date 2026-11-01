@@ -224,7 +224,7 @@ class RunScreen(Screen[None]):
     Mirrors :class:`MonitorApp`'s refresh, selection, and detail-toggle
     behavior as a pushed screen instead of a standalone application, so
     drilling into a run from the fleet or a group view reaches the same
-    dashboard the standalone ``mammoth monitor <run_name>`` invocation opens.
+    dashboard the standalone ``mammoth monitor tui <run_name>`` invocation opens.
     Back navigation pops this screen and returns to the originating view.
 
     ``initial_snapshot`` is ``None`` when pushed from a fleet or group drill-

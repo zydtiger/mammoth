@@ -18,7 +18,7 @@ section rather than an error, matching the monitor's passivity contract.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatch
@@ -342,9 +342,17 @@ class FleetMonitor:
     once rather than on every subsequent poll.
     """
 
-    def __init__(self, entry: Path, *, match: Union[str, None] = None) -> None:
+    def __init__(
+        self,
+        entry: Path,
+        *,
+        match: Union[str, None] = None,
+        run_names: Union[Collection[str], None] = None,
+    ) -> None:
         self.entry = Path(entry)
         self.match = match
+        # When set, only these runs appear, each as a loose run outside any group.
+        self.run_names = run_names
         self._manifests: dict[str, GroupManifest] = {}
         self._invalid_manifests: set[str] = set()
         self._group_readers: dict[str, GroupEventTailReader] = {}
@@ -363,7 +371,7 @@ class FleetMonitor:
         observed_at = now or datetime.now(timezone.utc)
         groups: list[GroupSnapshot] = []
         claimed: set[str] = set()
-        for group_id in discover_group_ids(self.entry):
+        for group_id in () if self.run_names is not None else discover_group_ids(self.entry):
             manifest = self._load_manifest(group_id)
             if manifest is None:
                 continue
@@ -381,7 +389,11 @@ class FleetMonitor:
                 )
             )
 
-        loose_names = [name for name in discover_run_names(self.entry) if name not in claimed]
+        loose_names = [
+            name
+            for name in discover_run_names(self.entry)
+            if name not in claimed and (self.run_names is None or name in self.run_names)
+        ]
         loose_runs: tuple[LooseRunSnapshot, ...] = ()
         if self.match is not None:
             matched = [name for name in loose_names if fnmatch(name, self.match)]
@@ -642,6 +654,13 @@ def _poll_member_tail(
             newest.metadata.execution_id,
             tail_window_bytes=FLEET_TAIL_WINDOW_BYTES,
         )
+        snapshot = tail.monitor.poll()
+        if not snapshot.tasks and tail.monitor.truncated:
+            # Frequent events pushed every task out of the window. Read this one
+            # stream fully, once, rather than show a run with no progress.
+            tail.monitor = ExecutionMonitor(layout, newest.metadata.execution_id)
+            snapshot = tail.monitor.poll()
+        return snapshot
     return tail.monitor.poll()
 
 
