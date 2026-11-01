@@ -29,7 +29,7 @@ Dependencies point downward only:
 consuming project
     │
     ├── mammoth.torch       optional generic nn.Module/DataLoader training
-    ├── mammoth.queue       local device-aware job spool and FIFO runner
+    ├── mammoth.queue       host-wide GPU job scheduler service and client
     ├── mammoth.workflow    programmatic serial steps and supervision
     ├── mammoth.monitor     replay, terminal and web UIs, and viewer telemetry
     ├── mammoth.execution   direct process lifecycle composition
@@ -37,10 +37,9 @@ consuming project
     └── mammoth.core        identities, layout, events, artifacts, provenance
 ```
 
-`mammoth.queue` imports `mammoth.core` (layout, identity, and atomic artifact
-publication) and reuses `mammoth.workflow.launch.launch_process` as its child
-launcher; nothing imports `mammoth.queue`, so a project that never queues a
-job carries no additional runtime dependency.
+`mammoth.queue` imports only `mammoth.core`'s lock adapter and `mammoth.compat`,
+and starts jobs through the `actl` command. The monitor's web server imports its
+client; a project that never queues a job carries no additional runtime dependency.
 
 `mammoth.core` uses the Python standard library, `typing-extensions` for
 portable type annotations, `portalocker` for descriptor locking, and `zstandard`
@@ -563,9 +562,7 @@ workflow leaves a group without that terminal record; consumers infer
 staleness from event recency, exactly as they do for a run's own execution
 events. The `.mammoth/` subtree is entirely optional: an entry that never
 hosted a `Workflow` invocation, and every run launched outside one, remain
-fully valid without it. `QueueLayout` resolves a sibling `.mammoth/queue/`
-subtree under the same optional root; see "Device-aware local job queue"
-below.
+fully valid without it.
 
 `mammoth.core.is_immutable_log_entry(log_dir, child)` classifies whether one
 child of a run's `logs/` directory is Mammoth-owned immutable state that a
@@ -582,205 +579,135 @@ whether it is a file, directory, or symlink. `child` must resolve inside
 `ValueError` instead of guessing. Extend this classification in the same
 change as any future addition to the immutable `logs/` layout.
 
-## Device-aware local job queue
+## Host-wide GPU job queue
 
-`mammoth.queue` is a component beside the workflow layer, not a workflow
-feature: it never parses or interprets a job's argv, and `Workflow`'s
-immutable frozen-at-construction dispatch is unchanged. A job is typically
-itself a workflow-launching invocation, but Mammoth treats it as an opaque
-caller-final command throughout. The queue is local-single-host scope only:
-no cluster or cloud scheduler integration, no priorities, preemption, or
-backfill beyond FIFO-per-lane, and no GPU health or idleness preflight.
+`mammoth.queue` is one long-lived user service for a host. It decides when and
+where opaque jobs run and delegates durable execution to `automationctl`
+(`actl`). It is a component beside the workflow layer: it never parses a job's
+argv, and a job is typically itself a workflow-launching invocation. The scope is
+one Linux host with systemd user services and NVIDIA GPUs, with no preemption,
+automatic retry, or runtime prediction.
 
-### Spool layout
+### Ownership
 
-`QueueLayout(entry)` resolves the optional, entry-level spool sharing
-`GroupLayout`'s `.mammoth/` root:
+- The queue owns ordering, dependencies, GPU selection, reservations, wait reasons,
+  and job outcomes.
+- ACTL owns the process, its cgroup, stdout and stderr, timeouts, cancellation, and
+  cleanup.
+- Jobs own every artifact location through their argv, env, or config. `run_dir` is
+  display-only: it links a job to monitor views and keys peak inheritance.
+
+### Service, state, and API
+
+`mammoth queue serve` holds an exclusive lock on `service.lock` in
+`$XDG_STATE_HOME/mammoth/queue/`, so a second instance exits without launching
+anything. It is the only writer of `state.db` (SQLite, owner-only). Durable state
+survives service restarts; nothing else persists jobs.
+
+The API is versioned JSON over HTTP on an owner-only Unix socket at
+`$XDG_RUNTIME_DIR/mammoth/queue.sock`. Submitting executes a command, so no TCP
+listener may reach it, and the socket's filesystem permissions are its only
+authentication. `mammoth queue submit|list|cancel|priority|wait` are clients. A
+submit with the service down exits non-zero and keeps nothing.
+
+Submit and cancel wake the scheduler immediately. A tick of a few seconds remains
+for what has no event source: GPU sampling, external tenants, and job status. One
+tick thread makes every launch and `actl` call; API threads only change the store
+under a lock, so a slow subprocess never blocks a submit.
+
+### Job contract
+
+A job states `argv`, an absolute `cwd`, explicit `env` and `env_files`, and
+optionally `gpus` (default 1, or the pin count), pinned `gpu` indices, `vram`,
+`ram`, `like`, `after`, `group`, `priority`, `timeout_seconds`, and `run_dir`. ACTL
+gives a job a minimal environment, and the submitter's shell env is never captured.
+Environment values live in `state.db` and never leave through the API, but secrets
+still belong in env files, which ACTL reads at launch.
+
+The scheduler sets `CUDA_VISIBLE_DEVICES` to GPU UUIDs, which stay correct whatever
+`CUDA_DEVICE_ORDER` a job uses, and rejects a submitted value for GPU jobs. A job
+with `gpus` 0 may set it and otherwise sees no GPU.
+
+### Scheduling
+
+The ready job with the highest priority, then oldest submission, is the head. A
+GPU's free memory is:
 
 ```text
-<entry>/.mammoth/queue/
-├── pending/
-│   └── <sequence>-<job-id>.json     unclaimed jobs, FIFO by filename
-├── claimed/
-│   └── <device-spec>/
-│       └── <sequence>-<job-id>.json claimed jobs, one subdirectory per lane
-├── lanes/
-│   └── <device-spec>.lock           per-device exclusive lease files
-├── journal.jsonl                    append-only completion journal
-└── .sequence.lock                   monotonic submission-sequence counter
+free_vram = total - external_used - sum(max(declared_vram, observed_vram) for managed jobs)
 ```
 
-A job file records its opaque `argv`, the run names it expects to produce
-(`expected_run_names`, validated with the same `validate_run_name` every
-other Mammoth identity uses), a single opaque `device` requirement, UTC
-`submitted_at` provenance, an optional working directory, and an optional
-caller-supplied JSON-compatible `metadata` block that Mammoth never
-interprets, mirroring `Workflow`'s own opaque `group_metadata` field. Job
-files are published with `mammoth.core.artifacts.atomic_write_json` and are
-never rewritten in place; their queue state is entirely their filesystem
-location (`pending/`, one lane's `claimed/<device>/`, or removed after a
-terminal journal record exists). Completed, failed, and interrupted jobs are
-never deleted: their terminal record moves to the completion journal.
+- `external_used` is memory on the GPU beyond managed jobs' observed use.
+- A job with no known `vram` reserves its whole GPU, preferring the most free memory.
+  Sharing requires known reservations, and known reservations prefer the tightest fit.
+- Reservations apply from launch, so a job still loading cannot make its GPU look free.
+- Host RAM admission requires `MemAvailable - headroom - sum(max(0, declared_ram -
+  anon_ram) for running jobs) >= requested_ram`.
+- Jobs with no known `ram` launch one at a time; the next waits until the previous
+  job's anonymous memory stops growing for a configurable window.
+- A later job may pass a blocked job only on a GPU the blocked job could not use even
+  with all managed jobs gone, and never while it is blocked on RAM. A job no GPU can
+  ever hold, or asking more RAM than the host can ever admit, reserves nothing, so it
+  cannot stall the queue. Submit rejects declared values that exceed the host.
+- Failed GPU sampling or a failed `actl` query stops new launches and leaves running
+  jobs alone.
 
-The submission sequence is a small monotonic counter, not a security
-boundary: `submit_job()` allocates it under a short-held blocking exclusive
-lease at `.sequence.lock` (open, `flock`, read-increment-write, `fsync`,
-unlock), so concurrent submitters from independent processes never race for
-the same FIFO position and job filenames sort lexicographically into
-submission order regardless of clock resolution.
+Pure admission lives in `mammoth.queue.scheduler`, which sees no store or subprocess.
 
-### Device spec
+### Measurement and outcomes
 
-A device spec is an opaque, caller-defined, single-path-component string
-(`mammoth.core.identity.validate_device_spec`): Mammoth never parses its
-internal structure. A bare index (`"0"`), a framework device string
-(`"cuda:0"`), and a stable hardware UUID are all accepted as opaque tokens,
-resolving the issue's open question in favor of the simplest defensible
-choice. A job's device requirement matches a lane by exact string equality
-against that lane's `--device` value; Mammoth defines no wildcard, set, or
-prefix matching. The runner never exports `CUDA_VISIBLE_DEVICES` or any
-other device-selection variable to a job's child process: a claimed job's
-argv is launched with the parent environment minus `MAMMOTH_*` variables
-only (mirroring the workflow layer's own child-environment sanitization),
-so the job's own argv remains fully self-describing about how it targets the
-device it declared. The lane's device spec is still recorded on every job
-outcome for provenance.
+The service samples each running job's anonymous memory from its cgroup, and its VRAM
+by mapping `nvidia-smi` compute processes to the job's unit through
+`/proc/<pid>/cgroup`, with no job cooperation. A process that maps to no job counts
+as external, the safe direction. Peaks persist during the run and are `partial` when
+samples were missed, because a gap can hide the true peak.
 
-### Lease and lane concurrency
+Declarations are reservations, not limits: exceeding one warns and raises the
+reservation but never kills the job. Reservations a job leaves unset come from
+measured peaks plus a 10% margin, capped at what the host can provide. `like` names any finished job or run except an
+out-of-memory one. Automatic inheritance through `run_dir` needs a complete
+measurement, from a completed job or one that ended after at least 30 minutes,
+since an early failure understates the peak.
 
-`claim_device_lease(entry, device)` mirrors
-`mammoth.core.execution.claim_logical_run_lease` exactly: a non-blocking
-`O_NOFOLLOW`-guarded advisory `flock` on `lanes/<device>.lock`, failing
-closed with `DeviceLeaseConflictError` instead of blocking when another
-lane already holds it, and released automatically by the OS on process
-exit or crash. Two `serve` processes on the same device spec can never both
-run; two processes on disjoint device specs are fully independent lanes
-with no shared mutable state beyond the pending directory and the shared
-completion journal.
+ACTL `ok` maps to `completed`; `failed`, `timeout`, `skipped`, and `error` to `failed`;
+`cancelled` to `cancelled`; and `abandoned` to `interrupted`. Failed jobs are labelled
+`oom` from their logs or a sampled cgroup `oom_kill` count, and OOM never retries. A
+failed `ok` dependency moves its dependent to `dependency_failed` without running it.
 
-A pending job is claimed by exactly one lane through `os.rename` directly
-from `pending/<file>` to that lane's `claimed/<device>/<file>`: this is
-atomic on a local filesystem, and a source path already renamed away by a
-racing lane raises `FileNotFoundError` rather than silently overwriting
-anything, so contention between two lanes (for example two misconfigured
-`serve` processes started against the same device before the lease
-conflict is discovered) still yields exactly one claimant. `mammoth queue
-cancel` removes only a job still in `pending/`; a job already renamed into
-any lane's `claimed/` directory, or already present in the completion
-journal, is refused with a clear `JobAlreadyClaimedError`.
+### Deployment
 
-### Runner and crash safety
+`deploy/` holds the complete systemd user units: `mammoth.target` starts
+`mammoth-queue.service` and `mammoth-monitor.service`, and each stops and restarts
+with it. They stay separate processes because the monitor depends on the queue but
+not the reverse, so its scans and any crash cannot delay scheduling, and the scheduler
+keeps no TCP listener. Hosts change `PATH` or `MAMMOTH_MONITOR_ARGS` through drop-ins.
 
-`mammoth queue serve --device <spec>` is a foreground process with no
-daemonization and no network listener. After claiming its lease, it first
-validates the completion journal unconditionally (one `read_job_journal`-
-backed call, regardless of whether this lane's claimed directory currently
-holds anything), then calls `reconcile_interrupted_jobs()`: because the
-lease was just exclusively acquired, any job file still present in this
-lane's `claimed/<device>/` directory can only be debris from a runner that
-died before recording that job's outcome, or debris from a runner that died
-*after* durably recording the outcome but before removing the claimed file.
-The completion journal is authoritative: a job ID already present there is
-stale cleanup, silently removed with no new record; every other leftover is
-durably appended as `status="interrupted"` (with
-`return_code`/`signal`/`duration_seconds` left `None`, since this process
-never observed the job run) before its claimed file is removed. A crashed
-job is therefore always classified fail-closed on restart, never silently
-re-run and never silently lost.
+### Execution and recovery
 
-The unconditional journal validation exists as a separate step because
-`reconcile_interrupted_jobs()` only reads the journal when its own
-`claimed_lane_dir` already exists; a lane with nothing to reconcile -- the
-common case -- would otherwise never read the journal at all during
-reconciliation, letting `serve` sail past a corrupted journal, claim and run
-pending jobs, and append new records past the corruption instead of
-refusing to start. Validating the journal up front keeps every `serve`
-invocation fail-closed on a corrupted journal, not only the crash-recovery
-case that happens to already have claimed debris.
+Only `mammoth.queue.executor` calls `actl`. Before starting a job the service records
+it as `launching` with its GPU and reservation, then submits a transient execution
+named `mammoth-<job-id>` and records the returned `tx` ID. Jobs run in their own units,
+so stopping, crashing, or upgrading the service does not stop them. The service probes
+ACTL before launching, so an outage leaves jobs pending. A submission that then fails
+with no record under that name is a rejection, and the job fails without retry.
 
-After reconciliation, the lane repeatedly claims the oldest pending job
-whose device matches, launches its argv through
-`mammoth.workflow.launch.launch_process` (the same supervised-child seam
-`Workflow` uses), and appends one terminal `JobOutcome` to `journal.jsonl`
-before removing the claimed file. `launch_process` already terminates a
-running child's process group and reports an interrupted outcome when
-SIGINT reaches the lane while a job is active; `run_serve_loop` additionally
-stops polling immediately after such an outcome instead of claiming further
-work, so an interactive Ctrl-C stops the whole lane rather than skipping one
-job. This is deliberately lighter than `Workflow.run()`'s stricter
-`pthread_sigmask` setup-signal masking: a job's queue state is always either
-untouched pending, or already durably claimed via one atomic rename, before
-its child ever launches, so no signal window (including the OS default
-action for an unhandled SIGTERM, or `SIGKILL`) can leave the spool in an
-ambiguous state that the next lease acquisition's reconciliation cannot
-already classify correctly.
+Every tick, including the first after a restart, settles live jobs before launching:
 
-That fail-closed classification is a bookkeeping guarantee about the queue's
-own on-disk state, not by itself a guarantee that the device is actually
-free: `SupervisedProcess` launches every job with `start_new_session=True`
-(its own new process group and session), so a runner killed with `SIGKILL`
-does not, on its own, take its job child down with it -- the child is simply
-reparented to the init process and keeps running, silently occupying the
-device the queue now believes is free. `mammoth queue serve` mitigates this
-with an opt-in, Linux-only, best-effort parent-death signal: its default
-launcher passes `parent_death_signal=signal.SIGTERM` to `launch_process`
-(see `mammoth.workflow.launch.SupervisedProcess.parent_death_signal`), which
-arms `prctl(PR_SET_PDEATHSIG, SIGTERM)` on the direct child before it execs,
-so the kernel itself delivers `SIGTERM` to that child the instant its parent
-process terminates for any reason, including `SIGKILL`, with no cooperation
-required from the dying runner. `Workflow.run()` never passes this
-parameter, so its behavior is byte-identical to before this mechanism
-existed. The mitigation's coverage is deliberately narrow and must not be
-overstated: it reaches only the *direct* child `launch_process` starts. A
-grandchild that job spawns into its own session (for example a training
-script that itself forks a data-loader worker pool, or execs into a
-supervisor of its own) is not armed with any death signal and can keep
-running -- and keep occupying the device -- after both the runner and its
-direct child are gone. Device exclusivity after a hard kill is therefore
-best-effort, not guaranteed; only a job whose own process tree fully
-terminates when its direct parent dies (the common case for a single
-training process) gets the full benefit.
+| Recorded state | ACTL state | Result |
+| --- | --- | --- |
+| `running` | Running | Keep tracking and keep the reservation |
+| `running` | Terminal | Record the outcome and end time, release, evaluate dependents |
+| `running` | Registration gone | Reconcile through ACTL to `abandoned`; record `interrupted`; never rerun |
+| `running` | Record pruned | Record `unknown`; never treat as success; never rerun |
+| `launching` | Found by name | Store the `tx` ID and continue by status |
+| `launching` | Confirmed absent, within ACTL retention | Return to pending after a short grace for an orphaned submit |
+| `launching` | Confirmed absent, past ACTL retention | Record `unknown`; never rerun |
+| Any | Query fails | Launch nothing and retry on the next tick |
 
-The completion journal is a single shared file that multiple concurrent
-lane processes append to. Each record is written with one raw `os.write()`
-call under `O_APPEND` (bypassing Python's buffered I/O layer, matching
-`mammoth.core.workstore.WorkStoreSession.commit`'s care around short
-writes) so concurrent appends from independent processes never interleave
-on a local filesystem, then `fsync`ed before the call returns. Unlike
-`mammoth.core.events` or `mammoth.core.groups`, journal records carry no
-cross-record sequence chain: each record is self-contained and independently
-validated, because a shared multi-writer file cannot support one writer's
-exclusive next-sequence ownership. `read_job_journal()` tolerates an
-incomplete trailing line exactly as `read_execution_events()` and
-`read_group_events()` do.
-
-### Passive readability
-
-Queue and lane state are plain files: `mammoth queue list` and every
-function in `mammoth.queue.spool` only read `pending/`, `claimed/`, and
-`journal.jsonl` directly, contacting no runner process. This is the
-contract a future monitor (#86) renders against; this change adds no
-monitor rendering of queue state.
-
-`list_jobs()` tolerates malformed on-disk state instead of aborting the
-whole snapshot: one unparsable pending or claimed job file is skipped and
-its path recorded in `QueueSnapshot.malformed_job_files`, so one bad file
-never hides the rest of a healthy spool. A malformed completion journal is
-instead recorded in `QueueSnapshot.journal_error`, leaving `completed`,
-`failed`, and `interrupted` empty, since Mammoth cannot safely determine
-terminal state from a partially trusted journal; `mammoth queue list`
-still prints the healthy pending/claimed sections in that case before
-reporting the journal error and exiting nonzero.
-
-Every `mammoth queue` command shares one clean-error contract for its own
-`QueueError` family (malformed job files, a malformed journal, an
-unreadable lease path, and similar on-disk problems): a one-line message
-on stderr and a nonzero exit, never a raw Python traceback. `serve`
-additionally validates the completion journal unconditionally before FIFO
-dispatch, regardless of whether its own lane currently has anything to
-reconcile, so a corrupted journal always refuses to start that lane
-through this same clean-error path instead of silently dispatching pending
-work past the corruption.
+`queue cancel` removes a pending job or cancels a live one through ACTL, and a direct
+`actl cancel` reconciles the same way. `queue wait` blocks on the socket, reconnects
+across service restarts, and exits non-zero after a configurable bound, stating that
+job state is unknown. It exits 0 whatever the job status, so callers read the status.
 
 ## Logging responsibilities
 
@@ -830,7 +757,7 @@ otherwise new streams use `.jsonl.zst`. Both variants for the same producer are
 ambiguous and produce an error instead of double-counting events. This default
 filename change is a breaking on-disk layout change for consumers that hardcode
 names or read logs as plain text; use event path helpers and event readers.
-Queue completion and work-store journals retain their existing plain formats.
+Work-store journals retain their existing plain formats.
 
 `RunObserver` asynchronously dispatches CPU-owned scalar observations. It owns
 one bounded ordered worker per sink, so a slow TensorBoard writer cannot stall
@@ -888,7 +815,7 @@ not inspect checkpoint contents or infer any of these facts.
 workers, keyboard navigation, scrolling, and responsive layout; Rich renderables
 provide progress bars, execution panels, task tables, and terminal-width-aware
 training charts. `mammoth monitor show` prints one stable ANSI-free or JSON
-snapshot. `mammoth monitor web` serves the same reconstructed state to a browser
+snapshot. `mammoth monitor web` and `serve` serve the same reconstructed state to a browser
 using only the standard library and packaged static files. Conventional loss and
 learning-rate names affect terminal presentation only and do not alter folding
 or assign scientific meaning. `docs/MONITOR.md` owns the detailed reconstruction
@@ -1230,7 +1157,7 @@ inspection/read sessions, prepared checkpoint publication, and JSONL/text/
 TensorBoard logging support Linux and Windows. Windows support is scoped to
 local filesystems (CI uses NTFS); remote shares, hostile same-user writers,
 and cross-host coordination are excluded. DDP, workflow subprocess supervision,
-device queues, generic retireable publication namespaces, multi-artifact
+the job queue, generic retireable publication namespaces, multi-artifact
 transactions, and work stores retain their existing POSIX/Linux contracts.
 Their modules remain importable on Windows so importing shared core or Torch
 APIs does not require `fcntl`; this does not implement their POSIX operations.
@@ -1241,8 +1168,8 @@ root-confined publication operations. Public artifacts retain byte verification;
 execution retains lifecycle policy; logging retains formatting; checkpoints
 retain serialization, receipt roles, ordered commit, and retention decisions.
 These callers do not select an OS backend. Existing POSIX lease, work-store,
-and queue clients also use the shared descriptor-lock adapter; directory locks
-remain POSIX operations, and queue sequence allocation retains blocking locking.
+and queue-service clients also use the shared descriptor-lock adapter; directory locks
+remain POSIX operations.
 Mammoth has no direct `fcntl` dependency; `portalocker` owns that platform choice.
 Both platforms use one checkpoint publication loop. The adapter preserves the existing POSIX lease protocol and
 Windows lease format rather than migrating live ownership state.

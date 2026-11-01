@@ -27,7 +27,7 @@ No familiarity with Mammoth is assumed below.
 
 Direct single-process training, artifact receipts, JSONL/TensorBoard logging,
 and `ExecutionSession` support Linux and Windows on local filesystems. Workflow
-subprocess supervision, device queues, multi-artifact transactions, and work
+subprocess supervision, the job queue, multi-artifact transactions, and work
 stores retain their POSIX/Linux requirements. See the
 [platform contract](docs/ARCHITECTURE.md#compatibility-policy) for Windows
 filesystem guarantees and limitations.
@@ -749,6 +749,43 @@ the trainer or profiler. `TorchBackendConfig` controls TF32, float32 matmul
 precision, cuDNN benchmarking, and deterministic modes; `TorchSeedPolicy`
 selects which generic Python and Torch generators receive the caller's seed.
 Mammoth does not choose those values or configure dataset workers.
+
+## Queue GPU jobs across a host
+
+`mammoth queue` schedules opaque commands from any project on one Linux host. It
+picks the GPU, sets `CUDA_VISIBLE_DEVICES`, and starts each job in its own
+[`automationctl`](https://github.com/zydtiger/automationctl) unit, so restarting the
+service never stops a job. Your command still decides where logs and checkpoints go.
+
+```sh
+mammoth queue submit --group study --run-dir "$PWD/runs/a" -- .venv/bin/python train.py
+mammoth queue submit --vram 28G --ram 60G --after <job-id>:any -- .venv/bin/python analyze.py
+mammoth queue list
+mammoth queue wait --group study
+```
+
+A job with no `--vram` reserves a whole GPU, and the service measures every job's
+peak, so `--like <job-or-run>` can reuse it later.
+
+The [`deploy/`](deploy) directory holds the complete systemd user units. Install
+them and start the queue and its web monitor together, and enable lingering if they
+must outlive logout:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp deploy/* ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now mammoth.target
+```
+
+The monitor shows every run any job named with `--run-dir`, including finished jobs,
+plus a Queue page at <http://127.0.0.1:8765/?view=queue> for cancelling jobs and
+changing priority. It needs no project paths. For runs that never went through the
+queue, use `mammoth monitor web`. Restarting `mammoth.target` or either service never
+stops a running job.
+
+The [architecture](docs/ARCHITECTURE.md#host-wide-gpu-job-queue) defines scheduling
+and recovery.
 
 ## Learn more
 
