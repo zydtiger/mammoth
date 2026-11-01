@@ -57,4 +57,24 @@ repos:
         language: system
         pass_filenames: false
         files: '(\.pyi?$|^(pyproject\.toml|uv\.lock)$)'
+        stages: [manual]
+      - id: pytest-fast
+        name: pytest fast subset
+        entry: >-
+          uv run pytest -q
+          tests/test_artifacts.py
+          tests/test_cli.py
+          tests/test_events.py
+          tests/test_execution.py
+          tests/test_groups.py
+          tests/test_layout.py
+          tests/test_leases.py
+          tests/test_pipeline.py
+          tests/test_queue_scheduler.py
+          tests/test_queue_service.py
+          tests/test_transactions.py
+          tests/test_workflow.py
+        language: system
+        pass_filenames: false
+        files: '(\.pyi?$|^(pyproject\.toml|uv\.lock)$)'
         stages: [pre-push]
