@@ -12,7 +12,7 @@ small presentation conventions stated below.
 ## Commands
 
 - `mammoth monitor tui` opens the interactive terminal dashboard.
-- `mammoth monitor web` serves the read-only web monitor.
+- `mammoth monitor web` serves the web monitor.
 - `mammoth monitor show` prints a stable plain-text snapshot or, with `--json`,
   one JSON document per snapshot. `--watch` repeats until a run reaches a terminal
   status. Fleet and group snapshots repeat until interrupted.
@@ -374,7 +374,12 @@ at most a few seconds, escalating to `SIGKILL`.
 ## Web Monitor
 
 `mammoth monitor web [--root DIR]... [--host] [--port] [--interval] [--stale-after]`
-serves one long-lived, read-only process.
+serves one long-lived process. Its Queue page (`?view=queue`) shows resources, jobs,
+wait reasons, and declared and measured peaks from the queue service, with links to
+run views. Its only writes are cancel and priority changes, forwarded to the service
+from a loopback bind after Host, Origin, and Content-Type checks. These stop browsers,
+not other local users, who can reach the port and so can cancel or reprioritize jobs.
+It never exposes submission.
 
 - Discovery walks each root up to `MAX_ENTRY_DEPTH` directories every
   `DISCOVERY_INTERVAL_SECONDS`, skipping hidden directories, symbolic links, and the
@@ -507,14 +512,14 @@ row followed by edge-aligned live metrics.
 - `src/mammoth/monitor/documents.py` owns JSON documents for `show --json` and the
   web monitor.
 - `src/mammoth/monitor/web.py` and `src/mammoth/monitor/web_static/` own entry
-  discovery, the read-only HTTP API, and the browser page.
+  discovery, the HTTP API, and the browser page.
 - `src/mammoth/core/telemetry.py` owns execution-host sampling and reading.
 - `tests/test_monitor.py` pins single-run reconstruction, layout, telemetry,
   responsive width, and interaction behavior, plus fleet/group presentation
   and navigation; also pins `ExecutionMonitor`'s incremental-fold/full-fold
   equivalence and the fleet drill-down's non-blocking loading state.
 - `tests/test_web_monitor.py` pins entry discovery, routes, cursors, downsampling,
-  lazy views, and read-only behavior. `tests/test_telemetry.py` pins execution-host
+  lazy views, read-only behavior, and queue write guards. `tests/test_telemetry.py` pins execution-host
   sampling, failure isolation, session ownership, and liveness separation.
 - `tests/test_fleet.py` pins fleet and group folding, ad-hoc `--match`
   grouping, and their plain-mode rendering; also pins bounded-tail-window

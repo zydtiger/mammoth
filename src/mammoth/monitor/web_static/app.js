@@ -765,7 +765,97 @@ async function runPage(entry, run, execution) {
   setInterval(() => { if (!document.hidden) view.refresh(); }, REFRESH_MS);
 }
 
+function bytes(value) {
+  if (value === null || value === undefined) return "–";
+  const units = [["T", 1024 ** 4], ["G", 1024 ** 3], ["M", 1024 ** 2]];
+  for (const [unit, scale] of units) {
+    if (Math.abs(value) >= scale) return `${(value / scale).toFixed(1)}${unit}`;
+  }
+  return `${value}B`;
+}
+
+const ACTIVE = new Set(["pending", "launching", "running"]);
+
+function queueRow(job) {
+  const run = job.link
+    ? `<a href="./?${query(job.link)}">${esc(job.link.run)}</a>`
+    : esc(job.run_dir ? job.run_dir.split("/").pop() : "–");
+  const status = job.label ? `${pill(job.status)} ${esc(job.label)}` : pill(job.status);
+  const gpus = job.gpu_indices.length ? job.gpu_indices.join(",") : job.pinned_gpus.length ? `pin ${job.pinned_gpus.join(",")}` : "–";
+  const partial = job.peak_partial ? " partial" : "";
+  const notes = [job.wait_reason, job.message, ...job.warnings].filter(Boolean).map(esc).join("<br>");
+  const buttons = [];
+  if (job.status === "pending") {
+    buttons.push(`<button data-action="priority" data-job="${esc(job.job_id)}" data-priority="${job.priority + 1}" title="Raise priority">↑</button>`);
+    buttons.push(`<button data-action="priority" data-job="${esc(job.job_id)}" data-priority="${job.priority - 1}" title="Lower priority">↓</button>`);
+  }
+  if (ACTIVE.has(job.status)) {
+    const label = job.cancel_requested ? "Cancelling" : "Cancel";
+    buttons.push(`<button data-action="cancel" data-job="${esc(job.job_id)}"${job.cancel_requested ? " disabled" : ""}>${label}</button>`);
+  }
+  return `<tr>${td(`<code>${esc(job.job_id)}</code>`)}${td(status)}${td(number(job.priority, 0), "num")}${td(run)}${td(esc(job.group ?? "–"))}${td(esc(gpus))}`
+    + `${td(`${job.gpu_indices.length && job.reserved_vram === null ? "whole" : bytes(job.reserved_vram ?? job.declared_vram)} / ${bytes(job.peak_vram)}`, "num")}`
+    + `${td(`${bytes(job.reserved_ram ?? job.declared_ram)} / ${bytes(job.peak_ram)}${partial}`, "num")}`
+    + `${td(notes || `<span class="muted">${esc(job.argv.join(" "))}</span>`)}${td(buttons.join(" "))}</tr>`;
+}
+
+function renderQueue(target, data) {
+  if (!data.available) {
+    setHtml(target, `<p class="muted">The queue service is not answering.</p><p class="meta">${esc(data.error)}</p>`);
+    return;
+  }
+  const resources = data.resources;
+  const problems = [resources.sampling_error, resources.executor_error].filter(Boolean)
+    .map((item) => `<p class="st-failed">${esc(item)}</p>`).join("");
+  const tiles = resources.gpus.map((gpu) => `<tr>${td(`GPU${gpu.index}`)}${td(bytes(gpu.free), "num")}${td(bytes(gpu.total), "num")}${td(bytes(gpu.external), "num")}${td(gpu.jobs.map((id) => `<code>${esc(id)}</code>`).join(" ") || "–")}</tr>`);
+  const ram = resources.ram
+    ? `<p class="meta">RAM admissible ${bytes(Math.max(0, resources.ram.admissible))}, available ${bytes(resources.ram.available)} of ${bytes(resources.ram.total)}</p>`
+    : "";
+  const heads = ["Job", "Status", "Priority", "Run", "Group", "GPU", "VRAM held / peak", "RAM held / peak", "Detail", ""].map((label) => th(label));
+  const active = data.jobs.filter((job) => ACTIVE.has(job.status));
+  const ended = data.jobs.filter((job) => !ACTIVE.has(job.status)).reverse();
+  setHtml(target, `${problems}<div class="table-title">Resources</div>`
+    + table([th("GPU"), th("Free"), th("Total"), th("External"), th("Jobs")], tiles)
+    + ram
+    + `<div class="table-title">Active (${active.length})</div>`
+    + (active.length ? table(heads, active.map(queueRow)) : `<p class="muted">Nothing is queued or running.</p>`)
+    + (ended.length ? `<details><summary>Ended (${ended.length})</summary>${table(heads, ended.map(queueRow))}</details>` : ""));
+}
+
+async function queuePage() {
+  page.innerHTML = `<div class="heading"><h1>Queue</h1></div><div id="queue"><p class="muted">Loading…</p></div>`;
+  const target = document.getElementById("queue");
+  const tick = async () => {
+    try {
+      renderQueue(target, await getJson("api/queue"));
+      setRefresh(true);
+    } catch (error) {
+      setRefresh(false, error.message);
+    }
+  };
+  target.addEventListener("click", async (event) => {
+    const button = event.target.closest("button[data-action]");
+    if (!button) return;
+    const { action, job, priority } = button.dataset;
+    if (action === "cancel" && !confirm(`Cancel job ${job}?`)) return;
+    const response = await fetch(`api/queue/${encodeURIComponent(job)}/${action}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(action === "priority" ? { priority: Number(priority) } : {}),
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      setRefresh(false, detail.error ?? String(response.status));
+      return;
+    }
+    await tick();
+  });
+  await tick();
+  setInterval(() => { if (!document.hidden) tick(); }, REFRESH_MS);
+}
+
 const entryParam = params.get("entry");
-if (entryParam && params.get("run")) runPage(entryParam, params.get("run"), params.get("execution"));
+if (params.get("view") === "queue") queuePage();
+else if (entryParam && params.get("run")) runPage(entryParam, params.get("run"), params.get("execution"));
 else if (entryParam && params.get("group")) groupPage(entryParam, params.get("group"));
 else fleetPage();

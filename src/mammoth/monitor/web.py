@@ -1,10 +1,13 @@
-"""Read-only web monitor serving every entry found below configured roots.
+"""Web monitor serving every entry found below configured roots.
 
 The server folds the same execution artifacts as the terminal dashboard and adds
 each execution's telemetry stream. It never writes artifacts or contacts
 producers. One background sweep keeps bounded fleet roll-ups fresh; a full
 :class:`~mammoth.monitor.model.RunMonitor` exists only for an opened run and is
 released after it has been idle.
+
+Its only writes are queue cancel and priority changes, forwarded to the queue
+service from a loopback bind. It never exposes job submission.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from collections.abc import Iterable, Sequence
@@ -30,6 +34,14 @@ from mammoth.core.telemetry import TelemetryTailReader, telemetry_stream_path
 from mammoth.monitor.documents import fleet_document, group_document, run_document
 from mammoth.monitor.fleet import FleetMonitor, FleetSnapshot
 from mammoth.monitor.model import RunMonitor, RunSnapshot, StagePoint
+from mammoth.queue.api import QueueClient, ServiceUnavailableError
+from mammoth.queue.model import (
+    JobNotFoundError,
+    JobStateError,
+    JobValidationError,
+    QueueError,
+    default_socket_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +52,9 @@ SUMMARY_SECONDS = 10.0
 MAX_DOCUMENT_ROWS = 100
 DEFAULT_MAX_POINTS = 1000
 MAX_POINTS_LIMIT = 5000
+MAX_WRITE_BYTES = 4096
 _LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+_QUEUE_WRITE = re.compile(r"^/api/queue/([0-9a-f]{12})/(cancel|priority)$")
 _STATIC_DIR = Path(__file__).with_name("web_static")
 _STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -426,8 +440,10 @@ class MonitorService:
         *,
         interval_seconds: float = 2.0,
         stale_after_seconds: float = 90.0,
+        queue_client: Union[QueueClient, None] = None,
     ) -> None:
         self.roots = tuple(roots)
+        self.queue_client = queue_client or QueueClient(default_socket_path())
         self.interval_seconds = interval_seconds
         self.stale_after_seconds = stale_after_seconds
         self._lock = threading.Lock()
@@ -445,6 +461,21 @@ class MonitorService:
     def start(self) -> None:
         """Start the background fleet sweep."""
         self._thread.start()
+
+    def queue(self) -> dict[str, Any]:
+        """Return queue state with run links, or say why the service cannot answer."""
+        try:
+            jobs = self.queue_client.list_jobs()
+            resources = self.queue_client.resources()
+        except QueueError as error:
+            return {"available": False, "error": str(error), "jobs": [], "resources": None}
+        with self._lock:
+            entry_ids = {os.path.abspath(path): name for name, path in self._entries.items()}
+        for job in jobs:
+            run_dir = str(job.get("run_dir") or "")
+            entry = entry_ids.get(os.path.dirname(run_dir))
+            job["link"] = {"entry": entry, "run": os.path.basename(run_dir)} if entry else None
+        return {"available": True, "error": None, "jobs": jobs, "resources": resources}
 
     def stop(self) -> None:
         """Stop the background fleet sweep."""
@@ -697,6 +728,64 @@ class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     timeout = 60
 
+    def do_POST(self) -> None:
+        """Forward one queue cancel or priority change; nothing else is writable."""
+        # Reading first keeps a reused connection's next request line intact.
+        body = self._read_body()
+        if body is None:
+            self._json({"error": "invalid or oversized Content-Length"}, status=400)
+            return
+        refusal = self._write_refusal()
+        if refusal is not None:
+            self._json({"error": refusal}, status=403)
+            return
+        match = _QUEUE_WRITE.match(urlsplit(self.path).path)
+        if match is None:
+            self._json({"error": "not found"}, status=404)
+            return
+        job_id, action = match.groups()
+        client = self.server.service.queue_client
+        try:
+            if action == "cancel":
+                self._json(client.cancel(job_id))
+            else:
+                self._json(client.set_priority(job_id, _write_document(body).get("priority")))
+        except JobValidationError as error:
+            self._json({"error": str(error)}, status=400)
+        except JobNotFoundError as error:
+            self._json({"error": str(error)}, status=404)
+        except JobStateError as error:
+            self._json({"error": str(error)}, status=409)
+        except ServiceUnavailableError as error:
+            self._json({"error": str(error)}, status=503)
+        except QueueError as error:
+            self._json({"error": str(error)}, status=500)
+
+    def _write_refusal(self) -> Union[str, None]:
+        """Allow writes only from this page on a loopback bind."""
+        if not self.server.loopback_only:
+            return "queue writes are disabled on a non-loopback bind"
+        host = self.headers.get("Host")
+        if host is None or not self._host_allowed():
+            return "unexpected Host header"
+        origin = self.headers.get("Origin")
+        if origin is not None and urlsplit(origin).netloc != host:
+            return "unexpected Origin header"
+        # A cross-site form cannot send this type without a CORS preflight.
+        if self.headers.get_content_type() != "application/json":
+            return "unexpected Content-Type header"
+        return None
+
+    def _read_body(self) -> Union[bytes, None]:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if not 0 <= length <= MAX_WRITE_BYTES:
+            self.close_connection = True
+            return None
+        return self.rfile.read(length)
+
     def do_GET(self) -> None:
         """Route one GET request; every route is read-only."""
         if not self._host_allowed():
@@ -755,6 +844,8 @@ class _Handler(BaseHTTPRequestHandler):
         max_points = int(min(max(2.0, number("max_points", DEFAULT_MAX_POINTS)), MAX_POINTS_LIMIT))
         if path == "/api/fleet":
             return service.fleet()
+        if path == "/api/queue":
+            return service.queue()
         if path == "/api/group":
             return service.group(required("entry"), required("group"))
         if path == "/api/run":
@@ -804,8 +895,18 @@ class _Handler(BaseHTTPRequestHandler):
         logger.debug(format, *args)
 
 
+def _write_document(body: bytes) -> dict[str, Any]:
+    try:
+        document = json.loads(body or b"{}")
+    except ValueError as error:
+        raise JobValidationError(f"Request body is not JSON: {error}") from error
+    if not isinstance(document, dict):
+        raise JobValidationError("Request body must be a JSON object")
+    return document
+
+
 class MonitorWebServer(ThreadingHTTPServer):
-    """Threaded read-only HTTP server bound to one :class:`MonitorService`."""
+    """Threaded HTTP server bound to one :class:`MonitorService`."""
 
     daemon_threads = True
 
@@ -837,12 +938,14 @@ def create_web_server(
     port: int = 8765,
     interval_seconds: float = 2.0,
     stale_after_seconds: float = 90.0,
+    queue_client: Union[QueueClient, None] = None,
 ) -> MonitorWebServer:
     """Bind the server and start its fleet sweep; the caller runs ``serve_forever``."""
     service = MonitorService(
         roots,
         interval_seconds=interval_seconds,
         stale_after_seconds=stale_after_seconds,
+        queue_client=queue_client,
     )
     server = MonitorWebServer((host, port), service)
     service.start()

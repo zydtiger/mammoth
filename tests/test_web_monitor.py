@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import shutil
@@ -713,7 +714,7 @@ def test_point_limit_is_clamped(tmp_path: Path, server: object) -> None:
     assert len(json.loads(body)["series"]["telemetry/cpu/main_cores"]["t"]) <= MAX_POINTS_LIMIT
 
 
-@pytest.mark.parametrize("method", ["POST", "PUT", "DELETE", "PATCH"])
+@pytest.mark.parametrize("method", ["PUT", "DELETE", "PATCH"])
 def test_server_has_no_state_changing_route(server: object, method: str) -> None:
     request = urllib.request.Request(f"{server.url}api/fleet", data=b"{}", method=method)
 
@@ -737,3 +738,162 @@ def test_web_reads_write_nothing_under_the_execution(tmp_path: Path, server: obj
     get(server, f"api/stages?entry={entry}&run=run")
 
     assert snapshot_tree(tmp_path) == before
+
+
+class _FakeQueue:
+    """Record forwarded writes and return one job with a run link target."""
+
+    def __init__(self, run_dir: str) -> None:
+        self.run_dir = run_dir
+        self.calls: list[tuple[str, object]] = []
+        self.failure: Exception | None = None
+
+    def list_jobs(self) -> list[dict[str, object]]:
+        return [{"job_id": "a" * 12, "status": "pending", "run_dir": self.run_dir}]
+
+    def resources(self) -> dict[str, object]:
+        return {"gpus": [], "ram": None}
+
+    def cancel(self, job_id: str) -> dict[str, object]:
+        if self.failure:
+            raise self.failure
+        self.calls.append(("cancel", job_id))
+        return {"job_id": job_id, "status": "cancelled"}
+
+    def set_priority(self, job_id: str, priority: object) -> dict[str, object]:
+        self.calls.append(("priority", priority))
+        return {"job_id": job_id, "priority": priority}
+
+
+@pytest.fixture
+def queue_server(tmp_path: Path) -> Iterator[tuple[object, _FakeQueue]]:
+    create_run(tmp_path, "run-a")
+    fake = _FakeQueue(str(tmp_path / "run-a"))
+    instance = create_web_server(
+        [tmp_path],
+        port=0,
+        interval_seconds=0.05,
+        queue_client=fake,  # type: ignore[arg-type]
+    )
+    instance.service.sweep()
+    thread = threading.Thread(target=instance.serve_forever, daemon=True)
+    thread.start()
+    yield instance, fake
+    instance.shutdown()
+    instance.shutdown_monitor()
+    thread.join(timeout=5.0)
+
+
+def _post(url: str, body: bytes = b"{}", **headers: str) -> tuple[int, dict]:
+    request = urllib.request.Request(url, data=body, method="POST")
+    request.add_header("Content-Type", headers.pop("content_type", "application/json"))
+    for name, value in headers.items():
+        request.add_header(name.replace("_", "-"), value)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as error:
+        return error.code, json.load(error)
+
+
+def test_queue_route_links_jobs_to_discovered_runs(queue_server) -> None:
+    server, _ = queue_server
+    with urllib.request.urlopen(f"{server.url}api/queue", timeout=10) as response:
+        document = json.load(response)
+    assert document["available"] is True
+    assert document["jobs"][0]["link"]["run"] == "run-a"
+
+
+def test_queue_route_reports_a_down_service(tmp_path: Path) -> None:
+    from mammoth.queue import QueueClient
+
+    service = MonitorService([tmp_path], queue_client=QueueClient(tmp_path / "none.sock"))
+    document = service.queue()
+    assert document["available"] is False
+    assert "not answering" in document["error"]
+
+
+def test_queue_writes_forward_cancel_and_priority_only(queue_server) -> None:
+    server, fake = queue_server
+    job_id = "a" * 12
+    assert _post(f"{server.url}api/queue/{job_id}/cancel")[0] == 200
+    status, _ = _post(f"{server.url}api/queue/{job_id}/priority", b'{"priority": 3}')
+    assert status == 200
+    assert fake.calls == [("cancel", job_id), ("priority", 3)]
+    assert _post(f"{server.url}api/queue/{job_id}/submit")[0] == 404
+    assert _post(f"{server.url}api/jobs")[0] == 404
+    assert _post(f"{server.url}api/queue")[0] == 404
+
+
+def test_queue_writes_map_service_errors(queue_server) -> None:
+    from mammoth.queue import JobStateError
+
+    server, fake = queue_server
+    fake.failure = JobStateError("already ended")
+    status, document = _post(f"{server.url}api/queue/{'a' * 12}/cancel")
+    assert (status, document["error"]) == (409, "already ended")
+
+
+def test_queue_writes_refuse_foreign_origin_and_form_posts(queue_server) -> None:
+    server, fake = queue_server
+    url = f"{server.url}api/queue/{'a' * 12}/cancel"
+    assert _post(url, Origin="http://evil.example")[0] == 403
+    assert _post(url, content_type="text/plain")[0] == 403
+    assert _post(url, content_type="application/x-www-form-urlencoded")[0] == 403
+    assert _post(url, Host="evil.example")[0] == 403
+    assert not fake.calls
+    assert _post(url, Origin=server.url.rstrip("/"))[0] == 200
+
+
+@pytest.mark.parametrize("path", ["cancel", "nowhere"])
+def test_queue_write_leaves_a_reused_connection_usable(queue_server, path: str) -> None:
+    server, _ = queue_server
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+    try:
+        connection.request(
+            "POST",
+            f"/api/queue/{'a' * 12}/{path}",
+            body=b"{}",
+            headers={"Content-Type": "application/json"},
+        )
+        connection.getresponse().read()
+        connection.request("GET", "/api/queue")
+        assert connection.getresponse().status == 200
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("length", ["nope", "-1", "99999999"])
+def test_queue_write_survives_a_bad_content_length(queue_server, length: str) -> None:
+    server, fake = queue_server
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+    try:
+        connection.putrequest("POST", f"/api/queue/{'a' * 12}/priority")
+        connection.putheader("Content-Type", "application/json")
+        connection.putheader("Content-Length", length)
+        connection.endheaders()
+        assert connection.getresponse().status == 400
+    finally:
+        connection.close()
+    assert not fake.calls
+
+
+def test_queue_writes_are_disabled_on_a_non_loopback_bind(tmp_path: Path) -> None:
+    instance = create_web_server(
+        [tmp_path],
+        host="0.0.0.0",
+        port=0,
+        interval_seconds=0.05,
+        queue_client=_FakeQueue(""),  # type: ignore[arg-type]
+    )
+    thread = threading.Thread(target=instance.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = instance.server_address[1]
+        status, document = _post(f"http://127.0.0.1:{port}/api/queue/{'a' * 12}/cancel")
+        assert status == 403
+        assert "non-loopback" in document["error"]
+    finally:
+        instance.shutdown()
+        instance.shutdown_monitor()
+        thread.join(timeout=5.0)

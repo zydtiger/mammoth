@@ -6,7 +6,9 @@ console script and ``python -m mammoth`` both enter through :func:`main`.
 
 import importlib
 import json
+import logging
 import math
+import sqlite3
 import sys
 import time
 from collections.abc import Sequence
@@ -31,18 +33,20 @@ from mammoth.monitor import (
 from mammoth.monitor.documents import fleet_document, group_document, run_document
 from mammoth.monitor.web import create_web_server
 from mammoth.queue import (
-    DeviceLeaseConflictError,
-    Job,
-    JobAlreadyClaimedError,
-    JobNotFoundError,
-    JobOutcome,
+    Dependency,
+    JobSpec,
+    JobValidationError,
+    QueueClient,
     QueueError,
-    QueueSnapshot,
-    cancel_job,
-    list_jobs,
-    run_serve_loop,
-    submit_job,
+    ServiceConfig,
+    default_socket_path,
+    default_state_dir,
+    format_size,
+    parse_duration,
+    parse_size,
+    run_service,
 )
+from mammoth.queue.model import check_local_paths
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
 app = typer.Typer(
@@ -55,7 +59,7 @@ app = typer.Typer(
 queue_app = typer.Typer(
     add_completion=False,
     context_settings=CONTEXT_SETTINGS,
-    help="Local device-aware job queue: submit, list, cancel, and serve opaque jobs.",
+    help="Host-wide GPU job queue: a scheduler service and its client commands.",
     no_args_is_help=True,
     pretty_exceptions_enable=False,
 )
@@ -324,166 +328,263 @@ def monitor_web(
         server.shutdown_monitor()
 
 
+SocketOption = Annotated[
+    Union[Path, None], typer.Option("--socket", help="Queue service API socket.")
+]
+
+
+def _client(socket_path: Union[Path, None]) -> QueueClient:
+    return QueueClient(socket_path if socket_path is not None else default_socket_path())
+
+
+def _queue_failure(error: QueueError) -> NoReturn:
+    typer.echo(str(error), err=True)
+    raise typer.Exit(code=1) from None
+
+
 @queue_app.command("submit")
 def queue_submit(
     command: Annotated[
         list[str],
         typer.Argument(help="Opaque job argv; separate options from it with '--'."),
     ],
-    device: Annotated[str, typer.Option("--device", help="Device spec this job requires.")],
-    run_name: Annotated[
-        list[str],
-        typer.Option("--run-name", help="Run name this job expects to produce; repeatable."),
-    ],
-    entry: Annotated[Path, typer.Option("--entry", help="Queue entry root.")] = Path("./runs"),
     cwd: Annotated[
-        Union[Path, None], typer.Option("--cwd", help="Working directory for the launched job.")
+        Union[Path, None],
+        typer.Option("--cwd", help="Working directory; defaults to the current one."),
     ] = None,
-    metadata: Annotated[
+    env: Annotated[
+        Union[list[str], None],
+        typer.Option("--env", help="KEY=VALUE for the job; repeatable. Shell env is not captured."),
+    ] = None,
+    env_file: Annotated[
+        Union[list[Path], None],
+        typer.Option("--env-file", help="Env file read at launch, for secrets; repeatable."),
+    ] = None,
+    gpus: Annotated[
+        Union[int, None],
+        typer.Option("--gpus", min=0, help="GPU count; defaults to the pin count, else 1."),
+    ] = None,
+    gpu: Annotated[
+        Union[list[int], None],
+        typer.Option("--gpu", help="Pin to a physical GPU index; repeatable."),
+    ] = None,
+    vram: Annotated[
         Union[str, None],
-        typer.Option("--metadata", help="Opaque JSON object recorded with the job."),
+        typer.Option("--vram", help="VRAM reservation per GPU; unset reserves the whole GPU."),
     ] = None,
+    ram: Annotated[Union[str, None], typer.Option("--ram", help="Host RAM reservation.")] = None,
+    like: Annotated[
+        Union[str, None],
+        typer.Option("--like", help="Job ID or run whose measured peaks fill missing values."),
+    ] = None,
+    after: Annotated[
+        Union[list[str], None],
+        typer.Option("--after", help="Earlier job as ID, ID:ok, or ID:any; repeatable."),
+    ] = None,
+    group: Annotated[Union[str, None], typer.Option("--group", help="Group name.")] = None,
+    priority: Annotated[int, typer.Option("--priority", help="Higher runs first.")] = 0,
+    timeout: Annotated[
+        Union[str, None],
+        typer.Option("--timeout", help="Wall-clock limit such as 90m or 14d."),
+    ] = None,
+    run_dir: Annotated[
+        Union[Path, None],
+        typer.Option("--run-dir", help="Run directory, for monitor links and peak inheritance."),
+    ] = None,
+    socket_path: SocketOption = None,
 ) -> None:
-    """Durably enqueue one opaque job under the entry's pending spool."""
-    parsed_metadata = _parse_metadata_option(metadata)
+    """Submit one opaque job; fails, keeping nothing, when the service is down."""
     try:
-        job = submit_job(
-            entry,
-            argv=command,
-            expected_run_names=run_name,
-            device=device,
-            cwd=cwd,
-            metadata=parsed_metadata,
+        spec = JobSpec(
+            argv=tuple(command),
+            cwd=str((cwd if cwd is not None else Path.cwd()).resolve()),
+            env=_parse_env_options(env),
+            env_files=tuple(str(path.resolve()) for path in env_file or ()),
+            gpus=gpus if gpus is not None else len(gpu or ()) or 1,
+            gpu=tuple(gpu or ()),
+            vram=parse_size(vram) if vram is not None else None,
+            ram=parse_size(ram) if ram is not None else None,
+            like=like,
+            after=tuple(Dependency.parse(item) for item in after or ()),
+            group=group,
+            priority=priority,
+            timeout_seconds=parse_duration(timeout) if timeout is not None else None,
+            run_dir=str(run_dir.resolve()) if run_dir is not None else None,
         )
-    except (OSError, ValueError) as error:
+        check_local_paths(spec)
+    except JobValidationError as error:
         raise typer.BadParameter(str(error)) from None
+    try:
+        job = _client(socket_path).submit(spec.to_dict())
     except QueueError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from None
-    typer.echo(f"submitted {job.job_id} (sequence={job.sequence}, device={job.device})")
+        _queue_failure(error)
+    typer.echo(job["job_id"])
 
 
 @queue_app.command("list")
 def queue_list(
-    entry: Annotated[Path, typer.Option("--entry", help="Queue entry root.")] = Path("./runs"),
+    as_json: Annotated[bool, typer.Option("--json", help="Print the API documents.")] = False,
+    socket_path: SocketOption = None,
 ) -> None:
-    """Render pending, claimed, completed, failed, and interrupted queue state.
-
-    A malformed pending or claimed job file is skipped and reported by
-    filename rather than aborting the whole listing. A malformed completion
-    journal, by contrast, is reported as a clean error with a nonzero exit
-    after the healthy pending/claimed sections are still printed: Mammoth
-    cannot safely determine completed/failed/interrupted state from a
-    partially trusted journal, so it reports that explicitly instead of
-    silently showing an empty (and misleadingly "nothing yet") history.
-    """
+    """Show active and recent jobs, with a specific reason for every waiting job."""
+    client = _client(socket_path)
     try:
-        snapshot = list_jobs(entry)
+        jobs, resources = client.list_jobs(), client.resources()
     except QueueError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from None
-    typer.echo(_render_queue_snapshot(snapshot))
-    if snapshot.journal_error is not None:
-        typer.echo(f"queue journal error: {snapshot.journal_error}", err=True)
-        raise typer.Exit(code=1) from None
+        _queue_failure(error)
+    if as_json:
+        typer.echo(json.dumps({"jobs": jobs, "resources": resources}, indent=2))
+        return
+    typer.echo(_render_queue(jobs, resources))
 
 
 @queue_app.command("cancel")
 def queue_cancel(
     job_id: Annotated[str, typer.Argument(help="Job ID to cancel.")],
-    entry: Annotated[Path, typer.Option("--entry", help="Queue entry root.")] = Path("./runs"),
+    socket_path: SocketOption = None,
 ) -> None:
-    """Remove one unclaimed job; refuse a job already claimed or terminal."""
+    """Remove a pending job or stop a running one."""
     try:
-        job = cancel_job(entry, job_id)
-    except JobNotFoundError as error:
-        raise typer.BadParameter(str(error)) from None
-    except JobAlreadyClaimedError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from None
+        job = _client(socket_path).cancel(job_id)
     except QueueError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from None
-    typer.echo(f"cancelled {job.job_id}")
+        _queue_failure(error)
+    typer.echo(f"{job_id} {'cancelled' if job['status'] == 'cancelled' else 'cancel requested'}")
+
+
+@queue_app.command("priority")
+def queue_priority(
+    job_id: Annotated[str, typer.Argument(help="Pending job ID.")],
+    priority: Annotated[int, typer.Argument(help="New priority; higher runs first.")],
+    socket_path: SocketOption = None,
+) -> None:
+    """Change one pending job's priority."""
+    try:
+        _client(socket_path).set_priority(job_id, priority)
+    except QueueError as error:
+        _queue_failure(error)
+    typer.echo(f"{job_id} priority {priority}")
+
+
+@queue_app.command("wait")
+def queue_wait(
+    job_id: Annotated[Union[list[str], None], typer.Argument(help="Job IDs to wait for.")] = None,
+    group: Annotated[Union[str, None], typer.Option("--group", help="Group to wait for.")] = None,
+    reconnect_timeout: Annotated[
+        str,
+        typer.Option(
+            "--reconnect-timeout",
+            help="How long a down service is retried before giving up.",
+        ),
+    ] = "10m",
+    socket_path: SocketOption = None,
+) -> None:
+    """Block until jobs end and print their outcomes.
+
+    Exits 0 whatever the jobs' status, so read each job's status. Exits 1 only
+    when the service stayed unreachable, which leaves job state unknown.
+    """
+    if not job_id and group is None:
+        raise typer.BadParameter("Name job IDs or --group")
+    try:
+        jobs = _client(socket_path).wait(
+            job_id or (), group, reconnect_seconds=parse_duration(reconnect_timeout)
+        )
+    except JobValidationError as error:
+        raise typer.BadParameter(str(error)) from None
+    except QueueError as error:
+        _queue_failure(error)
+    typer.echo(json.dumps({"jobs": jobs}, indent=2))
 
 
 @queue_app.command("serve")
 def queue_serve(
-    device: Annotated[
-        str,
-        typer.Option("--device", help="Device spec this lane exclusively serves."),
-    ],
-    entry: Annotated[Path, typer.Option("--entry", help="Queue entry root.")] = Path("./runs"),
-    poll_interval: Annotated[
+    state_dir: Annotated[
+        Union[Path, None],
+        typer.Option("--state-dir", help="Durable state directory."),
+    ] = None,
+    socket_path: SocketOption = None,
+    tick: Annotated[
         float,
-        typer.Option(
-            "--poll-interval",
-            callback=positive_float,
-            help="Idle poll interval in seconds.",
-        ),
-    ] = 1.0,
+        typer.Option("--tick", callback=positive_float, help="Scheduler tick in seconds."),
+    ] = 5.0,
+    ram_headroom: Annotated[
+        float,
+        typer.Option("--ram-headroom", min=0.0, max=1.0, help="Host RAM fraction kept free."),
+    ] = 0.1,
+    ram_stable_window: Annotated[
+        str,
+        typer.Option("--ram-stable-window", help="Unknown-RAM job stability window."),
+    ] = "5m",
+    default_timeout: Annotated[
+        str,
+        typer.Option("--default-timeout", help="Limit for jobs that set no --timeout."),
+    ] = "14d",
 ) -> None:
-    """Run the foreground FIFO device-lane runner until interrupted.
-
-    A malformed completion journal is refused with a clean error instead of
-    starting this lane: silently skipping journal corruption risks
-    double-running a job the journal had already durably recorded.
-    """
+    """Run the queue service until SIGTERM; running jobs keep running after it stops."""
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     try:
-        run_serve_loop(entry, device, poll_interval_seconds=poll_interval)
-    except DeviceLeaseConflictError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from None
-    except QueueError as error:
-        typer.echo(str(error), err=True)
-        raise typer.Exit(code=1) from None
-    except (OSError, ValueError) as error:
-        raise typer.BadParameter(str(error)) from None
-
-
-def _parse_metadata_option(metadata: Union[str, None]) -> Union[dict[str, Any], None]:
-    """Parse the ``--metadata`` CLI option into an opaque JSON object."""
-    if metadata is None:
-        return None
-    try:
-        parsed = json.loads(metadata)
-    except json.JSONDecodeError as error:
-        raise typer.BadParameter(f"--metadata must be a JSON object: {error}") from None
-    if not isinstance(parsed, dict):
-        raise typer.BadParameter("--metadata must be a JSON object.")
-    return parsed
-
-
-def _render_queue_snapshot(snapshot: QueueSnapshot) -> str:
-    """Render one plain, stable snapshot for passive queue-state readers."""
-    lines: list[str] = []
-
-    def render_job(status: str, job: Job) -> str:
-        return f"{status:<12}{job.job_id} device={job.device} sequence={job.sequence}"
-
-    def render_outcome(status: str, outcome: JobOutcome) -> str:
-        return (
-            f"{status:<12}{outcome.job_id} device={outcome.device} "
-            f"return_code={outcome.return_code} signal={outcome.signal}"
+        config = ServiceConfig(
+            tick_seconds=tick,
+            ram_headroom_fraction=ram_headroom,
+            ram_stable_seconds=parse_duration(ram_stable_window),
+            default_timeout_seconds=parse_duration(default_timeout),
         )
+    except JobValidationError as error:
+        raise typer.BadParameter(str(error)) from None
+    try:
+        run_service(
+            state_dir if state_dir is not None else default_state_dir(),
+            socket_path if socket_path is not None else default_socket_path(),
+            config,
+        )
+    except (QueueError, OSError, sqlite3.Error) as error:
+        typer.echo(f"Queue service failed: {error}", err=True)
+        raise typer.Exit(code=1) from None
 
-    lines.append(f"pending: {len(snapshot.pending)}")
-    lines.extend(render_job("PENDING", job) for job in snapshot.pending)
-    lines.append(f"claimed: {len(snapshot.claimed)}")
-    lines.extend(render_job("CLAIMED", job) for job in snapshot.claimed)
-    if snapshot.journal_error is not None:
-        lines.append(f"journal: unreadable ({snapshot.journal_error})")
-    else:
-        lines.append(f"completed: {len(snapshot.completed)}")
-        lines.extend(render_outcome("COMPLETED", outcome) for outcome in snapshot.completed)
-        lines.append(f"failed: {len(snapshot.failed)}")
-        lines.extend(render_outcome("FAILED", outcome) for outcome in snapshot.failed)
-        lines.append(f"interrupted: {len(snapshot.interrupted)}")
-        lines.extend(render_outcome("INTERRUPTED", outcome) for outcome in snapshot.interrupted)
-    if snapshot.malformed_job_files:
-        lines.append(f"malformed job files: {len(snapshot.malformed_job_files)}")
-        lines.extend(f"  {path}" for path in snapshot.malformed_job_files)
-    return "\n".join(lines)
+
+def _parse_env_options(values: Union[list[str], None]) -> dict[str, str]:
+    env = {}
+    for value in values or ():
+        key, separator, content = value.partition("=")
+        if not separator:
+            raise JobValidationError(f"--env requires KEY=VALUE: {value!r}")
+        env[key] = content
+    return env
+
+
+def _render_queue(jobs: Sequence[dict[str, Any]], resources: dict[str, Any]) -> str:
+    """Render one plain queue listing."""
+    lines = []
+    for problem in ("sampling_error", "executor_error"):
+        if resources.get(problem):
+            lines.append(f"{problem}: {resources[problem]}")
+    for gpu in resources.get("gpus", ()):
+        owners = ",".join(gpu["jobs"]) or "-"
+        lines.append(
+            f"GPU{gpu['index']} free={format_size(gpu['free'])} total={format_size(gpu['total'])} "
+            f"external={format_size(gpu['external'])} jobs={owners}"
+        )
+    ram = resources.get("ram")
+    if ram is not None:
+        lines.append(
+            f"RAM admissible={format_size(max(0, ram['admissible']))} "
+            f"available={format_size(ram['available'])} total={format_size(ram['total'])}"
+        )
+    for job in jobs:
+        gpus = ",".join(map(str, job["gpu_indices"])) or "-"
+        vram = format_size(job["reserved_vram"] or job["declared_vram"])
+        vram = f"{vram}/{format_size(job['peak_vram'])}"
+        memory = format_size(job["reserved_ram"] or job["declared_ram"])
+        memory = f"{memory}/{format_size(job['peak_ram'])}"
+        partial = " partial" if job["peak_partial"] else ""
+        status = f"{job['status']}({job['label']})" if job["label"] else job["status"]
+        detail = job["wait_reason"] or job["message"] or " ".join(job["argv"])
+        lines.append(
+            f"{job['job_id']} {status} pri={job['priority']} gpu={gpus} "
+            f"vram={vram} ram={memory}{partial} group={job['group'] or '-'} {detail}"
+        )
+        lines.extend(f"  warning: {warning}" for warning in job["warnings"])
+    return "\n".join(lines) if lines else "Queue is empty"
 
 
 def _show_fleet(
