@@ -22,6 +22,7 @@
 
   outputs =
     {
+      self,
       nixpkgs,
       pyproject-nix,
       uv2nix,
@@ -92,5 +93,14 @@
           default = mammoth;
         }
       );
+
+      # Runs the queue service and web monitor: import it and set
+      # `services.mammoth.enable`. Linux with systemd user services only.
+      homeManagerModules.default =
+        { pkgs, ... }:
+        {
+          imports = [ ./nix/home-manager.nix ];
+          services.mammoth.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        };
     };
 }

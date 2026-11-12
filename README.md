@@ -778,6 +778,21 @@ systemctl --user daemon-reload
 systemctl --user enable --now mammoth.target
 ```
 
+With Home Manager, the flake's module installs the package and the same units and
+enables `mammoth.target`:
+
+```nix
+{
+  imports = [ inputs.mammoth.homeManagerModules.default ];
+  services.mammoth = {
+    enable = true;
+    # Optional: bind beyond loopback and allow queue changes on a trusted network.
+    monitor.host = "192.0.2.10";
+    monitor.allowQueueWrites = true;
+  };
+}
+```
+
 The monitor shows every run any job named with `--run-dir`, including finished jobs,
 plus a Queue page at <http://127.0.0.1:8765/?view=queue> for cancelling jobs and
 changing priority. It needs no project paths. For runs that never went through the

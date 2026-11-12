@@ -41,6 +41,8 @@ when its subject changes instead of duplicating the same contract elsewhere.
 | `README.md` | Concise user-facing project introduction and setup entry point. | Public package purpose, installation, stable CLI/API, or user-visible behavior changes. |
 | `LICENSE` | MIT license terms and copyright notice. | The project license or copyright notice changes. |
 | `deploy/` | Complete systemd user units for the queue service and its web monitor. | A service command, its grouping, or its runtime prerequisites change. |
+| `flake.nix` | Nix package built from `uv.lock`, and the Home Manager module output. | Packaging, the Python extras installed, or the flake's outputs change. |
+| `nix/home-manager.nix` | Home Manager module that installs the package and the `deploy/` units and adapts them to the host. | A unit is added, renamed, or needs different host adaptation, or the module's options change. |
 | `docs/ARCHITECTURE.md` | Durable package boundary, dependency direction, runtime model, logging roles, trainer scope, and compatibility policy. | Responsibilities move between layers or a stable architectural contract changes. |
 | `docs/MONITOR.md` | Canonical passive-monitor reconstruction, dashboard hierarchy, telemetry, responsive presentation, and interaction behavior. | Monitor folding, layout, display naming or units, resource probes, refresh policy, or keyboard behavior changes. |
 | `docs/IMPLEMENTATION_PLAN.md` | Ordered delivery phases, acceptance conditions, migration sequence, and explicitly deferred capabilities. | A phase is started/completed, delivery order changes, or deferred scope is approved. |
